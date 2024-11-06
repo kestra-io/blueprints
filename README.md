@@ -41,4 +41,6 @@ Each Blueprint combines code and documentation and can be assigned several tags 
 
 ## Contributing Tips
 
-Make sure that the file name matches the namespace and flow id of your blueprint.
+1. Make sure your flow id uses url-style-hyphen-case-notation.
+2. Make your flow id as long and descriptive as possible.
+3. Make sure that the file name matches the flow id of your blueprint.
