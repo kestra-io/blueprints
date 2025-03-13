@@ -45,7 +45,7 @@ Each Blueprint combines code and documentation and can be assigned several tags 
 2. Make your flow id as long and descriptive as possible.
 3. Make sure that the file name matches the flow id of your blueprint.
 
-## Sanitychecks
+## Sanity checks
 
 Sanity checks in Kestra are test flows used to verify functionality of plugins and tasks:
 
