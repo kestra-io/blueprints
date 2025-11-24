@@ -52,13 +52,13 @@ Sanity checks in Kestra are test flows used to verify functionality of plugins a
 **Structure:**
 
 - Plugin sanity checks: Flow ID is the task name, namespace "sanitychecks", and include Assert tasks to test task outputs.
-- Flow sanity checks: Flow ID mentions main tasks, namespace "sanitychecks", they tests complete workflow (always self-contained)
+- Flow sanity checks: Flow ID mentions main tasks, namespace "sanitychecks"; they test the complete workflow (always self-contained)
 
 **External Dependencies:**
 
 - OSS services: Use Docker Run/Stop tasks
 - Cloud services: Leverage sandbox environments when possible
-- SaaS/License services: Not currently supported (or hard coded credentials from demo accounts)
+- SaaS/License services: Not currently supported (or hard-coded credentials from demo accounts)
 
 **Organization:**
 
