@@ -41,9 +41,65 @@ Each Blueprint combines code and documentation and can be assigned several tags 
 
 ## Contributing Tips
 
-1. Make sure your flow id uses url-style-hyphen-case-notation.
-2. Make your flow id as long and descriptive as possible.
-3. Make sure that the file name matches the flow id of your blueprint.
+## Blueprint YAML contribution guidelines (suggested)
+
+When contributing blueprints, please include clear metadata, documentation and runnable examples so other users can quickly understand, configure and run your flow.
+
+Required & recommended fields
+- id (required): hyphen-case, must match filename.
+- namespace (required): owner/team namespace.
+- tasks (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
+- extend (recommended): use this metadata block to explain the blueprint for the catalog UI.
+  - title: concise human title (one line).
+  - description: long explanation, prerequisites, steps to run, expected outputs, warnings.
+  - meta_description: short summary (<= 160 chars) used for search/cards.
+  - tags: categories to improve discoverability.
+  - ee: true/false (mark enterprise-only flows).
+  - demo: true/false (mark runnable demo flows).
+
+Documentation checklist for each blueprint
+1. Prerequisites: list required secrets, services, images.
+2. Secrets: list each secret name and exact purpose (do NOT include values).
+3. Inputs: document each input (type, default, allowed values).
+4. Outputs: show primary outputs and example paths (e.g., `{{ outputs.task.uri }}`).
+5. Links: include links to plugin docs or external APIs used.
+
+Style & best practices
+- Keep `meta_description` short and searchable.
+- Title should be human-friendly (not the same as id).
+- Put examples for common pitfalls (e.g., enabling schedules, how to set secrets).
+- Avoid hardcoding credentials—use `{{ secret('NAME') }}` placeholders.
+- Add task-level `description` fields liberally to explain purpose and side-effects.
+- Use `pluginDefaults` for API keys when the plugin supports it, and document the secret names.
+
+Example `extend` template to copy-paste:
+```yaml
+extend:
+  title: Short human-friendly title here
+  description: |
+    Short summary: what the blueprint does.
+
+    Prerequisites:
+      - Secrets:
+        - NAME: purpose (required)
+      - Services: Redis, Postgres, SMTP, etc.
+    Quick start:
+      1. Set secrets
+      2. Upload flow
+      3. (Optional) Enable schedule and run
+    Expected outputs:
+      - outputs.my_task.uri: CSV file with results
+    Notes:
+      - Estimated run time: ~30s
+      - Cost: may incur cloud egress charges
+  tags:
+    - Data
+  ee: false
+  demo: true
+  meta_description: One-line summary suitable for search (<=160 chars)
+```
+
+Thank you for contributing — clear docs make blueprints far more reusable, so be as detailed as you can :D
 
 ## Sanity checks
 
