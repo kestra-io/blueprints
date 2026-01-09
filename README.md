@@ -43,13 +43,13 @@ Each Blueprint combines code and documentation and can be assigned several tags 
 
 ## Blueprint YAML contribution guidelines (suggested)
 
-When contributing blueprints, please include clear metadata, documentation and runnable examples so other users can quickly understand, configure and run your flow.
+When contributing Blueprints, please include clear metadata, documentation and runnable examples so other users can quickly understand, configure and run your flow.
 
 Required & recommended fields
 - id (required): hyphen-case, must match filename.
 - namespace (required): owner/team namespace.
 - tasks (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
-- extend (recommended): use this metadata block to explain the blueprint for the catalog UI.
+- extend (recommended): use this metadata block to explain the Blueprint for the catalog UI.
   - title: concise human title (one line).
   - description: long explanation, prerequisites, steps to run, expected outputs, warnings.
   - meta_description: short summary (<= 160 chars) used for search/cards.
@@ -67,8 +67,8 @@ Documentation checklist for each blueprint
 Style & best practices
 - Keep `meta_description` short and searchable.
 - Title should be human-friendly (not the same as id).
-- Put examples for common pitfalls (e.g., enabling schedules, how to set secrets).
-- Avoid hardcoding credentials—use `{{ secret('NAME') }}` placeholders.
+- Put examples for common pitfalls (e.g., enabling schedules, how to set secrets, expressions).
+- Avoid hardcoding credentials — use `{{ secret('NAME') }}` placeholders.
 - Add task-level `description` fields liberally to explain purpose and side-effects.
 - Use `pluginDefaults` for API keys when the plugin supports it, and document the secret names.
 
@@ -77,7 +77,7 @@ Example `extend` template to copy-paste:
 extend:
   title: Short human-friendly title here
   description: |
-    Short summary: what the blueprint does.
+    Short summary: what the Blueprint does.
 
     Prerequisites:
       - Secrets:
@@ -89,17 +89,14 @@ extend:
       3. (Optional) Enable schedule and run
     Expected outputs:
       - outputs.my_task.uri: CSV file with results
-    Notes:
-      - Estimated run time: ~30s
-      - Cost: may incur cloud egress charges
   tags:
-    - Data
+    - Getting Started # Check Blueprints page or other Blueprints for all possible tags
   ee: false
   demo: true
   meta_description: One-line summary suitable for search (<=160 chars)
 ```
 
-Thank you for contributing — clear docs make blueprints far more reusable, so be as detailed as you can :D
+Thank you for contributing — clear docs make Blueprints far more reusable, so be as detailed as you can :D
 
 ## Sanity checks
 
