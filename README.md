@@ -41,7 +41,7 @@ Each Blueprint combines code and documentation and can be assigned several tags 
 
 ## Contributing Tips
 
-## Blueprint YAML contribution guidelines (suggested)
+## Blueprint YAML contribution guidelines
 
 When contributing Blueprints, please include clear metadata, documentation and runnable examples so other users can quickly understand, configure and run your flow.
 
@@ -49,7 +49,7 @@ Required & recommended fields
 - `id` (required): hyphen-case, must match filename.
 - `namespace` (required): owner/team namespace.
 - `tasks` (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
-- `extend` (recommended): use this metadata block to explain the Blueprint for the catalog UI.
+- `extend` (required): use this metadata block to explain the Blueprint for the catalog UI.
   - `title`: concise human title (one line).
   - `description`: long explanation, prerequisites, steps to run, expected outputs, warnings.
   - `meta_description`: short summary (<= 160 chars) used for search/cards.
