@@ -39,6 +39,10 @@ Blueprints are a curated, organized, and searchable catalog of ready-to-use exam
 
 Each Blueprint combines code and documentation and can be assigned several tags for organization and discoverability.
 
+## Tutorial namespace
+
+Some blueprints are packaged with Kestra and available in the `tutorial` namespace. This is a subset of the blueprints labeled "Getting Started".
+
 ## Contributing Tips
 
 ## Blueprint YAML contribution guidelines
