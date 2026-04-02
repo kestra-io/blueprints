@@ -8,7 +8,7 @@ labels: ["blueprint"]
 ## Required metadata
 - [ ] `id` matches the filename (hyphen-case) and `namespace` is set.
 - [ ] `tasks` are fully defined; add `description` where behaviour is not obvious.
-- [ ] `extend` block includes: `title`, rich `description` (prerequisites, quick start, expected outputs), `meta_description` (<=160 chars), `tags`, `ee`, and `demo`.
+- [ ] `extend` block includes: `title`, rich `description` (prerequisites, quick start, expected outputs), `metaDescription` (<=160 chars), `tags`, `ee`, and `demo`.
 
 ## Documentation checklist
 - [ ] Prerequisites are listed (services/images) and every secret is named with its purpose (no values).

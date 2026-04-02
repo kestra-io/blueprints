@@ -56,7 +56,7 @@ Required & recommended fields
 - `extend` (required): use this metadata block to explain the Blueprint for the catalog UI.
   - `title`: concise human title (one line).
   - `description`: long explanation, prerequisites, steps to run, expected outputs, warnings.
-  - `meta_description`: short summary (<= 160 chars) used for search/cards.
+  - `metaDescription`: short summary (<= 160 chars) used for search/cards.
   - `tags`: categories to improve discoverability.
   - `ee`: true/false (Flows that require Enterprise Edition).
   - `demo`: true/false (mark runnable demo flows).
@@ -69,7 +69,7 @@ Documentation checklist for each blueprint
 5. Links: include links to plugin docs or external APIs used.
 
 Style & best practices
-- Keep `meta_description` short and searchable.
+- Keep `metaDescription` short and searchable.
 - Title should be human-friendly (not the same as id).
 - Put examples for common pitfalls (e.g., enabling schedules, how to set secrets, expressions).
 - Avoid hardcoding credentials — use `{{ secret('NAME') }}` placeholders.
@@ -97,7 +97,7 @@ extend:
     - Getting Started # Check Blueprints page or other Blueprints for all possible tags
   ee: false
   demo: true
-  meta_description: One-line summary suitable for search (<=160 chars)
+  metaDescription: One-line summary suitable for search (<=160 chars)
 ```
 
 Thank you for contributing — clear docs make Blueprints far more reusable, so be as detailed as you can :D
