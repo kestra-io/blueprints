@@ -62,11 +62,12 @@ Required & recommended fields
   - `demo`: true/false (mark runnable demo flows).
 
 Documentation checklist for each blueprint
-1. Prerequisites: list required secrets, services, images.
-2. Secrets: list each secret name and exact purpose (do NOT include values).
-3. Inputs: document each input (type, default, allowed values).
-4. Outputs: show primary outputs and example paths (e.g., `{{ outputs.task.uri }}`).
-5. Links: include links to plugin docs or external APIs used.
+1. Tasks: include multiple tasks.
+2. Prerequisites: list required secrets, services, images.
+3. Secrets: list each secret name and exact purpose (do NOT include values).
+4. Inputs: document each input (type, default, allowed values).
+5. Outputs: show primary outputs and example paths (e.g., `{{ outputs.task.uri }}`).
+6. Links: include links to plugin docs or external APIs used.
 
 Style & best practices
 - Keep `metaDescription` short and searchable.
