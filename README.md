@@ -75,7 +75,6 @@ Style & best practices
 - Put examples for common pitfalls (e.g., enabling schedules, how to set secrets, expressions).
 - Avoid hardcoding credentials — use `{{ secret('NAME') }}` placeholders.
 - Add task-level `description` fields liberally to explain purpose and side-effects.
-- Use `pluginDefaults` for API keys when the plugin supports it, and document the secret names.
 
 Example `extend` template to copy-paste:
 ```yaml
