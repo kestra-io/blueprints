@@ -49,6 +49,13 @@ Some blueprints are packaged with Kestra and available in the `tutorial` namespa
 
 When contributing Blueprints, please include clear metadata, documentation and runnable examples so other users can quickly understand, configure and run your flow.
 
+A Blueprint is a ready-to-use flow template. Build something you would actually run — connected to AI, a database, a warehouse, whatever you work with. To be accepted, the flow needs to be doing more than just a 100-line script and a few logging tasks. Below are some minimum requirements.
+
+Minimum 3 runnable tasks
+- At least 1 flow task — Parallel, If, or a Loop, for example.
+- At least 1 trigger; event-based triggers are a nice to have
+- At least 1 non-core plugin (i.e., some third party plugin such as the Git plugin)
+
 Required & recommended fields
 - `id` (required): hyphen-case, must match filename.
 - `namespace` (required): owner/team namespace.
