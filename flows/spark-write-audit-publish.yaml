@@ -1,0 +1,263 @@
+id: spark-write-audit-publish
+namespace: company.team
+
+inputs:
+  - id: source_url
+    type: URI
+    displayName: Source CSV
+    description: CSV with order_id, customer_name, customer_email, product_id, price, quantity, total. The default is a public sample of 100 orders.
+    defaults: https://huggingface.co/datasets/kestra/datasets/raw/main/csv/orders.csv
+
+  - id: min_rows
+    type: INT
+    displayName: Minimum rows
+    defaults: 50
+
+  - id: max_bad_row_rate
+    type: FLOAT
+    displayName: Max bad row rate
+    description: Highest share of rows allowed to break a row rule (null or duplicate order_id, non-positive price or quantity, total not equal to price x quantity, invalid email). A row that breaks several rules counts once. Rows that share a duplicated order_id all count as bad.
+    defaults: 0.0
+
+  - id: inject_bad_rows
+    type: BOOL
+    displayName: Inject bad rows
+    description: Append duplicates, null keys and wrong totals to the batch to watch the audit quarantine it.
+    defaults: false
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Notify Slack
+    description: Post the result to Slack. Needs the SLACK_WEBHOOK_URL secret.
+    defaults: false
+
+variables:
+  published_path: data/published/orders.parquet
+  quarantine_path: "data/quarantine/orders-{{ execution.id }}.parquet"
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: nightly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Build, audit and publish the dataset every night.
+    cron: "0 3 * * *"
+
+tasks:
+  - id: download_source
+    type: io.kestra.plugin.core.http.Download
+    description: Fetch the raw batch.
+    uri: "{{ inputs.source_url }}"
+
+  - id: write
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: The Spark job writes the candidate Parquet into this directory. Nothing is published yet.
+    inputFiles:
+      orders.csv: "{{ outputs.download_source.uri }}"
+    outputFiles:
+      - candidate.parquet
+    tasks:
+      - id: build_and_audit
+        type: io.kestra.plugin.spark.PythonSubmit
+        description: >
+          Read the raw CSV, type and clean it, write one candidate Parquet file, then run
+          the audit on that candidate and print the results as Kestra outputs.
+        master: local[*]
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          user: root
+        args:
+          - "{{ inputs.inject_bad_rows }}"
+        mainScript: |
+          import glob, json, os, shutil, sys
+          from pyspark.sql import SparkSession, functions as F
+
+          inject_bad_rows = sys.argv[1].lower() == "true"
+          spark = SparkSession.builder.appName("write-audit-publish").getOrCreate()
+          spark.sparkContext.setLogLevel("WARN")
+
+          # WRITE: type and clean the raw batch into a candidate dataset
+          raw = spark.read.option("header", "true").csv("orders.csv")
+          orders = raw.select(
+              F.col("order_id").cast("long").alias("order_id"),
+              F.trim("customer_name").alias("customer_name"),
+              F.lower(F.trim("customer_email")).alias("customer_email"),
+              F.col("product_id").cast("int").alias("product_id"),
+              F.col("price").cast("decimal(10,2)").alias("price"),
+              F.col("quantity").cast("int").alias("quantity"),
+              F.col("total").cast("decimal(12,2)").alias("total"),
+          )
+          if inject_bad_rows:
+              bad = orders.limit(5).union(
+                  orders.limit(3).withColumn("order_id", F.lit(None).cast("long"))
+              ).union(
+                  orders.limit(4).withColumn("total", F.col("total") + F.lit(10))
+              )
+              orders = orders.union(bad)
+
+          orders.coalesce(1).write.mode("overwrite").parquet("candidate_dir")
+          shutil.move(glob.glob("candidate_dir/part-*.parquet")[0], "candidate.parquet")
+          shutil.rmtree("candidate_dir")
+
+          # AUDIT: read the candidate back, the exact bytes that would be published
+          c = spark.read.parquet("candidate.parquet")
+          rows = c.count()
+          from pyspark.sql.window import Window
+          flagged = c.withColumn("_id_count", F.count(F.lit(1)).over(Window.partitionBy("order_id"))).select(
+              F.col("order_id").isNull().alias("null_order_id"),
+              (F.col("order_id").isNotNull() & (F.col("_id_count") > 1)).alias("duplicate_order_id"),
+              ((F.col("price") <= 0) | (F.col("quantity") <= 0)).alias("non_positive_price_or_quantity"),
+              (F.abs(F.col("total") - F.col("price") * F.col("quantity")) > F.lit(0.01)).alias("total_mismatch"),
+              (~F.coalesce(F.col("customer_email"), F.lit("")).rlike(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")).alias("invalid_email"),
+          )
+          rules = flagged.columns
+          agg = flagged.agg(
+              *[F.sum(F.col(r).cast("int")).alias(r) for r in rules],
+              F.sum(F.greatest(*[F.coalesce(F.col(r), F.lit(True)).cast("int") for r in rules])).alias("bad_rows"),
+          ).first()
+          checks = {r: int(agg[r] or 0) for r in rules}
+          bad_rows = int(agg["bad_rows"] or 0)
+          failed = [k for k, v in checks.items() if v > 0]
+          spark.stop()
+
+          result = {
+              "rows": rows,
+              "bad_rows": bad_rows,
+              "bad_row_rate": round(bad_rows / rows, 6) if rows else 1.0,
+              "failed_checks": ",".join(failed),
+              "checks": json.dumps(checks),
+          }
+          print("::" + json.dumps({"outputs": result}) + "::", flush=True)
+
+  - id: audit_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Publish only when the candidate has enough rows and its bad row rate is within the limit.
+    condition: "{{ outputs.build_and_audit.vars.rows >= inputs.min_rows and outputs.build_and_audit.vars.bad_row_rate <= inputs.max_bad_row_rate }}"
+    then:
+      - id: publish
+        type: io.kestra.plugin.core.namespace.UploadFiles
+        description: Overwrite the published dataset with the audited candidate. Readers only ever see audited data.
+        namespace: "{{ flow.namespace }}"
+        filesMap:
+          "{{ render(vars.published_path) }}": "{{ outputs.write.outputFiles['candidate.parquet'] }}"
+
+      - id: record_publication
+        type: io.kestra.plugin.core.kv.Set
+        description: Store what is published and when, for downstream flows and dashboards.
+        key: orders_published
+        kvType: JSON
+        value: |
+          {
+            "path": "{{ render(vars.published_path) }}",
+            "rows": {{ outputs.build_and_audit.vars.rows }},
+            "execution_id": "{{ execution.id }}",
+            "published_at": "{{ now() }}"
+          }
+
+      - id: notify_published
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: slack_published
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "Orders dataset published: {{ outputs.build_and_audit.vars.rows }} rows passed the audit. Execution {{ execution.id }}."
+              }
+    else:
+      - id: quarantine
+        type: io.kestra.plugin.core.namespace.UploadFiles
+        description: Keep the rejected candidate for inspection. The published dataset is left as it was.
+        namespace: "{{ flow.namespace }}"
+        filesMap:
+          "{{ render(vars.quarantine_path) }}": "{{ outputs.write.outputFiles['candidate.parquet'] }}"
+
+      - id: notify_quarantined
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: slack_quarantined
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "Orders dataset NOT published. {{ outputs.build_and_audit.vars.bad_rows }} bad rows in {{ outputs.build_and_audit.vars.rows }} (failed checks: {{ outputs.build_and_audit.vars.failed_checks }}). Candidate quarantined at {{ render(vars.quarantine_path) }}. Execution {{ execution.id }}."
+              }
+
+      - id: block_publish
+        type: io.kestra.plugin.core.execution.Fail
+        description: End the run as FAILED so the rejected batch is visible.
+        errorMessage: "Audit failed: {{ outputs.build_and_audit.vars.bad_rows }} bad rows of {{ outputs.build_and_audit.vars.rows }}. Checks: {{ outputs.build_and_audit.vars.checks }}"
+
+extend:
+  title: Write-Audit-Publish a dataset with Spark and Kestra
+  metaTitle: Write-Audit-Publish data pipeline with Spark and Kestra
+  shortDescription: A Spark job writes a candidate Parquet dataset and audits it with row-level rules. Kestra publishes it only when the audit passes and quarantines it when it fails.
+  metaDescription: Write-Audit-Publish with Spark. Kestra builds a candidate Parquet file, audits row rules, publishes clean data, quarantines bad batches. Runs with no setup.
+  description: |
+    Write-Audit-Publish (WAP) keeps bad data away from readers. The pipeline writes a candidate dataset to a private location, audits that exact file, then publishes it only when the audit passes. In this blueprint a PySpark job builds the candidate Parquet file and audits it with row-level rules. Kestra publishes the file to a stable path when it passes. A batch that fails is quarantined with the failing checks named, and the published dataset is left as it was.
+
+    It runs with no setup. Spark runs in `local[*]` mode in the task container, the input is a public CSV of 100 orders, the output lands in namespace files and Slack is off. Run it with `inject_bad_rows` set to `true` to watch a batch get quarantined.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## How it works
+
+    1. `download_source` (`io.kestra.plugin.core.http.Download`) fetches the raw CSV.
+    2. `write` (`io.kestra.plugin.core.flow.WorkingDirectory`) runs `build_and_audit` (`io.kestra.plugin.spark.PythonSubmit`) and keeps its `candidate.parquet` as an output file.
+       - Write: the job types and cleans the rows (casts, trimmed names, lower-case emails) and writes one candidate Parquet file.
+       - Audit: the job reads the candidate back and flags each row against five rules: null `order_id`, duplicated `order_id`, non-positive price or quantity, `total` not equal to `price * quantity`, and an invalid email. A row that breaks several rules counts once. It outputs `rows`, `bad_rows`, `bad_row_rate`, `failed_checks` and the count per rule.
+    3. `audit_gate` (`io.kestra.plugin.core.flow.If`) passes when `rows >= min_rows` and `bad_row_rate <= max_bad_row_rate`.
+       - Publish: `publish` (`io.kestra.plugin.core.namespace.UploadFiles`) overwrites `data/published/orders.parquet` and `record_publication` (`io.kestra.plugin.core.kv.Set`) stores the path, row count, execution id and time under the `orders_published` key.
+       - Quarantine: `quarantine` writes the candidate to `data/quarantine/orders-<execution id>.parquet`, and `block_publish` (`io.kestra.plugin.core.execution.Fail`) ends the run as `FAILED` with the per-rule counts.
+    4. The `nightly` Schedule trigger runs it every night. Slack messages are optional on both paths.
+
+    ## Inputs
+
+    - `source_url` (URI, default the public orders CSV): the raw batch.
+    - `min_rows` (INT, default `50`): fewer rows fail the audit.
+    - `max_bad_row_rate` (FLOAT, default `0.0`): the highest share of bad rows allowed.
+    - `inject_bad_rows` (BOOL, default `false`): add 12 bad rows (duplicates, null keys, wrong totals) for a demo of the quarantine path.
+    - `notify_slack` (BOOL, default `false`): post the result to Slack.
+
+    ## Prerequisites
+
+    - A Kestra worker that can run Docker containers. The job uses the `apache/spark:4.0.1-java21-r` image, the plugin default. The Docker task runner runs it as `root` because the image user cannot read the task files otherwise.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook. Only needed when `notify_slack` is `true`.
+
+    ## Quick start
+
+    1. Save the flow and run it. The audit passes and `data/published/orders.parquet` appears under the namespace Files tab.
+    2. Run it with `inject_bad_rows: true`. The run fails with `17 bad rows of 112`, the candidate is in `data/quarantine/` and the published file is unchanged.
+    3. To use your own data, point `source_url` at your file and edit the rules in the audit section of the script.
+
+    ## Expected outputs
+
+    - `outputs.build_and_audit.vars.rows`, `bad_rows`, `bad_row_rate`, `failed_checks`, `checks`.
+    - Namespace file `data/published/orders.parquet`: the last audited dataset.
+    - KV `orders_published`: `{path, rows, execution_id, published_at}` for downstream flows.
+
+    ## Using it with a cluster and a lake
+
+    - Set `master` to your cluster, for example `spark://spark-master:7077`, and replace the namespace file steps with your object store tasks (S3, GCS, Azure Blob) to publish to a lake path.
+    - To read or write `s3a://` paths, add the `hadoop-aws` package through `configurations` (`spark.jars.packages`). The default image does not include it.
+    - With a table format such as Iceberg, write the candidate to a branch and publish by fast-forwarding the branch. The audit and gate stay the same.
+
+    ## Links
+
+    - Spark plugin: https://kestra.io/plugins/plugin-spark
+    - Namespace files: https://kestra.io/docs/concepts/namespace-files
+    - KV store: https://kestra.io/docs/concepts/kv-store
+    - Slack plugin: https://kestra.io/plugins/plugin-slack
+  tags:
+    - Data
+  subTags:
+    - Spark & Big Data
+    - Data Quality
+  ee: false
+  demo: true
