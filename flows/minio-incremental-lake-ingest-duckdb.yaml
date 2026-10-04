@@ -1,0 +1,296 @@
+id: minio-incremental-lake-ingest-duckdb
+namespace: company.team
+
+inputs:
+  - id: bucket
+    type: STRING
+    displayName: Lake bucket
+    defaults: data-lake
+
+  - id: incoming_prefix
+    type: STRING
+    displayName: Landing prefix
+    description: Producers drop Parquet files here. Only files that have not been ingested yet live here.
+    defaults: raw/incoming/
+
+  - id: processed_prefix
+    type: STRING
+    displayName: Processed prefix
+    description: Ingested files are moved here, keeping their sub-path.
+    defaults: raw/processed/
+
+  - id: curated_prefix
+    type: STRING
+    displayName: Curated prefix
+    description: Holds `events/` (row level, partitioned by event_day) and `daily_metrics/` (one file per event_day).
+    defaults: lake/curated/
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Notify Slack
+    description: Post the result to Slack. Needs the SLACK_WEBHOOK_URL secret.
+    defaults: false
+
+variables:
+  s3_secret: >-
+    CREATE OR REPLACE SECRET lake (TYPE s3,
+    KEY_ID '{{ secret('MINIO_ACCESS_KEY_ID') }}', SECRET '{{ secret('MINIO_SECRET_KEY_ID') }}',
+    ENDPOINT '{{ secret('MINIO_ENDPOINT') | split('//') | last }}', URL_STYLE 'path',
+    USE_SSL {{ (secret('MINIO_ENDPOINT') | split('https:') | length) > 1 }}, REGION 'us-east-1');
+  lake: "s3://{{ inputs.bucket }}/{{ inputs.curated_prefix }}"
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Drain the landing zone every hour. Each run handles only what arrived since the last one.
+    cron: "0 * * * *"
+
+tasks:
+  - id: list_incoming
+    type: io.kestra.plugin.minio.List
+    description: Freeze the batch. Every later step uses exactly these keys, so a file that lands mid-run waits for the next run.
+    endpoint: "{{ secret('MINIO_ENDPOINT') }}"
+    accessKeyId: "{{ secret('MINIO_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('MINIO_SECRET_KEY_ID') }}"
+    bucket: "{{ inputs.bucket }}"
+    prefix: "{{ inputs.incoming_prefix }}"
+    regexp: ".*\\.parquet$"
+    filter: FILES
+
+  - id: has_batch
+    type: io.kestra.plugin.core.flow.If
+    description: Nothing new means nothing to do.
+    condition: "{{ outputs.list_incoming.objects | length > 0 }}"
+    then:
+      - id: batch
+        type: io.kestra.plugin.core.output.OutputValues
+        description: The batch as a DuckDB list of S3 URLs.
+        values:
+          files: "[{% for o in outputs.list_incoming.objects %}'s3://{{ inputs.bucket }}/{{ o.key }}'{% if not loop.last %}, {% endif %}{% endfor %}]"
+
+      - id: list_curated
+        type: io.kestra.plugin.minio.List
+        description: Check whether curated events already exist. DuckDB fails on a glob that matches no file, so the first run skips the duplicate check.
+        endpoint: "{{ secret('MINIO_ENDPOINT') }}"
+        accessKeyId: "{{ secret('MINIO_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('MINIO_SECRET_KEY_ID') }}"
+        bucket: "{{ inputs.bucket }}"
+        prefix: "{{ inputs.curated_prefix }}events/"
+        regexp: ".*\\.parquet$"
+        filter: FILES
+
+      - id: profile
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: >
+          Check the batch against the contract straight from S3: the exact column names,
+          and every row parsing as the right type. Nothing is written.
+        fetchType: FETCH_ONE
+        sql: |
+          INSTALL httpfs; LOAD httpfs;
+          {{ render(vars.s3_secret) }}
+          CREATE TEMP TABLE b AS SELECT * FROM read_parquet({{ outputs.batch.values.files }}, union_by_name = true);
+          SELECT
+            (SELECT list(column_name ORDER BY column_name) FROM (DESCRIBE b))
+              = ['amount', 'country', 'event_id', 'event_time', 'user_id'] AS names_ok,
+            (SELECT string_agg(column_name || ' ' || column_type, ', ' ORDER BY column_name) FROM (DESCRIBE b)) AS columns,
+            (SELECT count(*) FROM b) AS rows,
+            (SELECT count(*) FROM b WHERE try_cast(event_time AS TIMESTAMP) IS NULL OR try_cast(amount AS DOUBLE) IS NULL OR event_id IS NULL) AS unparseable;
+
+      - id: contract
+        type: io.kestra.plugin.core.flow.If
+        description: Load only when the names match and every row parses. Otherwise leave the files where they are.
+        condition: "{{ (outputs.profile.outputs | last).row.names_ok and (outputs.profile.outputs | last).row.unparseable == 0 }}"
+        then:
+          - id: load
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: >
+              Append the new rows to curated events, skipping event_ids already ingested,
+              then rebuild daily_metrics for every day the batch touched from all curated
+              events, so late data and resent files never double count.
+            fetchType: FETCH_ONE
+            sql: |
+              INSTALL httpfs; LOAD httpfs;
+              {{ render(vars.s3_secret) }}
+              CREATE TEMP TABLE b AS
+                SELECT event_id::VARCHAR AS event_id, user_id::VARCHAR AS user_id, country::VARCHAR AS country,
+                       amount::DOUBLE AS amount, event_time::TIMESTAMP AS event_time, event_time::TIMESTAMP::DATE AS event_day
+                FROM read_parquet({{ outputs.batch.values.files }}, union_by_name = true)
+                QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY event_time) = 1;
+              CREATE TEMP TABLE seen AS
+              {% if outputs.list_curated.objects | length > 0 %}
+                SELECT DISTINCT event_id FROM read_parquet('{{ render(vars.lake) }}events/**/*.parquet', hive_partitioning = true) WHERE event_id IN (SELECT event_id FROM b);
+              {% else %}
+                SELECT NULL::VARCHAR AS event_id WHERE false;
+              {% endif %}
+              CREATE TEMP TABLE fresh AS SELECT * FROM b WHERE event_id NOT IN (SELECT event_id FROM seen);
+              COPY (SELECT * FROM fresh) TO '{{ render(vars.lake) }}events'
+                (FORMAT PARQUET, PARTITION_BY (event_day), OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'batch-{{ execution.id }}-{i}');
+              COPY (
+                SELECT event_day, country, count(*) AS events, count(DISTINCT user_id) AS active_users, round(sum(amount), 2) AS revenue
+                FROM read_parquet('{{ render(vars.lake) }}events/**/*.parquet', hive_partitioning = true)
+                WHERE event_day IN (SELECT DISTINCT event_day FROM fresh)
+                GROUP BY event_day, country
+              ) TO '{{ render(vars.lake) }}daily_metrics'
+                (FORMAT PARQUET, PARTITION_BY (event_day), OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'metrics');
+              SELECT
+                (SELECT count(*) FROM fresh) AS loaded,
+                (SELECT count(*) FROM seen) AS duplicates_skipped,
+                (SELECT coalesce(string_agg(DISTINCT event_day::VARCHAR, ', ' ORDER BY event_day::VARCHAR), '') FROM fresh) AS days_rebuilt;
+
+          - id: archive
+            type: io.kestra.plugin.core.flow.Loop
+            description: Move each file of the frozen batch to the processed prefix, keeping its sub-path so equal file names never collide.
+            values: "{{ outputs.list_incoming.objects | jq('[.[].key]') | first }}"
+            concurrencyLimit: 4
+            tasks:
+              - id: archive_object
+                type: io.kestra.plugin.minio.Copy
+                endpoint: "{{ secret('MINIO_ENDPOINT') }}"
+                accessKeyId: "{{ secret('MINIO_ACCESS_KEY_ID') }}"
+                secretKeyId: "{{ secret('MINIO_SECRET_KEY_ID') }}"
+                delete: true
+                from:
+                  bucket: "{{ inputs.bucket }}"
+                  key: "{{ item.value }}"
+                to:
+                  bucket: "{{ inputs.bucket }}"
+                  key: "{{ inputs.processed_prefix }}{{ item.value | slice(inputs.incoming_prefix | length, item.value | length) }}"
+
+          - id: log_loaded
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Ingested {{ outputs.list_incoming.objects | length }} file(s): {{ (outputs.load.outputs | last).row.loaded }} new rows,
+              {{ (outputs.load.outputs | last).row.duplicates_skipped }} already-ingested rows skipped,
+              daily_metrics rebuilt for [{{ (outputs.load.outputs | last).row.days_rebuilt }}].
+
+          - id: notify_loaded
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.notify_slack }}"
+            then:
+              - id: slack_loaded
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "text": "Lake ingest: {{ (outputs.load.outputs | last).row.loaded }} new rows from {{ outputs.list_incoming.objects | length }} file(s), {{ (outputs.load.outputs | last).row.duplicates_skipped }} duplicates skipped, metrics rebuilt for {{ (outputs.load.outputs | last).row.days_rebuilt }}. Execution {{ execution.id }}."
+                  }
+        else:
+          - id: notify_contract
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.notify_slack }}"
+            then:
+              - id: slack_contract
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "text": "Lake ingest BLOCKED by the contract. Columns: {{ (outputs.profile.outputs | last).row.columns }}. Unparseable rows: {{ (outputs.profile.outputs | last).row.unparseable }}. Files left in {{ inputs.incoming_prefix }}. Execution {{ execution.id }}."
+                  }
+
+          - id: block_batch
+            type: io.kestra.plugin.core.execution.Fail
+            description: End the run as FAILED. The batch stays in the landing zone for a fix and a rerun.
+            errorMessage: "Contract failed. Columns: {{ (outputs.profile.outputs | last).row.columns }}. Unparseable rows: {{ (outputs.profile.outputs | last).row.unparseable }}."
+    else:
+      - id: nothing_new
+        type: io.kestra.plugin.core.log.Log
+        message: "No new files under s3://{{ inputs.bucket }}/{{ inputs.incoming_prefix }}."
+
+errors:
+  - id: notify_error
+    type: io.kestra.plugin.core.flow.If
+    description: A task failed outside the contract check, for example the object store was unreachable. The contract failure already posts its own message.
+    condition: "{{ inputs.notify_slack and (outputs.block_batch ?? null) is null }}"
+    then:
+      - id: slack_error
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Lake ingest ERRORED in {{ flow.id }}. Files not yet archived stay in {{ inputs.incoming_prefix }} and are retried next run. Execution {{ execution.id }}."
+          }
+
+extend:
+  title: Incremental, idempotent lake ingestion from MinIO with DuckDB
+  metaTitle: Incremental MinIO data lake ingestion with DuckDB and Kestra
+  shortDescription: Drain a MinIO landing zone into partitioned curated Parquet with DuckDB, skip already-ingested events, rebuild daily metrics for touched days and block batches that break the contract.
+  metaDescription: Ingest new MinIO files into a partitioned lake with DuckDB. Kestra skips duplicates, rebuilds touched days so late data stays correct, blocks bad schemas.
+  description: |
+    Producers drop Parquet files into a MinIO landing prefix. Every hour this flow takes the files that are there, checks them against a column contract, appends the new rows to a curated `events` dataset partitioned by day, rebuilds `daily_metrics` for every day the batch touched, then moves the files to a processed prefix. DuckDB reads and writes the lake directly over S3, so no file is downloaded to the worker.
+
+    Three common lake problems are handled:
+    - **Late data.** A file for a day that was already loaded rebuilds that day's metrics from all its events. Distinct counts such as `active_users` stay correct, where appending per-batch rollups would double count them.
+    - **Resent files.** Rows whose `event_id` is already in `events` are skipped, so a producer retry loads nothing twice.
+    - **Bad batches.** Wrong column names or values that do not parse (for example `amount = 'n/a'`) block the batch. The files stay in the landing zone and the run ends `FAILED`.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## How it works
+
+    1. `list_incoming` (`io.kestra.plugin.minio.List`) freezes the batch. Every later step uses exactly these keys, so a file that lands during the run waits for the next one.
+    2. `has_batch` (`io.kestra.plugin.core.flow.If`) ends the run with a log line when there is nothing new.
+    3. `batch` (`io.kestra.plugin.core.output.OutputValues`) turns the keys into a DuckDB list of `s3://` URLs. `list_curated` checks whether `events` already has files.
+    4. `profile` (`io.kestra.plugin.jdbc.duckdb.Queries`) reads the batch with `httpfs` and checks the column names and that `event_id`, `event_time` and `amount` parse in every row.
+    5. `contract` (`io.kestra.plugin.core.flow.If`) loads when the profile is clean.
+       - `load` (`io.kestra.plugin.jdbc.duckdb.Queries`) types the rows, removes duplicates inside the batch and against `events`, writes the new rows to `events/event_day=<day>/batch-<execution>-0.parquet`, then rewrites `daily_metrics/event_day=<day>/metrics0.parquet` for each touched day from all of that day's events.
+       - `archive` (`io.kestra.plugin.core.flow.Loop` with `io.kestra.plugin.minio.Copy`, `delete: true`) moves each file to `processed_prefix`, keeping its sub-path.
+       - On a contract failure `block_batch` (`io.kestra.plugin.core.execution.Fail`) ends the run with the observed column types and the unparseable row count.
+    6. `concurrency.limit: 1` keeps two runs from taking the same files. `errors` alerts on any other failure. Slack is optional.
+
+    ## Inputs
+
+    - `bucket` (STRING, default `data-lake`): the lake bucket.
+    - `incoming_prefix` (STRING, default `raw/incoming/`): landing zone.
+    - `processed_prefix` (STRING, default `raw/processed/`): where ingested files are moved.
+    - `curated_prefix` (STRING, default `lake/curated/`): holds `events/` and `daily_metrics/`.
+    - `notify_slack` (BOOL, default `false`): post results to Slack.
+
+    ## Prerequisites
+
+    - MinIO or any S3-compatible store, with the bucket created.
+    - Producers writing Parquet with the columns `event_id`, `user_id`, `country`, `amount`, `event_time`.
+    - Network access from the worker to the DuckDB extension repository on first run, to install `httpfs`.
+
+    ### Secrets
+
+    - `MINIO_ENDPOINT`: endpoint URL, for example `http://minio:9000` or `https://s3.example.com`. The flow passes the host to DuckDB and turns SSL on for `https`.
+    - `MINIO_ACCESS_KEY_ID`: access key.
+    - `MINIO_SECRET_KEY_ID`: secret key.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook. Only needed when `notify_slack` is `true`.
+
+    ## Quick start
+
+    1. Add the secrets and create the bucket.
+    2. Drop one or more Parquet files under `raw/incoming/` and run the flow. The log shows the new row count and the rebuilt days.
+    3. Run it again. The log says there are no new files.
+    4. Drop a file with the same `event_id`s again. It is archived with 0 new rows.
+
+    ## Expected outputs
+
+    - `s3://<bucket>/<curated_prefix>events/event_day=<day>/*.parquet`: row-level curated events.
+    - `s3://<bucket>/<curated_prefix>daily_metrics/event_day=<day>/metrics0.parquet`: one row per country per day with `events`, `active_users` and `revenue`.
+    - `outputs.load.outputs`: the last row holds `loaded`, `duplicates_skipped` and `days_rebuilt`.
+
+    ## How to extend
+
+    - Move a blocked batch to a quarantine prefix so later good files are not held behind it.
+    - Turn the column list into an input so one flow serves several datasets.
+    - Swap the `Schedule` for `io.kestra.plugin.minio.Trigger` to ingest as soon as files land.
+
+    ## Links
+
+    - MinIO plugin: https://kestra.io/plugins/plugin-minio
+    - DuckDB plugin: https://kestra.io/plugins/plugin-jdbc-duckdb
+    - DuckDB S3 support: https://duckdb.org/docs/extensions/httpfs/s3api
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - MinIO
+    - DuckDB
+    - Data Lake
+  ee: false
+  demo: false
