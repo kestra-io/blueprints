@@ -1,0 +1,584 @@
+id: locomo-memory-retriever-benchmark
+namespace: company.team
+description: |
+  Benchmark retrieval for long-term conversational memory on the public LoCoMo
+  dataset. BM25 (plain SQL in DuckDB), embedding search (Kestra AI plugin),
+  and an oracle ceiling answer the same question sample; answers are scored with
+  token F1 and an LLM judge, and Slack is alerted when recall drops.
+
+triggers:
+  - id: weekly_benchmark
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Re-run the benchmark weekly so drift in the reader, judge, or embedding model shows up even when your retrieval code did not change. Shipped disabled; enable it after your first manual run.
+    cron: "0 7 * * 1"
+    disabled: true
+  - id: benchmark_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from CI when a chunking, embedding, or retrieval change lands, so the benchmark runs on the same commit that made the change.
+    key: locomo-memory-benchmark
+
+inputs:
+  - id: dataset_url
+    type: URI
+    defaults: https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+    description: LoCoMo JSON release to evaluate on. The `dataset_sha256` check guarantees the file has not changed under you.
+  - id: dataset_sha256
+    type: STRING
+    defaults: 79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4
+    description: Expected SHA-256 of the dataset file. The run fails before spending a single token if the download does not match. Set it to an empty string only if you deliberately point at a different release.
+  - id: max_conversations
+    type: INT
+    defaults: 10
+    description: Number of LoCoMo conversations to index and sample questions from (the release has 10). Lower it for a faster, cheaper run.
+  - id: sample_size
+    type: INT
+    defaults: 40
+    description: Number of questions to evaluate, drawn deterministically from the answerable categories (single-hop, multi-hop, temporal, open-domain). Adversarial questions are excluded because they have no gold answer.
+  - id: seed
+    type: STRING
+    defaults: kestra-locomo-v1
+    description: Sampling seed. Keep it fixed to compare runs over time; change it to draw a fresh sample.
+  - id: top_k
+    type: INT
+    defaults: 5
+    description: Number of conversation turns each retriever passes to the reader.
+  - id: model
+    type: STRING
+    defaults: gpt-4o-mini
+    description: Model that reads the retrieved turns and answers the question.
+  - id: judge_model
+    type: STRING
+    defaults: gpt-4o-mini
+    description: Model that grades each answer against the gold answer as CORRECT or WRONG.
+  - id: embedding_model
+    type: STRING
+    defaults: text-embedding-3-small
+    description: Embedding model for the `embedding` retriever.
+  - id: base_url
+    type: STRING
+    defaults: https://api.openai.com/v1
+    description: OpenAI-compatible API endpoint. Point it at Ollama, vLLM, or any compatible server to benchmark local models.
+  - id: price_in_per_1m
+    type: FLOAT
+    defaults: 0.15
+    description: USD per million input tokens for the reader and judge, used for the cost estimate and the actual-cost report. Check your provider's current pricing.
+  - id: price_out_per_1m
+    type: FLOAT
+    defaults: 0.60
+    description: USD per million output tokens for the reader and judge.
+  - id: price_embedding_per_1m
+    type: FLOAT
+    defaults: 0.02
+    description: USD per million tokens for the embedding model.
+  - id: max_cost_usd
+    type: FLOAT
+    defaults: 0.50
+    description: Budget for one run. If the estimate exceeds it, the run stops before any model call.
+  - id: min_recall
+    type: FLOAT
+    defaults: 0.5
+    description: Alert threshold for recall@k of the best non-oracle retriever (0.0-1.0).
+
+tasks:
+  - id: prepare
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download the dataset, verify its SHA-256, write every conversation as one line per turn, draw a deterministic question sample, and estimate the token cost of the run.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    outputFiles:
+      - turns.jsonl
+      - questions.jsonl
+      - "conv_*.txt"
+    env:
+      DATASET_URL: "{{ inputs.dataset_url }}"
+      DATASET_SHA256: "{{ inputs.dataset_sha256 }}"
+      MAX_CONVERSATIONS: "{{ inputs.max_conversations }}"
+      SAMPLE_SIZE: "{{ inputs.sample_size }}"
+      SEED: "{{ inputs.seed }}"
+      TOP_K: "{{ inputs.top_k }}"
+      PRICE_IN: "{{ inputs.price_in_per_1m }}"
+      PRICE_OUT: "{{ inputs.price_out_per_1m }}"
+      PRICE_EMBEDDING: "{{ inputs.price_embedding_per_1m }}"
+    script: |
+      import hashlib
+      import json
+      import os
+      import random
+      import re
+      import urllib.request
+
+      CATEGORIES = {1: "multi_hop", 2: "temporal", 3: "open_domain", 4: "single_hop"}
+
+      raw = urllib.request.urlopen(os.environ["DATASET_URL"], timeout=120).read()
+      digest = hashlib.sha256(raw).hexdigest()
+      expected = os.environ["DATASET_SHA256"].strip().lower()
+      if expected and digest != expected:
+          raise SystemExit("dataset SHA-256 mismatch: got %s, expected %s" % (digest, expected))
+
+      samples = json.loads(raw)[: int(os.environ["MAX_CONVERSATIONS"])]
+      turns, questions = [], []
+      for sample in samples:
+          sid = sample["sample_id"]
+          conv = sample["conversation"]
+          lines = []
+          for n in sorted(int(k.split("_")[1]) for k in conv if re.fullmatch(r"session_\d+", k)):
+              date = conv.get("session_%d_date_time" % n, "")
+              for t in conv["session_%d" % n]:
+                  text = " ".join(t["text"].split())
+                  line = "[%s] (%s) %s: %s" % (t["dia_id"], date, t["speaker"], text)
+                  turns.append({"sample_id": sid, "dia_id": t["dia_id"], "pos": len(lines), "text": t["speaker"] + ": " + text, "line": line})
+                  lines.append(line)
+          with open("conv_%s.txt" % sid, "w") as f:
+              f.write("\n".join(lines) + "\n")
+
+          known = {t["dia_id"] for t in turns if t["sample_id"] == sid}
+          for idx, qa in enumerate(sample.get("qa", [])):
+              if qa.get("category") not in CATEGORIES or qa.get("answer") is None:
+                  continue
+              evidence = [e.replace("(", "").replace(")", "").strip() for e in qa.get("evidence") or []]
+              # Skip questions whose evidence ids do not resolve to a turn: recall would be undefined.
+              if not evidence or any(e not in known for e in evidence):
+                  continue
+              questions.append({"qid": "%s::%d" % (sid, idx), "sample_id": sid, "category": CATEGORIES[qa["category"]],
+                                "question": qa["question"], "answer": str(qa["answer"]), "evidence": evidence})
+
+      size = int(os.environ["SAMPLE_SIZE"])
+      if size < 1 or size > len(questions):
+          raise SystemExit("sample_size must be between 1 and %d" % len(questions))
+      questions.sort(key=lambda q: q["qid"])
+      sample = random.Random(os.environ["SEED"]).sample(questions, size)
+
+      with open("turns.jsonl", "w") as f:
+          f.writelines(json.dumps(t) + "\n" for t in turns)
+      with open("questions.jsonl", "w") as f:
+          f.writelines(json.dumps(q) + "\n" for q in sample)
+
+      # Rough estimate at 4 characters per token: embed every turn once, then one
+      # reader call and one judge call per question for each of the 3 retrievers.
+      avg_line = sum(len(t["line"]) for t in turns) / len(turns)
+      reader_in = (avg_line * int(os.environ["TOP_K"]) + 400) / 4
+      chat = size * 3 * ((reader_in + 250) * float(os.environ["PRICE_IN"]) + 60 * float(os.environ["PRICE_OUT"])) / 1e6
+      embed = sum(len(t["line"]) for t in turns) / 4 * float(os.environ["PRICE_EMBEDDING"]) / 1e6
+      estimate = round(chat + embed, 4)
+
+      queries = [{"qid": q["qid"], "sample_id": q["sample_id"], "question": q["question"]} for q in sample]
+      conversations = sorted({q["sample_id"] for q in sample})
+      print("dataset %s verified: %d turns indexed, %d answerable questions, sampled %d, estimated cost $%s"
+            % (digest[:12], len(turns), len(questions), size, estimate))
+      print("::" + json.dumps({"outputs": {"questions": size, "estimated_cost_usd": estimate,
+                                           "conversations": conversations, "queries": queries}}) + "::")
+
+  - id: budget_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Stop before any model call when the estimated cost of the run is above the budget. The errors block then reports the reason to Slack.
+    condition: "{{ outputs.prepare.vars.estimated_cost_usd > inputs.max_cost_usd }}"
+    then:
+      - id: over_budget
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Estimated cost ${{ outputs.prepare.vars.estimated_cost_usd }} is above the ${{ inputs.max_cost_usd }} budget. Lower sample_size, max_conversations, or top_k, or raise max_cost_usd."
+
+  - id: index_conversations
+    type: io.kestra.plugin.core.flow.Loop
+    description: Embed every turn of each sampled conversation into its own embedding store, one parallel branch per conversation, so a search never returns turns from another conversation.
+    values: "{{ outputs.prepare.vars.conversations }}"
+    concurrencyLimit: 0
+    outputs:
+      - id: embedding_tokens
+        type: INT
+        value: "{{ outputs.embed_turns.inputTokenCount }}"
+    tasks:
+      - id: turn_files
+        type: io.kestra.plugin.core.flow.WorkingDirectory
+        inputFiles:
+          conversation.txt: "{{ outputs.prepare.outputFiles['conv_' ~ item.value ~ '.txt'] }}"
+        tasks:
+          - id: split_turns
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Write one file per turn so each turn is embedded as its own document (the line splitter would pack several turns into one chunk).
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            commands:
+              - mkdir -p turns && split -l 1 -a 5 --additional-suffix=.txt conversation.txt turns/turn_
+          - id: embed_turns
+            type: io.kestra.plugin.ai.rag.IngestDocument
+            provider:
+              type: io.kestra.plugin.ai.provider.OpenAI
+              apiKey: "{{ secret('OPENAI_API_KEY') }}"
+              baseUrl: "{{ inputs.base_url }}"
+              modelName: "{{ inputs.embedding_model }}"
+            embeddings:
+              type: io.kestra.plugin.ai.embeddings.KestraKVStore
+              kvName: "{{ flow.id }}-{{ item.value }}"
+            drop: true
+            fromPath: turns
+
+  - id: embedding_search
+    type: io.kestra.plugin.core.flow.Loop
+    description: Run the embedding retriever for every question against its own conversation's store.
+    values: "{{ outputs.prepare.vars.queries | toJson }}"
+    concurrencyLimit: 10
+    outputs:
+      - id: qid
+        type: STRING
+        value: "{{ fromJson(item.value).qid }}"
+      - id: results
+        type: JSON
+        value: "{{ outputs.search_turns.results | toJson }}"
+    tasks:
+      - id: search_turns
+        type: io.kestra.plugin.ai.rag.Search
+        provider:
+          type: io.kestra.plugin.ai.provider.OpenAI
+          apiKey: "{{ secret('OPENAI_API_KEY') }}"
+          baseUrl: "{{ inputs.base_url }}"
+          modelName: "{{ inputs.embedding_model }}"
+        embeddings:
+          type: io.kestra.plugin.ai.embeddings.KestraKVStore
+          kvName: "{{ flow.id }}-{{ fromJson(item.value).sample_id }}"
+        query: "{{ fromJson(item.value).question }}"
+        maxResults: "{{ inputs.top_k }}"
+        minScore: 0
+        fetchType: FETCH
+
+  - id: build_contexts
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Rank turns with BM25 in plain SQL, collect the embedding hits and the gold evidence, and build one reader context per question and retriever, with recall@k against the evidence turns.
+    inputFiles:
+      turns.jsonl: "{{ outputs.prepare.outputFiles['turns.jsonl'] }}"
+      questions.jsonl: "{{ outputs.prepare.outputFiles['questions.jsonl'] }}"
+      embedding.json: "{{ outputs.embedding_search.outputs | toJson }}"
+    fetchType: FETCH
+    sql: |
+      CREATE TABLE turns AS SELECT * FROM read_json_auto('{{ workingDir }}/turns.jsonl');
+      CREATE TABLE questions AS SELECT * FROM read_json_auto('{{ workingDir }}/questions.jsonl');
+
+      -- BM25 (k1 = 1.5, b = 0.75) in plain SQL, with term statistics computed per conversation.
+      CREATE MACRO terms(s) AS list_filter(
+        string_split_regex(regexp_replace(lower(s), '[^a-z0-9]+', ' ', 'g'), ' '),
+        w -> w <> '' AND NOT list_contains(['a','an','the','and','or','of','to','in','on','for','is','are','was','were','be','been','do','did','does','have','has','had','i','you','he','she','it','we','they','me','my','your','his','her','its','our','their','this','that','with','at','by','from','as','what','when','where','who','which','how','why'], w));
+      CREATE TABLE tf AS
+        SELECT sample_id, dia_id, term, count(*) AS tf
+        FROM (SELECT sample_id, dia_id, unnest(terms(text)) AS term FROM turns) GROUP BY ALL;
+      CREATE TABLE df AS SELECT sample_id, term, count(*) AS df FROM tf GROUP BY ALL;
+      CREATE TABLE docs AS
+        SELECT sample_id, dia_id, pos, len(terms(text)) AS dl,
+               avg(len(terms(text))) OVER (PARTITION BY sample_id) AS avgdl,
+               count(*) OVER (PARTITION BY sample_id) AS n_docs
+        FROM turns;
+
+      CREATE TABLE hits AS
+        SELECT 'bm25' AS retriever, qid, sample_id, dia_id FROM (
+          SELECT q.qid, d.sample_id, d.dia_id, d.pos,
+                 sum(ln(1 + (d.n_docs - df.df + 0.5) / (df.df + 0.5)) * tf.tf * 2.5 / (tf.tf + 1.5 * (0.25 + 0.75 * d.dl / d.avgdl))) AS score
+          FROM (SELECT DISTINCT qid, sample_id, unnest(terms(question)) AS term FROM questions) q
+          JOIN tf ON tf.sample_id = q.sample_id AND tf.term = q.term
+          JOIN df ON df.sample_id = q.sample_id AND df.term = q.term
+          JOIN docs d ON d.sample_id = tf.sample_id AND d.dia_id = tf.dia_id
+          GROUP BY q.qid, d.sample_id, d.dia_id, d.pos
+          QUALIFY row_number() OVER (PARTITION BY q.qid ORDER BY score DESC, d.pos) <= {{ inputs.top_k }}
+        )
+        UNION ALL
+        SELECT 'embedding', e.outputs.qid, q.sample_id, regexp_extract(r.line, '^\[([^\]]+)\]', 1)
+        FROM read_json_auto('{{ workingDir }}/embedding.json') e,
+             unnest(e.outputs.results) AS r(line),
+             questions q
+        WHERE q.qid = e.outputs.qid
+        UNION ALL
+        SELECT 'oracle', q.qid, q.sample_id, ev.dia_id
+        FROM questions q, unnest(q.evidence) AS ev(dia_id);
+
+      SELECT
+        q.qid, r.retriever, q.category, q.question, q.answer AS gold,
+        coalesce(string_agg(t.line, chr(10) ORDER BY t.pos), '(no excerpts retrieved)') AS context,
+        round(count(DISTINCT t.dia_id) FILTER (WHERE list_contains(q.evidence, t.dia_id)) / len(q.evidence), 4) AS recall
+      FROM questions q
+      CROSS JOIN (VALUES ('bm25'), ('embedding'), ('oracle')) AS r(retriever)
+      LEFT JOIN hits h ON h.qid = q.qid AND h.retriever = r.retriever
+      LEFT JOIN turns t ON t.sample_id = h.sample_id AND t.dia_id = h.dia_id
+      GROUP BY q.qid, r.retriever, q.category, q.question, q.answer, q.evidence
+      ORDER BY q.qid, r.retriever;
+
+  - id: answer_and_judge
+    type: io.kestra.plugin.core.flow.Loop
+    description: For every question and retriever, the reader answers from the retrieved turns only, then the judge grades the answer against the gold answer.
+    values: "{{ outputs.build_contexts.outputs[0].rows | toJson }}"
+    concurrencyLimit: 10
+    outputs:
+      - id: qid
+        type: STRING
+        value: "{{ fromJson(item.value).qid }}"
+      - id: retriever
+        type: STRING
+        value: "{{ fromJson(item.value).retriever }}"
+      - id: prediction
+        type: STRING
+        value: "{{ outputs.read.textOutput }}"
+      - id: verdict
+        type: STRING
+        value: "{{ outputs.judge.textOutput }}"
+      - id: input_tokens
+        type: INT
+        value: "{{ outputs.read.tokenUsage.inputTokenCount + outputs.judge.tokenUsage.inputTokenCount }}"
+      - id: output_tokens
+        type: INT
+        value: "{{ outputs.read.tokenUsage.outputTokenCount + outputs.judge.tokenUsage.outputTokenCount }}"
+    tasks:
+      - id: read
+        type: io.kestra.plugin.ai.completion.ChatCompletion
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+        provider:
+          type: io.kestra.plugin.ai.provider.OpenAI
+          apiKey: "{{ secret('OPENAI_API_KEY') }}"
+          baseUrl: "{{ inputs.base_url }}"
+          modelName: "{{ inputs.model }}"
+        configuration:
+          temperature: 0.0
+        messages:
+          - type: SYSTEM
+            content: You answer questions about a long conversation using only the excerpts provided. Reply with a short phrase, not a sentence. If the excerpts do not contain the answer, reply exactly unknown.
+          - type: USER
+            content: |
+              Excerpts:
+              {{ fromJson(item.value).context }}
+
+              Question: {{ fromJson(item.value).question }}
+      - id: judge
+        type: io.kestra.plugin.ai.completion.ChatCompletion
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+        provider:
+          type: io.kestra.plugin.ai.provider.OpenAI
+          apiKey: "{{ secret('OPENAI_API_KEY') }}"
+          baseUrl: "{{ inputs.base_url }}"
+          modelName: "{{ inputs.judge_model }}"
+        configuration:
+          temperature: 0.0
+        messages:
+          - type: SYSTEM
+            content: You grade answers. Given a question, a gold answer, and a predicted answer, reply with exactly one word, CORRECT if the prediction states the same fact as the gold answer (paraphrases and different date formats are fine), otherwise WRONG.
+          - type: USER
+            content: |
+              Question: {{ fromJson(item.value).question }}
+              Gold answer: {{ fromJson(item.value).gold }}
+              Predicted answer: {{ outputs.read.textOutput }}
+
+  - id: leaderboard
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Score every answer with SQuAD-style token F1 and the judge verdict, then build the leaderboard, a per-category breakdown, and the actual token cost of the run.
+    inputFiles:
+      contexts.json: "{{ outputs.build_contexts.outputs[0].rows | toJson }}"
+      answers.json: "{{ outputs.answer_and_judge.outputs | toJson }}"
+      index.json: "{{ outputs.index_conversations.outputs | toJson }}"
+    fetchType: FETCH
+    sql: |
+      CREATE TABLE answers AS
+        SELECT c.qid, c.retriever, c.category, c.gold, c.recall,
+               a.outputs.prediction AS prediction,
+               CASE WHEN upper(trim(a.outputs.verdict)) LIKE 'CORRECT%' THEN 1 ELSE 0 END AS judge,
+               a.outputs.input_tokens::BIGINT AS input_tokens, a.outputs.output_tokens::BIGINT AS output_tokens
+        FROM read_json_auto('{{ workingDir }}/contexts.json') c
+        JOIN read_json_auto('{{ workingDir }}/answers.json') a
+          ON a.outputs.qid = c.qid AND a.outputs.retriever = c.retriever;
+
+      -- SQuAD-style token F1: lowercase, drop punctuation and articles, compare token multisets.
+      CREATE TABLE tokens AS
+        SELECT qid, retriever, side, tok, count(*) AS n FROM (
+          SELECT qid, retriever, 'pred' AS side, unnest(string_split_regex(trim(regexp_replace(regexp_replace(lower(prediction), '[^a-z0-9 ]', '', 'g'), '\b(a|an|the|and)\b', ' ', 'g')), '\s+')) AS tok FROM answers
+          UNION ALL
+          SELECT qid, retriever, 'gold', unnest(string_split_regex(trim(regexp_replace(regexp_replace(lower(gold), '[^a-z0-9 ]', '', 'g'), '\b(a|an|the|and)\b', ' ', 'g')), '\s+')) FROM answers
+        ) WHERE tok <> '' GROUP BY ALL;
+
+      CREATE TABLE scored AS
+        WITH counts AS (
+          SELECT qid, retriever,
+                 sum(n) FILTER (WHERE side = 'pred') AS pred_n,
+                 sum(n) FILTER (WHERE side = 'gold') AS gold_n
+          FROM tokens GROUP BY ALL
+        ), common AS (
+          SELECT p.qid, p.retriever, sum(least(p.n, g.n)) AS common
+          FROM tokens p JOIN tokens g
+            ON g.qid = p.qid AND g.retriever = p.retriever AND g.tok = p.tok
+          WHERE p.side = 'pred' AND g.side = 'gold'
+          GROUP BY ALL
+        )
+        SELECT a.*,
+          CASE WHEN coalesce(m.common, 0) = 0 THEN 0.0
+               ELSE 2.0 * m.common / (c.pred_n + c.gold_n) END AS f1
+        FROM answers a
+        LEFT JOIN counts c USING (qid, retriever)
+        LEFT JOIN common m USING (qid, retriever);
+
+      SELECT
+        retriever,
+        count(*) AS questions,
+        round(avg(recall), 3) AS recall_at_k,
+        round(avg(f1), 3) AS token_f1,
+        round(avg(judge), 3) AS judge_accuracy,
+        round(avg(CASE WHEN (f1 >= 0.5) <> (judge = 1) THEN 1 ELSE 0 END), 3) AS f1_judge_disagreement,
+        round(max(CASE WHEN retriever <> 'oracle' THEN avg(recall) END) OVER (), 3) AS best_retriever_recall
+      FROM scored
+      GROUP BY retriever
+      ORDER BY judge_accuracy DESC, recall_at_k DESC;
+
+      SELECT retriever, category, count(*) AS questions, round(avg(recall), 3) AS recall_at_k, round(avg(judge), 3) AS judge_accuracy
+      FROM scored
+      GROUP BY retriever, category
+      ORDER BY category, retriever;
+
+      SELECT
+        sum(input_tokens)::BIGINT AS chat_input_tokens,
+        sum(output_tokens)::BIGINT AS chat_output_tokens,
+        (SELECT sum(outputs.embedding_tokens::BIGINT) FROM read_json_auto('{{ workingDir }}/index.json'))::BIGINT AS embedding_tokens,
+        round(sum(input_tokens) * {{ inputs.price_in_per_1m }} / 1e6
+              + sum(output_tokens) * {{ inputs.price_out_per_1m }} / 1e6
+              + (SELECT sum(outputs.embedding_tokens::BIGINT) FROM read_json_auto('{{ workingDir }}/index.json')) * {{ inputs.price_embedding_per_1m }} / 1e6, 4) AS actual_cost_usd
+      FROM scored;
+
+  - id: check_recall
+    type: io.kestra.plugin.core.flow.If
+    description: Alert when the best real retriever (oracle excluded) misses the recall bar; otherwise record the leaderboard in the execution logs.
+    condition: "{{ outputs.leaderboard.outputs[0].rows[0].best_retriever_recall < inputs.min_recall }}"
+    then:
+      - id: alert_low_recall
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the full leaderboard so the alert shows how far each retriever is from the oracle ceiling.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "LoCoMo memory benchmark: best retriever recall@{{ inputs.top_k }} is {{ outputs.leaderboard.outputs[0].rows[0].best_retriever_recall }}, below the {{ inputs.min_recall }} bar.\n{% for r in outputs.leaderboard.outputs[0].rows %}- {{ r.retriever }}: recall {{ r.recall_at_k }}, F1 {{ r.token_f1 }}, judge {{ r.judge_accuracy }}, F1/judge disagreement {{ r.f1_judge_disagreement }}\n{% endfor %}Cost ${{ outputs.leaderboard.outputs[2].rows[0].actual_cost_usd }}. Execution {{ execution.id }}."
+          }
+    else:
+      - id: log_leaderboard
+        type: io.kestra.plugin.core.log.Log
+        description: Keep a passing run's leaderboard in the execution history so scores can be compared across runs.
+        message: |
+          LoCoMo memory benchmark passed ({{ outputs.prepare.vars.questions }} questions, top_k {{ inputs.top_k }}, reader {{ inputs.model }}, judge {{ inputs.judge_model }}, cost ${{ outputs.leaderboard.outputs[2].rows[0].actual_cost_usd }}).
+          {%- for r in outputs.leaderboard.outputs[0].rows %}
+          {{ r.retriever }}: recall {{ r.recall_at_k }}, F1 {{ r.token_f1 }}, judge {{ r.judge_accuracy }}, F1/judge disagreement {{ r.f1_judge_disagreement }}
+          {%- endfor %}
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Report a run that produced no leaderboard (budget gate, dataset hash mismatch, rejected key, unreachable endpoint), so a broken benchmark never looks like a quiet one.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "LoCoMo memory benchmark failed in flow {{ flow.id }} (execution {{ execution.id }}). Check the execution logs: the budget gate, the dataset hash check, or the model endpoint stopped the run."
+      }
+
+outputs:
+  - id: leaderboard
+    type: JSON
+    description: One row per retriever with recall_at_k, token_f1, judge_accuracy, and f1_judge_disagreement.
+    value: "{{ outputs.leaderboard.outputs[0].rows ?? [] }}"
+  - id: by_category
+    type: JSON
+    description: Recall and judge accuracy per retriever and LoCoMo question category.
+    value: "{{ outputs.leaderboard.outputs[1].rows ?? [] }}"
+  - id: cost
+    type: JSON
+    description: Token counts and actual cost of the run.
+    value: "{{ outputs.leaderboard.outputs[2].rows[0] ?? {} }}"
+
+extend:
+  title: Benchmark Conversational Memory Retrievers on LoCoMo with an LLM Judge
+  shortDescription: Compare BM25 and embedding retrieval against an oracle ceiling on the LoCoMo long-conversation benchmark, scored by token F1 and an LLM judge, with a cost gate.
+  metaTitle: LoCoMo Conversational Memory Retrieval Benchmark with Kestra
+  metaDescription: Compare BM25 and embedding retrieval on LoCoMo, score answers with F1 and an LLM judge, gate on cost, and alert Slack when recall drops.
+  description: |
+    A chatbot with long-term memory is only as good as what it retrieves from past conversations, but end-to-end QA scores hide where the points are lost. This blueprint separates the pieces on the public [LoCoMo](https://snap-research.github.io/locomo/) benchmark (long multi-session conversations with annotated evidence turns). Three retrievers answer the same question sample: lexical BM25, semantic embedding search, and an `oracle` that hands the reader the gold evidence. Retrieval is measured directly with recall@k, and every answer is scored twice, with token F1 and with an LLM judge. The gap between a retriever and the oracle tells you how much better retrieval would buy before you build it.
+
+    ## How it works
+
+    1. `prepare` downloads the LoCoMo release, verifies its SHA-256 against the pinned hash, writes each conversation as one line per turn, and draws a deterministic sample of answerable questions (single-hop, multi-hop, temporal, open-domain). It also estimates the cost of the run.
+    2. `budget_gate` (`io.kestra.plugin.core.flow.If`) fails the run before any model call when the estimate is above `max_cost_usd`.
+    3. `index_conversations` (`io.kestra.plugin.core.flow.Loop`, one parallel branch per conversation) splits each conversation into one file per turn and embeds them with `io.kestra.plugin.ai.rag.IngestDocument` into a per-conversation `KestraKVStore`, so a search never crosses conversations.
+    4. `embedding_search` (`Loop`) runs `io.kestra.plugin.ai.rag.Search` for every question against its own conversation's store.
+    5. `build_contexts` (`io.kestra.plugin.jdbc.duckdb.Queries`) ranks turns with BM25 written in plain SQL (statistics per conversation, no extension needed), collects the embedding hits and the gold evidence, and builds one reader context per question and retriever, with recall@k against the evidence turns.
+    6. `answer_and_judge` (`Loop`) calls `io.kestra.plugin.ai.completion.ChatCompletion` twice per question and retriever: the reader answers from the retrieved turns only, then the judge grades the answer CORRECT or WRONG. Both tasks use Kestra's built-in `retry` for transient API errors.
+    7. `leaderboard` (DuckDB) computes SQuAD-style token F1 in SQL and returns three tables: one row per retriever, a per-category breakdown, and the actual token cost of the run.
+    8. `check_recall` alerts Slack with the full leaderboard when the best non-oracle retriever is below `min_recall`; otherwise the leaderboard is written to the execution logs. The `errors` block reports any failed run to Slack.
+
+    ## What you get
+
+    - A leaderboard per retriever: `recall_at_k`, `token_f1`, `judge_accuracy`, and `f1_judge_disagreement` (how often F1 and the judge disagree on the same answer, a direct read on how metric-dependent your score is).
+    - A per-category breakdown, since temporal and multi-hop questions usually fail for different reasons than single-hop ones.
+    - The actual cost of the run from the token counts the AI plugin reports, next to the pre-run estimate.
+    - Every reader answer and judge verdict as its own task run in the Kestra UI, so a surprising score can be traced to the exact question.
+
+    ## Who it's for
+
+    - Teams building chat assistants or agents with long-term memory who want to choose a retrieval strategy on evidence.
+    - Researchers who need a repeatable, budgeted LoCoMo run they can trigger from CI.
+    - Anyone who suspects their memory system's score depends more on the judge than on retrieval.
+
+    ## Prerequisites
+
+    - An OpenAI-compatible API key with access to a chat model and an embedding model. Set `base_url` to use another compatible server.
+    - A Slack incoming webhook for alerts.
+    - Outbound access from the worker to `raw.githubusercontent.com` to download the dataset.
+    - Python 3 and coreutils on the worker for `prepare` and `split_turns`, which run on the `Process` task runner. To isolate them in a container, swap the task runner for `io.kestra.plugin.scripts.runner.docker.Docker`.
+
+    ### Secrets
+
+    - `OPENAI_API_KEY`: API key for the reader, judge, and embedding calls.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL for low-recall and failure alerts.
+
+    ### Inputs
+
+    - `dataset_url` (URI) and `dataset_sha256` (STRING): the LoCoMo release and its expected hash. Defaults to `locomo10.json` from the official repository, checked against its known hash.
+    - `max_conversations` (INT, default 10), `sample_size` (INT, default 40), `seed` (STRING): which conversations to index and the deterministic question sample.
+    - `top_k` (INT, default 5): turns each retriever passes to the reader.
+    - `model`, `judge_model`, `embedding_model`, `base_url` (STRING): reader, judge, embedding model, and endpoint.
+    - `price_in_per_1m`, `price_out_per_1m`, `price_embedding_per_1m`, `max_cost_usd` (FLOAT): pricing for the estimate and the cost report, and the budget for one run.
+    - `min_recall` (FLOAT, default 0.5): recall@k bar for the best non-oracle retriever.
+
+    ### Outputs
+
+    - `leaderboard` (JSON): one row per retriever, from `{{ outputs.leaderboard.outputs[0].rows }}`.
+    - `by_category` (JSON): per-category rows, from `{{ outputs.leaderboard.outputs[1].rows }}`.
+    - `cost` (JSON): chat and embedding token counts and `actual_cost_usd`, from `{{ outputs.leaderboard.outputs[2].rows[0] }}`.
+
+    ## Quick start
+
+    1. Add the `OPENAI_API_KEY` and `SLACK_WEBHOOK_URL` secrets (in the open-source edition, as base64-encoded `SECRET_OPENAI_API_KEY` and `SECRET_SLACK_WEBHOOK_URL` environment variables).
+    2. Run the flow once with the defaults. Forty questions across three retrievers on `gpt-4o-mini` costs about one cent.
+    3. Open the `leaderboard` output and compare `bm25` and `embedding` against `oracle`.
+    4. Enable `weekly_benchmark`, or POST to the `locomo-memory-benchmark` webhook from CI when your retrieval code changes.
+
+    ## How to extend
+
+    - Benchmark your own memory store: swap `KestraKVStore` for `PGVector`, `Qdrant`, or another embedding store from the AI plugin, or add a retriever to the `hits` table in `build_contexts`.
+    - Keep a score history: append the leaderboard to a persistent DuckDB file or Postgres table and alert on a drop relative to the previous run instead of a fixed bar.
+    - Calibrate the judge: export the answers where F1 and the judge disagree and label them by hand to measure how often the judge is right.
+
+    ## Notes
+
+    - `KestraKVStore` keeps vectors in Kestra's KV store and loads them into memory on search. It is fine for LoCoMo-sized conversations; use a real vector store for production-sized memory.
+    - Model outputs can vary slightly between runs even at temperature 0, so expect small run-to-run differences in F1 and judge accuracy for the same sample and settings. Retrieval and recall@k are deterministic for BM25 and the oracle.
+    - Token F1 is the SQuAD-style metric without stemming, so absolute numbers differ slightly from the official LoCoMo scorer. Compare runs of this flow with each other, not with published leaderboards.
+
+    ## Links
+
+    - [LoCoMo paper and dataset](https://snap-research.github.io/locomo/)
+    - [Kestra AI plugin](https://kestra.io/plugins/plugin-ai)
+    - [Kestra Loop task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [DuckDB plugin](https://kestra.io/plugins/plugin-jdbc-duckdb)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - AI
+    - Data
+  subTags:
+    - Testing & Quality
+    - Monitoring & Alerting
+  ee: false
+  demo: false
