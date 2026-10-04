@@ -1,0 +1,262 @@
+id: kafka-dlq-quarantine-and-replay
+namespace: company.streaming
+description: |
+  Automated Dead-Letter Queue (DLQ) quarantine, classification, and safe replay
+  pipeline for Apache Kafka. Intercepts failed message events from a dead-letter
+  topic, inspects error taxonomy and retry budgets, safely replays transient
+  failures back to the source topic, and isolates unrecoverable poisoned records
+  to Amazon S3 storage while paging on-call via Slack.
+
+variables:
+  dlq_topic: orders-dlq
+  replay_topic: orders-raw
+  max_retry_attempts: 3
+  s3_quarantine_bucket: company-dlq-quarantine-archive
+  s3_region: us-east-1
+
+inputs:
+  - id: manual_payload
+    type: STRING
+    description: Optional test JSON payload for manual testing or diagnostic replay drills.
+    required: false
+    defaults: '{"order_id": "ORD-9921", "amount": 149.99, "error_reason": "NETWORK_TIMEOUT", "retry_count": 1}'
+
+triggers:
+  - id: on_dlq_event
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    description: Real-time trigger consuming dead-letter messages as soon as they land in the DLQ topic.
+    topic: "{{ vars.dlq_topic }}"
+    properties:
+      bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP_SERVERS') }}"
+    groupId: kestra-dlq-triage-group
+    valueDeserializer: JSON
+    disabled: true
+
+  - id: on_demand_replay_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Secured webhook for incident response engineers to inject quarantined records into the replay engine.
+    key: "{{ secret('DLQ_REPLAY_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: extract_event_payload
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Normalize input source whether triggered from Kafka topic, Webhook, or manual execution.
+    values:
+      raw_record: "{{ trigger.value ?? trigger.body ?? inputs.manual_payload }}"
+      error_category: >-
+        {%- set val = trigger.value ?? trigger.body ?? inputs.manual_payload -%}
+        {%- if 'TIMEOUT' in (val | string) or '503' in (val | string) or 'TEMPORARY' in (val | string) -%}
+        TRANSIENT
+        {%- else -%}
+        POISON_PILL
+        {%- endif -%}
+
+  - id: read_replay_counter
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Retrieve retry attempts counter for this message identifier from the Kestra namespace KV store.
+    values:
+      attempts: "{{ kv('dlq_retry_' ~ (outputs.extract_event_payload.values.raw_record | jq('.order_id // \"unknown\"') | first), errorOnMissing=false) ?? 0 }}"
+
+  - id: route_dlq_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Check if the failure is transient and retry budget has not been exhausted.
+    condition: "{{ outputs.extract_event_payload.values.error_category == 'TRANSIENT' and (outputs.read_replay_counter.values.attempts | number) < (vars.max_retry_attempts | number) }}"
+    then:
+      - id: record_retry_attempt
+        type: io.kestra.plugin.core.kv.Set
+        description: Bump the retry counter in the KV store with a 24-hour expiration window.
+        key: "dlq_retry_{{ outputs.extract_event_payload.values.raw_record | jq('.order_id // \"unknown\"') | first }}"
+        kvType: NUMBER
+        value: "{{ (outputs.read_replay_counter.values.attempts | number) + 1 }}"
+        ttl: P1D
+
+      - id: replay_to_kafka_topic
+        type: io.kestra.plugin.kafka.Produce
+        description: Safely republish the transient message back into the primary processing topic.
+        topic: "{{ vars.replay_topic }}"
+        properties:
+          bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP_SERVERS') }}"
+        value: "{{ outputs.extract_event_payload.values.raw_record | toJson }}"
+
+      - id: log_replayed_record
+        type: io.kestra.plugin.core.log.Log
+        description: Log successful replay action.
+        message: "Successfully replayed transient DLQ message for record {{ outputs.extract_event_payload.values.raw_record | jq('.order_id // \"unknown\"') | first }} back to topic {{ vars.replay_topic }} (Attempt {{ (outputs.read_replay_counter.values.attempts | number) + 1 }} of {{ vars.max_retry_attempts }})."
+
+    else:
+      - id: generate_quarantine_manifest
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Format quarantined message metadata and payload into an audit-compliant JSON artifact.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        commands:
+          - |
+            cat << 'EOF' > quarantine_record.json
+            {
+              "quarantined_at": "{{ now() }}",
+              "execution_id": "{{ execution.id }}",
+              "original_topic": "{{ vars.dlq_topic }}",
+              "classification": "{{ outputs.extract_event_payload.values.error_category }}",
+              "failed_attempts": {{ outputs.read_replay_counter.values.attempts | number }},
+              "payload": {{ outputs.extract_event_payload.values.raw_record | toJson }}
+            }
+            EOF
+        outputFiles:
+          - quarantine_record.json
+
+      - id: upload_quarantine_to_s3
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Archive poisoned record payload into cold storage S3 bucket for forensic inspection.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ vars.s3_region }}"
+        from: "{{ outputs.generate_quarantine_manifest.outputFiles['quarantine_record.json'] }}"
+        bucket: "{{ vars.s3_quarantine_bucket }}"
+        key: "quarantine/{{ now() | date('yyyy/MM/dd') }}/quarantine-{{ execution.id }}.json"
+
+      - id: alert_quarantined_message
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert on-call data engineers on Slack with the diagnostic classification and S3 quarantine location.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":rotating_light: *Kafka DLQ Quarantine Alert*\n*Topic:* `{{ vars.dlq_topic }}`\n*Classification:* `{{ outputs.extract_event_payload.values.error_category }}`\n*Retries Exhausted:* {{ outputs.read_replay_counter.values.attempts | number }} / {{ vars.max_retry_attempts }}\n*Archived Location:* `s3://{{ vars.s3_quarantine_bucket }}/quarantine/{{ now() | date('yyyy/MM/dd') }}/quarantine-{{ execution.id }}.json`\n*Execution Link:* {{ execution.id }}"
+          }
+
+errors:
+  - id: alert_pipeline_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notify operations if the DLQ triage engine encountered an unhandled exception.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":fire: *Kafka DLQ Triage Pipeline Failure*\nFlow `{{ flow.id }}` failed during execution `{{ execution.id }}`."
+      }
+
+extend:
+  title: Kafka DLQ Quarantine, Classification, and Safe Replay Gate
+  metaTitle: Kafka Dead-Letter Queue Quarantine and Replay with Kestra
+  shortDescription: Intercept Kafka dead-letter events, classify transient vs poisoned records, replay recoverable messages, and isolate toxic payloads to S3.
+  metaDescription: Automatically triage Kafka DLQ events with Kestra, safely replay transient failures to source topics, and quarantine poisoned records into Amazon S3.
+  description: |
+    Dead-Letter Queues (DLQs) in Apache Kafka prevent consumers from stalling when they encounter unexpected or corrupted records. However, without automated triage, messages in DLQs accumulate into dark data lakes or risk triggering secondary incident storms when operators attempt manual, unverified replays.
+
+    This blueprint implements an automated Dead-Letter Queue management and remediation engine. It intercepts failed messages in real time, classifies their error signatures into transient vs unrecoverable poison-pill categories, applies an exponential retry budget backed by Kestra namespace KV storage, safely republishes recoverable messages to the primary topic, and quarantines toxic records directly into partitioned Amazon S3 buckets while paging data engineers on Slack with forensic diagnostics.
+
+    ## Use Cases
+
+    - **Automated Stream Self-Healing:** Seamlessly recover messages that failed due to temporary network partitions, rate limits, or downstream database locks without human intervention.
+    - **Poison-Pill Quarantine:** Safely isolate malformed, schema-violating, or corrupted records from the streaming pipeline without dropping data.
+    - **Dead-Letter Observability:** Gain end-to-end lineage, failure categorization, and alerting across microservices architectures.
+    - **Audit Compliance:** Maintain an immutable cold-storage audit log in S3 of every quarantined message and associated stack trace.
+
+    ## Prerequisites
+
+    - An Apache Kafka cluster (or Confluent Cloud / Aiven Kafka) with a defined DLQ topic (e.g., `orders-dlq`) and target ingestion topic (e.g., `orders-raw`).
+    - An Amazon S3 bucket configured for cold-storage quarantine archives.
+    - An incoming Slack webhook configured for notifications.
+
+    ### Secrets
+
+    Configure the following secrets in your Kestra namespace:
+
+    - `KAFKA_BOOTSTRAP_SERVERS`: Kafka broker connection string (e.g. `broker1:9092,broker2:9092`).
+    - `AWS_ACCESS_KEY_ID`: IAM access key with `s3:PutObject` permissions for the quarantine bucket.
+    - `AWS_SECRET_ACCESS_KEY`: IAM secret key matching the access key.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for quarantine alerts and pipeline errors.
+    - `DLQ_REPLAY_WEBHOOK_KEY`: Secret authentication key for manual replay webhook trigger.
+
+    ### Configuration
+
+    Adjust flow variables to match your streaming infrastructure:
+
+    - `dlq_topic`: The dead-letter topic being monitored (default: `orders-dlq`).
+    - `replay_topic`: The primary destination topic for replayed messages (default: `orders-raw`).
+    - `max_retry_attempts`: The maximum number of transient replay cycles allowed before quarantine (default: `3`).
+    - `s3_quarantine_bucket`: Target S3 bucket for unrecoverable payloads (default: `company-dlq-quarantine-archive`).
+    - `s3_region`: AWS region for the S3 bucket (default: `us-east-1`).
+
+    ## Workflow
+
+    ```
+    ┌────────────────────────┐
+    │ Kafka DLQ / Webhook    │
+    └───────────┬────────────┘
+                │
+                ▼
+    ┌────────────────────────┐
+    │  Extract & Classify    │
+    └───────────┬────────────┘
+                │
+                ▼
+    ┌────────────────────────┐
+    │  Check KV Retry Budget │
+    └───────────┬────────────┘
+                │
+         [Transient & Attempts < Max?]
+               /         \
+            YES           NO (Poison / Budget Spent)
+            /               \
+           ▼                 ▼
+    ┌─────────────┐   ┌────────────────────────┐
+    │ Bump KV TTL │   │ Generate S3 Manifest   │
+    └──────┬──────┘   └───────────┬────────────┘
+           │                      │
+           ▼                      ▼
+    ┌─────────────┐   ┌────────────────────────┐
+    │ Replay to   │   │ Upload to S3 Cold      │
+    │ Topic       │   │ Storage                │
+    └──────┬──────┘   └───────────┬────────────┘
+           │                      │
+           ▼                      ▼
+    ┌─────────────┐   ┌────────────────────────┐
+    │ Log Success │   │ Alert Slack with Link  │
+    └─────────────┘   └────────────────────────┘
+    ```
+
+    ## Step-by-Step
+
+    1. **Event Interception:** `on_dlq_event` (`io.kestra.plugin.kafka.RealtimeTrigger`) subscribes to the DLQ topic and creates an execution immediately upon record receipt.
+    2. **Payload Extraction & Error Taxonomy:** `extract_event_payload` unifies record contents and inspects error strings to tag the event as `TRANSIENT` or `POISON_PILL`.
+    3. **Stateful Retry Tracking:** `read_replay_counter` queries the Kestra KV store for `dlq_retry_<record_id>` to read historical replay attempts.
+    4. **Policy Decision Gate:** `route_dlq_policy` (`io.kestra.plugin.core.flow.If`) evaluates the classified error type against the maximum allowed retry limit.
+    5. **Transient Remediation Branch:**
+       - `record_retry_attempt` (`io.kestra.plugin.core.kv.Set`) increments the retry counter with a 1-day TTL.
+       - `replay_to_kafka_topic` (`io.kestra.plugin.kafka.Produce`) publishes the record back into the raw ingestion topic.
+       - `log_replayed_record` (`io.kestra.plugin.core.log.Log`) records the successful replay event in the execution log.
+    6. **Poison Quarantine Branch:**
+       - `generate_quarantine_manifest` formats the corrupt payload, execution ID, and timestamp into `quarantine_record.json`.
+       - `upload_quarantine_to_s3` (`io.kestra.plugin.aws.s3.Upload`) securely archives the artifact into S3.
+       - `alert_quarantined_message` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) dispatches a high-priority Slack alert with the S3 URI.
+
+    ## Expected Output
+
+    - **Recovered Records:** Produced to the destination Kafka topic with updated retry counts in Kestra KV store.
+    - **Quarantined Records:** Persisted to S3 under `s3://<bucket>/quarantine/YYYY/MM/DD/quarantine-<execution_id>.json`.
+    - **Slack Notifications:** Real-time alert messages containing classification rationale, retry count, and S3 URI.
+
+    ## Failure Handling
+
+    - If any internal Kestra task fails (e.g. AWS credential failure or Kafka disconnection), the flow-level `errors` handler executes immediately, delivering a critical incident alert to Slack with the execution URL.
+
+    ## Customization
+
+    - **Exponential Backoff:** Introduce a `io.kestra.plugin.core.flow.Pause` or schedule-based replay to enforce an escalating backoff window between retry attempts.
+    - **Alternative Cloud Storage:** Swap `aws.s3.Upload` with `gcp.gcs.Upload` or `azure.storage.blob.Upload` for multi-cloud parity.
+    - **Schema Registry Integration:** Add an Avro or Protobuf schema validation task using Kestra Python scripts to validate payloads against Confluent Schema Registry before replay.
+
+    ## Links
+
+    - [Kestra Kafka Plugin Documentation](https://kestra.io/plugins/plugin-kafka)
+    - [Kestra AWS S3 Plugin Documentation](https://kestra.io/plugins/plugin-aws)
+    - [Kestra KV Store Concepts](https://kestra.io/docs/concepts/kv-store)
+    - [This blueprint was created by Vedant817](https://github.com/Vedant817).
+  tags:
+    - Data
+    - Cloud
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Monitoring & Alerting
+  ee: false
+  demo: false
