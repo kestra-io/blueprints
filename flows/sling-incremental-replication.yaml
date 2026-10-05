@@ -1,0 +1,300 @@
+id: sling-incremental-replication
+namespace: company.team
+
+inputs:
+  - id: demo_mode
+    type: BOOL
+    displayName: Demo mode
+    description: Replicate a generated DuckDB source to namespace files instead of Postgres to S3. The hourly trigger turns this off.
+    defaults: true
+
+  - id: tables
+    type: ARRAY
+    itemType: STRING
+    displayName: Postgres tables
+    description: Tables to replicate, as schema.table (unquoted, lowercase identifiers). Each needs the column named in update_key. Ignored in demo mode.
+    defaults:
+      - public.customers
+      - public.payments
+
+  - id: update_key
+    type: STRING
+    displayName: Update key
+    description: Timestamp column (preferably timestamptz) that is set on every insert and update.
+    defaults: updated_at
+    validator: ^[A-Za-z_][A-Za-z0-9_]*$
+
+  - id: spike_factor
+    type: INT
+    displayName: Volume alert factor
+    description: Alert when a batch is this many times larger or smaller than the previous non-empty batch of the same table.
+    defaults: 5
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    description: Post volume alerts and failed runs to Slack. The hourly trigger turns this on.
+    defaults: false
+
+variables:
+  bucket: my-data-lake
+  region: eu-west-1
+  prefix: raw/postgres/
+  pg_sslmode: require
+  lag_minutes: 1
+
+concurrency:
+  behavior: QUEUE
+  limit: 1
+
+tasks:
+  - id: plan
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Fix the upper bound of this run's window and pick the tables to replicate.
+    values:
+      high: "{{ execution.startDate | dateAdd(-vars.lag_minutes, 'MINUTES') | date(\"yyyy-MM-dd HH:mm:ss.SSSSSSXXX\", timeZone='UTC') }}"
+      tables: "{{ inputs.demo_mode ? ['main.orders', 'main.payments'] : inputs.tables }}"
+      kv_prefix: "{{ inputs.demo_mode ? 'sling_demo_' : 'sling_' }}"
+
+  - id: replicate
+    type: io.kestra.plugin.core.flow.Loop
+    description: Replicate each table in parallel, then advance its watermark and check the batch size.
+    values: "{{ outputs.plan.values.tables }}"
+    concurrencyLimit: 3
+    tasks:
+      - id: sync
+        type: io.kestra.plugin.scripts.python.Script
+        description: Copy the rows changed since the table's watermark to Parquet with Sling and compare the batch size with the previous one.
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - "pip install -q --root-user-action=ignore sling==1.6.4 {{ inputs.demo_mode ? 'duckdb==1.4.1' : '' }}"
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+          TABLE: "{{ item.value }}"
+          UPDATE_KEY: "{{ inputs.update_key }}"
+          LOW: "{{ kv(outputs.plan.values.kv_prefix ~ 'watermark_' ~ (item.value | replace({'.': '__'})), errorOnMissing=false) ?? '' }}"
+          HIGH: "{{ outputs.plan.values.high }}"
+          BASELINE: "{{ kv(outputs.plan.values.kv_prefix ~ 'rows_' ~ (item.value | replace({'.': '__'})), errorOnMissing=false) ?? '' }}"
+          SPIKE_FACTOR: "{{ inputs.spike_factor }}"
+          TARGET_OBJECT: "{{ vars.prefix ~ (item.value | replace({'.': '/'})) ~ '/' ~ (execution.startDate | date('yyyyMMdd_HHmmss', timeZone='UTC')) ~ '.parquet' }}"
+          SLING_DISABLE_TELEMETRY: "true"
+          SRC: "{{ inputs.demo_mode ? '' : ({'type': 'postgres', 'host': secret('POSTGRES_HOST'), 'port': 5432, 'database': secret('POSTGRES_DB'), 'user': secret('POSTGRES_USER'), 'password': secret('POSTGRES_PASSWORD'), 'sslmode': vars.pg_sslmode} | toJson) }}"
+          LAKE: "{{ inputs.demo_mode ? '' : ({'type': 's3', 'bucket': vars.bucket, 'region': vars.region, 'access_key_id': secret('AWS_ACCESS_KEY_ID'), 'secret_access_key': secret('AWS_SECRET_ACCESS_KEY')} | toJson) }}"
+        outputFiles:
+          - "sling_demo/**/*.parquet"
+        script: |
+          import json
+          import os
+          import re
+          import subprocess
+
+          demo = os.environ["DEMO_MODE"].lower() == "true"
+          table, key = os.environ["TABLE"], os.environ["UPDATE_KEY"]
+          if not re.fullmatch(r"[A-Za-z_]\w*\.[A-Za-z_]\w*", table):
+              raise SystemExit(f"Table must be schema.table, got {table!r}")
+          initial = os.environ["LOW"] == ""
+          low = os.environ["LOW"] or "1970-01-01 00:00:00+00:00"
+          high = os.environ["HIGH"]
+
+          if demo:
+              import duckdb
+
+              # One order every 10 s and one payment every 25 s since midnight UTC,
+              # so each run finds the rows that "arrived" since the last one.
+              path = os.path.abspath("demo.duckdb")
+              con = duckdb.connect(path)
+              con.execute("SET TimeZone = 'UTC'")
+              for name, every in (("orders", 10), ("payments", 25)):
+                  con.execute(f"""
+                      CREATE TABLE {name} AS
+                      SELECT i AS id, round(10 + (i * 7) % 90, 2) AS amount,
+                             current_date::TIMESTAMPTZ + to_seconds(i * {every}) AS {key}
+                      FROM range(1, 86400 // {every}) t(i)
+                      WHERE current_date::TIMESTAMPTZ + to_seconds(i * {every}) <= now()
+                  """)
+              con.close()
+              os.environ["SRC"] = f"duckdb://{path}"
+              target = ["--tgt-object", f"file://sling_demo/{table.replace('.', '/')}/{os.path.basename(os.environ['TARGET_OBJECT'])}"]
+          else:
+              target = ["--tgt-conn", "LAKE", "--tgt-object", os.environ["TARGET_OBJECT"]]
+
+          query = (
+              f"SELECT * FROM {table} "
+              f"WHERE {key} > CAST('{low}' AS TIMESTAMPTZ) AND {key} <= CAST('{high}' AS TIMESTAMPTZ)"
+          )
+          run = subprocess.run(
+              ["sling", "run", "--src-conn", "SRC", "--src-stream", query, *target, "--mode", "full-refresh"],
+              capture_output=True, text=True,
+          )
+          log = run.stdout + run.stderr
+          if run.returncode != 0:
+              print(log)
+              raise SystemExit(f"Sling failed for {table}")
+          match = re.search(r"wrote (\d+) rows", log)
+          if not match:
+              print(log)
+              raise SystemExit("Could not read the row count from the Sling output")
+          rows = int(match.group(1))
+
+          factor = int(os.environ["SPIKE_FACTOR"])
+          baseline = int(float(os.environ["BASELINE"])) if os.environ["BASELINE"] else 0
+          spike = not initial and rows > 0 and baseline >= 10 and (rows > baseline * factor or rows * factor < baseline)
+
+          print(f"{table}: {rows} rows changed in ({low}, {high}]" + (f", previous batch {baseline}" if baseline else ""))
+          print("::" + json.dumps({"outputs": {
+              "rows": rows, "low": low, "high": high, "initial_load": initial, "baseline": baseline, "spike": spike,
+          }}) + "::")
+
+      - id: publish_demo_files
+        type: io.kestra.plugin.core.namespace.UploadFiles
+        description: In demo mode, keep the Parquet batch in the namespace files so it is easy to find.
+        runIf: "{{ inputs.demo_mode and outputs.sync.vars.rows > 0 }}"
+        namespace: "{{ flow.namespace }}"
+        filesMap: "{{ outputs.sync.outputFiles }}"
+
+      - id: save_watermark
+        type: io.kestra.plugin.core.kv.Set
+        description: Advance the watermark only after the batch was written, so a failed run is retried from the same point.
+        key: "{{ outputs.plan.values.kv_prefix ~ 'watermark_' ~ (item.value | replace({'.': '__'})) }}"
+        value: "{{ outputs.sync.vars.high }}"
+
+      - id: check_volume
+        type: io.kestra.plugin.core.flow.If
+        description: Warn when the batch is much larger or smaller than the previous one.
+        condition: "{{ outputs.sync.vars.spike }}"
+        then:
+          - id: log_volume_change
+            type: io.kestra.plugin.core.log.Log
+            description: Record the unusual batch size, even when Slack is off.
+            level: WARN
+            message: "{{ item.value }}: {{ outputs.sync.vars.rows }} rows this run vs {{ outputs.sync.vars.baseline }} in the previous batch"
+
+          - id: alert_slack
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Tell the data team about the unusual batch size.
+            runIf: "{{ inputs.notify_slack }}"
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": {{ ('Sling replication: `' ~ item.value ~ '` changed by ' ~ outputs.sync.vars.rows ~ ' rows this run vs ' ~ outputs.sync.vars.baseline ~ ' in the previous batch. Execution: ' ~ execution.id) | toJson }}
+              }
+
+      - id: save_row_count
+        type: io.kestra.plugin.core.kv.Set
+        description: Keep the size of the last non-empty incremental batch as the baseline for the next run. The initial full load is not a baseline.
+        runIf: "{{ outputs.sync.vars.rows > 0 and not outputs.sync.vars.initial_load }}"
+        key: "{{ outputs.plan.values.kv_prefix ~ 'rows_' ~ (item.value | replace({'.': '__'})) }}"
+        kvType: NUMBER
+        value: "{{ outputs.sync.vars.rows }}"
+
+errors:
+  - id: alert_failed_run
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when a run fails. Tables whose batch failed keep their watermark and are retried by the next run.
+    runIf: "{{ inputs.notify_slack }}"
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": {{ ('Sling replication execution ' ~ execution.id ~ ' failed. Tables whose batch failed keep their watermark and are retried by the next run.') | toJson }}
+      }
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Replicate the Postgres tables every hour. Enable after setting the secrets.
+    disabled: true
+    cron: "0 * * * *"
+    recoverMissedSchedules: LAST
+    inputs:
+      demo_mode: false
+      notify_slack: true
+
+extend:
+  title: Incremental Postgres to S3 Parquet replication with Sling and Kestra watermarks
+  metaTitle: Incremental Postgres to S3 Parquet replication with Sling and Kestra
+  shortDescription: Copy only the rows that changed since the last run from Postgres tables to Parquet files in S3 with Sling, keep a per-table watermark in the KV Store, and alert Slack when a batch is unusually large or small.
+  metaDescription: Replicate changed Postgres rows to S3 Parquet with Sling. Kestra keeps per-table watermarks, runs tables in parallel and alerts on volume spikes.
+  description: |
+    [Sling](https://slingdata.io) moves data between databases and object storage with a single command. The free CLI does not keep incremental state when the target is a file, so every run would copy whole tables again. This flow lets Kestra own the state: it keeps a watermark per table in the KV Store and asks Sling only for the rows changed since then.
+
+    Each run:
+    - copies the rows whose update timestamp falls in `(last watermark, run start - 1 minute]` to a new Parquet file per table in S3, all tables in parallel,
+    - advances a table's watermark only once its file is written, so a failed table is retried from the same point by the next run,
+    - warns, and alerts Slack when `notify_slack` is on, when a batch is more than `spike_factor` (default 5) times larger or smaller than the previous non-empty batch.
+
+    It runs with no setup. In demo mode the source is a DuckDB database generated inside the task, where an order arrives every 10 seconds and a payment every 25 seconds since midnight UTC, and the Parquet files go to the namespace files. Run it twice a minute apart and the second run copies only the rows that arrived in between.
+
+    This blueprint was created by [manojgosavi](https://github.com/manojgosavi).
+
+    ## How it works
+
+    1. `hourly` (`io.kestra.plugin.core.trigger.Schedule`) starts the flow every hour with `demo_mode: false` and `notify_slack: true`. Runs are queued one at a time (`concurrency.limit: 1`), and after downtime only the last missed run is started, which covers the whole gap.
+    2. `plan` (`io.kestra.plugin.core.output.OutputValues`) fixes the upper bound of the window (`high`, the execution start minus `lag_minutes`) and picks the tables: `inputs.tables`, or `main.orders` and `main.payments` in demo mode.
+    3. `replicate` (`io.kestra.plugin.core.flow.Loop`) processes up to 3 tables at a time. For each table:
+       - `sync` (`io.kestra.plugin.scripts.python.Script`, `sling==1.6.4`) reads the table's watermark from the KV Store and runs Sling with `SELECT * FROM <table> WHERE <update_key> > <watermark> AND <update_key> <= <high>`. The batch goes to `raw/postgres/<schema>/<table>/<execution start, UTC, yyyyMMdd_HHmmss>.parquet` in S3. It outputs `rows`, `low`, `high`, `initial_load`, `baseline` and `spike`.
+       - In demo mode, `publish_demo_files` (`io.kestra.plugin.core.namespace.UploadFiles`) copies the batch to the namespace files under `sling_demo/`.
+       - `save_watermark` (`io.kestra.plugin.core.kv.Set`) stores `high` as the new watermark.
+       - `check_volume` (`io.kestra.plugin.core.flow.If`): when `spike` is true, `log_volume_change` (`io.kestra.plugin.core.log.Log`) logs a warning and `alert_slack` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts it.
+       - `save_row_count` (`io.kestra.plugin.core.kv.Set`) keeps the batch size as the next baseline. Empty batches and the initial full load are not used as a baseline.
+    4. If a run fails, `alert_failed_run` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts to Slack. Tables that succeeded in that run keep their new watermark.
+
+    ## Inputs
+
+    - `demo_mode` (BOOL, default `true`): use the generated DuckDB source and namespace files. The trigger sets it to `false`.
+    - `tables` (ARRAY of STRING, default `public.customers`, `public.payments`): the Postgres tables, as `schema.table`.
+    - `update_key` (STRING, default `updated_at`): the timestamp column set on every insert and update.
+    - `spike_factor` (INT, default `5`): the volume alert threshold.
+    - `notify_slack` (BOOL, default `false`): post volume alerts and failed runs to Slack. The trigger sets it to `true`.
+
+    ## Prerequisites
+
+    - A Kestra worker that can run Docker containers. The script uses `python:3.12-slim` and installs the pinned Sling version (and DuckDB in demo mode) for each table, which takes about 15 seconds.
+    - For production: Postgres tables with an update timestamp column that is set on every insert and update (for example with a trigger or your ORM), and an S3 bucket.
+
+    ### Secrets
+
+    Only needed when `demo_mode` is `false`:
+    - `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: read access to the tables. The SSL mode is set in `variables.pg_sslmode` (`require`; use `verify-full` to also verify the server certificate).
+    - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: write access to the bucket.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for volume alerts and failed runs.
+
+    ## Quick start
+
+    1. Run the flow. Each table copies everything since midnight UTC (up to about 8,600 orders and 3,400 payments late in the day; close to midnight there is little to copy). The files appear in the namespace Files tab under `sling_demo/`.
+    2. Wait a minute and run it again. Only the rows that arrived in between are copied, for example 6 orders and 2 payments. The watermarks are in the KV Store under `sling_demo_watermark_*`.
+    3. For production, set the secrets, change `bucket`, `region` and `prefix` in `variables` and the default `tables`, and set `disabled: false` on the `hourly` trigger.
+
+    ## Expected outputs
+
+    - Per table: `outputs.sync.vars.rows`, `low`, `high`, `initial_load`, `baseline` and `spike`, and a Parquet file per non-empty batch.
+    - KV Store: `sling_watermark_<schema>__<table>` (the last `high`) and `sling_rows_<schema>__<table>` (the last batch size), with a `sling_demo_` prefix in demo mode.
+    - A `WARN` log line, and a Slack message when `notify_slack` is on, when a batch size changes by more than `spike_factor`.
+
+    ## Things to know
+
+    - Rows are captured by their update timestamp, so hard deletes are not replicated. Use soft deletes, or a CDC tool such as Debezium.
+    - Rows are missed if a transaction stays open longer than `lag_minutes`, or if the Postgres clock runs behind Kestra's. Raise `lag_minutes` to cover both.
+    - `update_key` should be `timestamptz`. With `timestamp without time zone`, the database `TimeZone` must match how the timestamps were written.
+    - A row updated twice between two runs is copied once, with its latest values. Downstream, keep the latest version of each primary key.
+    - Volume checks start once a table has an incremental batch of at least 10 rows. After a spike, the next normal batch can raise a second alert in the other direction.
+    - Table names must be unquoted `schema.table` identifiers. To re-copy a table from scratch, delete its watermark from the KV Store.
+
+    ## How to extend
+
+    - Load the Parquet files into a warehouse with its own loader, for example Snowflake `COPY INTO` or BigQuery external tables. Writing to a warehouse table directly with Sling also needs `--mode incremental` and `--primary-key`, because `full-refresh` would replace the table with each batch.
+    - Add tables by appending them to `tables`; each one gets its own watermark.
+    - Replace the Schedule with a Postgres trigger to run as soon as new rows appear.
+
+    ## Links
+
+    - Sling: https://docs.slingdata.io
+    - KV Store: https://kestra.io/docs/concepts/kv-store
+    - Python scripts plugin: https://kestra.io/plugins/plugin-script-python
+    - Slack plugin: https://kestra.io/plugins/plugin-slack
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Scheduling
+  ee: false
+  demo: true
