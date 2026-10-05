@@ -1,0 +1,413 @@
+id: certificate-transparency-issuance-watch
+namespace: company.team
+
+inputs:
+  - id: domains
+    type: ARRAY
+    itemType: STRING
+    displayName: Domains to watch
+    description: Registrable domains you own. One Cert Spotter request is spent per domain per run, so keep this list short.
+    defaults:
+      - "kestra.io"
+
+  - id: include_subdomains
+    type: BOOL
+    displayName: Include subdomains
+    description: Return certificates for every name under the domain. Leave this on, since subdomains are where the surprises are.
+    defaults: true
+
+  - id: expected_hostnames
+    type: ARRAY
+    itemType: STRING
+    displayName: Hostnames you already know about
+    description: 'Exact names you run, plus zone patterns for name space you delegate. An entry of *.example.com covers example.com and every depth below it, so use it only for a zone you genuinely hand to someone else, for example *.cloudflaressl.com.'
+    defaults: []
+
+  - id: approved_issuers
+    type: ARRAY
+    itemType: STRING
+    displayName: Approved certificate authorities
+    description: 'Cert Spotter issuer.friendly_name values you expect. Anything else is reported, whether or not the hostname is new.'
+    defaults:
+      - "Let's Encrypt"
+      - "Google Trust Services"
+
+  - id: max_known_hostnames
+    type: INT
+    displayName: Max remembered hostnames
+    description: Ceiling on the per-domain hostname memory in the KV store. Oldest entries are dropped first, so a dropped name can be reported once more later.
+    defaults: 500
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Notify Slack
+    description: Post findings to Slack. Needs the SLACK_WEBHOOK_URL secret. Every run logs its findings either way.
+    defaults: false
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly matches the Cert Spotter keyless budget of 10 requests per hour per IP address.
+    cron: "17 * * * *"
+
+tasks:
+  - id: watch_domains
+    type: io.kestra.plugin.core.flow.Loop
+    description: One domain at a time. Serial iteration keeps the run inside the per hour request budget.
+    values: "{{ inputs.domains }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: read_cursor
+        type: io.kestra.plugin.core.kv.Get
+        description: The opaque Cert Spotter issuance id this domain reached last run. Never give this key a ttl, an expired key throws on read.
+        key: "ct_cursor_{{ item.value | replace({'.': '_'}) }}"
+        errorOnMissing: false
+
+      - id: read_seen
+        type: io.kestra.plugin.core.kv.Get
+        description: Hostname memory plus the at_head flag for this domain, as a JSON document.
+        key: "ct_seen_{{ item.value | replace({'.': '_'}) }}"
+        errorOnMissing: false
+
+      - id: fetch_issuances
+        type: io.kestra.plugin.core.http.Request
+        # The next page URI is built here from the stored id. Cert Spotter's own Link rel="next" header drops the /v1 prefix and 404s, so it is not followed.
+        description: One page of issuances for this domain, newest page last. HTTP 429 is an allowed response code because the keyless budget is 10 requests per hour per IP address.
+        uri: "https://api.certspotter.com/v1/issuances?domain={{ item.value }}&include_subdomains={{ inputs.include_subdomains }}&expand=dns_names&expand=issuer{{ (outputs.read_cursor.value ?? '') == '' ? '' : '&after=' ~ outputs.read_cursor.value }}"
+        method: GET
+        # Production users should authenticate. Add a Cert Spotter API token, then uncomment:
+        # headers:
+        #   Authorization: "Bearer {{ secret('CERTSPOTTER_API_KEY') }}"
+        options:
+          allowedResponseCodes:
+            - 200
+            - 429
+          timeout:
+            connectTimeout: PT10S
+            readIdleTimeout: PT30S
+
+      - id: classify_issuances
+        type: io.kestra.plugin.scripts.python.Script
+        description: Split the page into hostnames nobody registered, certificates from an unapproved authority plus new wildcards, then hand back the next cursor and the updated memory.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        inputFiles:
+          issuances.json: "{{ outputs.fetch_issuances.body }}"
+          seen.json: "{{ outputs.read_seen.value ?? '{}' }}"
+          config.json: |
+            {
+              "domain": "{{ item.value }}",
+              "cursor": "{{ outputs.read_cursor.value ?? '' }}",
+              "expected_hostnames": {{ inputs.expected_hostnames | toJson }},
+              "approved_issuers": {{ inputs.approved_issuers | toJson }},
+              "max_known_hostnames": {{ inputs.max_known_hostnames }},
+              "http_code": {{ outputs.fetch_issuances.code }}
+            }
+        script: |
+          import json
+          from pathlib import Path
+
+          from kestra import Kestra
+
+          cfg = json.loads(Path("config.json").read_text())
+          seen = json.loads(Path("seen.json").read_text().strip() or "{}")
+
+          domain = cfg["domain"]
+          cursor = str(cfg["cursor"] or "")
+          approved = set(cfg["approved_issuers"])
+          expected = list(cfg["expected_hostnames"])
+          cap = max(1, int(cfg["max_known_hostnames"]))
+          http_code = int(cfg["http_code"])
+
+          at_head = bool(seen.get("at_head"))
+          known = list(seen.get("known") or [])
+          first_run = not cursor and not known
+
+          # 429 is a normal condition on the keyless tier, not a failure. Keep the
+          # cursor where it is so the next run asks for the same page again.
+          rate_limited = http_code == 429
+          records = []
+          if not rate_limited:
+              page = json.loads(Path("issuances.json").read_text())
+              if not isinstance(page, list):
+                  raise SystemExit("Cert Spotter returned a %s, expected a JSON array: %r" % (type(page).__name__, page))
+              records = page
+
+
+          def is_expected(name):
+              """An entry of *.example.com covers example.com plus every depth below it."""
+              for pattern in expected:
+                  if pattern.startswith("*."):
+                      zone = pattern[2:]
+                      if name == zone or name.endswith("." + zone):
+                          return True
+                  elif name == pattern:
+                      return True
+              return False
+
+
+          def sample(items, limit=15):
+              if not items:
+                  return "none"
+              head = ", ".join(items[:limit])
+              if len(items) <= limit:
+                  return head
+              return head + " (+%d more)" % (len(items) - limit)
+
+
+          known_set = set(known)
+          page_names = []
+          for record in records:
+              page_names.extend(record.get("dns_names") or [])
+          distinct = sorted(set(page_names))
+
+          unregistered = [n for n in distinct if n not in known_set and not is_expected(n)]
+          new_wildcards = [n for n in unregistered if n.startswith("*.")]
+
+          # Issuer findings are deliberately not suppressed by the hostname memory. A
+          # certificate authority you do not use signing a hostname you already run is
+          # the mis-issuance case, so it has to be reported every time.
+          unapproved = set()
+          for record in records:
+              issuer = record.get("issuer") or {}
+              who = issuer.get("friendly_name") or issuer.get("name") or "unknown issuer"
+              if who not in approved:
+                  for name in (record.get("dns_names") or []):
+                      unapproved.add(name + " (" + who + ")")
+          unapproved = sorted(unapproved)
+
+          # The first page returned is the OLDEST issuance on record, so early runs are
+          # a backfill. Alerting waits until an empty page has proved the cursor reached
+          # the head of the log. at_head only ever goes from false to true.
+          cursor_after = str(records[-1]["id"]) if records else cursor
+          at_head_after = at_head or (not rate_limited and not records)
+          findings = len(unregistered) + len(unapproved)
+          alertable = at_head and findings > 0
+
+          merged = known + [n for n in distinct if n not in known_set]
+          trimmed = 0
+          if len(merged) > cap:
+              trimmed = len(merged) - cap
+              merged = merged[trimmed:]
+
+          if rate_limited:
+              phase = "RATE LIMITED"
+          elif first_run:
+              phase = "BASELINE SEEDED"
+          elif not records:
+              phase = "CAUGHT UP"
+          elif not at_head:
+              phase = "BACKFILL"
+          else:
+              phase = "WATCHING"
+
+          summary = (
+              "%s: %s. page=%d certificates covering %d distinct hostnames. "
+              "unregistered=%d unapproved_issuer=%d new_wildcards=%d. "
+              "cursor %s to %s. at_head=%s alert=%s remembered=%d"
+          ) % (domain, phase, len(records), len(distinct), len(unregistered),
+               len(unapproved), len(new_wildcards), cursor or "(none)",
+               cursor_after or "(none)", at_head_after, alertable, len(merged))
+
+          print(summary)
+          print("  unregistered hostnames : " + sample(unregistered))
+          print("  unapproved issuer      : " + sample(unapproved))
+          print("  new wildcards          : " + sample(new_wildcards))
+          if trimmed:
+              print("  dropped %d oldest remembered hostnames to stay under max_known_hostnames=%d" % (trimmed, cap))
+
+          Kestra.outputs({
+              "phase": phase,
+              "records": len(records),
+              "distinct_hostnames": len(distinct),
+              "unregistered_count": len(unregistered),
+              "unregistered": sample(unregistered),
+              "unapproved_count": len(unapproved),
+              "unapproved": sample(unapproved),
+              "new_wildcard_count": len(new_wildcards),
+              "new_wildcards": sample(new_wildcards),
+              "findings": findings,
+              "alertable": alertable,
+              "at_head": at_head_after,
+              "first_run": first_run,
+              "rate_limited": rate_limited,
+              "cursor_before": cursor,
+              "cursor_after": cursor_after,
+              "known_count": len(merged),
+              "known_dropped": trimmed,
+              "seen_out": json.dumps({"at_head": at_head_after, "known": merged}, separators=(",", ":")),
+              "summary": summary,
+          })
+
+      - id: report
+        type: io.kestra.plugin.core.log.Log
+        description: Every run logs its verdict, including the backfill runs that never alert.
+        message: |
+          {{ outputs.classify_issuances.vars.summary }}
+            unregistered hostnames : {{ outputs.classify_issuances.vars.unregistered }}
+            unapproved issuer      : {{ outputs.classify_issuances.vars.unapproved }}
+            new wildcards          : {{ outputs.classify_issuances.vars.new_wildcards }}
+            rate budget left       : {{ (outputs.fetch_issuances.headers['x-ratelimit-remaining'] ?? ['unknown']) | first }} of {{ (outputs.fetch_issuances.headers['x-ratelimit-limit'] ?? ['10']) | first }} this hour
+
+      - id: save_seen
+        type: io.kestra.plugin.core.kv.Set
+        description: Persist the hostname memory plus at_head. Written before alerting so a Slack outage cannot wedge the cursor on one page forever.
+        key: "ct_seen_{{ item.value | replace({'.': '_'}) }}"
+        kvType: STRING
+        value: "{{ outputs.classify_issuances.vars.seen_out }}"
+
+      - id: advance_cursor
+        type: io.kestra.plugin.core.flow.If
+        description: An empty page or an HTTP 429 leaves the cursor alone, so a good cursor is never blanked.
+        condition: "{{ outputs.classify_issuances.vars.cursor_after != '' }}"
+        then:
+          - id: save_cursor
+            type: io.kestra.plugin.core.kv.Set
+            key: "ct_cursor_{{ item.value | replace({'.': '_'}) }}"
+            kvType: STRING
+            value: "{{ outputs.classify_issuances.vars.cursor_after }}"
+
+      - id: alert
+        type: io.kestra.plugin.core.flow.If
+        description: Alert only once the cursor reached the head of the log, so the backfill does not page anyone.
+        condition: "{{ outputs.classify_issuances.vars.alertable and inputs.notify_slack }}"
+        then:
+          - id: slack_alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: |
+              :lock: *New certificates issued for {{ item.value }}*
+              {{ outputs.classify_issuances.vars.summary }}
+              Hostnames nobody registered: {{ outputs.classify_issuances.vars.unregistered }}
+              Unapproved issuer: {{ outputs.classify_issuances.vars.unapproved }}
+              New wildcards: {{ outputs.classify_issuances.vars.new_wildcards }}
+              Execution {{ execution.id }}
+
+errors:
+  - id: report_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    description: Name the two likely causes so a failed run is not a mystery.
+    message: "Certificate Transparency watch FAILED in {{ flow.id }}, execution {{ execution.id }}. Usual causes: the Cert Spotter request budget of 10 per hour per IP address is spent, or api.certspotter.com is unreachable. No cursor was advanced, so the next run asks for the same page."
+
+extend:
+  title: Watch Certificate Transparency logs for certificates issued under your domains
+  metaTitle: Certificate Transparency issuance watcher with Kestra
+  shortDescription: Poll the Cert Spotter Certificate Transparency API on a schedule, advance an opaque id cursor in the KV store, then report hostnames nobody registered, certificate authorities outside your allowlist plus new wildcards.
+  metaDescription: Watch Certificate Transparency logs with Kestra. Find hostnames under your domains that nobody registered, unapproved CAs plus new wildcards.
+  description: |
+    An expiry monitor checks hostnames you already know about. This flow returns hostnames you did **not** know about, read out of a public append-only log that no probe of your own network can reveal. Every publicly trusted certificate authority is required to log what it signs, so Certificate Transparency is the one place a forgotten staging host, a shadow IT subdomain, a wildcard somebody issued last night plus a certificate authority you never approved all show up in the same feed.
+
+    Run against `kestra.io` for a minute and the point lands. The log hands back `develop.registry.internal.kestra.io`, `kibana.prod.internal.gcp.kestra.io`, `bookmarks.internal.kestra.io`, 23 more names with `internal` in them, 10 wildcard issuances for `*.kestra.io`, plus two certificates for `support.kestra.io` signed by Amazon Trust Services while every other certificate in that page came from Let's Encrypt or Google Trust Services. No port scan finds those names. No DNS zone transfer gives them to you. A public log does.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## What it reports
+
+    - **Hostnames nobody registered.** Names in the page that are neither in `expected_hostnames` nor in the per domain memory the flow keeps in the KV store.
+    - **Certificates from an unapproved authority.** Any `issuer.friendly_name` outside `approved_issuers`. This check is on purpose not suppressed by the hostname memory, because a certificate authority you do not use signing a hostname you already run is the mis-issuance case.
+    - **New wildcards.** A `*.` name the flow has not recorded before. One wildcard quietly covers every host in the zone.
+
+    ## Read this before the first run
+
+    Cert Spotter returns the **oldest** issuance first, not the newest. So the first executions are a backfill, not a watch:
+
+    1. Run one. Nothing is in the KV store, the flow takes the oldest page, writes down every hostname in it, advances the cursor, logs `BASELINE SEEDED`. Nobody is paged.
+    2. Further runs page forward through history, logging `BACKFILL`. Still nobody is paged.
+    3. The run that gets an empty page logs `CAUGHT UP` and sets `at_head`. `kestra.io` took two pages.
+    4. From then on every page is genuinely new, the phase reads `WATCHING`, findings alert.
+
+    The baseline run is noisy by design, because on a first look every hostname is unknown. Read it as an inventory, then move the names you recognise into `expected_hostnames`. Certificates shared with a CDN or a SaaS put names outside your zone in the list as well: `kestra.io` pulls in `c837a3a0.sni.cloudflaressl.com`, which is Cloudflare, not an intruder. `*.cloudflaressl.com` in `expected_hostnames` silences that whole class.
+
+    ## Request budget
+
+    The keyless Cert Spotter tier allows **10 requests per hour per egress IP address**, measured from the `x-ratelimit-limit` response header. The flow spends exactly one request per domain per run, loops domains serially then runs hourly. There is no flow-level `concurrency` limit on purpose: each `Loop` iteration runs as a sub-execution of this same flow, and a flow limit of 1 leaves the first iteration queued behind its own parent forever. A run takes seconds, so hourly schedules do not overlap. HTTP 429 is an allowed response code rather than a crash: the run logs `RATE LIMITED`, leaves the cursor untouched, exits green.
+
+    SSLMate describes the keyless tier as "for personal or evaluation purposes" and asks production users to authenticate. The `fetch_issuances` task carries the authenticated header ready to uncomment:
+
+    ```yaml
+    headers:
+      Authorization: "Bearer {{ secret('CERTSPOTTER_API_KEY') }}"
+    ```
+
+    ## How it works
+
+    1. `watch_domains` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) takes one domain at a time.
+    2. `read_cursor` plus `read_seen` (`io.kestra.plugin.core.kv.Get`, `errorOnMissing: false`) load the opaque issuance id this domain reached plus its hostname memory. Neither key gets a `ttl`: `kv.Get` throws on an expired key whatever `errorOnMissing` says.
+    3. `fetch_issuances` (`io.kestra.plugin.core.http.Request`) asks for one page. The next page URI is built from the stored id, because the server's own `Link: rel="next"` header omits its `/v1` prefix then returns 404. One line of comment on the task says so.
+    4. `classify_issuances` (`io.kestra.plugin.scripts.python.Script` on `ghcr.io/kestra-io/pydata:latest`, Python standard library only) splits the page three ways, computes the next cursor, returns the updated memory through `Kestra.outputs`.
+    5. `report` (`io.kestra.plugin.core.log.Log`) prints the verdict on every run, backfill runs included, with the remaining request budget read off the response header.
+    6. `save_seen` (`io.kestra.plugin.core.kv.Set`) persists the memory before any alert, so a Slack outage cannot wedge the flow on one page.
+    7. `advance_cursor` (`io.kestra.plugin.core.flow.If`) writes the cursor only when the page produced one. An empty page or a 429 leaves a good cursor alone.
+    8. `alert` (`io.kestra.plugin.core.flow.If`) gates `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` on `at_head`, on findings existing, plus on `notify_slack`.
+
+    ## Inputs
+
+    - `domains` (ARRAY of STRING, default `["kestra.io"]`): registrable domains you own. One request each per run.
+    - `include_subdomains` (BOOL, default `true`): subdomains are where the surprises live.
+    - `expected_hostnames` (ARRAY of STRING, default `[]`): names you already run. A `*.example.com` entry covers `example.com` plus every depth below it, so use it only for a zone you hand to someone else. Allowlisting your own apex wildcard switches the signal off.
+    - `approved_issuers` (ARRAY of STRING, default `["Let's Encrypt", "Google Trust Services"]`): expected `issuer.friendly_name` values.
+    - `max_known_hostnames` (INT, default `500`): ceiling on the per domain memory. Oldest first out, so a dropped name can be reported once more later. Raise it or move names into `expected_hostnames`.
+    - `notify_slack` (BOOL, default `false`): Slack on top of the log.
+
+    ## Prerequisites
+
+    - Docker on the Kestra Worker for the Python task.
+    - Outbound HTTPS to `api.certspotter.com`. No account, no key, nothing to register.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: only when `notify_slack` is `true`.
+    - `CERTSPOTTER_API_KEY`: only if you uncomment the authenticated header.
+
+    ## Quick start
+
+    1. Add the blueprint, set `domains` to a domain you own, leave everything else alone.
+    2. Run it. The log reads `BASELINE SEEDED` with your hostname inventory.
+    3. Run it again until the log reads `CAUGHT UP`. Two or three runs is typical.
+    4. Read the baseline inventory, then put the names you recognise into `expected_hostnames`.
+    5. Turn `notify_slack` on with the webhook secret set, then leave the hourly schedule running.
+    6. To prove the issuer check can fail, drop one authority you actually use out of `approved_issuers` then re-run. Every certificate it signed is reported.
+
+    ## Expected outputs
+
+    `outputs.classify_issuances.vars` per domain:
+
+    - `phase`: `BASELINE SEEDED`, `BACKFILL`, `CAUGHT UP`, `WATCHING` or `RATE LIMITED`.
+    - `records`, `distinct_hostnames`: size of this page.
+    - `unregistered_count` plus `unregistered`: hostnames nobody registered.
+    - `unapproved_count` plus `unapproved`: `hostname (issuer)` pairs outside the allowlist.
+    - `new_wildcard_count` plus `new_wildcards`.
+    - `cursor_before`, `cursor_after`, `at_head`, `known_count`, `known_dropped`, `alertable`.
+
+    KV keys per domain: `ct_cursor_<domain>` holds the opaque id, `ct_seen_<domain>` holds `{"at_head": bool, "known": [...]}`. Delete both to start over.
+
+    ## Known limits
+
+    - One external dependency. `api.certspotter.com` is the only source. crt.sh was the obvious second opinion, it returned HTTP 502 on every attempt, so it is not wired in.
+    - Certificate Transparency shows what a certificate authority logged. A certificate issued by a private internal authority never appears.
+    - The hostname memory is capped, so a dropped name can be reported a second time.
+
+    ## How to extend
+
+    - Open a ticket per unregistered hostname instead of posting to Slack.
+    - Add `revoked` to the findings. The field is already in every record.
+    - Diff `dns_names` against your DNS zone or your Terraform state rather than a hand written `expected_hostnames`.
+    - Match hostnames against a typosquat pattern list to catch lookalike domains in the same log.
+    - Write each page to Postgres or S3 for a searchable certificate history.
+
+    ## Links
+
+    - Cert Spotter API: https://sslmate.com/help/reference/ct_search_api
+    - Certificate Transparency: https://certificate.transparency.dev/
+    - RFC 6962: https://www.rfc-editor.org/rfc/rfc6962
+    - Kestra KV store: https://kestra.io/docs/concepts/kv-store
+  tags:
+    - Infrastructure
+    - System
+  subTags:
+    - Monitoring & Alerting
+    - Policy & Compliance
+  ee: false
+  demo: false
