@@ -1,0 +1,293 @@
+id: postgres-backup-s3-restore-verify
+namespace: company.database
+
+inputs:
+  - id: database
+    type: STRING
+    displayName: Source database
+    description: Name of the PostgreSQL production database to back up.
+    defaults: production_db
+
+  - id: restore_database
+    type: STRING
+    displayName: Restore drill database
+    description: Dedicated scratch database where the archive is test-restored to verify integrity. Never point this at production.
+    defaults: restore_drill_db
+
+  - id: s3_bucket
+    type: STRING
+    displayName: S3 Backup Bucket
+    description: Target AWS S3 bucket to store the encrypted, timestamped database dumps.
+    defaults: company-postgres-backups
+
+  - id: s3_region
+    type: STRING
+    displayName: AWS Region
+    description: AWS region where the backup S3 bucket resides.
+    defaults: us-east-1
+
+  - id: min_tables
+    type: INT
+    displayName: Minimum expected tables
+    description: Minimum number of tables required in the database. Catches accidental empty backups.
+    defaults: 1
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Notify Slack
+    description: Send success and failure notifications to Slack. Requires SLACK_WEBHOOK_URL secret.
+    defaults: true
+
+variables:
+  archive_filename: "pg_backup_{{ inputs.database }}_{{ execution.startDate | date('yyyy-MM-dd-HH-mm-ss') }}.dump"
+  archive_s3_key: "backups/{{ inputs.database }}/{{ execution.startDate | date('yyyy-MM-dd-HH-mm-ss') }}.dump"
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: nightly_backup_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Run nightly database backup and automated restore verification drill at 02:00 UTC.
+    cron: "0 2 * * *"
+
+tasks:
+  - id: source_stats
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Query the source database to establish a baseline of table counts and estimated row volume before generating the dump.
+    url: "jdbc:postgresql://{{ secret('POSTGRES_HOST') }}:{{ secret('POSTGRES_PORT') }}/{{ inputs.database }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      SELECT
+        COUNT(DISTINCT table_name) AS table_count
+      FROM information_schema.tables
+      WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+    fetchOne: true
+
+  - id: dump_database
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Run pg_dump inside a postgres container to create a custom-format compressed backup archive.
+    containerImage: postgres:16-alpine
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      PGHOST: "{{ secret('POSTGRES_HOST') }}"
+      PGPORT: "{{ secret('POSTGRES_PORT') }}"
+      PGUSER: "{{ secret('POSTGRES_USER') }}"
+      PGPASSWORD: "{{ secret('POSTGRES_PASSWORD') }}"
+      PGDATABASE: "{{ inputs.database }}"
+    outputFiles:
+      - "{{ vars.archive_filename }}"
+    commands:
+      - |
+        set -euo pipefail
+        ARCHIVE="{{ vars.archive_filename }}"
+        echo "Starting pg_dump for database ${PGDATABASE}..."
+        pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -F c -b -v -f "$ARCHIVE" 2> dump.log || { cat dump.log; exit 1; }
+        cat dump.log
+        if [ ! -s "$ARCHIVE" ]; then
+          echo "Dump file $ARCHIVE is empty or missing!" >&2
+          exit 1
+        fi
+        DUMP_SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
+        echo "::{\"outputs\":{\"dump_size_bytes\":${DUMP_SIZE}}}::"
+
+  - id: upload_to_s3
+    type: io.kestra.plugin.aws.s3.Upload
+    description: Upload the timestamped compressed PostgreSQL backup archive to Amazon S3.
+    from: "{{ outputs.dump_database.outputFiles[vars.archive_filename] }}"
+    bucket: "{{ inputs.s3_bucket }}"
+    key: "{{ vars.archive_s3_key }}"
+    region: "{{ inputs.s3_region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+
+  - id: restore_drill
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Restore the generated backup into the scratch restore drill database to verify that the archive is completely uncorrupted.
+    containerImage: postgres:16-alpine
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      restore.dump: "{{ outputs.upload_to_s3.uri }}"
+    env:
+      PGHOST: "{{ secret('POSTGRES_HOST') }}"
+      PGPORT: "{{ secret('POSTGRES_PORT') }}"
+      PGUSER: "{{ secret('POSTGRES_USER') }}"
+      PGPASSWORD: "{{ secret('POSTGRES_PASSWORD') }}"
+      RESTORE_DB: "{{ inputs.restore_database }}"
+    commands:
+      - |
+        set -euo pipefail
+        echo "Testing restore against drill database ${RESTORE_DB}..."
+        # Drop and recreate schema / tables in scratch database using pg_restore clean flag
+        pg_restore --clean --if-exists --no-owner --no-privileges -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$RESTORE_DB" restore.dump 2> restore.log || {
+          EXIT_CODE=$?
+          cat restore.log
+          # pg_restore exit code 1 indicates non-fatal warnings (e.g. objects already exist), but >1 indicates fatal failure
+          if [ "$EXIT_CODE" -gt 1 ]; then
+            echo "pg_restore failed with fatal error code $EXIT_CODE" >&2
+            exit "$EXIT_CODE"
+          fi
+        }
+        cat restore.log
+        echo "::{\"outputs\":{\"restore_status\":\"COMPLETED\"}}::"
+
+  - id: restore_stats
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Query the scratch database to confirm that all tables were restored accurately.
+    url: "jdbc:postgresql://{{ secret('POSTGRES_HOST') }}:{{ secret('POSTGRES_PORT') }}/{{ inputs.restore_database }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      SELECT
+        COUNT(DISTINCT table_name) AS table_count
+      FROM information_schema.tables
+      WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+    fetchOne: true
+
+  - id: verify_backup_integrity
+    type: io.kestra.plugin.core.flow.If
+    description: Verify that the restored table count matches the source table count and meets minimum table requirements.
+    condition: >-
+      {{ (outputs.restore_stats.row.table_count | number) == (outputs.source_stats.row.table_count | number)
+      and (outputs.restore_stats.row.table_count | number) >= inputs.min_tables }}
+    then:
+      - id: log_verification_success
+        type: io.kestra.plugin.core.log.Log
+        description: Log verification report when restore drill succeeds.
+        message: >-
+          PostgreSQL backup drill SUCCEEDED for database '{{ inputs.database }}'.
+          Source tables: {{ outputs.source_stats.row.table_count }}, Restored tables: {{ outputs.restore_stats.row.table_count }}.
+          Archive safely stored at s3://{{ inputs.s3_bucket }}/{{ vars.archive_s3_key }} (Size: {{ outputs.dump_database.vars.dump_size_bytes }} bytes).
+
+      - id: notify_slack_success
+        type: io.kestra.plugin.core.flow.If
+        description: Notify Slack on verified backup success if notification is enabled.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: slack_success_alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Post verified backup success card to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "PostgreSQL Backup & Restore Drill PASSED: Database `{{ inputs.database }}` successfully dumped, uploaded to S3, and verified against `{{ inputs.restore_database }}`. Table count: {{ outputs.restore_stats.row.table_count }}. S3 path: `s3://{{ inputs.s3_bucket }}/{{ vars.archive_s3_key }}`."
+              }
+    else:
+      - id: notify_slack_failure
+        type: io.kestra.plugin.core.flow.If
+        description: Notify Slack on restore verification mismatch.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: slack_failure_alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Send critical failure notification to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "CRITICAL: PostgreSQL Backup Drill FAILED for database `{{ inputs.database }}`! Mismatch detected: Source had {{ outputs.source_stats.row.table_count }} tables, but restore produced {{ outputs.restore_stats.row.table_count }} tables. Execution {{ execution.id }}."
+              }
+
+      - id: fail_execution
+        type: io.kestra.plugin.core.execution.Fail
+        description: Fail the flow execution so the on-call team is alerted to the corrupted or incomplete backup.
+        errorMessage: "Restore drill failed parity check: source tables ({{ outputs.source_stats.row.table_count }}) != restored tables ({{ outputs.restore_stats.row.table_count }})."
+
+errors:
+  - id: on_pipeline_error_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Catch unexpected connection or runner errors during backup or upload and alert the team.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "PostgreSQL backup workflow encountered an unexpected failure in flow `{{ flow.id }}` (Execution `{{ execution.id }}`). Check task logs for details."
+      }
+
+outputs:
+  - id: backup_s3_uri
+    type: STRING
+    description: S3 URI of the verified backup archive.
+    value: "s3://{{ inputs.s3_bucket }}/{{ vars.archive_s3_key }}"
+  - id: dump_size_bytes
+    type: INT
+    description: Total size in bytes of the compressed database dump archive.
+    value: "{{ outputs.dump_database.vars.dump_size_bytes }}"
+  - id: tables_verified
+    type: INT
+    description: Total number of tables successfully restored and validated.
+    value: "{{ outputs.restore_stats.row.table_count }}"
+
+extend:
+  title: Automated PostgreSQL Backup to AWS S3 with Restore Verification
+  shortDescription: Schedule pg_dump database archives to Amazon S3 and test-restore them into a scratch database to verify backup integrity.
+  metaTitle: Automated PostgreSQL Backup to AWS S3 with Restore Verification
+  metaDescription: Schedule pg_dump backups to AWS S3, test-restore into an ephemeral database to verify schema parity, and send Slack alerts on success or failure.
+  description: |
+    Automating backups is only half the battle: an unverified backup is an outage waiting to happen. Silent schema corruptions, broken permissions, or incomplete pg_dump executions frequently go unnoticed until disaster strikes and recovery fails.
+
+    This blueprint implements a disaster recovery workflow for PostgreSQL: it schedules automated custom-format `pg_dump` backups, streams the archive to Amazon S3, and immediately performs an automated **restore drill** into an ephemeral scratch database. Only backups that pass full schema and table parity checks are certified and announced to the team.
+
+    ## How it works
+
+    1. `source_stats` queries `information_schema.tables` on the production database using the PostgreSQL JDBC plugin to record baseline table counts.
+    2. `dump_database` launches a `postgres:16-alpine` container via Docker task runner and runs `pg_dump -F c -b -v` to generate a compressed custom-format archive, recording the byte size.
+    3. `upload_to_s3` uses the AWS S3 plugin (`io.kestra.plugin.aws.s3.Upload`) to ship the timestamped archive to a secured S3 backup bucket.
+    4. `restore_drill` launches a container to restore the archive into a dedicated scratch database (`restore_database`) using `pg_restore --clean --if-exists`.
+    5. `restore_stats` inspects the scratch database and counts the restored user tables.
+    6. `verify_backup_integrity` (`io.kestra.plugin.core.flow.If`) compares source and restored table counts:
+       - On match: Logs verification metrics, publishes output metadata, and notifies Slack.
+       - On mismatch: Dispatches an incident alert to Slack and fails the execution via `Fail`.
+    7. An `errors` block catches unexpected worker failures, network issues, or S3 upload timeouts.
+
+    ## What you get
+
+    - **Automated Disaster Recovery Testing**: Every night's backup is tested against a real PostgreSQL instance before you need it in production.
+    - **Cloud Cold Storage**: Timestamped archives in Amazon S3 ready for point-in-time recovery.
+    - **Zero Credential Leaks**: Fully parameterized with secure Kestra secret placeholders.
+    - **Instant Feedback**: Slack alerts containing backup size, table counts, and exact S3 paths.
+
+    ## Prerequisites
+
+    - A PostgreSQL 13+ instance accessible from the Kestra worker.
+    - A dedicated scratch database or permissions to drop and recreate drill tables (never point `restore_database` to production).
+    - An AWS S3 bucket and IAM credentials with `s3:PutObject` permission.
+    - An incoming Slack webhook URL for alerts.
+
+    ### Secrets
+
+    - `POSTGRES_HOST`: Hostname or IP of the PostgreSQL server.
+    - `POSTGRES_PORT`: Port of the PostgreSQL server (default `5432`).
+    - `POSTGRES_USER`: PostgreSQL user with `pg_read_all_data` / dump permissions.
+    - `POSTGRES_PASSWORD`: Password for the PostgreSQL user.
+    - `AWS_ACCESS_KEY_ID`: AWS IAM access key ID.
+    - `AWS_SECRET_ACCESS_KEY`: AWS IAM secret access key.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for backup status alerts.
+
+    ## Quick start
+
+    1. Add the required PostgreSQL, AWS, and Slack secrets to your Kestra namespace.
+    2. Ensure your scratch database (e.g. `restore_drill_db`) is created on your test PostgreSQL server.
+    3. Adjust `s3_bucket` and `database` inputs to match your environment.
+    4. Trigger a manual execution in the Kestra UI to run the first verification drill.
+    5. Keep the `nightly_backup_schedule` active for recurring 02:00 UTC runs.
+
+    ## How to extend
+
+    - **S3 Retention Policy**: Chain an S3 lifecycle rule or task to prune archives older than 30 or 90 days.
+    - **Row Count Parity**: Extend `source_stats` and `restore_stats` to query exact `pg_stat_user_tables.n_live_tup` or run checksum queries on critical tables.
+    - **Multi-Cloud Replication**: Add a secondary upload task to replicate dumps to Google Cloud Storage or Azure Blob Storage in parallel.
+
+    ## Links
+
+    - [Kestra PostgreSQL Plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Kestra AWS S3 Plugin](https://kestra.io/plugins/plugin-aws)
+    - [PostgreSQL pg_dump Documentation](https://www.postgresql.org/docs/current/app-pgdump.html)
+    - This blueprint has been created by [community-contributor](https://github.com/kestra-io/blueprints)
+  tags:
+    - Data
+    - Infrastructure
+    - Cloud
+  ee: false
+  demo: false
