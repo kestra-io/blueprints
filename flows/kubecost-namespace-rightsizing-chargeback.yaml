@@ -1,0 +1,377 @@
+id: kubecost-namespace-rightsizing-chargeback
+namespace: company.team
+
+description: |
+  Weekly FinOps loop: pull per-namespace cost allocations from Kubecost, compute
+  rightsizing proposals plus a budget-vs-actual chargeback report, send both to
+  Slack, then hold a durable human approval before enforcing right-sized default
+  resource requests via Kubernetes LimitRange patches.
+
+triggers:
+  - id: weekly_rightsizing
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Weekly rightsizing review (enable by flipping disabled to false).
+    cron: "0 6 * * 1"
+    disabled: true
+
+  - id: on_demand
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: On-demand run, e.g. after a big cluster scale-up or at month end.
+
+inputs:
+  - id: budgets
+    type: JSON
+    displayName: Chargeback budgets per namespace
+    description: Namespace to owner/budget mapping used for the chargeback report.
+    defaults: |
+      {
+        "prod-payments": {"owner_team": "payments", "monthly_budget_usd": 800},
+        "prod-search": {"owner_team": "discovery", "monthly_budget_usd": 500},
+        "staging-shared": {"owner_team": "platform", "monthly_budget_usd": 150}
+      }
+
+  - id: kubecost_url
+    type: STRING
+    displayName: Kubecost base URL
+    description: Base URL of the Kubecost /model API.
+    defaults: "https://kubecost.example.internal"
+
+  - id: window
+    type: STRING
+    displayName: Cost window
+    description: Kubecost allocation window (for example 7d or 30d).
+    defaults: "30d"
+
+  - id: util_threshold
+    type: NUMBER
+    displayName: Utilization threshold
+    description: Propose smaller requests when CPU or RAM utilization sits below this fraction of requested resources.
+    defaults: 0.4
+
+  - id: min_monthly_savings_usd
+    type: NUMBER
+    displayName: Minimum monthly savings
+    description: Ignore namespaces whose projected savings are below this amount.
+    defaults: 40
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration to wait for an approver before the pause expires.
+    defaults: "PT24H"
+
+tasks:
+  - id: fetch_allocations
+    type: io.kestra.plugin.core.http.Request
+    description: Pull per-namespace allocation costs from the Kubecost allocation API.
+    uri: "{{ inputs.kubecost_url }}/model/allocation?aggregate=namespace&window={{ inputs.window }}&currency=USD"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('KUBECOST_API_TOKEN') }}"
+
+  - id: analyze_rightsizing
+    type: io.kestra.plugin.scripts.python.Script
+    description: Join allocations against chargeback budgets and compute rightsizing proposals.
+    env:
+      ALLOCATION_BODY: "{{ outputs.fetch_allocations.body }}"
+      BUDGETS_JSON: "{{ inputs.budgets | toJson }}"
+      UTIL_THRESHOLD: "{{ inputs.util_threshold }}"
+      MIN_SAVINGS_USD: "{{ inputs.min_monthly_savings_usd }}"
+      WINDOW: "{{ inputs.window }}"
+    script: |
+      import json
+      import os
+
+      def clamp(value, low, high):
+          return max(low, min(high, value))
+
+      try:
+          payload = json.loads(os.environ.get("ALLOCATION_BODY") or "{}")
+      except Exception:
+          payload = {}
+          print("warning: Kubecost response was not valid JSON - reporting zero allocations")
+      if not isinstance(payload, dict):
+          payload = {}
+      budgets = json.loads(os.environ.get("BUDGETS_JSON") or "{}")
+      threshold = float(os.environ.get("UTIL_THRESHOLD") or "0.4")
+      min_savings = float(os.environ.get("MIN_SAVINGS_USD") or "40")
+      window = os.environ.get("WINDOW") or "30d"
+      digits = "".join(ch for ch in window if ch.isdigit())
+      window_days = float(digits) if digits else 30.0
+      scale_to_month = 30.0 / window_days
+
+      allocs = payload.get("allocations")
+      if allocs is None and isinstance(payload.get("data"), dict):
+          allocs = payload["data"].get("allocations")
+      allocs = allocs or {}
+
+      proposals = []
+      chargeback = []
+      untracked = []
+      total_savings = 0.0
+      analyzed = 0
+
+      for ns, data in sorted(allocs.items()):
+          if not isinstance(data, dict):
+              continue
+          analyzed += 1
+          cost = round(float(data.get("totalCost") or 0) * scale_to_month, 2)
+          request_cost = float(data.get("requestCost") or 0) * scale_to_month
+          cpu_util = float(data.get("cpuUtil") or 0)
+          mem_util = float(data.get("memUtil") or 0)
+          request_cores = float(data.get("requestCpuCores") or 0)
+          request_mem_bytes = float(data.get("requestMemBytes") or 0)
+
+          spec = budgets.get(ns, {})
+          if not spec:
+              untracked.append(ns)
+          owner = spec.get("owner_team") or "unassigned"
+          budget = float(spec.get("monthly_budget_usd") or 0)
+
+          chargeback.append({
+              "namespace": ns,
+              "owner_team": owner,
+              "cost_usd": cost,
+              "budget_usd": budget,
+              "over_budget": budget > 0 and cost > budget,
+          })
+
+          util = max(cpu_util, mem_util)
+          if util < threshold and request_cost > 0:
+              ratio = clamp(util / threshold, 0.25, 1.0)
+              if ratio < 0.95:
+                  savings = round(request_cost * (1 - ratio), 2)
+                  if savings >= min_savings:
+                      total_savings += savings
+                      new_cores = max(0.1, round(request_cores * ratio, 2))
+                      new_mem_mib = max(64, int(round(request_mem_bytes * ratio / (1024 * 1024))))
+                      proposals.append({
+                          "namespace": ns,
+                          "owner_team": owner,
+                          "cpu_util": round(cpu_util, 3),
+                          "mem_util": round(mem_util, 3),
+                          "recommended_ratio": round(ratio, 2),
+                          "new_request_cpu": "{}".format(new_cores),
+                          "new_request_memory": "{}Mi".format(new_mem_mib),
+                          "monthly_savings_usd": savings,
+                      })
+
+      chargeback.sort(key=lambda row: row["cost_usd"], reverse=True)
+      proposals.sort(key=lambda row: row["monthly_savings_usd"], reverse=True)
+      over_budget = [row["namespace"] for row in chargeback if row["over_budget"]]
+
+      print(
+          "analyzed {} namespaces, {} proposals, {} over budget, untracked: {}".format(
+              analyzed, len(proposals), len(over_budget), ",".join(untracked) or "none"
+          )
+      )
+      print(
+          "::"
+          + json.dumps(
+              {
+                  "outputs": {
+                      "proposals": proposals,
+                      "chargeback": chargeback,
+                      "over_budget": over_budget,
+                      "untracked_namespaces": untracked,
+                      "total_monthly_savings_usd": round(total_savings, 2),
+                      "analyzed_namespaces": analyzed,
+                  }
+              }
+          )
+          + "::"
+      )
+
+  - id: publish_chargeback
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: "Always publish the chargeback report - cost vs budget per owning team."
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":money_with_wings: *Namespace chargeback* (window {{ inputs.window }})\n{% for row in outputs.analyze_rightsizing.chargeback %}• {{ row.namespace }} — {{ row.owner_team }} — ${{ row.cost_usd }}{% if row.budget_usd > 0 %} / ${{ row.budget_usd }} budget{% endif %}{{ row.over_budget ? ' :warning: OVER' : '' }}\n{% endfor %}Rightsizing opportunity: ${{ outputs.analyze_rightsizing.total_monthly_savings_usd }}/month over {{ outputs.analyze_rightsizing.analyzed_namespaces }} namespaces."
+      }
+
+  - id: rightsizing_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only hold an approval when there are rightsizing proposals to enforce.
+    condition: "{{ outputs.analyze_rightsizing.proposals | length > 0 }}"
+    then:
+      - id: notify_proposals
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: List the proposed request changes for reviewers.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":mag: *Rightsizing proposals* — approve in Kestra to apply LimitRange defaults\n{% for p in outputs.analyze_rightsizing.proposals %}• {{ p.namespace }} ({{ p.owner_team }}): CPU util {{ p.cpu_util }}, RAM util {{ p.mem_util }} → requests x{{ p.recommended_ratio }} (cpu {{ p.new_request_cpu }}, mem {{ p.new_request_memory }}), save ${{ p.monthly_savings_usd }}/month\n{% endfor %}Total: ${{ outputs.analyze_rightsizing.total_monthly_savings_usd }}/month."
+          }
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Hold for a human decision with structured resume fields.
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        onResume:
+          - id: approved
+            type: BOOL
+            displayName: Apply these rightsized defaults?
+          - id: reason
+            type: STRING
+            displayName: Decision notes
+
+      - id: decision
+        type: io.kestra.plugin.core.flow.If
+        description: Apply only when the approver said yes.
+        condition: "{{ outputs.approval.onResume.approved == true }}"
+        then:
+          - id: enforce_defaults
+            type: io.kestra.plugin.core.flow.Loop
+            description: One LimitRange per approved namespace so new pods get right-sized default requests.
+            values: "{{ outputs.analyze_rightsizing.proposals }}"
+            tasks:
+              - id: apply_limitrange
+                type: io.kestra.plugin.kubernetes.kubectl.Apply
+                description: Create or update the namespace LimitRange with recommended default requests.
+                connection:
+                  masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                  oauthToken: "{{ secret('K8S_TOKEN') }}"
+                  trustCerts: true
+                namespace: "{{ item.value.namespace }}"
+                spec: |
+                  apiVersion: v1
+                  kind: LimitRange
+                  metadata:
+                    name: {{ item.value.namespace }}-rightsize
+                    namespace: {{ item.value.namespace }}
+                  spec:
+                    limits:
+                      - type: Container
+                        defaultRequest:
+                          cpu: "{{ item.value.new_request_cpu }}"
+                          memory: "{{ item.value.new_request_memory }}"
+
+          - id: announce_applied
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Confirm enforcement and record the approval reason.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": ":white_check_mark: *Rightsizing applied* by approval — {{ outputs.analyze_rightsizing.proposals | length }} namespace LimitRanges updated. Decision: {{ outputs.approval.onResume.reason | default('(no notes)') }}. Projected savings: ${{ outputs.analyze_rightsizing.total_monthly_savings_usd }}/month."
+              }
+
+        else:
+          - id: announce_rejected
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Record the rejection without touching the cluster.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": ":x: *Rightsizing rejected* — cluster left untouched. Reason: {{ outputs.approval.onResume.reason | default('(no notes)') }}."
+              }
+
+    else:
+      - id: log_no_op
+        type: io.kestra.plugin.core.log.Log
+        description: Nothing over-provisioned; chargeback report above is the whole story.
+        message: "No rightsizing proposals above ${{ inputs.min_monthly_savings_usd }}/month threshold — skipping approval and enforcement."
+
+outputs:
+  - id: namespace_report
+    type: JSON
+    description: "Chargeback rows - cost vs budget per namespace with owning team."
+    value: "{{ outputs.analyze_rightsizing.chargeback }}"
+
+  - id: over_budget_namespaces
+    type: JSON
+    description: Namespaces whose projected monthly spend exceeds their budget.
+    value: "{{ outputs.analyze_rightsizing.over_budget }}"
+
+  - id: total_monthly_savings_usd
+    type: DOUBLE
+    description: Combined projected monthly savings across all proposals.
+    value: "{{ outputs.analyze_rightsizing.total_monthly_savings_usd }}"
+
+  - id: proposals
+    type: JSON
+    description: Rightsizing proposals with recommended requests and savings.
+    value: "{{ outputs.analyze_rightsizing.proposals }}"
+
+  - id: approval_decision
+    type: STRING
+    description: Approver verdict when proposals were held for review.
+    value: "{{ outputs.approval is defined ? (outputs.approval.onResume.approved ? 'approved' : 'rejected') : 'no-proposals' }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Surface failures so a broken Kubecost or cluster connection never fails silently.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "kubecost-namespace-rightsizing-chargeback ERRORED in flow {{ flow.id }} (execution {{ execution.id }}) - check the execution logs."
+      }
+
+extend:
+  title: Kubecost Namespace Rightsizing with Approval and Chargeback
+  metaTitle: Kubecost Rightsizing Chargeback
+  metaDescription: Pull Kubecost allocations, build a budget-vs-actual chargeback report, hold a human approval, then enforce right-sized Kubernetes LimitRange defaults.
+  shortDescription: Chargeback reporting plus approved rightsizing of Kubernetes namespace resource requests.
+  description: |
+    ## How it works
+    1. A weekly `Schedule` trigger (shipped disabled) or the on-demand `Webhook` starts the run.
+    2. `fetch_allocations` (`core.http.Request`) calls the Kubecost `/model/allocation` API grouped by namespace with a Bearer token.
+    3. `analyze_rightsizing` (`scripts.python.Script`, Process runner) joins allocations with the `budgets` input and builds three things: a chargeback table (cost vs budget per owning team, with over-budget flags and an `unassigned` bucket for namespaces missing from the budget map), rightsizing proposals for namespaces whose CPU/RAM utilization sits below `util_threshold` (savings scaled to a 30-day month, filtered by `min_monthly_savings_usd`), and a headline savings total. Results come back through Kestra's `::json::` outputs protocol.
+    4. `publish_chargeback` (Slack) always posts the report — the chargeback half of the blueprint is useful even when nothing needs resizing.
+    5. `rightsizing_gate` (`core.flow.If`) branches only when proposals exist: a second Slack message lists them, then `approval` (`core.flow.Pause` with structured `onResume` fields) holds the execution for a human decision for up to `approval_timeout`.
+    6. On approval, `enforce_defaults` (`core.flow.Loop`) applies one `kubernetes.kubectl.Apply` LimitRange per namespace so future pods get the recommended default requests; on rejection the cluster is untouched. Either verdict is announced to Slack with the approver's reason.
+    7. Flow outputs expose the chargeback rows, over-budget list, proposals, savings total and the decision; `errors` posts any failure to Slack.
+
+    ## What you get
+    - A per-team chargeback report (actual spend vs budget, over-budget alerts) delivered on a schedule.
+    - Data-driven rightsizing proposals with projected monthly savings per namespace.
+    - A durable, auditable human approval gate before anything touches the cluster.
+    - Enforcement via LimitRange defaults rather than mutating running workloads.
+
+    ## Who it's for
+    Platform and FinOps engineers who own showback/chargeback reporting and want a governed path from "here is the waste" to "here is the enforced change."
+
+    ## Why orchestrate
+    The analysis, the report, the approval and the enforcement live in different tools today — a Kubecost dashboard, a spreadsheet, a ticket, a kubectl session. Kestra joins them into one execution graph: the Pause holds state durably while an approver decides, the structured resume fields become branch conditions downstream, and every sweep leaves a single auditable record of what was proposed, approved and applied.
+
+    ## Prerequisites
+    - A reachable Kubecost installation with an API token.
+    - Kubernetes service account credentials able to read namespaces and apply LimitRange objects.
+    - A Slack incoming webhook for notifications.
+    - The `budgets` input populated with your namespace-to-team mapping.
+
+    ### Secrets
+    - `KUBECOST_API_TOKEN` - Bearer token for the Kubecost `/model` API.
+    - `K8S_MASTER_URL` - Kubernetes API server URL.
+    - `K8S_TOKEN` - Service account token with namespace and LimitRange apply permissions.
+    - `SLACK_WEBHOOK_URL` - Slack incoming webhook for report and approval messages.
+
+    ## Quick start
+    1. Set the four secrets above in Kestra.
+    2. Replace the `budgets` input defaults with your namespaces, owner teams and monthly budgets.
+    3. Run the flow with the `on_demand` webhook (or enable `weekly_rightsizing`), then inspect `namespace_report` and `total_monthly_savings_usd` in the outputs.
+    4. When proposals exist, open the paused execution, review the Slack thread, and resume with the `approved` decision plus notes.
+    5. Confirm the LimitRanges landed and watch the next report reflect smaller requests.
+
+    ## How to extend
+    - Tighten `util_threshold` or `min_monthly_savings_usd` to cut noise, or set `window` to `7d` for a tighter signal.
+    - Swap the LimitRange `Apply` for a `kubectl.Patch` of Deployment resources if you prefer to resize workloads directly.
+    - Fan the chargeback rows out to a Subflow per owning team, or write them to a database for a finance-facing dashboard.
+    - Add a second approval step for namespaces over budget rather than over-provisioned.
+
+    ## Links
+    - [Kubecost allocation API](https://docs.kubecost.com/apis/allocation-api)
+    - [Kubernetes LimitRange](https://kubernetes.io/docs/concepts/policy/limit-range/)
+    - Related Kestra blueprints: `k8-pod-lifecycle`, `kubernetes-vault-rotation-restart`, `product-order-approval-hitl`
+    - This blueprint has been created by [RudraMalvankar](https://github.com/RudraMalvankar)
+  ee: false
+  demo: false
+  tags:
+    - Cloud
+    - Business
+  subTags:
+    - FinOps
+    - Kubernetes
+    - Cost Management
