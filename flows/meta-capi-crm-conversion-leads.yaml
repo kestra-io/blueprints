@@ -1,0 +1,288 @@
+id: meta-capi-crm-conversion-leads
+namespace: company.team
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: dataset_id
+    type: STRING
+    displayName: Meta dataset (pixel) ID
+    description: ID of the Meta dataset that receives the CRM events.
+    defaults: "123456789012345"
+
+  - id: lead_event_source
+    type: STRING
+    displayName: CRM name
+    description: Sent as `custom_data.lead_event_source`, the name of the tool the leads come from. Required by Meta.
+    defaults: In-house CRM
+
+  - id: test_event_code
+    type: STRING
+    displayName: Test event code
+    description: >
+      Optional code from Events Manager > Test events. With it, the batch goes to the Test events
+      tab and the rows stay pending, so they are still sent for real on the next scheduled run.
+    required: false
+
+  - id: graph_api_url
+    type: STRING
+    displayName: Graph API base URL
+    defaults: https://graph.facebook.com/v26.0
+
+tasks:
+  - id: check_inputs
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ inputs.lead_event_source | trim is empty }}"
+    errorMessage: "`lead_event_source` is required by Meta on every Conversion Leads event."
+
+  - id: prepare_batch
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: >
+      One statement normalizes the pending rows following Meta's rules, takes out the ones that
+      would make Meta reject the whole batch, and builds up to 1,000 events (the API limit).
+      Email and phone are hashed here, so raw PII never reaches Kestra outputs or logs.
+    fetchType: FETCH_ONE
+    sql: |
+      WITH normalized AS (
+        SELECT
+          id,
+          event_time,
+          nullif(btrim(regexp_replace(event_name, '[[:space:][:cntrl:]\u00a0]+', ' ', 'g')), '') AS event_name,
+          -- Meta: lead IDs are 15 to 17 digits
+          CASE WHEN lead_id BETWEEN 100000000000000 AND 99999999999999999 THEN lead_id END AS lead_id,
+          -- Meta: trim and lowercase; any whitespace, including invisible characters, would change the hash
+          CASE WHEN e ~ '^[^@]+@[^@]+$' THEN e END AS email,
+          -- Meta: digits only, no leading zeros, country code included
+          CASE WHEN length(p) BETWEEN 8 AND 15 THEN p END AS phone,
+          CASE WHEN value BETWEEN 0 AND 1e12 AND upper(btrim(currency)) ~ '^[A-Z]{3}$' THEN value END AS value,
+          CASE WHEN value BETWEEN 0 AND 1e12 AND upper(btrim(currency)) ~ '^[A-Z]{3}$' THEN upper(btrim(currency)) END AS currency
+        FROM meta_capi_outbox
+        CROSS JOIN LATERAL (
+          SELECT
+            lower(regexp_replace(coalesce(email, ''), '[[:space:]\u00a0\u200b\ufeff]', '', 'g')) AS e,
+            ltrim(regexp_replace(coalesce(phone, ''), '\D', '', 'g'), '0') AS p
+        ) AS cleaned
+        WHERE status = 'pending'
+      ),
+      classified AS (
+        SELECT *,
+          CASE
+            -- Meta rejects the batch if one event_time is more than 7 days old; keep a 1-hour margin
+            WHEN event_time < now() - interval '7 days' + interval '1 hour' THEN 'expired'
+            WHEN event_name IS NULL OR (lead_id IS NULL AND email IS NULL AND phone IS NULL) THEN 'invalid'
+            ELSE 'sendable'
+          END AS verdict
+        FROM normalized
+      ),
+      discarded AS (
+        UPDATE meta_capi_outbox AS o
+        SET status = c.verdict, updated_at = now()
+        FROM classified AS c
+        WHERE o.id = c.id AND c.verdict <> 'sendable'
+        RETURNING o.status
+      ),
+      batch AS (
+        SELECT *
+        FROM classified
+        WHERE verdict = 'sendable'
+        ORDER BY event_time
+        LIMIT 1000
+      )
+      SELECT
+        (SELECT count(*) FROM batch) AS event_count,
+        (SELECT count(*) FROM discarded WHERE status = 'expired') AS expired_count,
+        (SELECT count(*) FROM discarded WHERE status = 'invalid') AS invalid_count,
+        (SELECT coalesce(string_agg(id::text, ','), '') FROM batch) AS ids,
+        (SELECT coalesce(json_agg(jsonb_strip_nulls(jsonb_build_object(
+          'event_name', event_name,
+          'event_time', extract(epoch FROM least(event_time, now()))::bigint,
+          'event_id', 'crm-' || id,
+          'action_source', 'system_generated',
+          'user_data', jsonb_build_object(
+            'lead_id', lead_id,
+            'em', CASE WHEN email IS NOT NULL THEN jsonb_build_array(encode(sha256(convert_to(email, 'UTF8')), 'hex')) END,
+            'ph', CASE WHEN phone IS NOT NULL THEN jsonb_build_array(encode(sha256(convert_to(phone, 'UTF8')), 'hex')) END
+          ),
+          'custom_data', jsonb_build_object(
+            'event_source', 'crm',
+            'lead_event_source', '{{ inputs.lead_event_source | trim | replace({"'": "''"}) }}',
+            'value', value,
+            'currency', currency
+          )
+        )) ORDER BY event_time), '[]')::text FROM batch) AS payload;
+
+  - id: has_events
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.prepare_batch.row.event_count > 0 }}"
+    then:
+      - id: send_events
+        type: io.kestra.plugin.core.http.Request
+        description: One request per run with the whole batch. The token goes in the body, not in the URL.
+        uri: "{{ inputs.graph_api_url }}/{{ inputs.dataset_id }}/events"
+        method: POST
+        contentType: application/json
+        body: |
+          {
+            "data": {{ outputs.prepare_batch.row.payload }},
+            {% if inputs.test_event_code is not empty %}"test_event_code": {{ inputs.test_event_code | toJson }},{% endif %}
+            "access_token": "{{ secret('META_ACCESS_TOKEN') }}"
+          }
+
+      - id: mark_sent
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        description: >
+          Only the ids of this batch are updated, so rows inserted while the request was in flight
+          stay pending. Test runs skip this step: Test events do not count as production events.
+        runIf: "{{ inputs.test_event_code is empty }}"
+        fetchType: NONE
+        sql: |
+          UPDATE meta_capi_outbox
+          SET status = 'sent',
+              sent_at = now(),
+              updated_at = now(),
+              fbtrace_id = '{{ outputs.send_events.body | jq('.fbtrace_id // ""') | first }}'
+          WHERE id = ANY(string_to_array('{{ outputs.prepare_batch.row.ids }}', ',')::bigint[]);
+
+      - id: log_result
+        type: io.kestra.plugin.core.log.Log
+        message: >
+          {% if inputs.test_event_code is not empty %}Test run, rows left pending. {% endif %}Meta received
+          {{ outputs.send_events.body | jq('.events_received') | first }} of
+          {{ outputs.prepare_batch.row.event_count }} events
+          (fbtrace_id {{ outputs.send_events.body | jq('.fbtrace_id // ""') | first }});
+          {{ outputs.prepare_batch.row.expired_count }} expired and
+          {{ outputs.prepare_batch.row.invalid_count }} invalid row(s) were taken out.
+    else:
+      - id: nothing_to_send
+        type: io.kestra.plugin.core.log.Log
+        message: >
+          No CRM events to send; {{ outputs.prepare_batch.row.expired_count }} expired and
+          {{ outputs.prepare_batch.row.invalid_count }} invalid row(s) were taken out.
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: >
+      The run failed. Rows not marked as sent stay pending and go out again on the next run. If
+      send_events failed, its logs contain Meta's error: one invalid event makes Meta reject the
+      whole batch.
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: Send CRM lead stages to Meta Conversions API (Conversion Leads)
+  description: |
+    Sends lead stage changes from your CRM to Meta as Conversion Leads events, so Meta can
+    optimize Lead Ads for the leads that actually move down your funnel instead of every form
+    submission.
+
+    The flow reads an outbox table in Postgres. Your CRM, an application trigger or another
+    flow inserts one row per stage change, and this flow ships them in batches every 15 minutes:
+
+    1. `check_inputs` stops the run if `lead_event_source` is empty, since Meta requires it.
+    2. `prepare_batch` runs one SQL statement that:
+       - normalizes the pending rows with Meta's customer information rules: email without any
+         whitespace (invisible characters included) and lowercased, phone with digits only and
+         no leading zeros, both SHA-256 hashed. Raw email and phone never leave the database;
+       - leaves out of the event the values that cannot match or that Meta rejects: an email
+         without `@`, a phone outside 8 to 15 digits, a `lead_id` outside 15 to 17 digits, and a
+         `value` that is negative, `NaN`, infinite or without a valid ISO 4217 `currency`;
+       - marks as `expired` the rows older than 7 days minus a one-hour margin, and as `invalid`
+         the rows left without a stage name or without any customer identifier. Meta rejects the
+         entire batch if a single event breaks one of these rules, so one bad row would
+         otherwise block the queue for good;
+       - builds the `data` array for up to 1,000 events, the API limit.
+    3. `has_events` skips the API call when there is nothing to send.
+    4. `send_events` posts the batch with `action_source: system_generated` and the two
+       `custom_data` fields Meta requires on every Conversion Leads event: `event_source: crm`
+       and `lead_event_source`. Timestamps in the future are capped at the current time.
+    5. `mark_sent` flags exactly the rows of this batch and stores the `fbtrace_id`. It is
+       skipped on test runs, so a row checked in Test events still goes to production later.
+
+    Each event carries `event_id` = `crm-<row id>`. If a run fails after Meta accepted the batch
+    (the database is unreachable for `mark_sent`), the next run sends the same events again with
+    the same `event_id`; keep that in mind when reconciling counts. The flow-level concurrency
+    limit queues a manual run behind a running one, so the same batch is never sent twice in
+    parallel.
+
+    ## Prerequisites
+
+    - A Meta dataset (pixel) with a Conversions API access token
+      (Events Manager > dataset > Settings > Generate access token).
+    - A Postgres database with this table:
+
+    ```sql
+    CREATE TABLE meta_capi_outbox (
+      id          bigserial PRIMARY KEY,
+      event_name  text        NOT NULL,          -- your CRM stage, e.g. 'Qualified', 'Won'
+      event_time  timestamptz NOT NULL,          -- when the lead entered the stage
+      lead_id     bigint,                        -- Meta Lead Ads lead ID, sent unhashed
+      email       text,
+      phone       text,                          -- with country code, any format
+      value       numeric,
+      currency    text,                          -- ISO 4217, e.g. 'USD'
+      status      text        NOT NULL DEFAULT 'pending',  -- pending | sent | expired | invalid
+      fbtrace_id  text,
+      sent_at     timestamptz,
+      created_at  timestamptz NOT NULL DEFAULT now(),
+      updated_at  timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX ON meta_capi_outbox (status, event_time);
+    ```
+
+    ## Secrets
+
+    - `POSTGRES_URL`: JDBC URL, e.g. `jdbc:postgresql://host:5432/crm`
+    - `POSTGRES_USER` and `POSTGRES_PASSWORD`: a user that can read and update `meta_capi_outbox`
+    - `META_ACCESS_TOKEN`: Conversions API access token of the dataset
+
+    ## Inputs
+
+    - `dataset_id` (STRING): the Meta dataset ID. Replace the default.
+    - `lead_event_source` (STRING, default `In-house CRM`): your CRM name, e.g. `HubSpot`.
+    - `test_event_code` (STRING, optional): run the flow manually with the code from
+      Events Manager > Test events to check the payload. Sendable rows stay pending on test
+      runs; expired and invalid rows are still taken out. Leave it empty on the schedule.
+    - `graph_api_url` (STRING, default `https://graph.facebook.com/v26.0`): pins the Graph API version.
+
+    ## Quick start
+
+    1. Create the table and the secrets. The schedule is active as soon as the flow is saved, so
+       disable the trigger until the test below passes.
+    2. Insert a test row:
+       `INSERT INTO meta_capi_outbox (event_name, event_time, email) VALUES ('Qualified', now(), 'lead@example.com');`
+    3. Execute the flow with a `test_event_code` and check the event in Events Manager > Test events.
+    4. In Events Manager, finish the CRM setup by choosing which stages count as positive in the sales funnel.
+    5. Enable the trigger; it runs every 15 minutes and sends the pending rows, the test row included.
+
+    ## Outputs
+
+    - `{{ outputs.prepare_batch.row.event_count }}`: events in the batch
+    - `{{ outputs.prepare_batch.row.expired_count }}` and `{{ outputs.prepare_batch.row.invalid_count }}`: rows taken out in this run
+    - `{{ outputs.send_events.body }}`: Meta response with `events_received` and `fbtrace_id`
+    - Rows in `meta_capi_outbox` move from `pending` to `sent`, `expired` or `invalid`
+
+    ## Links
+
+    - [Conversion Leads payload specification](https://developers.facebook.com/docs/marketing-api/conversions-api/conversion-leads-integration/payload-specification/)
+    - [Customer information parameters (normalization and hashing)](https://developers.facebook.com/docs/marketing-api/conversions-api/parameters/customer-information-parameters)
+    - [Conversions API: batching and event_time limits](https://developers.facebook.com/docs/marketing-api/conversions-api/using-the-api/)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+  tags:
+    - Business
+    - Data
+  ee: false
+  demo: false
+  metaDescription: Send CRM lead stages from a Postgres outbox to Meta Conversions API as Conversion Leads events, with hashing and batch guards.
