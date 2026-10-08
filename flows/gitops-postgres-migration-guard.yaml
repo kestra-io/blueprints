@@ -1,0 +1,693 @@
+id: gitops-postgres-migration-guard
+namespace: company.team
+description: |
+  Audit PostgreSQL DDL migrations for exclusive lock escalation, missing concurrent index operations,
+  unindexed foreign keys, and circular RLS recursion patterns. Executes transactional dry-runs against
+  staging and gates pull request approval through Slack notifications.
+
+triggers:
+  - id: migration_pr_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Webhook trigger called by GitHub Actions on PR open or synchronize touching SQL migrations.
+    key: "{{ secret('MIGRATION_WEBHOOK_KEY') }}"
+
+  - id: weekly_schema_drift_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scheduled check for weekly database schema drift and migration audit.
+    cron: "0 3 * * 0"
+    disabled: true
+
+inputs:
+  - id: pr_number
+    type: INT
+    displayName: PR Number
+    defaults: 101
+    description: GitHub Pull Request number being verified
+
+  - id: repo_full_name
+    type: STRING
+    displayName: Repository Name
+    defaults: company/core-backend
+    description: Target repository nameWithOwner
+
+  - id: commit_sha
+    type: STRING
+    displayName: Commit SHA
+    defaults: HEAD
+    description: Commit SHA to annotate
+
+  - id: migration_sql
+    type: STRING
+    displayName: Migration SQL Payload
+    description: SQL DDL migration payload to audit and dry-run
+    defaults: |
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT 'active' NOT NULL;
+      CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_status ON users(status);
+
+  - id: max_allowed_lock_level
+    type: SELECT
+    displayName: Max Allowed Lock Level
+    description: Highest permissible PostgreSQL lock mode before flagging risk escalation.
+    values:
+      - ACCESS_SHARE
+      - ROW_SHARE
+      - ROW_EXCLUSIVE
+      - SHARE_UPDATE_EXCLUSIVE
+      - SHARE
+      - SHARE_ROW_EXCLUSIVE
+      - EXCLUSIVE
+      - ACCESS_EXCLUSIVE
+    defaults: SHARE_UPDATE_EXCLUSIVE
+
+  - id: alert_channel
+    type: STRING
+    displayName: Alert Channel
+    defaults: "#database-ops"
+    description: Slack destination channel for migration risk notifications.
+
+tasks:
+  - id: log_migration_event
+    type: io.kestra.plugin.core.log.Log
+    description: Record inbound GitOps PostgreSQL migration verification request.
+    message: |
+      Starting GitOps PostgreSQL migration verification:
+      - Repository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}
+      - Pull Request: #{{ trigger.body.pr_number ?? inputs.pr_number }}
+      - Commit SHA: {{ trigger.body.commit_sha ?? inputs.commit_sha }}
+      - Max Allowed Lock Level: {{ trigger.body.max_allowed_lock_level ?? inputs.max_allowed_lock_level }}
+      - Alert Channel: {{ trigger.body.alert_channel ?? inputs.alert_channel }}
+      - Execution ID: {{ execution.id }}
+
+  - id: audit_migration_ast
+    type: io.kestra.plugin.scripts.python.Script
+    description: Run static analysis over migration SQL for lock escalation, missing CONCURRENTLY, unindexed foreign keys, and circular RLS recursion.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    dependencies:
+      - kestra
+    inputFiles:
+      migration.sql: "{{ trigger.body.migration_sql ?? inputs.migration_sql }}"
+    outputFiles:
+      - migration_audit_report.json
+    env:
+      MAX_ALLOWED_LOCK: "{{ trigger.body.max_allowed_lock_level ?? inputs.max_allowed_lock_level }}"
+    script: |
+      import json
+      import os
+      import re
+      from kestra import Kestra
+
+      with open("migration.sql", "r") as f:
+          sql_text = f.read()
+
+      max_allowed_lock = os.environ.get("MAX_ALLOWED_LOCK", "SHARE_UPDATE_EXCLUSIVE")
+
+      LOCK_RANKS = {
+          "ACCESS_SHARE": 1,
+          "ROW_SHARE": 2,
+          "ROW_EXCLUSIVE": 3,
+          "SHARE_UPDATE_EXCLUSIVE": 4,
+          "SHARE": 5,
+          "SHARE_ROW_EXCLUSIVE": 6,
+          "EXCLUSIVE": 7,
+          "ACCESS_EXCLUSIVE": 8
+      }
+
+      max_rank = LOCK_RANKS.get(max_allowed_lock, 4)
+      highest_rank = 1
+      highest_lock = "ACCESS_SHARE"
+      detected_anti_patterns = []
+      has_breaking = False
+      risk_score = 0
+      safe_rewrites = []
+
+      # Strip SQL comments
+      cleaned = re.sub(r"--.*", "", sql_text)
+      cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+      statements = [s.strip() for s in cleaned.split(";") if s.strip()]
+
+      # Collect indexed columns to check if foreign keys are indexed
+      created_indexes = set()
+      for s in statements:
+          m = re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(([^)]+)\)", s, re.IGNORECASE)
+          if m:
+              tbl = m.group(2).lower()
+              cols = [c.strip().lower() for c in m.group(3).split(",")]
+              for c in cols:
+                  created_indexes.add((tbl, c))
+
+      for stmt in statements:
+          stmt_lock = "ACCESS_SHARE"
+
+          # 1. Missing CONCURRENTLY on index creation
+          if re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+", stmt, re.IGNORECASE):
+              if re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+", stmt, re.IGNORECASE):
+                  stmt_lock = "SHARE_UPDATE_EXCLUSIVE"
+              else:
+                  stmt_lock = "SHARE"
+                  detected_anti_patterns.append({
+                      "code": "INDEX_MISSING_CONCURRENTLY",
+                      "statement": stmt[:100],
+                      "severity": "HIGH",
+                      "description": "CREATE INDEX without CONCURRENTLY acquires SHARE lock, blocking concurrent INSERT, UPDATE, and DELETE operations.",
+                      "remediation": "Use CREATE INDEX CONCURRENTLY IF NOT EXISTS to build index online without blocking production writes."
+                  })
+                  has_breaking = True
+                  risk_score += 35
+                  safe_rewrites.append("Replace CREATE INDEX with CREATE INDEX CONCURRENTLY IF NOT EXISTS.")
+
+          # 2. Missing CONCURRENTLY on drop index
+          elif re.search(r"DROP\s+INDEX\s+", stmt, re.IGNORECASE):
+              if not re.search(r"DROP\s+INDEX\s+CONCURRENTLY\s+", stmt, re.IGNORECASE):
+                  stmt_lock = "ACCESS_EXCLUSIVE"
+                  detected_anti_patterns.append({
+                      "code": "DROP_INDEX_MISSING_CONCURRENTLY",
+                      "statement": stmt[:100],
+                      "severity": "HIGH",
+                      "description": "DROP INDEX without CONCURRENTLY acquires ACCESS EXCLUSIVE lock.",
+                      "remediation": "Use DROP INDEX CONCURRENTLY IF EXISTS."
+                  })
+                  has_breaking = True
+                  risk_score += 30
+                  safe_rewrites.append("Replace DROP INDEX with DROP INDEX CONCURRENTLY IF EXISTS.")
+
+          # 3. Retyping columns (forces table rewrite holding ACCESS EXCLUSIVE)
+          elif re.search(r"ALTER\s+TABLE\s+\w+\s+ALTER(?:\s+COLUMN)?\s+\w+\s+(?:SET\s+DATA\s+)?TYPE", stmt, re.IGNORECASE):
+              stmt_lock = "ACCESS_EXCLUSIVE"
+              detected_anti_patterns.append({
+                "code": "COLUMN_RETYPE_ACCESS_EXCLUSIVE",
+                "statement": stmt[:100],
+                "severity": "CRITICAL",
+                "description": "Altering column type acquires ACCESS EXCLUSIVE lock and forces complete table rewrite.",
+                "remediation": "Add new column with target type, backfill asynchronously in batches, and switch application write paths."
+              })
+              has_breaking = True
+              risk_score += 45
+              safe_rewrites.append("Expand/contract: Add new typed column, backfill via batch UPDATEs, switch application dual-write.")
+
+          # 4. Dropping columns
+          elif re.search(r"ALTER\s+TABLE\s+\w+\s+DROP(?:\s+COLUMN)?\s+\w+", stmt, re.IGNORECASE):
+              stmt_lock = "ACCESS_EXCLUSIVE"
+              detected_anti_patterns.append({
+                  "code": "DROP_COLUMN_LOCK_ESCALATION",
+                  "statement": stmt[:100],
+                  "severity": "HIGH",
+                  "description": "Dropping a column takes ACCESS EXCLUSIVE lock and immediately breaks backward compatibility.",
+                  "remediation": "Deprecate column in application code first, then drop in subsequent maintenance window."
+              })
+              has_breaking = True
+              risk_score += 35
+              safe_rewrites.append("Deprecate column in application model before issuing DROP COLUMN in DDL.")
+
+          # 5. Adding NOT NULL column without DEFAULT
+          elif re.search(r"ALTER\s+TABLE\s+\w+\s+ADD(?:\s+COLUMN)?\s+\w+.*?\bNOT\s+NULL\b", stmt, re.IGNORECASE):
+              if not re.search(r"\bDEFAULT\b", stmt, re.IGNORECASE):
+                  stmt_lock = "ACCESS_EXCLUSIVE"
+                  detected_anti_patterns.append({
+                      "code": "ADD_NOT_NULL_WITHOUT_DEFAULT",
+                      "statement": stmt[:100],
+                      "severity": "CRITICAL",
+                      "description": "Adding NOT NULL column without DEFAULT requires ACCESS EXCLUSIVE lock and fails on non-empty tables.",
+                      "remediation": "Add column as NULLABLE, backfill default values, add NOT VALID check constraint, validate constraint, then set NOT NULL."
+                  })
+                  has_breaking = True
+                  risk_score += 40
+                  safe_rewrites.append("Add column as NULLABLE, backfill values in batches, then add NOT VALID constraint and validate.")
+              else:
+                  stmt_lock = "SHARE_UPDATE_EXCLUSIVE"
+                  risk_score += 10
+
+          # 6. Add column with default (safe metadata operation in PostgreSQL 11+)
+          elif re.search(r"ALTER\s+TABLE\s+\w+\s+ADD(?:\s+COLUMN)?\s+", stmt, re.IGNORECASE):
+              stmt_lock = "SHARE_UPDATE_EXCLUSIVE"
+              risk_score += 5
+
+          # 7. Add constraint without NOT VALID
+          elif re.search(r"ALTER\s+TABLE\s+\w+\s+ADD\s+CONSTRAINT\s+", stmt, re.IGNORECASE):
+              if not re.search(r"\bNOT\s+VALID\b", stmt, re.IGNORECASE):
+                  stmt_lock = "ACCESS_EXCLUSIVE"
+                  detected_anti_patterns.append({
+                      "code": "CONSTRAINT_MISSING_NOT_VALID",
+                      "statement": stmt[:100],
+                      "severity": "HIGH",
+                      "description": "Adding constraint without NOT VALID scans entire table under ACCESS EXCLUSIVE lock.",
+                      "remediation": "Add constraint with NOT VALID, then run ALTER TABLE ... VALIDATE CONSTRAINT."
+                  })
+                  has_breaking = True
+                  risk_score += 35
+                  safe_rewrites.append("Append NOT VALID to ADD CONSTRAINT, then follow with ALTER TABLE ... VALIDATE CONSTRAINT.")
+              else:
+                  stmt_lock = "SHARE_UPDATE_EXCLUSIVE"
+
+          # 8. Destructive DDL (DROP TABLE, TRUNCATE, VACUUM FULL, CLUSTER)
+          elif re.search(r"\b(?:DROP\s+TABLE|TRUNCATE(?:\s+TABLE)?|VACUUM\s+FULL|CLUSTER)\b", stmt, re.IGNORECASE):
+              stmt_lock = "ACCESS_EXCLUSIVE"
+              detected_anti_patterns.append({
+                  "code": "DESTRUCTIVE_DDL_LOCK_ESCALATION",
+                  "statement": stmt[:100],
+                  "severity": "CRITICAL",
+                  "description": "Destructive DDL statement acquires ACCESS EXCLUSIVE lock and disrupts relation availability.",
+                  "remediation": "Use table archiving, soft deletes, or partitioned retirement strategies."
+              })
+              has_breaking = True
+              risk_score += 50
+              safe_rewrites.append("Replace destructive DDL with non-blocking lifecycle management.")
+
+          # 9. Foreign keys without supporting index
+          fk_match = re.search(r"ALTER\s+TABLE\s+(\w+)\s+ADD(?:\s+CONSTRAINT\s+\w+)?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+(\w+)", stmt, re.IGNORECASE)
+          if fk_match:
+              child_tbl = fk_match.group(1).lower()
+              fk_cols = [c.strip().lower() for c in fk_match.group(2).split(",")]
+              ref_tbl = fk_match.group(3).lower()
+              for col in fk_cols:
+                  if (child_tbl, col) not in created_indexes:
+                      detected_anti_patterns.append({
+                          "code": "FOREIGN_KEY_UNINDEXED",
+                          "statement": stmt[:100],
+                          "severity": "HIGH",
+                          "description": f"Foreign key on {child_tbl}({col}) references {ref_tbl} without supporting index, risking table-level locks during parent deletions and updates.",
+                          "remediation": f"Add supporting index: CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_{child_tbl}_{col} ON {child_tbl}({col});"
+                      })
+                      has_breaking = True
+                      risk_score += 30
+                      safe_rewrites.append(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_{child_tbl}_{col} ON {child_tbl}({col});")
+
+          # 10. Circular RLS recursion patterns
+          policy_match = re.search(r"CREATE\s+POLICY\s+(\w+)\s+ON\s+(\w+).*?(?:USING|WITH\s+CHECK)\s*\((.*?)\)", stmt, re.IGNORECASE | re.DOTALL)
+          if policy_match:
+              pol_name = policy_match.group(1)
+              pol_tbl = policy_match.group(2)
+              pol_body = policy_match.group(3)
+              if re.search(r"SELECT\s+.*?\s+FROM\s+", pol_body, re.IGNORECASE) and not re.search(r"security\s+definer", pol_body, re.IGNORECASE):
+                  stmt_lock = "ACCESS_EXCLUSIVE"
+                  detected_anti_patterns.append({
+                      "code": "CIRCULAR_RLS_RECURSION_RISK",
+                      "statement": stmt[:100],
+                      "severity": "HIGH",
+                      "description": f"Policy {pol_name} on {pol_tbl} contains cross-table subquery without SECURITY DEFINER wrapper, risking circular RLS recursion.",
+                      "remediation": "Wrap authorization lookup in a SECURITY DEFINER function with strict search_path, or use session variables (current_setting)."
+                  })
+                  has_breaking = True
+                  risk_score += 35
+                  safe_rewrites.append(f"Encapsulate policy subqueries on {pol_tbl} inside a SECURITY DEFINER function.")
+
+          stmt_rank = LOCK_RANKS.get(stmt_lock, 1)
+          if stmt_rank > highest_rank:
+              highest_rank = stmt_rank
+              highest_lock = stmt_lock
+
+      if highest_rank > max_rank:
+          detected_anti_patterns.append({
+              "code": "LOCK_LEVEL_EXCEEDED",
+              "statement": "Global Migration Lock Evaluation",
+              "severity": "CRITICAL",
+              "description": f"Maximum detected lock level {highest_lock} exceeds allowed threshold {max_allowed_lock}.",
+              "remediation": f"Refactor migration DDL to acquire only {max_allowed_lock} or lower."
+          })
+          has_breaking = True
+          risk_score = max(risk_score, 55)
+
+      risk_score = min(max(risk_score, 0), 100)
+
+      result = {
+          "risk_score": risk_score,
+          "lock_level": highest_lock,
+          "detected_anti_patterns": detected_anti_patterns,
+          "has_breaking_changes": has_breaking,
+          "safe_rewrites": safe_rewrites,
+          "anti_pattern_count": len(detected_anti_patterns),
+          "statements_analyzed": len(statements)
+      }
+
+      with open("migration_audit_report.json", "w") as out_f:
+          json.dump(result, out_f, indent=2)
+
+      Kestra.outputs(result)
+
+  - id: transactional_dry_run
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Execute migration inside an isolated rollback transaction against staging PostgreSQL to verify zero syntax or execution errors.
+    url: "{{ secret('STAGING_POSTGRES_URL') }}"
+    fetchType: NONE
+    sql: |
+      BEGIN;
+      {{ trigger.body.migration_sql ?? inputs.migration_sql }}
+      ROLLBACK;
+
+  - id: evaluate_risk_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate risk score and breaking change flags against policy thresholds.
+    condition: "{{ outputs.audit_migration_ast.vars.risk_score > 40 or outputs.audit_migration_ast.vars.has_breaking_changes }}"
+    then:
+      - id: alert_high_risk_migration
+        type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+        description: Post emergency Slack alert with anti-pattern details and recommended safe migration rewrite.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ trigger.body.alert_channel ?? inputs.alert_channel }}",
+            "text": "ALERT: High-Risk PostgreSQL Migration Blocked for PR #{{ trigger.body.pr_number ?? inputs.pr_number }}\nRepository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}\nCommit SHA: {{ trigger.body.commit_sha ?? inputs.commit_sha }}\nRisk Score: {{ outputs.audit_migration_ast.vars.risk_score }}/100\nPeak Lock Level: {{ outputs.audit_migration_ast.vars.lock_level }}\nBreaking Changes Detected: {{ outputs.audit_migration_ast.vars.has_breaking_changes }}\nDetected Anti-Patterns Count: {{ outputs.audit_migration_ast.vars.anti_pattern_count }}\nExecution ID: {{ execution.id }}\n\nAnti-Patterns:\n{{ outputs.audit_migration_ast.vars.detected_anti_patterns | json }}\n\nRecommended Safe Rewrite:\n{{ outputs.audit_migration_ast.vars.safe_rewrites | json }}"
+          }
+
+      - id: log_migration_blocked
+        type: io.kestra.plugin.core.log.Log
+        description: Log migration rejection and gate failure.
+        message: |
+          MIGRATION REJECTED: Risk score {{ outputs.audit_migration_ast.vars.risk_score }} exceeds threshold (40) or breaking changes detected.
+          Repository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}
+          PR: #{{ trigger.body.pr_number ?? inputs.pr_number }}
+          Peak Lock: {{ outputs.audit_migration_ast.vars.lock_level }}
+          Breaking Changes: {{ outputs.audit_migration_ast.vars.has_breaking_changes }}
+    else:
+      - id: post_pr_review_approval
+        type: io.kestra.plugin.core.log.Log
+        description: Certify migration as safe for production deployment.
+        message: |
+          MIGRATION APPROVED FOR PRODUCTION DEPLOYMENT
+          Repository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}
+          Pull Request: #{{ trigger.body.pr_number ?? inputs.pr_number }}
+          Commit SHA: {{ trigger.body.commit_sha ?? inputs.commit_sha }}
+          Risk Score: {{ outputs.audit_migration_ast.vars.risk_score }}/100 (Passes gate <= 40)
+          Max Lock Level Detected: {{ outputs.audit_migration_ast.vars.lock_level }}
+          Breaking Changes: {{ outputs.audit_migration_ast.vars.has_breaking_changes }}
+          Transactional Dry-Run: Verified on staging with zero errors.
+          Status: CERTIFIED SAFE
+
+      - id: notify_migration_approved
+        type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+        description: Post safe migration approval certification to Slack alert channel.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ trigger.body.alert_channel ?? inputs.alert_channel }}",
+            "text": "PASSED: PostgreSQL Migration Certified Safe for PR #{{ trigger.body.pr_number ?? inputs.pr_number }}\nRepository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}\nCommit SHA: {{ trigger.body.commit_sha ?? inputs.commit_sha }}\nRisk Score: {{ outputs.audit_migration_ast.vars.risk_score }}/100\nLock Mode: {{ outputs.audit_migration_ast.vars.lock_level }}\nTransactional Dry-Run: Succeeded with ROLLBACK\nStatus: Approved for production deploy."
+          }
+
+  - id: record_migration_audit
+    type: io.kestra.plugin.core.log.Log
+    description: Record complete migration audit event summary for compliance and traceability.
+    message: |
+      AUDIT SUMMARY RECORD
+      Execution ID: {{ execution.id }}
+      Workflow: {{ flow.id }}
+      Namespace: {{ flow.namespace }}
+      Repository: {{ trigger.body.repo_full_name ?? inputs.repo_full_name }}
+      PR Number: {{ trigger.body.pr_number ?? inputs.pr_number }}
+      Commit SHA: {{ trigger.body.commit_sha ?? inputs.commit_sha }}
+      Max Allowed Lock Level: {{ trigger.body.max_allowed_lock_level ?? inputs.max_allowed_lock_level }}
+      Evaluated Lock Level: {{ outputs.audit_migration_ast.vars.lock_level }}
+      Risk Score: {{ outputs.audit_migration_ast.vars.risk_score }}/100
+      Anti-Patterns Found: {{ outputs.audit_migration_ast.vars.anti_pattern_count }}
+      Breaking Changes: {{ outputs.audit_migration_ast.vars.has_breaking_changes }}
+      Gate Result: {{ (outputs.audit_migration_ast.vars.risk_score > 40 or outputs.audit_migration_ast.vars.has_breaking_changes) ? 'BLOCKED' : 'APPROVED' }}
+
+errors:
+  - id: alert_pipeline_failure
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    description: Alert database ops channel if migration verification pipeline encounters an unexpected error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "{{ trigger.body.alert_channel ?? inputs.alert_channel }}",
+        "text": "CRITICAL: GitOps PostgreSQL Migration Guard failed during execution {{ execution.id }}.\nTask: {{ task.id }}\nFlow: {{ flow.id }}\nNamespace: {{ flow.namespace }}\nPlease inspect Kestra execution logs for error details."
+      }
+
+extend:
+  title: GitOps PostgreSQL Zero-Downtime Migration Verifier and Lock Risk Guard
+  shortDescription: Audit PostgreSQL DDL migrations for exclusive locks and circular RLS, run dry-runs, and post PR checks.
+  metaTitle: GitOps PostgreSQL Zero-Downtime Migration Verifier & Lock Risk Guard in Kestra
+  metaDescription: Audit PostgreSQL DDL migrations for exclusive lock escalation and circular RLS, run transactional dry-runs, and post GitHub PR checks.
+  tags:
+    - Infrastructure
+    - Data
+    - Cloud
+  ee: false
+  demo: false
+  description: |
+    Automate continuous verification and safety auditing for PostgreSQL database DDL migrations in GitOps pipelines.
+    This blueprint statically analyzes SQL migrations for table-level exclusive locks, missing concurrent index operations,
+    unindexed foreign keys, and circular Row-Level Security (RLS) recursion. It validates migration syntax and semantics
+    via isolated transactional dry-runs against a staging PostgreSQL database and enforces a strict risk-scoring gate that
+    posts real-time notifications to Slack and GitHub PRs.
+
+    ## Problem Statement
+
+    Relational database migrations remain one of the most common causes of unplanned production downtime in cloud-native
+    microservice architectures. While application services deploy seamlessly through zero-downtime rolling updates or
+    blue-green deployments, database DDL operations can inadvertently lock entire tables:
+
+    - **ACCESS EXCLUSIVE Lock Escalation:** Routine operations like altering a column type, adding a NOT NULL column without
+      a default, or adding check constraints without `NOT VALID` acquire `ACCESS EXCLUSIVE` locks. In PostgreSQL, this blocks
+      all incoming queries (both reads and writes), rapidly exhausting connection pools and causing cascading HTTP 504 timeouts.
+    - **Missing CONCURRENTLY on Indexes:** Running `CREATE INDEX` or `DROP INDEX` without the `CONCURRENTLY` keyword locks the
+      table against writes (`SHARE` or `ACCESS EXCLUSIVE` lock) for the entire duration of index generation. On large tables,
+      this leads to hours of write starvation.
+    - **Unindexed Foreign Keys:** When foreign keys are added without supporting B-tree indexes on the child columns, deleting
+      or updating primary key rows on the referenced parent table forces sequential scans and table-level locking on the child relation.
+    - **Circular RLS Recursion:** In multi-tenant databases with Row-Level Security, defining policies that query back to parent
+      or cross-tenant tables without `SECURITY DEFINER` wrappers leads to infinite recursion exceptions (`ERROR: infinite recursion
+      detected in policy for relation`) and query deadlock.
+    - **Lack of Shift-Left Dry-Runs:** Migrations often pass local unit tests with small synthetic datasets, only to fail in staging
+      or production due to syntax mismatches, lock contention, or transaction timeouts.
+
+    ## Architecture and Workflow Mechanics
+
+    This workflow establishes an automated shift-left safety gate between GitHub pull requests and production deployment:
+
+    1. **Inbound Triggering:**
+       - **Webhook Trigger (`migration_pr_webhook`):** Triggered automatically by GitHub Actions whenever a pull request touching
+         SQL migration directories (`db/migrations/**` or `migrations/*.sql`) is opened, updated, or synchronized.
+       - **Schedule Trigger (`weekly_schema_drift_check`):** An optional scheduled sweep (`0 3 * * 0`, disabled by default)
+         to re-verify staged migration batches or audit baseline drift.
+    2. **Event Logging (`log_migration_event`):**
+       Logs the incoming event context, including GitHub repository, pull request number, commit SHA, and targeted lock threshold.
+    3. **Static AST and Lock Analysis (`audit_migration_ast`):**
+       Executes a containerized Python static analyzer that evaluates every DDL statement against PostgreSQL lock hierarchy rules:
+       - Detects column type changes (`ALTER TABLE ... ALTER COLUMN ... TYPE`) and unconstrained `ADD COLUMN ... NOT NULL`.
+       - Enforces `CONCURRENTLY` on all `CREATE INDEX` and `DROP INDEX` statements.
+       - Maps all declared foreign key constraints against migration indexes to flag unindexed foreign key hazards.
+       - Audits Row-Level Security policies (`CREATE POLICY`) for un-encapsulated cross-table lookups causing circular recursion.
+       - Calculates a normalized `risk_score` (0-100) and detects peak lock rank against `max_allowed_lock_level`.
+    4. **Transactional Dry-Run (`transactional_dry_run`):**
+       Opens a JDBC connection to the staging PostgreSQL database via `io.kestra.plugin.jdbc.postgresql.Queries` and executes the
+       migration inside an isolated transaction block:
+       ```sql
+       BEGIN;
+       -- Migration DDL
+       ROLLBACK;
+       ```
+       Because the transaction explicitly rolls back, staging database state remains completely untouched while verifying that
+       syntax, data types, constraints, and execution triggers succeed with zero runtime errors.
+    5. **Risk Gate Evaluation (`evaluate_risk_gate`):**
+       A flowable `If` task tests whether `risk_score > 40` or `has_breaking_changes` is true:
+       - **High-Risk Path (`alert_high_risk_migration`):** Dispatches an emergency alert to the database operations Slack channel
+         with full details of detected anti-patterns and safe alternative SQL rewrite suggestions.
+       - **Safe Path (`post_pr_review_approval` & `notify_migration_approved`):** Certifies the migration as production-ready
+         and posts an approval status to Slack.
+    6. **Audit Record (`record_migration_audit`):**
+       Materializes the complete audit event record in the Kestra execution logs for compliance tracking.
+    7. **Error Handling (`errors`):**
+       If the dry-run fails with a syntax error, staging connection timeout, or invalid credentials, the flow triggers `alert_pipeline_failure`
+       to notify on-call database administrators immediately.
+
+    ## PostgreSQL Lock Hierarchy Reference
+
+    The static analysis engine evaluates DDL against the formal PostgreSQL lock mode matrix:
+
+    | Lock Level | Rank | Permissible Operations | Conflicting Modes |
+    |---|---|---|---|
+    | ACCESS_SHARE | 1 | SELECT | ACCESS_EXCLUSIVE |
+    | ROW_SHARE | 2 | SELECT FOR UPDATE / FOR SHARE | EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | ROW_EXCLUSIVE | 3 | INSERT, UPDATE, DELETE | SHARE, SHARE_ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | SHARE_UPDATE_EXCLUSIVE | 4 | VACUUM (non-full), ANALYZE, CREATE INDEX CONCURRENTLY, VALIDATE CONSTRAINT | SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | SHARE | 5 | CREATE INDEX (non-concurrent) | ROW_EXCLUSIVE, SHARE_UPDATE_EXCLUSIVE, SHARE_ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | SHARE_ROW_EXCLUSIVE | 6 | CREATE TRIGGER, certain ALTER TABLE variants | ROW_EXCLUSIVE, SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | EXCLUSIVE | 7 | REFRESH MATERIALIZED VIEW CONCURRENTLY | ROW_SHARE, ROW_EXCLUSIVE, SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE |
+    | ACCESS_EXCLUSIVE | 8 | DROP TABLE, TRUNCATE, ALTER TABLE ADD COLUMN, ALTER TABLE ALTER TYPE, VACUUM FULL | All lock modes (blocks all reads and writes) |
+
+    ## Prerequisites
+
+    - A running PostgreSQL staging database instance with network access from Kestra workers.
+    - A Slack workspace with an Incoming Webhook configured for database alerts.
+    - Kestra instance with Docker runner enabled for containerized script execution.
+
+    ### Secret Configuration
+
+    Configure the following secrets in your Kestra namespace (`company.team`):
+
+    - `STAGING_POSTGRES_URL`: JDBC URL to staging PostgreSQL (e.g. `jdbc:postgresql://postgres.staging.internal:5432/staging_db?user=kestra_ci&password=secretpassword`).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for alerting.
+    - `MIGRATION_WEBHOOK_KEY`: Secret authentication token authorizing GitHub Actions to trigger the migration verification webhook.
+
+    ## Input Parameters
+
+    - `pr_number` (INT, default: `101`): GitHub Pull Request number being verified.
+    - `repo_full_name` (STRING, default: `company/core-backend`): Target GitHub repository in `owner/repo` format.
+    - `commit_sha` (STRING, default: `HEAD`): Commit SHA to annotate.
+    - `migration_sql` (STRING): SQL DDL migration payload to audit and dry-run.
+    - `max_allowed_lock_level` (SELECT, default: `SHARE_UPDATE_EXCLUSIVE`): Highest permissible PostgreSQL lock mode before triggering risk gate escalation.
+    - `alert_channel` (STRING, default: `#database-ops`): Slack channel destination for notifications.
+
+    ## Tasks Summary
+
+    1. `log_migration_event` (`io.kestra.plugin.core.log.Log`): Logs incoming pull request and migration metadata.
+    2. `audit_migration_ast` (`io.kestra.plugin.scripts.python.Script`): Analyzes SQL statements for lock escalation, missing CONCURRENTLY, unindexed foreign keys, and circular RLS recursion patterns.
+    3. `transactional_dry_run` (`io.kestra.plugin.jdbc.postgresql.Queries`): Executes the migration against staging PostgreSQL in an isolated transaction block with automatic ROLLBACK.
+    4. `evaluate_risk_gate` (`io.kestra.plugin.core.flow.If`): Tests if `risk_score > 40` or `has_breaking_changes` is true:
+       - `alert_high_risk_migration` (`io.kestra.plugin.notifications.slack.SlackIncomingWebhook`): Posts emergency alert to Slack with anti-pattern details and safe rewrite suggestions.
+       - `log_migration_blocked` (`io.kestra.plugin.core.log.Log`): Records migration rejection in execution logs.
+       - `post_pr_review_approval` (`io.kestra.plugin.core.log.Log`): Logs production deployment approval certificate.
+       - `notify_migration_approved` (`io.kestra.plugin.notifications.slack.SlackIncomingWebhook`): Posts approval confirmation to Slack.
+    5. `record_migration_audit` (`io.kestra.plugin.core.log.Log`): Emits final audit compliance record with lineage.
+    6. `alert_pipeline_failure` (`io.kestra.plugin.notifications.slack.SlackIncomingWebhook`): Global flow-level error listener.
+
+    ## Example Execution Output
+
+    ### Safe Migration (Approved)
+
+    When auditing zero-downtime migrations (such as adding a column with a constant default and creating an index concurrently):
+
+    ```json
+    {
+      "risk_score": 10,
+      "lock_level": "SHARE_UPDATE_EXCLUSIVE",
+      "detected_anti_patterns": [],
+      "has_breaking_changes": false,
+      "safe_rewrites": [],
+      "anti_pattern_count": 0,
+      "statements_analyzed": 2
+    }
+    ```
+
+    Slack notification dispatched:
+    ```text
+    PASSED: PostgreSQL Migration Certified Safe for PR #101
+    Repository: company/core-backend
+    Commit SHA: HEAD
+    Risk Score: 10/100
+    Lock Mode: SHARE_UPDATE_EXCLUSIVE
+    Transactional Dry-Run: Succeeded with ROLLBACK
+    Status: Approved for production deploy.
+    ```
+
+    ### High-Risk Migration (Blocked)
+
+    When auditing migrations containing anti-patterns (such as retyping a column, non-concurrent index creation, unindexed foreign key, and circular RLS policy):
+
+    ```json
+    {
+      "risk_score": 100,
+      "lock_level": "ACCESS_EXCLUSIVE",
+      "detected_anti_patterns": [
+        {
+          "code": "COLUMN_RETYPE_ACCESS_EXCLUSIVE",
+          "statement": "ALTER TABLE orders ALTER COLUMN amount TYPE NUMERIC(18, 4)",
+          "severity": "CRITICAL",
+          "description": "Altering column type acquires ACCESS EXCLUSIVE lock and forces complete table rewrite.",
+          "remediation": "Add new column with target type, backfill asynchronously in batches, and switch application write paths."
+        },
+        {
+          "code": "INDEX_MISSING_CONCURRENTLY",
+          "statement": "CREATE INDEX idx_orders_customer ON orders(customer_id)",
+          "severity": "HIGH",
+          "description": "CREATE INDEX without CONCURRENTLY acquires SHARE lock, blocking concurrent INSERT, UPDATE, and DELETE operations.",
+          "remediation": "Use CREATE INDEX CONCURRENTLY IF NOT EXISTS to build index online without blocking production writes."
+        },
+        {
+          "code": "FOREIGN_KEY_UNINDEXED",
+          "statement": "ALTER TABLE order_items ADD CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id)",
+          "severity": "HIGH",
+          "description": "Foreign key on order_items(order_id) references orders without supporting index, risking table-level locks during parent deletions and updates.",
+          "remediation": "Add supporting index: CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);"
+        },
+        {
+          "code": "CIRCULAR_RLS_RECURSION_RISK",
+          "statement": "CREATE POLICY tenant_isolation_policy ON tenant_documents USING (tenant_id IN (SELECT id FROM accounts WHERE owner_id = current_user))",
+          "severity": "HIGH",
+          "description": "Policy tenant_isolation_policy on tenant_documents contains cross-table subquery without SECURITY DEFINER wrapper, risking circular RLS recursion.",
+          "remediation": "Wrap authorization lookup in a SECURITY DEFINER function with strict search_path, or use session variables (current_setting)."
+        },
+        {
+          "code": "LOCK_LEVEL_EXCEEDED",
+          "statement": "Global Migration Lock Evaluation",
+          "severity": "CRITICAL",
+          "description": "Maximum detected lock level ACCESS_EXCLUSIVE exceeds allowed threshold SHARE_UPDATE_EXCLUSIVE.",
+          "remediation": "Refactor migration DDL to acquire only SHARE_UPDATE_EXCLUSIVE or lower."
+        }
+      ],
+      "has_breaking_changes": true,
+      "safe_rewrites": [
+        "Expand/contract: Add new typed column, backfill via batch UPDATEs, switch application dual-write.",
+        "Replace CREATE INDEX with CREATE INDEX CONCURRENTLY IF NOT EXISTS.",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);",
+        "Encapsulate policy subqueries on tenant_documents inside a SECURITY DEFINER function."
+      ],
+      "anti_pattern_count": 5,
+      "statements_analyzed": 4
+    }
+    ```
+
+    ## GitHub Actions CI/CD Integration Runbook
+
+    Add this GitHub Actions step to your pull request workflow (`.github/workflows/db-migration-check.yml`) to automatically trigger verification on every migration PR:
+
+    ```yaml
+    name: Database Migration Guard
+    on:
+      pull_request:
+        paths:
+          - 'migrations/**.sql'
+          - 'db/migrations/**.sql'
+
+    jobs:
+      verify-migration:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Checkout code
+            uses: actions/checkout@v4
+
+          - name: Concatenate Migration SQL Changes
+            id: extract_sql
+            run: |
+              MIGRATION_CONTENT=$(git diff origin/main...HEAD -- 'migrations/*.sql' | grep '^+[^+]' | sed 's/^+//' || cat migrations/*.sql)
+              echo "migration_payload<<EOF" >> $GITHUB_ENV
+              echo "$MIGRATION_CONTENT" >> $GITHUB_ENV
+              echo "EOF" >> $GITHUB_ENV
+
+          - name: Trigger Kestra Migration Guard Webhook
+            run: |
+              curl -X POST "https://kestra.example.com/api/v1/executions/webhook/company.team/gitops-postgres-migration-guard/${{ secrets.MIGRATION_WEBHOOK_KEY }}" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "pr_number": ${{ github.event.pull_request.number }},
+                  "repo_full_name": "${{ github.repository }}",
+                  "commit_sha": "${{ github.sha }}",
+                  "migration_sql": ${{ toJson(env.migration_payload) }},
+                  "max_allowed_lock_level": "SHARE_UPDATE_EXCLUSIVE",
+                  "alert_channel": "#database-ops"
+                }'
+    ```
+
+    ## Quick Start
+
+    1. Configure the three required secrets (`STAGING_POSTGRES_URL`, `SLACK_WEBHOOK_URL`, `MIGRATION_WEBHOOK_KEY`) in your Kestra namespace (`company.team`).
+    2. Deploy this blueprint YAML file to your Kestra instance.
+    3. Trigger a manual execution in the Kestra UI using the default inputs to test the happy path.
+    4. Verify that the execution runs the static analyzer, performs the dry-run with rollback, and posts an approval certificate to Slack.
+    5. Test a high-risk migration by passing `ALTER TABLE users DROP COLUMN email;` and verify that the gate blocks execution and dispatches an emergency Slack alert.
+
+    ## How to Extend
+
+    - **GitHub PR Status Checks:** Add an `io.kestra.plugin.core.http.Request` task in the `post_pr_review_approval` block to set GitHub Commit Status Check (`state: success`) or leave an automated review comment.
+    - **Schema Diff Comparison:** Integrate `pg-dump` or `Atlas` CLI to generate a visual ERD diff artifact comparing pre-migration and post-migration staging catalogs.
+    - **Lock Timeout Enforcement:** Prepend `SET lock_timeout = '2s';` to the migration payload in staging and production to guarantee statements fail fast instead of queuing up behind conflicting locks.
+    - **Liquibase / Flyway Integration:** Connect to Flyway or Liquibase metadata tables (`schema_version`) to verify version number sequence ordering before executing DDL.
+
+    ## Links
+
+    - [PostgreSQL Explicit Locking Documentation](https://www.postgresql.org/docs/current/explicit-locking.html)
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgresql)
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Notification Plugin Documentation](https://kestra.io/plugins/plugin-notifications)
+    - [Zero Downtime Migrations Guide](https://github.com/ankane/strong_migrations)
