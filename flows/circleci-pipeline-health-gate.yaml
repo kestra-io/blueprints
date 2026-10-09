@@ -1,0 +1,431 @@
+id: circleci-pipeline-health-gate
+namespace: company.team
+description: |
+  Watch a CircleCI project's recent builds from a webhook or a disabled hourly
+  schedule and gate on regressions. A Python ratchet compares failure and flaky
+  rates against a rolling baseline window, then escalates a trip as a GitHub
+  issue, a Slack alert, and a red execution while healthy runs stay quiet.
+
+triggers:
+  - id: on_build_event
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: CircleCI or any notifier POSTs here whenever a workflow finishes, so the ratchet sees fresh builds the moment they land.
+    key: "{{ secret('CIRCLECI_WEBHOOK_KEY') }}"
+  - id: hourly_rollup
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly roll-up over the same windows for teams that prefer a cadence, shipped disabled so nothing runs until the thresholds are reviewed.
+    cron: "0 * * * *"
+    disabled: true
+
+inputs:
+  - id: project_slug
+    type: STRING
+    defaults: github/your-org/your-repo
+    description: CircleCI project slug in vcs-type/org/repo form, such as github/kestra-io/kestra.
+  - id: github_repository
+    type: STRING
+    defaults: your-org/your-repo
+    description: GitHub repository in owner/repo form where a regression issue is opened when the ratchet trips.
+  - id: regression_threshold_pct
+    type: FLOAT
+    defaults: 20.0
+    description: Percentage points of worsening tolerated against the baseline window before failure rate or flaky rate counts as a regression.
+
+tasks:
+  # --- 1. collect recent builds ---
+  - id: fetch_recent_builds
+    type: io.kestra.plugin.core.http.Request
+    description: Pull the last 30 runs for the project slug from the CircleCI builds endpoint with the Circle-Token header, retrying transient API errors three times.
+    uri: "https://circleci.com/api/v1.1/project/{{ inputs.project_slug }}"
+    method: GET
+    headers:
+      Circle-Token: "{{ secret('CIRCLECI_TOKEN') }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+
+  # --- 2. ratchet the rates against the baseline window ---
+  - id: assess_health
+    type: io.kestra.plugin.scripts.python.Script
+    description: Sort the fetched runs newest first, split completed builds into a recent window and a baseline window, and emit failure rate, flaky rate, deltas, and worst steps as a verdict through the outputs protocol.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      BUILDS: "{{ outputs.fetch_recent_builds.body }}"
+      REGRESSION_THRESHOLD_PCT: "{{ inputs.regression_threshold_pct }}"
+      RECENT_WINDOW: "10"
+      BASELINE_WINDOW: "20"
+      MIN_RECENT: "4"
+      MIN_BASELINE: "8"
+    script: |
+      import json
+      import os
+
+      FAILED_STATUSES = {"failed", "timedout", "infrastructure_fail"}
+      COMPLETED_STATUSES = FAILED_STATUSES | {"success", "fixed", "no_tests"}
+      FLAKY_STATUSES = {"retried", "fixed"}
+      FAILED_ACTIONS = {"failed", "timedout", "infrastructure_fail", "error"}
+
+
+      def env_number(name, default):
+          raw = os.environ.get(name, "")
+          try:
+              return float(raw) if raw != "" else float(default)
+          except ValueError:
+              return float(default)
+
+
+      def load_builds(raw):
+          try:
+              data = json.loads(raw or "[]")
+          except ValueError:
+              return []
+          if isinstance(data, dict):
+              data = data.get("items") or data.get("builds") or data.get("recent_builds") or []
+          if not isinstance(data, list):
+              return []
+          return [b for b in data if isinstance(b, dict)]
+
+
+      def status_of(build):
+          for key in ("status", "outcome"):
+              value = build.get(key)
+              if isinstance(value, str) and value.strip():
+                  return value.strip().lower()
+          return "unknown"
+
+
+      def action_failed(action):
+          if not isinstance(action, dict):
+              return False
+          if action.get("ignore-failure") is True:
+              return False
+          status = str(action.get("status") or action.get("outcome") or "").strip().lower()
+          if status in FAILED_ACTIONS:
+              return True
+          if action.get("failed") is True:
+              return True
+          try:
+              return int(action.get("exit-code") or 0) != 0
+          except (TypeError, ValueError):
+              return False
+
+
+      def build_facts(build):
+          status = status_of(build)
+          steps_present = set()
+          failed_steps = set()
+          for step in build.get("steps") or []:
+              if not isinstance(step, dict):
+                  continue
+              name = str(step.get("name") or "").strip() or "unnamed step"
+              steps_present.add(name)
+              for action in step.get("actions") or []:
+                  if action_failed(action):
+                      failed_steps.add(name)
+          job = build.get("job_name") or ""
+          workflows = build.get("workflows")
+          if not job and isinstance(workflows, dict):
+              job = workflows.get("job_name") or workflows.get("name") or ""
+          job = str(job).strip()
+          retried = build.get("retried") is True
+          return {
+              "status": status,
+              "completed": status in COMPLETED_STATUSES,
+              "failed": status in FAILED_STATUSES,
+              "flaky": (status in FLAKY_STATUSES) or retried or (status == "success" and bool(failed_steps)),
+              "steps_present": steps_present,
+              "failed_steps": failed_steps,
+              "job": job,
+          }
+
+
+      def newest_first(builds):
+          def sort_key(build):
+              try:
+                  return int(build.get("build_num"))
+              except (TypeError, ValueError):
+                  return -1
+          return sorted(builds, key=sort_key, reverse=True)
+
+
+      def rate(window, flag):
+          if not window:
+              return 0.0
+          hits = sum(1 for _, f in window if f[flag])
+          return hits / float(len(window))
+
+
+      def worst_units(window):
+          step_stats = {}
+          job_stats = {}
+          for _, f in window:
+              if f["steps_present"]:
+                  for name in f["steps_present"]:
+                      step_stats.setdefault(name, {"failures": 0, "occurrences": 0})
+                      step_stats[name]["occurrences"] += 1
+                  for name in f["failed_steps"]:
+                      step_stats[name]["failures"] += 1
+              elif f["job"]:
+                  job_stats.setdefault(f["job"], {"failures": 0, "occurrences": 0})
+                  job_stats[f["job"]]["occurrences"] += 1
+                  if f["failed"] or f["flaky"]:
+                      job_stats[f["job"]]["failures"] += 1
+          if step_stats:
+              source, stats = "steps", step_stats
+          elif job_stats:
+              source, stats = "jobs", job_stats
+          else:
+              source, stats = "none", {}
+          worst = sorted(
+              [{"step": name, "failures": s["failures"], "occurrences": s["occurrences"]}
+               for name, s in stats.items() if s["failures"] > 0],
+              key=lambda w: (-w["failures"], -w["occurrences"], w["step"]),
+          )[:5]
+          summary = ", ".join("%s (%d/%d)" % (w["step"], w["failures"], w["occurrences"]) for w in worst)
+          return source, worst, (summary or "none")
+
+
+      builds = newest_first(load_builds(os.environ.get("BUILDS")))
+      threshold_pct = max(env_number("REGRESSION_THRESHOLD_PCT", 20.0), 0.0)
+      recent_window = int(env_number("RECENT_WINDOW", 10))
+      baseline_window = int(env_number("BASELINE_WINDOW", 20))
+      min_recent = int(env_number("MIN_RECENT", 4))
+      min_baseline = int(env_number("MIN_BASELINE", 8))
+
+      facts = [(b, build_facts(b)) for b in builds]
+      completed = [(b, f) for b, f in facts if f["completed"]]
+      recent = completed[:recent_window]
+      baseline = completed[recent_window:recent_window + baseline_window]
+
+      recent_failed = rate(recent, "failed")
+      baseline_failed = rate(baseline, "failed")
+      recent_flaky = rate(recent, "flaky")
+      baseline_flaky = rate(baseline, "flaky")
+      failed_delta = recent_failed - baseline_failed
+      flaky_delta = recent_flaky - baseline_flaky
+      threshold = threshold_pct / 100.0
+
+      insufficient = len(recent) < min_recent or len(baseline) < min_baseline
+      fail_trip = failed_delta > threshold
+      flaky_trip = flaky_delta > threshold
+      regression = (not insufficient) and (fail_trip or flaky_trip)
+
+      if insufficient:
+          verdict = "insufficient_data"
+          reason = "fewer than %d recent or %d baseline completed builds" % (min_recent, min_baseline)
+      elif fail_trip and flaky_trip:
+          verdict = "regression"
+          reason = "failure rate and flaky rate both crossed the ratchet"
+      elif fail_trip:
+          verdict = "regression"
+          reason = "failure rate crossed the ratchet"
+      elif flaky_trip:
+          verdict = "regression"
+          reason = "flaky rate crossed the ratchet"
+      else:
+          verdict = "stable"
+          reason = "both rates are within the ratchet"
+
+      source, worst, summary = worst_units(recent)
+
+      report = {
+          "verdict": verdict,
+          "regression": regression,
+          "reason": reason,
+          "threshold_pct": round(threshold_pct, 1),
+          "project_builds_seen": len(builds),
+          "completed_builds_seen": len(completed),
+          "recent_count": len(recent),
+          "baseline_count": len(baseline),
+          "failed_rate": round(recent_failed, 3),
+          "baseline_failed_rate": round(baseline_failed, 3),
+          "failed_delta": round(failed_delta, 3),
+          "flaky_rate": round(recent_flaky, 3),
+          "baseline_flaky_rate": round(baseline_flaky, 3),
+          "flaky_delta": round(flaky_delta, 3),
+          "failed_rate_pct": round(recent_failed * 100, 1),
+          "baseline_failed_rate_pct": round(baseline_failed * 100, 1),
+          "failed_delta_pct": round(failed_delta * 100, 1),
+          "flaky_rate_pct": round(recent_flaky * 100, 1),
+          "baseline_flaky_rate_pct": round(baseline_flaky * 100, 1),
+          "flaky_delta_pct": round(flaky_delta * 100, 1),
+          "worst_steps_source": source,
+          "worst_steps": worst,
+          "worst_steps_summary": summary,
+      }
+
+      print("verdict=%s recent_failed=%.1f%% baseline_failed=%.1f%% worst=%s" % (
+          verdict, recent_failed * 100, baseline_failed * 100, summary))
+      print("::" + json.dumps({"outputs": report}) + "::")
+
+  # --- 3. escalate only on a regression verdict ---
+  - id: gate
+    type: io.kestra.plugin.core.flow.If
+    description: Open the escalation path only when the verdict is a regression, keeping healthy runs and thin data windows quiet.
+    condition: "{{ outputs.assess_health.vars.verdict == 'regression' }}"
+    then:
+      - id: open_regression_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: File the ratchet numbers and the worst failing steps in the team's GitHub backlog, so a trip becomes tracked work instead of a scrollback memory.
+        jwtToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "CircleCI regression in {{ inputs.project_slug }} at {{ outputs.assess_health.vars.failed_rate_pct }}% failure rate"
+        body: |
+          ## CircleCI health ratchet trip
+
+          Project `{{ inputs.project_slug }}` returned verdict **{{ outputs.assess_health.vars.verdict }}** ({{ outputs.assess_health.vars.reason }}).
+
+          - Failure rate {{ outputs.assess_health.vars.failed_rate_pct }}% over the recent {{ outputs.assess_health.vars.recent_count }} completed builds, against a baseline of {{ outputs.assess_health.vars.baseline_failed_rate_pct }}% over {{ outputs.assess_health.vars.baseline_count }} builds (delta {{ outputs.assess_health.vars.failed_delta_pct }} pts)
+          - Flaky rate {{ outputs.assess_health.vars.flaky_rate_pct }}%, against a baseline of {{ outputs.assess_health.vars.baseline_flaky_rate_pct }}% (delta {{ outputs.assess_health.vars.flaky_delta_pct }} pts)
+          - Ratchet threshold {{ outputs.assess_health.vars.threshold_pct }} pts
+          - Worst steps: {{ outputs.assess_health.vars.worst_steps_summary }}
+
+          Execution {{ execution.id }}
+
+          Review the failing steps above, fix or quarantine the flake, then close this issue once the ratchet settles back under the threshold.
+        labels:
+          - ci
+          - circleci
+          - regression
+      - id: alert_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the same ratchet figures and worst steps to the team channel right after the issue is filed.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "CircleCI ratchet TRIPPED for {{ inputs.project_slug }}: failure rate {{ outputs.assess_health.vars.failed_rate_pct }}% vs baseline {{ outputs.assess_health.vars.baseline_failed_rate_pct }}% (delta {{ outputs.assess_health.vars.failed_delta_pct }} pts), flaky {{ outputs.assess_health.vars.flaky_rate_pct }}% vs {{ outputs.assess_health.vars.baseline_flaky_rate_pct }}%. Worst steps: {{ outputs.assess_health.vars.worst_steps_summary }}. Issue opened in {{ inputs.github_repository }}. Execution {{ execution.id }}."
+          }
+      - id: fail_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Turn the execution red so downstream flow triggers and dashboards see the regression as a gate failure instead of a quiet pass.
+        errorMessage: "CircleCI health ratchet regression on {{ inputs.project_slug }}: failure rate {{ outputs.assess_health.vars.failed_rate_pct }}% vs baseline {{ outputs.assess_health.vars.baseline_failed_rate_pct }}% (delta {{ outputs.assess_health.vars.failed_delta_pct }} pts). Worst steps: {{ outputs.assess_health.vars.worst_steps_summary }}."
+    else:
+      - id: log_all_clear
+        type: io.kestra.plugin.core.log.Log
+        description: Record the stable or thin-data verdict quietly, so every check leaves an audit line without waking anyone.
+        message: "CircleCI ratchet quiet for {{ inputs.project_slug }}: verdict {{ outputs.assess_health.vars.verdict }}, failure {{ outputs.assess_health.vars.failed_rate_pct }}% vs baseline {{ outputs.assess_health.vars.baseline_failed_rate_pct }}%, flaky {{ outputs.assess_health.vars.flaky_rate_pct }}%."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert Slack when the fetch or the ratchet itself breaks, because a dead gate is indistinguishable from a healthy pipeline.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "FAILED {{ flow.id }} run {{ execution.id }}: the CircleCI health gate could not assess {{ inputs.project_slug }}. Check the CIRCLECI_TOKEN secret, the CircleCI API response, and Python on the worker."
+      }
+
+# --- 4. trend report outputs for downstream flows ---
+outputs:
+  - id: verdict
+    type: STRING
+    description: Ratchet verdict, one of regression, stable, or insufficient_data.
+    value: "{{ outputs.assess_health.vars.verdict }}"
+  - id: regression
+    type: BOOLEAN
+    description: True when the gate escalated, false for stable verdicts or thin data windows.
+    value: "{{ outputs.assess_health.vars.regression }}"
+  - id: failed_rate_pct
+    type: STRING
+    description: Failure rate of the recent window as a percent, for example 40.0.
+    value: "{{ outputs.assess_health.vars.failed_rate_pct }}"
+  - id: flaky_rate_pct
+    type: STRING
+    description: Flaky rate of the recent window as a percent, for example 10.0.
+    value: "{{ outputs.assess_health.vars.flaky_rate_pct }}"
+  - id: health_report
+    type: STRING
+    description: Full trend report as a JSON string with rates, deltas, window counts, and worst steps.
+    value: "{{ outputs.assess_health.vars | toJson }}"
+
+extend:
+  title: CircleCI Pipeline Failure and Flake Ratchet Gate
+  metaTitle: CircleCI Pipeline Health Gate with Kestra
+  shortDescription: Pull recent CircleCI builds over a webhook or schedule, ratchet failure and flaky rates against a rolling baseline, and escalate regressions as a GitHub issue plus a Slack alert.
+  metaDescription: CircleCI health gate for Kestra. Ratchet failure and flaky rates against a rolling baseline, then open a GitHub issue and Slack alert when the trend regresses.
+  description: |
+    CircleCI tells you a build went red, but it does not tell you that your pipeline is failing more often than it used to. This blueprint turns recent build history into a ratchet: a webhook or an hourly schedule fetches the last runs for a project, a Python step compares the newest window against an older baseline window, and any deterioration past your threshold escalates as a GitHub issue, a Slack ping, and a red execution while healthy runs stay quiet.
+
+    ## How it works
+
+    1. The `on_build_event` trigger (`io.kestra.plugin.core.trigger.Webhook`, guarded by the `CIRCLECI_WEBHOOK_KEY` secret) starts a run whenever CircleCI or your notifier POSTs to it, and the `hourly_rollup` `io.kestra.plugin.core.trigger.Schedule` trigger offers a cron cadence that ships `disabled: true`.
+    2. `fetch_recent_builds` (`io.kestra.plugin.core.http.Request`) calls the CircleCI builds endpoint for `{{ inputs.project_slug }}` with the `Circle-Token` header resolved from the `CIRCLECI_TOKEN` secret, retrying transient API errors up to three times.
+    3. `assess_health` (`io.kestra.plugin.scripts.python.Script` on the `io.kestra.plugin.core.runner.Process` runner) sorts the runs newest first, drops unfinished and canceled builds, and splits the completed ones into a recent window of 10 and a baseline window of 20.
+    4. Inside that step, failure rate and flaky rate are computed for both windows, the deltas are compared against `regression_threshold_pct`, and the worst failing steps (or failing job names when the payload carries no step detail) are aggregated over the recent window.
+    5. The verdict travels through the outputs protocol as `regression`, `stable`, or `insufficient_data`, with fractions, percentages, deltas, window counts, and the worst-step summary all in one report payload.
+    6. `gate` (`io.kestra.plugin.core.flow.If`) opens the escalation path only when the verdict equals `regression`: `open_regression_issue` (`io.kestra.plugin.github.issues.Create`) files the numbers and worst steps in GitHub, `alert_slack` posts the same figures to Slack, and `fail_gate` (`io.kestra.plugin.core.execution.Fail`) turns the execution red.
+    7. Healthy and thin-data runs fall through to `log_all_clear` (`io.kestra.plugin.core.log.Log`) and stay silent, while the `errors` handler pings Slack whenever the fetch or the ratchet itself breaks.
+
+    ## What you get
+
+    - A rolling ratchet instead of a raw count: today's failure rate is judged against your own recent history, not an arbitrary number.
+    - Flaky detection alongside failures, so a pipeline that passes only after retries is treated as a problem.
+    - Worst-step attribution in both the GitHub issue and the Slack message, pointing at the stage to inspect first.
+    - A `regression` boolean, the verdict string, both rates, and a full `health_report` JSON for downstream flows and dashboards.
+    - A red execution on every trip, so branch protections and flow triggers can treat pipeline health as a hard gate.
+    - A quiet, logged all-clear on healthy runs, giving you a dated audit trail of every check.
+
+    ## Who it's for
+
+    - Platform and DevOps teams who own a CircleCI project and want to catch slow quality decay before users do.
+    - Engineering leads who need a ratchet that names the failing stage rather than another green or red dot.
+    - SRE and reliability engineers who wire CI health into incident workflows and on-call alerting.
+
+    ## Why orchestrate this with Kestra
+
+    CircleCI reports each build on its own and keeps historical charts in Insights, but it does not compare the newest window against your rolling baseline, open issues, or fail a downstream gate when the trend worsens. Kestra supplies the event trigger, the schedule fallback, retries around a flaky API, a branch that separates escalation from quiet record keeping, and plugin routing into GitHub and Slack, all in one declarative file. Because the ratchet runs as an execution, every trip carries inputs, outputs, and logs that you can replay and audit.
+
+    ## Prerequisites
+
+    - A CircleCI project and a personal API token that can read its builds, with the project slug in vcs-type/org/repo form.
+    - A GitHub token allowed to open issues in the target repository, and a Slack incoming webhook for alerts.
+    - Python 3 on the Kestra worker, since the ratchet uses the Process runner; switch the script to a Docker task runner if the host has no Python.
+
+    ### Secrets
+
+    - `CIRCLECI_TOKEN`: CircleCI personal API token sent as the `Circle-Token` header.
+    - `CIRCLECI_WEBHOOK_KEY`: key segment guarding the webhook trigger URL, treat it like a password.
+    - `GITHUB_TOKEN`: GitHub token used by `jwtToken` to open the regression issue.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used for regression and failure alerts.
+
+    ## Quick start
+
+    1. Add the four secrets above under Namespace, Secrets, then set `project_slug` and `github_repository` inputs to your project.
+    2. Run the flow once by hand and read `verdict` plus `health_report` from the Outputs tab to confirm the ratchet against your real build history.
+    3. Point CircleCI at the webhook so every finished workflow starts a check:
+
+    ```yaml
+    # webhook target to paste into CircleCI or a notifier
+    https://your-kestra.example.com/api/v1/main/executions/webhook/company.team/circleci-pipeline-health-gate/$CIRCLECI_WEBHOOK_KEY
+    ```
+
+    4. When you want a cadence instead of events, enable the schedule by flipping the flag it ships with:
+
+    ```yaml
+    - id: hourly_rollup
+      type: io.kestra.plugin.core.trigger.Schedule
+      cron: "0 * * * *"
+      disabled: false
+    ```
+
+    ## How to extend
+
+    - Tune `RECENT_WINDOW`, `BASELINE_WINDOW`, `MIN_RECENT`, and `MIN_BASELINE` in the `assess_health` env block to fit your build volume.
+    - Split the single threshold into warn and page tiers with a second `If` nested under the current gate.
+    - Add the CircleCI build URL from the webhook payload to the issue body for one-click navigation to the failing run.
+    - Fan out one gate per project with a `ForEach` over a project list, or chain a remediation flow from this flow's FAILED state.
+
+    ## Links
+
+    - CircleCI API reference for the builds endpoint: https://circleci.com/docs/api/v1/
+    - CircleCI configuration reference: https://circleci.com/docs/configuration-reference/
+    - GitHub plugin documentation: https://kestra.io/plugins/plugin-github
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+    - Monitoring & Alerting
+  ee: false
+  demo: false
