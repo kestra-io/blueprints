@@ -55,28 +55,34 @@ inputs:
 tasks:
   - id: poll_pending_outbox_events
     type: io.kestra.plugin.jdbc.postgresql.Query
-    description: Atomically claim pending outbox events using FOR UPDATE SKIP LOCKED and claim fencing to preserve strict per-aggregate FIFO order.
+    description: Atomically claim an ordered prefix of pending outbox events using monotonic event sequencing and FOR UPDATE SKIP LOCKED to guarantee per-aggregate FIFO ordering.
     url: "jdbc:postgresql://{{ inputs.postgres_host }}:{{ inputs.postgres_port }}/{{ inputs.database_name }}"
     username: "{{ secret('POSTGRES_USER') }}"
     password: "{{ secret('POSTGRES_PASSWORD') }}"
     fetchType: FETCH
     sql: |
-      WITH eligible AS (
-        SELECT id
-        FROM outbox_events o1
-        WHERE (status = 'PENDING' OR (status = 'CLAIMED' AND claimed_at < NOW() - INTERVAL '15 minutes'))
-          AND NOT EXISTS (
-            -- Guarantee strict per-aggregate FIFO order: do not claim if an earlier event for this aggregate is still pending or claimed
-            SELECT 1
-            FROM outbox_events o2
-            WHERE o2.aggregate_type = o1.aggregate_type
-              AND o2.aggregate_id = o1.aggregate_id
-              AND o2.status IN ('PENDING', 'CLAIMED')
-              AND (o2.created_at < o1.created_at OR (o2.created_at = o1.created_at AND o2.id < o1.id))
-          )
-        ORDER BY created_at ASC, id ASC
+      WITH locked_candidates AS (
+        SELECT id, aggregate_type, aggregate_id, event_sequence
+        FROM outbox_events
+        WHERE status = 'PENDING'
+           OR (status = 'CLAIMED' AND claimed_at < NOW() - INTERVAL '15 minutes')
+        ORDER BY event_sequence ASC
         LIMIT {{ inputs.batch_size }}
         FOR UPDATE SKIP LOCKED
+      ),
+      eligible AS (
+        SELECT c.id
+        FROM locked_candidates c
+        WHERE NOT EXISTS (
+          -- Guarantee per-aggregate FIFO: exclude event if an earlier event for this aggregate is missing from this batch
+          SELECT 1
+          FROM outbox_events o2
+          WHERE o2.aggregate_type = c.aggregate_type
+            AND o2.aggregate_id = c.aggregate_id
+            AND o2.event_sequence < c.event_sequence
+            AND o2.status IN ('PENDING', 'CLAIMED')
+            AND o2.id NOT IN (SELECT id FROM locked_candidates)
+        )
       ),
       claimed AS (
         UPDATE outbox_events o
@@ -88,6 +94,7 @@ tasks:
         WHERE o.id = eligible.id
         RETURNING
           o.id::text AS event_id,
+          o.event_sequence,
           o.aggregate_type,
           o.aggregate_id,
           o.event_type,
@@ -99,6 +106,7 @@ tasks:
       )
       SELECT
         event_id,
+        event_sequence,
         aggregate_type,
         aggregate_id,
         event_type,
@@ -108,7 +116,7 @@ tasks:
         retry_count,
         TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
       FROM claimed
-      ORDER BY created_at ASC, event_id ASC;
+      ORDER BY event_sequence ASC;
 
   - id: evaluate_batch_content
     type: io.kestra.plugin.core.flow.If
@@ -135,6 +143,7 @@ tasks:
               value: "{{ item.value.event_payload }}"
               headers:
                 event_id: "{{ item.value.event_id }}"
+                event_sequence: "{{ item.value.event_sequence }}"
                 event_type: "{{ item.value.event_type }}"
                 correlation_id: "{{ item.value.correlation_id }}"
 
@@ -185,7 +194,7 @@ extend:
   description: |
     In distributed systems and microservices architectures, updating a local database and publishing a streaming event in a single atomic transaction is impossible without distributed two-phase commits (2PC), which introduces significant latency and operational fragility. The **Transactional Outbox Pattern** solves this dual-write dilemma: microservices commit domain data and corresponding integration events into a local `outbox_events` relational table within the same ACID transaction. An asynchronous worker then polls the outbox and reliably relays the events to an event streaming broker like Apache Kafka.
 
-    This blueprint implements a production-grade Transactional Outbox relay using Kestra. It uses PostgreSQL's native `FOR UPDATE SKIP LOCKED` inside an atomic Common Table Expression (CTE) to lease batches of pending events (`status = 'CLAIMED'`) with fenced execution tokens (`claim_owner = execution.id`), streams the records to topic partitions keyed by entity ID (`aggregate_id`) to preserve strict per-aggregate message ordering, includes explicit `event_id` headers for downstream consumer deduplication, marks events as `DISPATCHED`, and alerts on-call engineers via Slack if broker connectivity or database operations fail.
+    This blueprint implements a production-grade Transactional Outbox relay using Kestra. It uses PostgreSQL's native `FOR UPDATE SKIP LOCKED` inside an atomic Common Table Expression (CTE) to lease batches of pending events (`status = 'CLAIMED'`) with fenced execution tokens (`claim_owner = execution.id`), maintains monotonic event sequencing (`event_sequence`) to guarantee strict per-aggregate FIFO order even across multi-event batches and simultaneous transaction commits, streams records to topic partitions keyed by `aggregate_id`, includes explicit `event_id` and `event_sequence` headers for consumer idempotency, marks events as `DISPATCHED`, and alerts on-call engineers via Slack if broker connectivity or database operations fail.
 
     ## Outbox Table Schema
 
@@ -197,6 +206,7 @@ extend:
 
     CREATE TABLE IF NOT EXISTS outbox_events (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_sequence BIGINT GENERATED ALWAYS AS IDENTITY,
         aggregate_type VARCHAR(64) NOT NULL,
         aggregate_id VARCHAR(128) NOT NULL,
         event_type VARCHAR(128) NOT NULL,
@@ -212,21 +222,26 @@ extend:
     );
 
     CREATE INDEX IF NOT EXISTS idx_outbox_aggregate_fifo
-    ON outbox_events (aggregate_type, aggregate_id, created_at ASC, id ASC)
+    ON outbox_events (aggregate_type, aggregate_id, event_sequence ASC)
+    WHERE status IN ('PENDING', 'CLAIMED');
+
+    CREATE INDEX IF NOT EXISTS idx_outbox_polling_queue
+    ON outbox_events (event_sequence ASC)
     WHERE status IN ('PENDING', 'CLAIMED');
     ```
 
     ## How it works
 
     1. **Execution Serialization:** The workflow specifies `concurrency: { behavior: QUEUE, limit: 1 }` so overlapping scheduled intervals or incoming webhooks serialize neatly, preventing multi-producer race conditions across batches.
-    2. **Atomic Batch Claiming with FIFO Enforcement:** `poll_pending_outbox_events` (`io.kestra.plugin.jdbc.postgresql.Query`) runs an atomic `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING` statement. The query:
+    2. **Atomic Batch Claiming with Contiguous Prefix Drainage:** `poll_pending_outbox_events` (`io.kestra.plugin.jdbc.postgresql.Query`) runs an atomic `UPDATE ... FROM CTE RETURNING` statement. The query:
+       - Locks up to `batch_size` candidate rows ordered by monotonic `event_sequence ASC` with `FOR UPDATE SKIP LOCKED`.
+       - Drains multiple contiguous pending events per aggregate within the same batch while preserving strict FIFO: a candidate event is only excluded if an earlier event for that same aggregate is missing from the locked candidate set (e.g. held by an active external lock or in-flight claim).
        - Fences the claim by assigning `claim_owner = '{{ execution.id }}'` and recording `claimed_at = NOW()`.
-       - Enforces strict per-aggregate FIFO order via a `NOT EXISTS` subquery that forbids claiming an event if an earlier event for the same aggregate is still pending or claimed.
-       - Guarantees deterministic iteration ordering by returning the leased records through an outer `SELECT ... ORDER BY created_at ASC, event_id ASC`.
+       - Guarantees deterministic iteration ordering by returning the leased records through an outer `SELECT ... ORDER BY event_sequence ASC`.
        - Automatically recovers stale leases where `claimed_at < NOW() - INTERVAL '15 minutes'`.
     3. **Backlog Evaluation:** `evaluate_batch_content` (`io.kestra.plugin.core.flow.If`) evaluates `outputs.poll_pending_outbox_events.size > 0`. If the outbox is empty, the flow logs a clean state and finishes cleanly with minimal overhead.
     4. **Event Streaming:** `dispatch_events_to_kafka` (`io.kestra.plugin.core.flow.Loop`) iterates through each claimed event sequentially using `item.value`:
-       - `publish_event_to_kafka` (`io.kestra.plugin.kafka.Produce`) publishes the record via the `from` property to `{{ inputs.kafka_topic_prefix }}.{{ aggregate_type }}` using `aggregate_id` as the message key for hash-based partition locality and `acks: all` for high durability. It explicitly includes `event_id`, `event_type`, and `correlation_id` in the Kafka message headers to empower downstream consumers with end-to-end idempotency and deduplication.
+       - `publish_event_to_kafka` (`io.kestra.plugin.kafka.Produce`) publishes the record via the `from` property to `{{ inputs.kafka_topic_prefix }}.{{ aggregate_type }}` using `aggregate_id` as the message key for hash-based partition locality and `acks: all` for high durability. It explicitly includes `event_id`, `event_sequence`, `event_type`, and `correlation_id` in the Kafka message headers to empower downstream consumers with end-to-end idempotency and deduplication.
        - `mark_event_dispatched` (`io.kestra.plugin.jdbc.postgresql.Query`) updates the record status to `DISPATCHED` fenced with `claim_owner = '{{ execution.id }}'` and records `dispatched_at = NOW()`.
     5. **Audit Logging:** `log_dispatch_success` (`io.kestra.plugin.core.log.Log`) outputs the count of successfully relayed messages.
     6. **Failure Pager:** `alert_on_pipeline_failure` in the `errors` block posts an immediate incident alert to Slack with execution context and connection parameters.
@@ -235,8 +250,8 @@ extend:
 
     - Guaranteed at-least-once delivery from PostgreSQL to Apache Kafka without dual-write inconsistency.
     - Zero lock contention between workers via PostgreSQL's non-blocking `SKIP LOCKED` and atomic lease transitions.
-    - Strict per-aggregate FIFO ordering guaranteed through serialized concurrency, deterministic sorting, and aggregate-level dependency gates.
-    - Idempotent consumer contract with `event_id` in Kafka record headers.
+    - Strict per-aggregate FIFO ordering guaranteed through monotonic sequence numbers, contiguous prefix batching, and serialized concurrency.
+    - Idempotent consumer contract with `event_id` and `event_sequence` in Kafka record headers.
     - Observability and delivery tracking directly in database records (`dispatched_at` timestamps).
     - Fail-safe alerting with detailed execution tracing.
 
