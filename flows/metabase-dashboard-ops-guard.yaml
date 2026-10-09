@@ -1,0 +1,462 @@
+id: metabase-dashboard-ops-guard
+namespace: company.team
+description: |
+  Reconcile a Metabase dashboard against the warehouse rows it is supposed to show, then alert Slack when row counts, revenue totals, or freshness disagree. A drift verdict also triggers a cache warming retry so viewers stop reading stale results.
+
+triggers:
+  - id: hourly_consistency_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Six hour consistency sweep. Shipped disabled, flip it to false after the first successful manual run.
+    cron: "0 */6 * * *"
+    disabled: true
+
+  - id: on_demand_check
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: On demand entry point for a deploy hook or an operator who wants an immediate verdict on the dashboard.
+    key: "{{ secret('METABASE_GUARD_WEBHOOK_KEY') }}"
+
+inputs:
+  - id: metabase_url
+    type: STRING
+    displayName: Metabase base URL
+    description: Base URL of the Metabase instance with no trailing slash.
+    defaults: https://metabase.example.com
+
+  - id: dashboard_id
+    type: INT
+    displayName: Metabase dashboard id
+    description: Numeric id of the dashboard that should be verified.
+    defaults: 1
+
+  - id: staleness_threshold_minutes
+    type: INT
+    displayName: Staleness threshold in minutes
+    description: Maximum age of the newest row before the dashboard counts as stale.
+    defaults: 60
+
+tasks:
+  # --- 1. collect the Metabase side ---
+  - id: fetch_dashboard
+    type: io.kestra.plugin.core.http.Request
+    description: GET the dashboard definition so the run inspects the same object a viewer opens.
+    uri: "{{ inputs.metabase_url }}/api/dashboard/{{ inputs.dashboard_id }}"
+    method: GET
+    headers:
+      Accept: "application/json"
+      X-API-KEY: "{{ secret('METABASE_API_KEY') }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT20S
+      maxAttempts: 3
+
+  - id: pick_primary_card
+    type: io.kestra.plugin.scripts.python.Script
+    description: Read the dashboard definition and pick its first card, exposing the card id and name for the query step.
+    env:
+      DASHBOARD_JSON: "{{ outputs.fetch_dashboard.body }}"
+    script: |
+      import json
+      import os
+
+      raw = os.environ.get("DASHBOARD_JSON", "")
+      try:
+          payload = json.loads(raw) if raw.strip() else {}
+      except Exception:
+          payload = {}
+
+      cards = []
+      if isinstance(payload, dict):
+          cards = payload.get("dashcards") or payload.get("ordered_cards") or []
+      if not isinstance(cards, list):
+          cards = []
+
+      card_id = 0
+      card_name = "unknown"
+      for entry in cards:
+          if isinstance(entry, dict) and entry.get("card_id"):
+              card_id = int(entry["card_id"])
+              nested = entry.get("card") if isinstance(entry.get("card"), dict) else {}
+              card_name = str(entry.get("name") or nested.get("name") or "card " + str(card_id))
+              break
+
+      print("selected card " + str(card_id) + " (" + card_name + ") of " + str(len(cards)) + " dashboard cards")
+      print("::" + json.dumps({"outputs": {
+          "card_id": card_id,
+          "card_name": card_name,
+          "card_count": len(cards),
+      }}) + "::")
+
+  - id: fetch_card_query
+    type: io.kestra.plugin.core.http.Request
+    description: POST the card query to capture the row count, revenue total, and data timestamp the dashboard is currently serving.
+    uri: "{{ inputs.metabase_url }}/api/card/{{ outputs.pick_primary_card.vars.card_id }}/query"
+    method: POST
+    contentType: "application/json"
+    headers:
+      Accept: "application/json"
+      X-API-KEY: "{{ secret('METABASE_API_KEY') }}"
+    body: '{"parameters": []}'
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT20S
+      maxAttempts: 3
+
+  # --- 2. collect the warehouse side ---
+  - id: load_warehouse_kpi
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Aggregate the same KPI window from Postgres so the dashboard gets an independent source of truth.
+    url: "{{ secret('POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: STORE
+    sql: |
+      SELECT
+        count(*)::bigint AS row_count,
+        coalesce(sum(order_total), 0)::numeric(18, 2) AS revenue_total,
+        max(updated_at) AS last_updated
+      FROM public.fact_orders
+      WHERE updated_at >= now() - INTERVAL '7 days';
+
+  # --- 3. assess consistency ---
+  - id: check_consistency
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compare row counts, revenue totals, and staleness across both sources, then emit the JSON verdict payload.
+    env:
+      CARD_JSON: "{{ outputs.fetch_card_query.body }}"
+      WAREHOUSE_ROWS: "{{ outputs.load_warehouse_kpi.rows | toJson }}"
+      STALENESS_THRESHOLD_MINUTES: "{{ inputs.staleness_threshold_minutes }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      DEFAULT_TOLERANCE_PCT = 0.5
+
+
+      def env_number(name, default):
+          raw = os.environ.get(name, "")
+          try:
+              return float(str(raw).strip())
+          except (TypeError, ValueError):
+              return default
+
+
+      def parse_time(value):
+          if value is None or isinstance(value, bool):
+              raise ValueError("missing timestamp")
+          if isinstance(value, (int, float)):
+              return datetime.fromtimestamp(float(value), tz=timezone.utc)
+          text = str(value).strip()
+          if not text:
+              raise ValueError("empty timestamp")
+          try:
+              numeric = float(text)
+              if numeric > 100000000:
+                  return datetime.fromtimestamp(numeric, tz=timezone.utc)
+          except ValueError:
+              pass
+          if text.endswith("Z"):
+              text = text[:-1] + "+00:00"
+          parsed = datetime.fromisoformat(text)
+          if parsed.tzinfo is None:
+              parsed = parsed.replace(tzinfo=timezone.utc)
+          return parsed.astimezone(timezone.utc)
+
+
+      def to_number(value):
+          if value is None or isinstance(value, bool):
+              raise ValueError("missing number")
+          if isinstance(value, (int, float)):
+              return float(value)
+          text = str(value).strip().replace(",", "").replace("$", "")
+          if not text:
+              raise ValueError("empty number")
+          return float(text)
+
+
+      def age_minutes(moment, now):
+          return max(0.0, (now - moment).total_seconds() / 60.0)
+
+
+      def metabase_metrics(raw):
+          if raw is None or not str(raw).strip():
+              raise ValueError("empty card payload")
+          payload = json.loads(raw)
+          data = payload.get("data") if isinstance(payload, dict) else None
+          if not isinstance(data, dict):
+              raise ValueError("missing data section")
+          rows = data.get("rows") or []
+          cols = data.get("cols") or []
+          if not rows or not isinstance(rows[0], list):
+              raise ValueError("no result rows")
+          row = rows[0]
+          if cols and len(cols) == len(row):
+              names = []
+              for col in cols:
+                  if isinstance(col, dict):
+                      names.append(str(col.get("name", "")).lower())
+                  else:
+                      names.append(str(col).lower())
+              mapped = dict(zip(names, row))
+              count_value = mapped.get("row_count", row[0])
+              revenue_value = mapped.get("revenue_total", row[1] if len(row) > 1 else None)
+              updated_value = mapped.get("updated_at", row[2] if len(row) > 2 else None)
+          else:
+              count_value = row[0] if len(row) > 0 else None
+              revenue_value = row[1] if len(row) > 1 else None
+              updated_value = row[2] if len(row) > 2 else None
+          return {
+              "row_count": to_number(count_value),
+              "revenue_total": to_number(revenue_value),
+              "updated_at": parse_time(updated_value),
+          }
+
+
+      def warehouse_metrics(raw):
+          rows = raw
+          if isinstance(rows, str):
+              rows = json.loads(rows) if rows.strip() else []
+          if not isinstance(rows, list) or not rows:
+              raise ValueError("no warehouse rows")
+          row = rows[0]
+          if not isinstance(row, dict):
+              raise ValueError("unexpected warehouse row shape")
+          return {
+              "row_count": to_number(row.get("row_count")),
+              "revenue_total": to_number(row.get("revenue_total")),
+              "updated_at": parse_time(row.get("last_updated")),
+          }
+
+
+      threshold = env_number("STALENESS_THRESHOLD_MINUTES", 60)
+      tolerance = env_number("REVENUE_TOLERANCE_PCT", DEFAULT_TOLERANCE_PCT)
+      now_text = str(os.environ.get("NOW_ISO", "")).strip()
+      now = parse_time(now_text) if now_text else datetime.now(tz=timezone.utc)
+
+      issues = []
+      errors = []
+      dashboard = None
+      warehouse = None
+
+      try:
+          dashboard = metabase_metrics(os.environ.get("CARD_JSON", ""))
+      except Exception as exc:
+          errors.append("metabase card payload unreadable: " + str(exc))
+
+      try:
+          warehouse = warehouse_metrics(os.environ.get("WAREHOUSE_ROWS", ""))
+      except Exception as exc:
+          errors.append("warehouse kpi rows unreadable: " + str(exc))
+
+      ages = []
+      if dashboard is not None:
+          ages.append(age_minutes(dashboard["updated_at"], now))
+      if warehouse is not None:
+          ages.append(age_minutes(warehouse["updated_at"], now))
+      staleness = int(max(ages)) if ages else 0
+
+      row_metabase = "n/a"
+      row_warehouse = "n/a"
+      revenue_metabase = "n/a"
+      revenue_warehouse = "n/a"
+      delta = "n/a"
+
+      if errors:
+          verdict = "unavailable"
+          issues.extend(errors)
+      else:
+          row_metabase = int(dashboard["row_count"])
+          row_warehouse = int(warehouse["row_count"])
+          revenue_metabase = round(dashboard["revenue_total"], 2)
+          revenue_warehouse = round(warehouse["revenue_total"], 2)
+          base = max(abs(revenue_warehouse), 1.0)
+          delta = round((revenue_metabase - revenue_warehouse) / base * 100.0, 2)
+          row_drift = row_metabase != row_warehouse
+          revenue_drift = abs(revenue_metabase - revenue_warehouse) / base * 100.0 > tolerance
+          stale = staleness > threshold
+          if row_drift:
+              issues.append("row count drift, metabase " + str(row_metabase) + " vs warehouse " + str(row_warehouse))
+          if revenue_drift:
+              issues.append("revenue drift " + str(delta) + "% beyond tolerance " + str(tolerance) + "%")
+          if stale:
+              issues.append("staleness " + str(staleness) + "m beyond threshold " + str(int(threshold)) + "m")
+          if row_drift or revenue_drift:
+              verdict = "drift"
+          elif stale:
+              verdict = "stale"
+          else:
+              verdict = "ok"
+
+      needs_action = verdict != "ok"
+      if issues:
+          summary = "; ".join(issues)
+      else:
+          summary = "row counts, revenue totals, and freshness all match"
+      summary = summary.replace("\\", "/").replace('"', "'").replace("\n", " ")
+
+      payload = {"outputs": {
+          "verdict": verdict,
+          "needs_action": needs_action,
+          "issues": issues,
+          "issues_summary": summary,
+          "row_count_metabase": row_metabase,
+          "row_count_warehouse": row_warehouse,
+          "revenue_metabase": revenue_metabase,
+          "revenue_warehouse": revenue_warehouse,
+          "revenue_delta_pct": delta,
+          "staleness_minutes": staleness,
+      }}
+      print("verdict=" + verdict + " staleness=" + str(staleness) + "m issues=" + str(len(issues)))
+      print("::" + json.dumps(payload) + "::")
+
+  # --- 4. route the verdict ---
+  - id: route_verdict
+    type: io.kestra.plugin.core.flow.If
+    description: Branch on the verdict so drift or staleness wakes the channel while a clean run stays quiet.
+    condition: "{{ outputs.check_consistency.vars.verdict != 'ok' }}"
+    then:
+      - id: alert_drift
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the verdict, both row counts, both revenue totals, the delta, staleness, and the issue summary to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Metabase guard ALERT for dashboard {{ inputs.dashboard_id }}: verdict {{ outputs.check_consistency.vars.verdict }}. Rows {{ outputs.check_consistency.vars.row_count_metabase }} on the dashboard vs {{ outputs.check_consistency.vars.row_count_warehouse }} in the warehouse, revenue {{ outputs.check_consistency.vars.revenue_metabase }} vs {{ outputs.check_consistency.vars.revenue_warehouse }} ({{ outputs.check_consistency.vars.revenue_delta_pct }}% delta), staleness {{ outputs.check_consistency.vars.staleness_minutes }}m against a {{ inputs.staleness_threshold_minutes }}m threshold. {{ outputs.check_consistency.vars.issues_summary }}. Cache warm retry follows. Execution {{ execution.id }}."
+          }
+
+      - id: warm_cache_retry
+        type: io.kestra.plugin.core.http.Request
+        description: Re-run the card query so Metabase recomputes the question and repopulates the cached result behind the dashboard.
+        uri: "{{ inputs.metabase_url }}/api/card/{{ outputs.pick_primary_card.vars.card_id }}/query"
+        method: POST
+        contentType: "application/json"
+        headers:
+          Accept: "application/json"
+          X-API-KEY: "{{ secret('METABASE_API_KEY') }}"
+        body: '{"parameters": []}'
+        allowFailure: true
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+    else:
+      - id: all_clear_note
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post a short all clear note so the channel keeps a day by day record of healthy checks.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Metabase guard OK for dashboard {{ inputs.dashboard_id }}: rows {{ outputs.check_consistency.vars.row_count_metabase }} matched the warehouse, revenue delta {{ outputs.check_consistency.vars.revenue_delta_pct }}%, staleness {{ outputs.check_consistency.vars.staleness_minutes }}m inside the {{ inputs.staleness_threshold_minutes }}m budget. Execution {{ execution.id }}."
+          }
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Surface a failed guard run, because a broken check looks exactly like a healthy dashboard until someone looks.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "Metabase dashboard ops guard FAILED for {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}. No consistency verdict was produced, so drift was NOT verified."
+      }
+
+outputs:
+  - id: verdict
+    type: STRING
+    description: Verdict of the comparison, one of ok, drift, stale, unavailable.
+    value: "{{ outputs.check_consistency.vars.verdict }}"
+  - id: needs_action
+    type: BOOLEAN
+    description: True when the verdict is anything other than ok.
+    value: "{{ outputs.check_consistency.vars.needs_action }}"
+  - id: staleness_minutes
+    type: INT
+    description: Oldest age in minutes across the dashboard payload and the warehouse row.
+    value: "{{ outputs.check_consistency.vars.staleness_minutes }}"
+  - id: consistency
+    type: JSON
+    description: Full verdict payload with both row counts, both revenue totals, delta percent, and the issue list.
+    value: "{{ outputs.check_consistency.vars | toJson }}"
+
+extend:
+  title: Metabase Cache and Consistency Ops Guard
+  metaTitle: Metabase Dashboard Consistency and Cache Warm Guard with Kestra
+  shortDescription: Pull a Metabase dashboard and its card query, reconcile the numbers against Postgres KPI rows, and alert Slack when they drift or go stale.
+  metaDescription: Compare Metabase dashboard numbers with warehouse KPI rows in Kestra, alert Slack on row or revenue drift, and re-warm stale card caches.
+  description: |
+    Dashboards lie quietly. A stale cache, a dropped filter, or a late warehouse load can leave a Metabase dashboard showing numbers that nobody has checked. This flow reconciles the dashboard against the warehouse on a schedule or on demand, tells Slack exactly what disagreed, and kicks a cache warming retry when freshness is the problem.
+
+    ## How it works
+    1. The `hourly_consistency_check` trigger (`io.kestra.plugin.core.trigger.Schedule`, shipped with `disabled: true`) and the `on_demand_check` trigger (`io.kestra.plugin.core.trigger.Webhook`) give you a six hour cadence and an on demand HTTP entry point.
+    2. `fetch_dashboard` (`io.kestra.plugin.core.http.Request`) GETs `/api/dashboard/{id}` with an `X-API-KEY` header sourced from the `METABASE_API_KEY` secret, and `pick_primary_card` (`io.kestra.plugin.scripts.python.Script`) reads the definition to select the first card.
+    3. `fetch_card_query` POSTs `/api/card/{card_id}/query`, so the run compares against the row count, revenue total, and data timestamp that the dashboard itself is serving.
+    4. `load_warehouse_kpi` (`io.kestra.plugin.jdbc.postgresql.Query`) runs the matching aggregate over `public.fact_orders` with `fetchType: STORE`.
+    5. `check_consistency` (Python) parses both payloads and emits a `::json::` verdict carrying both row counts, both revenue totals, the delta percent, staleness minutes, and a sanitized issue summary.
+    6. `route_verdict` (`io.kestra.plugin.core.flow.If`) branches on that verdict, with `alert_drift` and `warm_cache_retry` in the `then` branch and `all_clear_note` in the `else` branch, while the `errors` block reports any crash to Slack.
+
+    ## What you get
+    - A `verdict` output (`ok`, `drift`, `stale`, `unavailable`) that any downstream flow can branch on.
+    - Numbers in the Slack alert, so the channel sees both row counts, both revenue totals, the delta percent, and staleness in a single message.
+    - A cache warming retry that re-runs the card query when the numbers are old, instead of leaving viewers on stale results.
+    - An execution history that records every comparison, which turns "did anyone check the dashboard" into an answerable question.
+
+    ## Who it's for
+    - Analytics engineers who own a Metabase dashboard and need evidence that it matches the warehouse.
+    - Data platform teams that run freshness and reconciliation checks next to their ELT pipelines.
+    - BI operations leads who want a Slack signal before stakeholders spot a wrong number.
+
+    ## Why orchestrate this with Kestra
+    A one off script can call two APIs, but it cannot retry a flaky Metabase request, branch on a verdict, or leave an audit trail behind every comparison. Kestra puts the schedule, the webhook, the secrets, the branch, and the notifications in one versioned file, so the guard is reviewed like any other change. The `If` branch keeps a healthy run quiet and an unhealthy run loud, the `errors` handler catches crashes in the guard itself, and every execution stores the exact numbers that were compared.
+
+    ## Prerequisites
+    - A Metabase instance with an API key and a dashboard whose first card returns `row_count`, `revenue_total`, and `updated_at`, or adapt the two queries to your column names.
+    - A Postgres warehouse with a `public.fact_orders` table holding `order_total` and `updated_at`.
+    - Network access from the Kestra worker to Metabase, to Postgres, and to Slack.
+    - Python 3 available on the Kestra worker for the two script steps.
+
+    ### Secrets
+    - `METABASE_API_KEY`: Metabase API key sent as the `X-API-KEY` header.
+    - `POSTGRES_JDBC_URL`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`: warehouse connection details used by the KPI query.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the alert, the all clear note, and the failure message.
+    - `METABASE_GUARD_WEBHOOK_KEY`: key segment of the on demand webhook URL.
+
+    ## Quick start
+    1. Add the five secrets above to your Kestra namespace.
+    2. Set `metabase_url` and `dashboard_id`, then choose a `staleness_threshold_minutes` that matches your load cadence.
+    3. Run the flow once by hand and read the `verdict` output before trusting the branch.
+    4. Enable the schedule by flipping the trigger, for example:
+
+    ```yaml
+    triggers:
+      - id: hourly_consistency_check
+        type: io.kestra.plugin.core.trigger.Schedule
+        cron: "0 */6 * * *"
+        disabled: false
+    ```
+
+    5. Or call the webhook directly from a shell:
+
+    ```bash
+    curl -X POST https://<your-kestra-host>/api/v1/executions/webhook/company.team/metabase-dashboard-ops-guard/<METABASE_GUARD_WEBHOOK_KEY>
+    ```
+
+    ## How to extend
+    - Point the warehouse query at a different table or add more KPI columns, then map the new fields inside `check_consistency`.
+    - Alert a second channel by adding another Slack task to the `then` branch, or route the verdict through a subflow.
+    - Replace `all_clear_note` with `io.kestra.plugin.core.log.Log` when a clean run should stay silent in Slack.
+    - Add `io.kestra.plugin.core.execution.Fail` after `alert_drift` when a drift verdict should turn the whole execution red for downstream gates.
+
+    ## Links
+    - Metabase API documentation: https://www.metabase.com/docs/latest/api
+    - Metabase query caching guide: https://www.metabase.com/docs/latest/configuring-metabase/caching
+    - PostgreSQL plugin documentation: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Business
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Reporting & Digests
+  ee: false
+  demo: false
