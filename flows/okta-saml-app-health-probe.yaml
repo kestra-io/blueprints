@@ -1,0 +1,479 @@
+id: okta-saml-app-health-probe
+namespace: company.team
+description: |
+  Probe the health of SAML single sign-on applications in an Okta org on a daily
+  schedule. The flow inventories apps through the Okta API, scores certificate
+  expiry, assignment, status, and sign-on mode signals, and escalates findings
+  through a GitHub issue and a Slack warning.
+
+triggers:
+  - id: daily_probe
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Run the probe every day at 06:00 UTC. Shipped disabled so the thresholds and the escalation path can be reviewed before it runs unattended.
+    cron: "0 6 * * *"
+    disabled: true
+
+inputs:
+  - id: days_warn_threshold
+    type: INT
+    description: Warn when a signing certificate expires within this many days of the probe run.
+    defaults: 30
+  - id: okta_org_url
+    type: STRING
+    description: Base URL of the Okta org, for example https://your-org.okta.com.
+    defaults: https://your-org.okta.com
+  - id: github_repository
+    type: STRING
+    description: Repository that receives the issue when the probe finds problems, written as owner/repo.
+    defaults: your-org/identity-ops
+
+tasks:
+  # --- 1. inventory ---
+  - id: list_saml_apps
+    type: io.kestra.plugin.core.http.Request
+    description: List every application in the org with the SSWS API token so the assessment sees status, sign-on mode, signing metadata, and settings in one payload.
+    uri: "{{ inputs.okta_org_url }}/api/v1/apps?limit=200"
+    method: GET
+    headers:
+      Authorization: "SSWS {{ secret('OKTA_API_TOKEN') }}"
+      Accept: application/json
+
+  # --- 2. assessment ---
+  - id: assess_saml_apps
+    type: io.kestra.plugin.scripts.python.Script
+    description: Keep the SAML apps, score certificate expiry, zero assignees, recent disables, and sign-on mode anomalies, then publish verdict, expired_soon, and dead_apps through the outputs protocol.
+    inputFiles:
+      apps.json: "{{ outputs.list_saml_apps.body }}"
+    script: |
+      import json
+      from datetime import datetime, timedelta, timezone
+
+      OKTA_ORG_URL = "{{ inputs.okta_org_url }}".rstrip("/")
+      DAYS_WARN = int({{ inputs.days_warn_threshold }})
+      RECENTLY_DISABLED_DAYS = 30
+      SAML_MODES = ("SAML_2_0", "SAML_1_1")
+      DEPRECATED_SAML_MODES = ("SAML_1_1",)
+      KNOWN_MODES = (
+          "SAML_2_0", "SAML_1_1", "BOOKMARK", "AUTO_LOGIN", "BASIC_AUTH",
+          "BROWSER_PLUGIN", "SECURE_PASSWORD_STORE", "FEDERATION_PROXY",
+          "HEADER_PROPAGATION", "IWA", "CUSTOM", "OPENID_CONNECT",
+          "WS_FEDERATION", "PASSWORD_VAULT", "FACTOR_ADMIN", "FACTOR_ENROLL",
+      )
+      SAML_HINT_KEYS = ("ssoAcsUrl", "audienceUri", "idpIssuer", "ssoStatement")
+      DATE_KEYS = ("notAfter", "expiresAt", "certNotAfter", "certExpiresAt", "expires_at", "not_after")
+      NESTED_KEY_KEYS = ("signing", "keyCredentials", "certificates", "signingKeys", "keys")
+      ASSIGNEE_COUNT_KEYS = ("assigneeCount", "assignedUserCount", "assignedCount", "userCount")
+      ASSIGNEE_LIST_KEYS = ("assignments", "users", "groups")
+      DISABLED_STATUSES = ("INACTIVE", "DELETED")
+      def load_apps():
+          try:
+              with open("apps.json", "r", encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except (OSError, ValueError):
+              return []
+          if isinstance(payload, dict):
+              nested = None
+              for key in ("apps", "items", "results"):
+                  if isinstance(payload.get(key), list):
+                      nested = payload.get(key)
+                      break
+              payload = nested
+          if not isinstance(payload, list):
+              return []
+          return [entry for entry in payload if isinstance(entry, dict)]
+
+
+      def parse_when(value):
+          if not isinstance(value, str):
+              return None
+          text = value.strip()
+          if not text:
+              return None
+          if text.endswith("Z"):
+              text = text[:-1] + "+00:00"
+          if len(text) == 10 and text[4] == "-" and text[7] == "-":
+              text = text + "T00:00:00+00:00"
+          try:
+              moment = datetime.fromisoformat(text)
+          except ValueError:
+              return None
+          if moment.tzinfo is None:
+              moment = moment.replace(tzinfo=timezone.utc)
+          return moment
+
+
+      def collect_dates(node, found, depth=0):
+          if depth > 3:
+              return
+          if isinstance(node, dict):
+              for key in DATE_KEYS:
+                  if key in node:
+                      found.append(node.get(key))
+              for key in NESTED_KEY_KEYS:
+                  if key in node:
+                      collect_dates(node.get(key), found, depth + 1)
+          elif isinstance(node, list):
+              for item in node:
+                  collect_dates(item, found, depth + 1)
+
+
+      def cert_expiry(app):
+          found = []
+          for key in ("certNotAfter", "notAfter", "certExpiresAt", "expiresAt"):
+              if key in app:
+                  found.append(app.get(key))
+          for key in ("credentials", "keyCredentials", "certificate", "signingCert", "signingCertificate"):
+              collect_dates(app.get(key), found)
+          moments = [moment for moment in (parse_when(value) for value in found) if moment is not None]
+          if not moments:
+              return None
+          return min(moments)
+
+
+      def assignee_count(app):
+          for key in ASSIGNEE_COUNT_KEYS:
+              value = app.get(key)
+              if isinstance(value, bool):
+                  continue
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and value.strip().isdigit():
+                  return int(value.strip())
+          for key in ASSIGNEE_LIST_KEYS:
+              value = app.get(key)
+              if isinstance(value, list):
+                  return len(value)
+              if isinstance(value, dict) and isinstance(value.get("count"), int):
+                  return value.get("count")
+          return None
+      def signon_settings(app):
+          settings = app.get("settings")
+          if not isinstance(settings, dict):
+              return {}
+          signon = settings.get("signOn")
+          return signon if isinstance(signon, dict) else {}
+
+
+      def has_saml_hints(app):
+          signon = signon_settings(app)
+          return any(signon.get(key) for key in SAML_HINT_KEYS)
+
+
+      def signon_mode(app):
+          return str(app.get("signOnMode") or "").strip()
+
+
+      def app_status(app):
+          return str(app.get("status") or "").strip().upper()
+
+
+      def last_change(app):
+          for key in ("statusChanged", "lastUpdated", "created", "activated"):
+              moment = parse_when(app.get(key))
+              if moment is not None:
+                  return moment
+          return None
+
+
+      def signon_reasons(app, mode):
+          reasons = []
+          if not mode:
+              reasons.append("missing_signon_mode")
+          elif mode not in KNOWN_MODES:
+              reasons.append("unknown_signon_mode")
+          elif mode in DEPRECATED_SAML_MODES:
+              reasons.append("deprecated_signon_mode")
+          elif mode != "SAML_2_0" and has_saml_hints(app):
+              reasons.append("signon_mode_mismatch")
+          if mode == "SAML_2_0":
+              signon = signon_settings(app)
+              if not (signon.get("ssoAcsUrl") or signon.get("audienceUri")):
+                  reasons.append("missing_saml_endpoints")
+          return reasons
+
+
+      def label_of(app):
+          return str(app.get("label") or app.get("id") or "unnamed app")
+
+
+      def admin_link(app):
+          app_id = str(app.get("id") or "")
+          if not app_id:
+              return OKTA_ORG_URL
+          return OKTA_ORG_URL + "/admin/app/" + app_id
+
+
+      def expired_markdown(entries):
+          if not entries:
+              return "- none"
+          lines = []
+          for entry in entries:
+              note = " (already expired)" if entry["already_expired"] else ""
+              lines.append(
+                  "- " + entry["label"] + ": " + entry["expires_at"]
+                  + ", " + str(entry["days_left"]) + " day(s) left" + note
+              )
+          return "\n".join(lines)
+
+
+      def dead_markdown(entries):
+          if not entries:
+              return "- none"
+          return "\n".join(
+              "- " + entry["label"] + " (" + entry["status"] + "): " + entry["reason_text"]
+              for entry in entries
+          )
+      apps = load_apps()
+      now = datetime.now(timezone.utc)
+      warn_cutoff = now + timedelta(days=DAYS_WARN)
+      disabled_cutoff = now - timedelta(days=RECENTLY_DISABLED_DAYS)
+
+      expired_soon = []
+      dead_apps = []
+      saml_app_count = 0
+      skipped_apps = 0
+      cert_date_missing = 0
+
+      for app in apps:
+          mode = signon_mode(app)
+          if mode not in SAML_MODES and not has_saml_hints(app):
+              skipped_apps += 1
+              continue
+          saml_app_count += 1
+
+          base = {
+              "label": label_of(app),
+              "app_id": str(app.get("id") or ""),
+              "admin_link": admin_link(app),
+          }
+
+          expiry = cert_expiry(app)
+          if expiry is None:
+              cert_date_missing += 1
+          elif expiry <= warn_cutoff:
+              record = dict(base)
+              record.update({
+                  "expires_at": expiry.isoformat(timespec="seconds"),
+                  "days_left": int((expiry - now).total_seconds() // 86400),
+                  "already_expired": bool(expiry <= now),
+              })
+              expired_soon.append(record)
+
+          reasons = []
+          count = assignee_count(app)
+          if count == 0:
+              reasons.append("zero_assignees")
+          status = app_status(app)
+          if status in DISABLED_STATUSES:
+              changed = last_change(app)
+              if changed is not None and disabled_cutoff <= changed <= now:
+                  reasons.append("recently_disabled")
+          reasons.extend(signon_reasons(app, mode))
+          if reasons:
+              dead = dict(base)
+              dead.update({
+                  "status": status or "UNKNOWN",
+                  "assignee_count": count,
+                  "reasons": reasons,
+                  "reason_text": ", ".join(reasons),
+              })
+              dead_apps.append(dead)
+
+      expired_soon.sort(key=lambda item: (item["days_left"], item["label"]))
+      dead_apps.sort(key=lambda item: item["label"])
+
+      issue_count = len(expired_soon) + len(dead_apps)
+      verdict = "action_required" if issue_count else "clean"
+
+      bits = []
+      if expired_soon:
+          bits.append(str(len(expired_soon)) + " app(s) with certificate expiry within " + str(DAYS_WARN) + " day(s)")
+      if dead_apps:
+          bits.append(str(len(dead_apps)) + " app(s) disabled, unassigned, or misconfigured")
+      summary = "; ".join(bits) if bits else "no issues found"
+      summary = summary.replace('"', "'").replace("\n", " ")
+
+      payload = {
+          "outputs": {
+              "verdict": verdict,
+              "checked_at": now.isoformat(timespec="seconds"),
+              "org_url": OKTA_ORG_URL,
+              "warn_days": DAYS_WARN,
+              "app_count": len(apps),
+              "saml_app_count": saml_app_count,
+              "skipped_apps": skipped_apps,
+              "cert_date_missing": cert_date_missing,
+              "expired_count": len(expired_soon),
+              "dead_count": len(dead_apps),
+              "issue_count": issue_count,
+              "expired_soon": expired_soon,
+              "dead_apps": dead_apps,
+              "expired_list_md": expired_markdown(expired_soon),
+              "dead_list_md": dead_markdown(dead_apps),
+              "summary": summary,
+          }
+      }
+      print("::" + json.dumps(payload) + "::")
+
+  # --- 3. escalate or record the all-clear ---
+  - id: issue_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Escalate when the assessment found at least one certificate or app configuration problem, otherwise record a clean probe run.
+    condition: "{{ outputs.assess_saml_apps.vars.issue_count > 0 }}"
+    then:
+      - id: create_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: Open a labeled GitHub issue carrying both lists so the finding lands in the backlog the identity team already works from.
+        jwtToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "Okta SAML app health probe found {{ outputs.assess_saml_apps.vars.issue_count }} issue(s)"
+        body: |
+          ## Okta SAML app health probe
+
+          Verdict {{ outputs.assess_saml_apps.vars.verdict }} for {{ inputs.okta_org_url }}, checked at {{ outputs.assess_saml_apps.vars.checked_at }}.
+
+          Scanned {{ outputs.assess_saml_apps.vars.app_count }} app(s): {{ outputs.assess_saml_apps.vars.saml_app_count }} SAML, {{ outputs.assess_saml_apps.vars.skipped_apps }} skipped as non-SAML.
+
+          ### Certificates expiring within {{ inputs.days_warn_threshold }} day(s)
+
+          {{ outputs.assess_saml_apps.vars.expired_list_md }}
+
+          ### Dead or misconfigured apps
+
+          {{ outputs.assess_saml_apps.vars.dead_list_md }}
+
+          Execution {{ execution.id }}
+        labels:
+          - okta
+          - saml
+          - sso
+      - id: alert_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Warn the identity channel with the verdict, the summary, and the certificate and app finding counts.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Okta SAML app health probe verdict {{ outputs.assess_saml_apps.vars.verdict }} for {{ inputs.okta_org_url }}: {{ outputs.assess_saml_apps.vars.summary }}. Certificate findings {{ outputs.assess_saml_apps.vars.expired_count }}, app findings {{ outputs.assess_saml_apps.vars.dead_count }}. A GitHub issue is open in {{ inputs.github_repository }}. Execution {{ execution.id }}."
+          }
+    else:
+      - id: log_all_clear
+        type: io.kestra.plugin.core.log.Log
+        description: Record the clean run so execution history proves the probe checked the org today.
+        message: "Okta SAML app health probe found no issues across {{ outputs.assess_saml_apps.vars.saml_app_count }} SAML app(s) in {{ inputs.okta_org_url }}."
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when the probe itself breaks, because a failed probe looks identical to a healthy org.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED {{ flow.id }} run {{ execution.id }} - the Okta SAML app health probe stopped before it could verdict {{ inputs.okta_org_url }}."}
+
+outputs:
+  - id: verdict
+    type: STRING
+    description: Either clean when nothing needed attention or action_required when the probe found a problem.
+    value: "{{ outputs.assess_saml_apps.vars.verdict }}"
+  - id: expired_soon
+    type: JSON
+    description: Certificate expiry findings ordered most urgent first and serialized as JSON.
+    value: "{{ outputs.assess_saml_apps.vars.expired_soon | toJson }}"
+  - id: dead_apps
+    type: JSON
+    description: Dead or misconfigured apps with the reasons that flagged each one, serialized as JSON.
+    value: "{{ outputs.assess_saml_apps.vars.dead_apps | toJson }}"
+  - id: checked_at
+    type: STRING
+    description: UTC timestamp of the probe assessment.
+    value: "{{ outputs.assess_saml_apps.vars.checked_at }}"
+
+extend:
+  title: Okta SAML SSO App Certificate and Configuration Health Probe
+  metaTitle: Daily Okta SAML App Health Probe with Kestra
+  shortDescription: List every Okta app on a schedule, flag SAML apps with expiring signing certificates, zero assignees, recent disables, or sign-on mode anomalies, and escalate through a GitHub issue and a Slack warning.
+  metaDescription: Probe Okta SAML apps for expiring signing certificates, zero assignees, recent disables, and sign-on mode anomalies, then open a GitHub issue and warn Slack.
+  description: |
+    Okta SAML apps break quietly: a signing certificate lapses over a long weekend, a team reorg leaves an app with nobody assigned, or a sign-on mode gets flipped during a migration and nobody notices until partner logins fail. This probe runs on a schedule, asks the Okta Applications API for the whole inventory, and reduces the response to a verdict, a certificate expiry list, and a list of dead or misconfigured apps. Anything it finds becomes a labeled GitHub issue plus a Slack warning, while a clean day simply records itself as a green execution with outputs that prove the check ran.
+
+    ## How it works
+
+    1. The `daily_probe` trigger (`io.kestra.plugin.core.trigger.Schedule`, cron `0 6 * * *`, shipped with `disabled: true`) starts the probe every day at 06:00 UTC once you enable it.
+    2. `list_saml_apps` (`io.kestra.plugin.core.http.Request`) calls `GET /api/v1/apps?limit=200` on `{{ inputs.okta_org_url }}` with an `SSWS` header built from the `OKTA_API_TOKEN` secret, returning status, sign-on mode, signing metadata, and settings for every app in the org.
+    3. `assess_saml_apps` (`io.kestra.plugin.scripts.python.Script`) keeps the apps that are SAML, either because `signOnMode` says so or because `settings.signOn` still carries an ACS URL or an audience, and scores each one against four rules: certificate `notAfter` or `expiresAt` dates inside `days_warn_threshold`, zero known assignees, apps disabled within the last 30 days, and sign-on anomalies such as a deprecated `SAML_1_1` app, a bookmark app that still exposes SAML endpoints, or a `SAML_2_0` app with no audience or ACS URL. Results are published through the `::json::` output protocol as `verdict`, `expired_soon`, `dead_apps`, and `checked_at`.
+    4. `issue_gate` (`io.kestra.plugin.core.flow.If`) branches on `issue_count`. When it is over zero, `create_issue` (`io.kestra.plugin.github.issues.Create`) opens an issue in `github_repository` with both lists rendered as markdown and `alert_slack` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts the verdict and summary; otherwise `log_all_clear` records the all-clear.
+    5. The `errors` handler posts to Slack if any step fails, because a probe that crashed looks identical to a probe that found nothing.
+
+    ## What you get
+
+    - A verdict of `clean` or `action_required` on every run, with the counts behind it exposed as flow outputs.
+    - An `expired_soon` list carrying the app label, the certificate date, the days remaining, and an admin console link, ordered most urgent first.
+    - A `dead_apps` list where every entry states its reasons, which are `zero_assignees`, `recently_disabled`, `deprecated_signon_mode`, `signon_mode_mismatch`, `missing_signon_mode`, `unknown_signon_mode`, or `missing_saml_endpoints`.
+    - A labeled GitHub issue with both lists whenever the probe finds anything, so the work lands in the same backlog as everything else the team tracks.
+    - A Slack warning carrying the verdict and a one line summary, plus a separate Slack alert if the probe itself fails.
+    - A dated execution history that doubles as evidence the SAML estate was actually checked.
+
+    ## Who it's for
+
+    - Identity and access engineers who own SSO application configuration in Okta and want certificate lapses surfaced before users notice them.
+    - Security teams that need proof the SAML estate was checked every day rather than only when a partner reports a login failure.
+    - Platform teams that already keep infrastructure in Git and prefer a reviewed YAML file to a spreadsheet of app owners and renewal dates.
+    - Small IT groups without a dedicated IdP administrator, where certificate rotation currently depends on one person remembering.
+
+    ## Why orchestrate this with Kestra
+
+    The probe is an API call and a small script, but the value sits in the loop around them: a schedule that cannot be forgotten, a branch that separates escalation from the all-clear, an issue, an alert, and a history that proves the check ran. A cron job on a laptop can fetch the same JSON, yet it cannot open a tracked issue, notify a channel, retry a transient API failure, or show an auditor when the last probe ran. Keeping the rules, the thresholds, and the escalation in one versioned file means a threshold change becomes a reviewed pull request instead of an undocumented edit. This flow also stays deliberately separate from a quarterly entitlement recertification campaign: that one reviews which people hold which directory groups, while this one watches SSO application configuration and certificate health every day.
+
+    ## Prerequisites
+
+    - An Okta org whose API token can read applications, which is the `okta.apps.read` scope when you use a scoped OAuth token or a classic API token with read access to apps.
+    - Certificate and assignment fields vary by app type, so the probe evaluates a certificate date when the inventory carries `notAfter` or `expiresAt` under `credentials`, and an assignee count when it carries one of the common count or list fields.
+    - A GitHub repository where the provided token is allowed to open issues, named through the `github_repository` input.
+    - A Slack incoming webhook for the warning and the failure alert.
+    - A Python runner available to Kestra for the assessment task.
+
+    ### Secrets
+
+    - `OKTA_API_TOKEN`: Okta API token sent as an `SSWS` header when listing applications.
+    - `GITHUB_TOKEN`: token used to open the issue, with permission to create issues in the target repository.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL used for warnings and failure alerts.
+
+    ## Quick start
+
+    1. Add the three secrets above to the `company.team` namespace in Kestra under Settings, then Secrets.
+    2. Point `okta_org_url` at your org and set `github_repository` to the `owner/repo` that should receive findings.
+    3. Run the flow once by hand and confirm the verdict output, the two lists, and either the new issue or the all-clear log line.
+    4. Enable the schedule when you are happy with the result. The block to enable is this one, shipped disabled so nothing fires during review:
+
+    ```yaml
+    triggers:
+      - id: daily_probe
+        type: io.kestra.plugin.core.trigger.Schedule
+        cron: "0 6 * * *"
+        disabled: true
+    ```
+
+    5. Leave it enabled and the daily run keeps the certificate and configuration picture current without anyone opening the Okta admin console.
+
+    ## How to extend
+
+    - Raise or lower `days_warn_threshold` per environment, since a 30 day horizon suits production SAML apps while an internal tool can live with less warning.
+    - Fetch exact signing certificate dates per app with `GET /api/v1/apps/{appId}/credentials/keys` and assignment counts with `GET /api/v1/apps/{appId}/users`, then merge them into `apps.json` before the assessment for full coverage on large orgs.
+    - Lower `RECENTLY_DISABLED_DAYS` inside the assessment script to catch disabled apps sooner, or raise it to report only fresh deactivations.
+    - Route findings to the app owner by mapping app labels to a team list and naming that team in the issue body.
+    - Replace the GitHub issue with a Jira or Linear ticket by swapping `create_issue` for the matching plugin task.
+    - Follow the Okta pagination cursor in a loop when the org has more than 200 applications, so the inventory stays complete.
+
+    ## Links
+
+    - Okta API reference: https://developer.okta.com/docs/api/
+    - GitHub plugin docs: https://kestra.io/plugins/plugin-github
+    - Schedules trigger docs: https://kestra.io/docs/workflow-components/triggers
+  tags:
+    - Infrastructure
+    - System
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
+
