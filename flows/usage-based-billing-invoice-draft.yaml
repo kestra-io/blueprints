@@ -1,0 +1,554 @@
+id: usage-based-billing-invoice-draft
+namespace: company.team
+description: |
+  Draft month end usage based invoices from Postgres metered events. Aggregate per
+  customer billable units, apply plan tiers and overage, hold the draft on usage
+  anomalies with a Slack alert, and email the invoice CSV to finance when clean.
+
+inputs:
+  - id: billing_month
+    type: STRING
+    displayName: Billing month
+    description: Period to draft as YYYY-MM. Leave empty to draft the month at run time.
+    defaults: ""
+
+  - id: hold_on_anomaly
+    type: BOOL
+    displayName: Hold on anomaly
+    description: When true, any usage anomaly holds the draft and posts a Slack alert instead of emailing finance.
+    defaults: true
+
+  - id: pricing_tiers
+    type: JSON
+    displayName: Plan pricing tiers
+    description: Tier table with included units, base price and overage unit price per plan, used to price each customer's billable units.
+    defaults: |
+      {
+        "currency": "USD",
+        "tiers": [
+          {"plan": "starter", "included_units": 1000, "base_price": 49.0, "overage_unit_price": 0.02},
+          {"plan": "growth", "included_units": 10000, "base_price": 299.0, "overage_unit_price": 0.01},
+          {"plan": "scale", "included_units": 100000, "base_price": 999.0, "overage_unit_price": 0.005}
+        ]
+      }
+
+variables:
+  variance_threshold_pct: "25"
+
+triggers:
+  - id: month_end_draft
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 28 * *"
+    disabled: true
+    description: Start the draft run on the 28th of each month so finance reviews it before the books close. Enable after the schema and secrets exist.
+
+tasks:
+  # --- 1. pull metered usage and the prior month baseline ---
+  - id: pull_usage_events
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Pull one raw metered usage row per customer and day for the billing period, carrying plan and source so the pricing step can group and triage them.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      WITH bounds AS (
+        SELECT date_trunc('month', COALESCE(NULLIF(:billing_month, '') || '-01', CURRENT_DATE::text)::date)::date AS start_date
+      )
+      SELECT
+        e.customer_id,
+        e.event_day,
+        e.units,
+        e.plan,
+        e.source
+      FROM public.metered_usage_events e
+      CROSS JOIN bounds b
+      WHERE e.event_day >= b.start_date
+        AND e.event_day < (b.start_date + INTERVAL '1 month')::date
+      ORDER BY e.customer_id, e.event_day;
+    parameters:
+      billing_month: "{{ inputs.billing_month }}"
+
+  - id: pull_prior_totals
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Pull last month's finalized per customer totals so the gate compares this draft against what customers were actually billed before.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      WITH bounds AS (
+        SELECT date_trunc('month', COALESCE(NULLIF(:billing_month, '') || '-01', CURRENT_DATE::text)::date)::date AS start_date
+      )
+      SELECT
+        t.customer_id,
+        t.total_amount AS prior_total
+      FROM public.customer_monthly_totals t
+      CROSS JOIN bounds b
+      WHERE t.billing_month = to_char((b.start_date - INTERVAL '1 month')::date, 'YYYY-MM')
+      ORDER BY t.customer_id;
+    parameters:
+      billing_month: "{{ inputs.billing_month }}"
+
+  # --- 2. price the draft and detect usage anomalies ---
+  - id: compute_invoice_draft
+    type: io.kestra.plugin.scripts.python.Script
+    description: Aggregate billable units per customer, apply the tier table and overage rates, check missing days, negative units and baseline variance, write the draft CSV, and emit the invoice lines through the JSON output protocol.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.12-slim
+    outputFiles:
+      - invoice_draft.csv
+    inputFiles:
+      usage_events.json: "{{ outputs.pull_usage_events.rows | json }}"
+      prior_totals.json: "{{ outputs.pull_prior_totals.rows | json }}"
+      tiers.json: "{{ inputs.pricing_tiers | toJson }}"
+      config.json: |
+        {
+          "billing_month": "{{ inputs.billing_month }}",
+          "hold_on_anomaly": "{{ inputs.hold_on_anomaly }}",
+          "variance_threshold_pct": "{{ vars.variance_threshold_pct }}"
+        }
+    script: |
+      import calendar
+      import csv
+      import hashlib
+      import json
+      import re
+      from datetime import date
+
+      DEFAULT_TIERS = {
+          "currency": "USD",
+          "tiers": [
+              {"plan": "starter", "included_units": 1000, "base_price": 49.0, "overage_unit_price": 0.02},
+              {"plan": "growth", "included_units": 10000, "base_price": 299.0, "overage_unit_price": 0.01},
+              {"plan": "scale", "included_units": 100000, "base_price": 999.0, "overage_unit_price": 0.005}
+          ]
+      }
+
+      def read_text(name):
+          try:
+              with open(name, "r", encoding="utf-8") as handle:
+                  return handle.read()
+          except OSError:
+              return None
+
+      def load_payload(name, fallback):
+          raw = read_text(name)
+          if raw is None:
+              return fallback, "missing_file"
+          if not raw.strip():
+              return fallback, "empty_file"
+          try:
+              value = json.loads(raw)
+          except ValueError:
+              return fallback, "malformed_json"
+          if isinstance(value, str):
+              try:
+                  value = json.loads(value)
+              except ValueError:
+                  return fallback, "string_payload"
+          return value, "ok"
+
+      def safe_id(value):
+          return re.sub(r"[^A-Za-z0-9_.-]", "", str(value))[:64]
+
+      def as_float(value, default=0.0):
+          try:
+              return float(value)
+          except (TypeError, ValueError):
+              return default
+
+      def as_bool(value, default=True):
+          if isinstance(value, bool):
+              return value
+          if value is None:
+              return default
+          text = str(value).strip().lower()
+          if text in ("true", "1", "yes", "on"):
+              return True
+          if text in ("false", "0", "no", "off"):
+              return False
+          return default
+
+      anomalies = []
+
+      config, config_state = load_payload("config.json", {})
+      if not isinstance(config, dict):
+          config = {}
+          anomalies.append("config_not_an_object")
+      elif config_state != "ok":
+          anomalies.append("config_" + config_state)
+
+      billing_month = str(config.get("billing_month") or "").strip()
+      hold_on_anomaly = as_bool(config.get("hold_on_anomaly"), True)
+      threshold_pct = as_float(config.get("variance_threshold_pct"), 25.0)
+
+      month_pattern = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+      month_ok = month_pattern.match(billing_month) is not None
+      today = date.today()
+
+      if billing_month and not month_ok:
+          anomalies.append("invalid_billing_month:" + safe_id(billing_month))
+
+      if month_ok:
+          year = int(billing_month[:4])
+          month = int(billing_month[5:7])
+      else:
+          year = today.year
+          month = today.month
+
+      billing_month_resolved = "%04d-%02d" % (year, month)
+      start = date(year, month, 1)
+      last_day = calendar.monthrange(year, month)[1]
+      month_end = date(year, month, last_day)
+      next_month = date(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1)
+      period_complete = next_month <= today
+
+      if start > today:
+          anomalies.append("billing_month_in_future:" + billing_month_resolved)
+
+      expected_last = month_end if period_complete else min(today, month_end)
+      expected_days = max(0, (expected_last - start).days + 1)
+
+      events, events_state = load_payload("usage_events.json", [])
+      if events_state != "ok":
+          anomalies.append("usage_feed_" + events_state)
+      if not isinstance(events, list):
+          events = []
+          if events_state == "ok":
+              anomalies.append("usage_feed_not_a_list")
+      if not events:
+          anomalies.append("usage_feed_empty")
+
+      prior_raw, prior_state = load_payload("prior_totals.json", [])
+      if prior_state != "ok":
+          anomalies.append("baseline_" + prior_state)
+      if not isinstance(prior_raw, list):
+          prior_raw = []
+          if prior_state == "ok":
+              anomalies.append("baseline_not_a_list")
+
+      tiers_payload, tiers_state = load_payload("tiers.json", DEFAULT_TIERS)
+      if tiers_state != "ok":
+          anomalies.append("tier_table_" + tiers_state)
+          tiers_payload = DEFAULT_TIERS
+      if not isinstance(tiers_payload, dict):
+          anomalies.append("tier_table_not_an_object")
+          tiers_payload = DEFAULT_TIERS
+
+      tier_cfg = tiers_payload
+      default_currency = str(DEFAULT_TIERS["currency"])
+      currency = str(tier_cfg.get("currency") or default_currency).strip().upper() or default_currency
+
+      tier_list = tier_cfg.get("tiers")
+      if not isinstance(tier_list, list) or not tier_list:
+          tier_list = DEFAULT_TIERS["tiers"]
+          if tiers_state == "ok" and isinstance(tiers_payload, dict):
+              anomalies.append("tier_table_empty")
+
+      plan_map = {}
+      for tier in tier_list:
+          if isinstance(tier, dict) and str(tier.get("plan") or "").strip():
+              plan_map[str(tier.get("plan")).strip().lower()] = tier
+
+      customers = {}
+      observed_days = set()
+      negative_rows = 0
+      unparsed_rows = 0
+      outside_period_rows = 0
+
+      for row in events:
+          if not isinstance(row, dict):
+              unparsed_rows += 1
+              continue
+          cid = safe_id(row.get("customer_id") or "")
+          if not cid:
+              unparsed_rows += 1
+              continue
+          try:
+              units = float(row.get("units"))
+          except (TypeError, ValueError):
+              unparsed_rows += 1
+              units = 0.0
+          if units < 0:
+              negative_rows += 1
+          plan = str(row.get("plan") or "").strip().lower()
+          source = str(row.get("source") or "").strip() or "unknown"
+          day_raw = str(row.get("event_day") or "")
+          event_day = None
+          if len(day_raw) >= 10:
+              try:
+                  event_day = date(int(day_raw[:4]), int(day_raw[5:7]), int(day_raw[8:10]))
+              except ValueError:
+                  event_day = None
+          if event_day is None:
+              unparsed_rows += 1
+          elif start <= event_day <= expected_last:
+              observed_days.add(event_day)
+          else:
+              outside_period_rows += 1
+          entry = customers.setdefault(cid, {"units": 0.0, "plan": "", "sources": set()})
+          entry["units"] += units
+          if plan:
+              entry["plan"] = plan
+          entry["sources"].add(source)
+
+      missing_days = max(0, expected_days - len(observed_days))
+      if missing_days > 0:
+          anomalies.append("missing_usage_days:%d of %d expected" % (missing_days, expected_days))
+      if negative_rows > 0:
+          anomalies.append("negative_units:%d rows" % negative_rows)
+      if unparsed_rows > 0:
+          anomalies.append("unparsable_usage_rows:%d" % unparsed_rows)
+      if outside_period_rows > 0:
+          anomalies.append("usage_rows_outside_period:%d" % outside_period_rows)
+
+      prior_map = {}
+      for row in prior_raw:
+          if not isinstance(row, dict):
+              continue
+          cid = safe_id(row.get("customer_id") or "")
+          if not cid:
+              continue
+          prior_map[cid] = as_float(row.get("prior_total"), 0.0)
+
+      invoice_lines = []
+      unknown_plans = []
+      for cid in sorted(customers):
+          info = customers[cid]
+          plan = info["plan"] or "unknown"
+          tier = plan_map.get(plan)
+          units = round(info["units"], 3)
+          if tier is None:
+              unknown_plans.append(cid)
+              base = 0.0
+              overage = 0.0
+              line_currency = currency
+          else:
+              base = round(as_float(tier.get("base_price"), 0.0), 2)
+              included = as_float(tier.get("included_units"), 0.0)
+              rate = as_float(tier.get("overage_unit_price"), 0.0)
+              overage = round(max(0.0, units - included) * rate, 2)
+              line_currency = str(tier.get("currency") or currency).strip().upper() or currency
+          invoice_lines.append({
+              "customer_id": cid,
+              "plan": plan,
+              "units": units,
+              "base": base,
+              "overage": overage,
+              "total": round(base + overage, 2),
+              "currency": line_currency
+          })
+      if unknown_plans:
+          anomalies.append("unknown_plan:" + ",".join(sorted(unknown_plans)[:8]))
+
+      variance_breaches = 0
+      if period_complete:
+          for line in invoice_lines:
+              prior = prior_map.get(line["customer_id"])
+              if prior is None or prior <= 0:
+                  continue
+              signed_pct = (line["total"] - prior) / prior * 100.0
+              if abs(signed_pct) > threshold_pct:
+                  variance_breaches += 1
+                  anomalies.append("variance:%s:%+.1f%%" % (line["customer_id"], signed_pct))
+
+      total_billable_units = round(sum(c["units"] for c in customers.values()), 3)
+      draft_total = round(sum(line["total"] for line in invoice_lines), 2)
+      prior_total = round(sum(prior_map.values()), 2)
+      total_mrr_delta = "%.2f" % round(draft_total - prior_total, 2)
+
+      digest = hashlib.sha1(json.dumps(invoice_lines, sort_keys=True).encode("utf-8")).hexdigest()[:8].upper()
+      draft_id = "DRAFT-%s-%s" % (billing_month_resolved, digest)
+
+      hold = bool(anomalies) and hold_on_anomaly
+      anomaly_count = len(anomalies)
+      anomalies_text = "; ".join(anomalies[:12])[:800] if anomalies else "none"
+
+      with open("invoice_draft.csv", "w", newline="", encoding="utf-8") as handle:
+          writer = csv.writer(handle)
+          writer.writerow(["customer_id", "plan", "units", "base", "overage", "total", "currency"])
+          for line in invoice_lines:
+              writer.writerow([line["customer_id"], line["plan"], line["units"], line["base"],
+                               line["overage"], line["total"], line["currency"]])
+
+      payload = {
+          "hold": hold,
+          "hold_on_anomaly": hold_on_anomaly,
+          "billing_month": billing_month_resolved,
+          "period_complete": period_complete,
+          "expected_days": expected_days,
+          "missing_days": missing_days,
+          "negative_rows": negative_rows,
+          "unparsed_rows": unparsed_rows,
+          "outside_period_rows": outside_period_rows,
+          "variance_breaches": variance_breaches,
+          "variance_threshold_pct": threshold_pct,
+          "anomaly_count": anomaly_count,
+          "anomalies": anomalies[:20],
+          "anomalies_text": anomalies_text,
+          "customer_count": len(invoice_lines),
+          "total_billable_units": total_billable_units,
+          "currency": currency,
+          "draft_total": draft_total,
+          "prior_total": prior_total,
+          "total_mrr_delta": total_mrr_delta,
+          "draft_id": draft_id,
+          "invoice_lines": invoice_lines
+      }
+      print("::" + json.dumps({"outputs": payload}) + "::")
+      print("draft=%s month=%s lines=%d hold=%s anomalies=%d" % (
+          draft_id, billing_month_resolved, len(invoice_lines), hold, anomaly_count))
+
+  # --- 3. anomaly gate ---
+  - id: anomaly_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Hold the draft when the feed is missing days, carries negative units or swings past the baseline threshold, and release it to finance only when every check passes.
+    condition: "{{ outputs.compute_invoice_draft.vars.hold }}"
+    then:
+      - id: hold_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the hold notice with the anomaly list so revenue ops can repair the feed before finance sees a draft.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "HOLD invoice draft {{ outputs.compute_invoice_draft.vars.draft_id }} for {{ outputs.compute_invoice_draft.vars.billing_month }}. {{ outputs.compute_invoice_draft.vars.anomaly_count }} anomaly count, {{ outputs.compute_invoice_draft.vars.customer_count }} customers, delta {{ outputs.compute_invoice_draft.vars.total_mrr_delta }} {{ outputs.compute_invoice_draft.vars.currency }}. Details: {{ outputs.compute_invoice_draft.vars.anomalies_text }}. Execution {{ execution.id }}."
+          }
+
+    else:
+      - id: send_invoice_draft
+        type: io.kestra.plugin.email.MailSend
+        description: Email the draft CSV to finance over the secret SMTP relay with the draft id, customer count and month over month delta in the body.
+        from: "{{ secret('FINANCE_EMAIL_FROM') }}"
+        to: "{{ secret('FINANCE_EMAIL_TO') }}"
+        subject: "Invoice draft {{ outputs.compute_invoice_draft.vars.draft_id }} for {{ outputs.compute_invoice_draft.vars.billing_month }}"
+        host: "{{ secret('SMTP_HOST') }}"
+        username: "{{ secret('SMTP_USERNAME') }}"
+        password: "{{ secret('SMTP_PASSWORD') }}"
+        port: 465
+        sessionTimeout: 6000
+        attachments:
+          - name: invoice_draft_{{ outputs.compute_invoice_draft.vars.billing_month }}.csv
+            uri: "{{ outputs.compute_invoice_draft.outputFiles['invoice_draft.csv'] }}"
+            contentType: text/csv
+        htmlTextContent: |
+          <h3>Invoice draft {{ outputs.compute_invoice_draft.vars.draft_id }}</h3>
+          <p>Billing month {{ outputs.compute_invoice_draft.vars.billing_month }} with
+          {{ outputs.compute_invoice_draft.vars.customer_count }} customers,
+          {{ outputs.compute_invoice_draft.vars.total_billable_units }} billable units,
+          draft total {{ outputs.compute_invoice_draft.vars.draft_total }} against a prior total of
+          {{ outputs.compute_invoice_draft.vars.prior_total }} for a delta of
+          {{ outputs.compute_invoice_draft.vars.total_mrr_delta }} {{ outputs.compute_invoice_draft.vars.currency }}.</p>
+          <p>Anomaly check: {{ outputs.compute_invoice_draft.vars.anomalies_text }}</p>
+          <p>The invoice lines are attached as CSV.</p>
+
+      - id: log_draft_released
+        type: io.kestra.plugin.core.log.Log
+        description: Record the released draft with its id, line count, delta and any anomalies that were allowed through.
+        message: "Released draft {{ outputs.compute_invoice_draft.vars.draft_id }} for {{ outputs.compute_invoice_draft.vars.billing_month }} with {{ outputs.compute_invoice_draft.vars.customer_count }} lines, delta {{ outputs.compute_invoice_draft.vars.total_mrr_delta }}, anomaly count {{ outputs.compute_invoice_draft.vars.anomaly_count }}."
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Post a failure notice to Slack when the database, the pricing step or the SMTP relay fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED {{ flow.id }} run {{ execution.id }}: {{ error.message }}"}
+
+outputs:
+  - id: hold
+    type: BOOLEAN
+    value: "{{ outputs.compute_invoice_draft.vars.hold }}"
+
+  - id: invoice_lines
+    type: JSON
+    value: "{{ outputs.compute_invoice_draft.vars.invoice_lines | toJson }}"
+
+  - id: total_mrr_delta
+    type: STRING
+    value: "{{ outputs.compute_invoice_draft.vars.total_mrr_delta }}"
+
+  - id: draft_id
+    type: STRING
+    value: "{{ outputs.compute_invoice_draft.vars.draft_id }}"
+
+extend:
+  title: Metered Usage Invoice Draft with Anomaly Hold
+  metaTitle: Metered Usage Invoice Drafting and Anomaly Hold with Kestra
+  shortDescription: Pull month end metered usage from PostgreSQL, price every customer with plan tiers and overage, hold the draft on usage anomalies with a Slack alert, and email the invoice CSV to finance only when the checks pass.
+  metaDescription: Price month end metered usage into an invoice draft, hold it on missing days, negative units or a baseline swing, then email the CSV to finance only when clean.
+  description: |
+    Metered SaaS revenue is easy to bill wrong. If the usage feed drops a day, if a negative correction slips through, or if a customer's billable total swings far from last month, the invoice that goes out is wrong and the cleanup conversation is expensive. This blueprint turns the month end billing run into a gated workflow that pulls raw metered usage events from PostgreSQL, prices every customer from a plan tier table with an overage rate, compares the result against last month's finalized totals, and sends the draft to finance only when every check passes. When something looks off the draft is held and the anomaly list lands in Slack instead of a finance inbox.
+
+    ## How it works
+    1. The `month_end_draft` trigger (`io.kestra.plugin.core.trigger.Schedule`, cron `0 6 28 * *`, shipped with `disabled: true`) starts the run on the 28th of each month so the draft exists before the books close. Pass `billing_month` to draft or replay a specific period, and leave it empty to draft the month at run time.
+    2. `pull_usage_events` (`io.kestra.plugin.jdbc.postgresql.Query` with `fetchType: FETCH`) selects `customer_id`, `event_day`, `units`, `plan` and `source` from `public.metered_usage_events` for the period, binding `billing_month` as a named parameter so user input never lands inside the SQL text.
+    3. `pull_prior_totals` (`io.kestra.plugin.jdbc.postgresql.Query`) reads last month's finalized per customer totals from `public.customer_monthly_totals`, which is the baseline the variance check compares against.
+    4. `compute_invoice_draft` (`io.kestra.plugin.scripts.python.Script` on a Docker task runner) aggregates billable units per customer, applies the tier table from the `pricing_tiers` input (included units, base price, overage unit price), writes `invoice_draft.csv`, and emits `invoice_lines`, `total_mrr_delta`, `draft_id`, `hold` and the anomaly list through the `::json::` output protocol. The variance check uses the `variance_threshold_pct` variable, set to 25 percent here, and only runs once the billing period is complete so a partial month is not judged against a full baseline.
+    5. `anomaly_gate` (`io.kestra.plugin.core.flow.If`) branches on `hold`. The hold path posts a Slack notice with `io.kestra.plugin.slack.notifications.SlackIncomingWebhook`, and the clean path sends the CSV to finance with `io.kestra.plugin.email.MailSend` over the secret SMTP relay, then logs the released draft.
+    6. Failures in the database tasks, the pricing step or the SMTP relay fall into the `errors` block, which posts the failing execution to Slack.
+
+    ## What you get
+    - A priced invoice draft per customer with base, overage, total and currency, ready for finance review as a CSV attachment.
+    - An anomaly gate that catches missing usage days, negative unit rows, unparsable feed rows, unknown plans and baseline swings before money moves.
+    - A deterministic `draft_id` derived from the billing month and the invoice lines, so replays of the same period produce the same draft identity.
+    - Month over month context through `total_mrr_delta`, computed from this draft against last month's finalized totals.
+    - Typed flow outputs (`hold`, `invoice_lines`, `total_mrr_delta`, `draft_id`) that a parent revenue flow or approval workflow can branch on.
+
+    ## Who it's for
+    - SaaS finance and revenue operations teams that close metered invoices every month and want a reviewable draft instead of a spreadsheet exercise.
+    - Platform engineers who own the usage event pipeline and need bad feeds surfaced in Slack the moment they appear.
+    - Billing product teams that want plan pricing, overage and hold policy expressed as version controlled configuration rather than buried in a cron script.
+
+    ## Why orchestrate this with Kestra
+    The hard part of usage billing is not the arithmetic, it is the confidence that the inputs are complete and the decision trail survives an audit. Kestra gives the run a durable execution record with every query, every anomaly and the exact invoice lines that were produced, a real branch that separates the hold path from the release path instead of an if statement nobody reads, and an errors handler that pages the team when the database or SMTP relay fails. The threshold, the tier table and the hold switch are inputs and variables, so changing pricing or relaxing the gate is a reviewable YAML diff. The same flow doubles as a manual re-draft for any past period by passing `billing_month`.
+
+    ## Prerequisites
+    - A Kestra instance with the core, Python script, PostgreSQL, email and Slack plugins available to the worker, plus Docker for the pricing task runner.
+    - A PostgreSQL database with `public.metered_usage_events` (columns `customer_id`, `event_day`, `units`, `plan`, `source`) holding one row per customer and day.
+    - A PostgreSQL table `public.customer_monthly_totals` (columns `billing_month`, `customer_id`, `total_amount`) with last month's finalized totals.
+    - An SMTP relay that accepts submissions on port 465 for the finance draft mail.
+    - A Slack incoming webhook for the hold notice and for failure alerts.
+
+    ### Secrets
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: connection details for the usage and billing tables.
+    - `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`: SMTP relay credentials used by the email plugin.
+    - `FINANCE_EMAIL_FROM`, `FINANCE_EMAIL_TO`: sender and recipient addresses for the invoice draft.
+    - `SLACK_WEBHOOK_URL`: incoming webhook used for hold notices and for failure alerts.
+
+    ## Quick start
+    1. Add the secrets above to the `company.team` namespace and confirm the two PostgreSQL tables exist with the documented columns.
+    2. Adjust the `pricing_tiers` input to your plans, and set `variance_threshold_pct` in the `variables` block to the swing that should hold a draft.
+    3. Run the flow once manually with a completed `billing_month` so you can inspect the draft before anyone depends on it.
+    4. Enable the schedule by saving this trigger with `disabled: false` so the draft runs on the 28th of each month:
+
+    ```yaml
+    triggers:
+      - id: month_end_draft
+        type: io.kestra.plugin.core.trigger.Schedule
+        cron: "0 6 28 * *"
+        disabled: false
+    ```
+
+    5. Leave `hold_on_anomaly` at `true` while the feed settles, and flip it to `false` only when finance has agreed to receive drafts with flagged anomalies.
+
+    ## How to extend
+    - Add a `io.kestra.plugin.core.execution.Fail` task on the hold path when a held draft should stop a downstream release pipeline instead of only alerting.
+    - Write the invoice lines to a billing system with `io.kestra.plugin.jdbc.postgresql.Query` after finance approves, reusing `draft_id` as the idempotency key.
+    - Extend the tier table with progressive bands per plan by pricing each customer against several rows of `pricing_tiers` instead of one row per plan.
+    - Add a second Slack message on the clean path, or replace the plain payload with a block set that lists the largest deltas.
+    - Fan the draft out per currency or per subsidiary by wrapping this flow in a parent that calls it with a different `pricing_tiers` value.
+
+    ## Links
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+    - Email plugin: https://kestra.io/plugins/plugin-email
+    - Kestra schedule trigger: https://kestra.io/docs/workflow-components/triggers/schedule-trigger
+  tags:
+    - Business
+    - Data
+  subTags:
+    - Reporting & Digests
+    - Approval Gates
+  ee: false
+  demo: false
