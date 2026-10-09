@@ -1,0 +1,576 @@
+id: postgres-wraparound-guard
+namespace: company.team
+description: |
+  Catch the two PostgreSQL limits that stop writes without warning:
+  transaction ID (and MultiXact) wraparound, and integer sequences running
+  out of values. Reports how close each database and sequence is, what is
+  holding back freezing (old transactions, prepared transactions,
+  replication slots), and with on-call approval terminates the blockers,
+  freezes the oldest tables, or widens sequences.
+
+triggers:
+  - id: alertmanager
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from Alertmanager (postgres_exporter alerts on xid age or sequence usage) to run a full diagnosis at once.
+    key: pg-wraparound-change-me
+  - id: hourly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "17 * * * *"
+
+inputs:
+  - id: xid_warn_percent
+    type: FLOAT
+    defaults: 25
+    description: Warn when a database's transaction ID or MultiXact age passes this share of the 2^31 limit. Autovacuum normally keeps ages near autovacuum_freeze_max_age (10% by default).
+  - id: xid_critical_percent
+    type: FLOAT
+    defaults: 50
+    description: Critical level; on-call is asked to act.
+  - id: sequence_warn_percent
+    type: FLOAT
+    defaults: 75
+    description: Warn when a sequence has used this share of what its column (or the sequence itself) can hold.
+  - id: sequence_critical_percent
+    type: FLOAT
+    defaults: 90
+  - id: holder_min_age
+    type: INT
+    defaults: 10000000
+    description: Report sessions, prepared transactions, slots and standbys whose xmin is at least this many transactions old.
+  - id: top_tables
+    type: INT
+    defaults: 5
+    description: Number of tables with the oldest relfrozenxid to report and offer to freeze.
+  - id: ask_again_hours
+    type: INT
+    defaults: 6
+    description: Wait this long before asking on-call again about the same problem.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link.
+
+variables:
+  # The hard limit: PostgreSQL refuses new transaction IDs about 3 million before 2^31.
+  limit: 2147483647
+
+tasks:
+  - id: check_server
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Fail fast if the database is unreachable, and record what this role may do.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT current_setting('server_version_num')::int AS version_num, current_database() AS database,
+             pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') AS can_terminate,
+             current_setting('autovacuum_freeze_max_age') AS freeze_max_age
+    retry:
+      type: exponential
+      interval: PT5S
+      maxInterval: PT1M
+      maxAttempts: 3
+
+  - id: version_guard
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_server.row.version_num < 130000 }}"
+    then:
+      - id: unsupported_version
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "PostgreSQL {{ outputs.check_server.row.version_num }} is not supported; this blueprint needs PostgreSQL 13 or later"
+
+  - id: ensure_tables
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS wraparound_watch (
+        object       TEXT PRIMARY KEY,
+        level        TEXT NOT NULL,
+        changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        asked_at     TIMESTAMPTZ
+      );
+      CREATE TABLE IF NOT EXISTS sequence_samples (
+        sequence     TEXT NOT NULL,
+        last_value   NUMERIC NOT NULL,
+        sampled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (sequence, sampled_at)
+      );
+
+  - id: databases
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Transaction ID and MultiXact age of every database in the cluster, as a share of the 2^31 limit.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      warn: "{{ inputs.xid_warn_percent }}"
+      critical: "{{ inputs.xid_critical_percent }}"
+    sql: |
+      SELECT datname, xid_age, mxid_age,
+             CAST(round(100.0 * greatest(xid_age, mxid_age) / {{ vars.limit }}, 4) AS TEXT) AS used_percent,
+             CASE WHEN 100.0 * greatest(xid_age, mxid_age) / {{ vars.limit }} >= CAST(:critical AS numeric) THEN 'critical'
+                  WHEN 100.0 * greatest(xid_age, mxid_age) / {{ vars.limit }} >= CAST(:warn AS numeric) THEN 'warn'
+                  ELSE 'ok' END AS level
+      FROM (SELECT datname, age(datfrozenxid) AS xid_age, mxid_age(datminmxid) AS mxid_age
+            FROM pg_database WHERE datallowconn) d
+      ORDER BY greatest(xid_age, mxid_age) DESC
+
+  - id: holders
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: What keeps VACUUM from freezing. Anything holding an old xmin caps how far any database can be frozen.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      min_age: "{{ inputs.holder_min_age }}"
+    sql: |
+      SELECT * FROM (
+        SELECT 'session' AS kind, CAST(pid AS TEXT) AS id, greatest(age(backend_xmin), age(backend_xid)) AS xmin_age,
+               format('%s@%s, %s for %s: %s', usename, datname, state,
+                      date_trunc('second', now() - xact_start), left(regexp_replace(query, '\s+', ' ', 'g'), 80)) AS detail,
+               CAST(xact_start AS TEXT) AS guard,
+               'terminate it (pg_terminate_backend), or fix the client that leaves transactions open' AS remedy
+        FROM pg_stat_activity
+        WHERE pid <> pg_backend_pid() AND (backend_xmin IS NOT NULL OR backend_xid IS NOT NULL)
+        UNION ALL
+        SELECT 'prepared transaction', gid, age(transaction),
+               format('owner %s in %s, prepared %s ago', owner, database, date_trunc('second', now() - prepared)),
+               CAST(prepared AS TEXT),
+               format('COMMIT PREPARED %L or ROLLBACK PREPARED %L, after checking with the application that created it', gid, gid)
+        FROM pg_prepared_xacts
+        UNION ALL
+        SELECT 'replication slot', slot_name, greatest(age(xmin), age(catalog_xmin)),
+               format('%s slot, %s', slot_type, CASE WHEN active THEN 'active' ELSE 'inactive' END),
+               NULL,
+               'restart its consumer, or drop the slot if the consumer is gone'
+        FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
+        UNION ALL
+        SELECT 'standby', application_name, age(backend_xmin),
+               format('hot_standby_feedback from %s', client_addr), NULL,
+               'look for long queries on that standby'
+        FROM pg_stat_replication WHERE backend_xmin IS NOT NULL
+      ) h
+      WHERE xmin_age >= CAST(:min_age AS bigint)
+      ORDER BY xmin_age DESC
+      LIMIT 10
+
+  - id: oldest_tables
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Tables of this database with the oldest frozen horizon, including their TOAST tables.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      top: "{{ inputs.top_tables }}"
+    sql: |
+      SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS qualified,
+             greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS xid_age,
+             pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
+             CAST(s.last_autovacuum AS TEXT) AS last_autovacuum,
+             p.phase AS vacuum_phase
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+      LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+      LEFT JOIN pg_stat_progress_vacuum p ON p.relid = c.oid
+      WHERE c.relkind IN ('r', 'm')
+      ORDER BY xid_age DESC
+      LIMIT CAST(:top AS int)
+
+  - id: sequences
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: |
+      Usage of every ascending sequence against the smaller of its own maximum and its column's type,
+      with the consumption rate from earlier samples and the days left at that rate.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      warn: "{{ inputs.sequence_warn_percent }}"
+      critical: "{{ inputs.sequence_critical_percent }}"
+    sql: |
+      WITH seq AS (
+        SELECT s.schemaname || '.' || s.sequencename AS sequence,
+               quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename) AS qualified,
+               CAST(s.data_type AS TEXT) AS sequence_type, coalesce(s.last_value, 0) AS last_value, s.max_value,
+               CASE WHEN t.relname IS NOT NULL THEN quote_ident(tn.nspname) || '.' || quote_ident(t.relname) END AS owner_table,
+               a.attname AS owner_column, format_type(a.atttypid, a.atttypmod) AS column_type
+        FROM pg_sequences s
+        JOIN pg_namespace sn ON sn.nspname = s.schemaname
+        JOIN pg_class sc ON sc.relname = s.sequencename AND sc.relnamespace = sn.oid
+        LEFT JOIN pg_depend d ON d.objid = sc.oid AND d.classid = CAST('pg_class' AS regclass)
+             AND d.refclassid = CAST('pg_class' AS regclass) AND d.deptype IN ('a', 'i')
+        LEFT JOIN pg_class t ON t.oid = d.refobjid
+        LEFT JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        LEFT JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+        WHERE s.increment_by > 0
+      ), cap AS (
+        SELECT *, least(max_value, CASE column_type WHEN 'smallint' THEN 32767 WHEN 'integer' THEN 2147483647
+                                                    ELSE 9223372036854775807 END) AS capacity
+        FROM seq
+      ), prev AS (
+        -- the oldest sample from the last 7 days gives a stable rate
+        SELECT DISTINCT ON (sequence) sequence, last_value AS prev_value, sampled_at AS prev_at
+        FROM sequence_samples WHERE sampled_at > now() - interval '7 days'
+        ORDER BY sequence, sampled_at
+      ), sample AS (
+        INSERT INTO sequence_samples (sequence, last_value) SELECT sequence, last_value FROM cap
+      ), prune AS (
+        DELETE FROM sequence_samples WHERE sampled_at < now() - interval '30 days'
+      )
+      SELECT c.sequence, c.qualified, c.sequence_type, c.owner_table, c.owner_column, c.column_type,
+             c.last_value, c.capacity, round(100.0 * c.last_value / c.capacity, 2) AS used_percent,
+             CASE WHEN p.prev_at IS NOT NULL AND c.last_value > p.prev_value AND now() > p.prev_at
+                  THEN round((c.last_value - p.prev_value) / (extract(epoch FROM now() - p.prev_at) / 86400)) END AS per_day,
+             CASE WHEN p.prev_at IS NOT NULL AND c.last_value > p.prev_value AND now() > p.prev_at
+                  THEN round((c.capacity - c.last_value) / ((c.last_value - p.prev_value) / (extract(epoch FROM now() - p.prev_at) / 86400)), 1) END AS days_left,
+             -- the column is already bigint and only the sequence is small: ALTER SEQUENCE ... AS bigint is instant
+             coalesce(c.column_type = 'bigint' AND c.sequence_type <> 'bigint', false) AS widenable,
+             CASE WHEN 100.0 * c.last_value / c.capacity >= CAST(:critical AS numeric) THEN 'critical'
+                  WHEN 100.0 * c.last_value / c.capacity >= CAST(:warn AS numeric) THEN 'warn'
+                  ELSE 'ok' END AS level
+      FROM cap c LEFT JOIN prev p USING (sequence)
+      ORDER BY used_percent DESC
+
+  - id: track
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: |
+      Turn levels into changes. Each database and sequence is reported when its level changes;
+      a critical database or a sequence that can be widened is proposed again every ask_again_hours.
+      The conditional UPDATE keeps overlapping runs from reporting the same change twice.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      current: >-
+        {{ {'d': outputs.databases.rows, 's': outputs.sequences.rows}
+        | jq('[(.d[] | {object: ("database " + .datname), level, actionable: (.level == "critical")}),
+               (.s[] | select(.level != "ok") | {object: ("sequence " + .sequence), level, actionable: .widenable})]')
+        | first | toJson }}
+      ask_again: "{{ inputs.ask_again_hours }}"
+    sql: |
+      WITH cur AS (
+        SELECT x->>'object' AS object, x->>'level' AS level, CAST(x->>'actionable' AS boolean) AS actionable
+        FROM jsonb_array_elements(CAST(:current AS jsonb)) x
+      ), gone AS (
+        -- sequences that dropped back below the warning level
+        DELETE FROM wraparound_watch w
+        WHERE w.object LIKE 'sequence %' AND NOT EXISTS (SELECT 1 FROM cur WHERE cur.object = w.object)
+        RETURNING w.object, w.level AS previous
+      ), ins AS (
+        INSERT INTO wraparound_watch (object, level, asked_at)
+        SELECT object, level, CASE WHEN actionable THEN now() END FROM cur
+        ON CONFLICT (object) DO NOTHING
+        RETURNING object, level, asked_at IS NOT NULL AS propose
+      ), upd AS (
+        UPDATE wraparound_watch w
+        SET level = c.level,
+            changed_at = CASE WHEN w.level <> c.level THEN now() ELSE w.changed_at END,
+            asked_at = CASE WHEN c.actionable AND (w.level <> c.level OR w.asked_at IS NULL
+                                 OR w.asked_at < now() - make_interval(hours => CAST(:ask_again AS int)))
+                            THEN now() ELSE w.asked_at END
+        FROM cur c
+        WHERE w.object = c.object
+          AND (w.level <> c.level OR (c.actionable AND (w.asked_at IS NULL
+               OR w.asked_at < now() - make_interval(hours => CAST(:ask_again AS int)))))
+        RETURNING w.object, w.level, w.changed_at = now() AS changed, w.asked_at = now() AS propose
+      )
+      SELECT object, level, level <> 'ok' AS changed, propose, NULL AS previous FROM ins
+      UNION ALL SELECT object, level, changed, propose, NULL FROM upd
+      UNION ALL SELECT object, 'ok', true, false, previous FROM gone
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.track.rows | jq('[.[] | select(.changed)] | length') | first > 0 }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          PostgreSQL {{ outputs.check_server.row.database }}: wraparound and sequence check
+          {% for t in outputs.track.rows %}{% if t.changed %}{% for d in outputs.databases.rows %}{% if t.object == ('database ' ~ d.datname) %}- {{ d.level | upper }} database {{ d.datname }}: {{ d.used_percent }}% of the limit (xid age {{ d.xid_age }}, multixact age {{ d.mxid_age }}){% if d.level == 'ok' %}, back to normal{% endif %}
+          {% endif %}{% endfor %}{% for s in outputs.sequences.rows %}{% if t.object == ('sequence ' ~ s.sequence) and (t.previous ?? '') == '' %}- {{ s.level | upper }} sequence {{ s.sequence }}: {{ s.used_percent }}% of {{ s.capacity }} ({{ s.owner_table ?? 'no owning column' }}{% if (s.owner_column ?? '') != '' %}.{{ s.owner_column }} {{ s.column_type }}{% endif %}){% if (s.days_left ?? '') != '' %}, about {{ s.days_left }} days left at {{ s.per_day }}/day{% endif %}. {% if s.widenable %}The column is bigint: widening the sequence is instant.{% elseif (s.column_type ?? 'bigint') != 'bigint' %}Migrate {{ s.owner_table }}.{{ s.owner_column }} to bigint (ALTER TABLE ... TYPE bigint rewrites the table: plan it).{% endif %}
+          {% endif %}{% endfor %}{% if (t.previous ?? '') != '' %}- {{ t.object }} is back below {{ inputs.sequence_warn_percent }}%
+          {% endif %}{% endif %}{% endfor %}{% if outputs.databases.rows | jq('[.[] | select(.level != "ok")] | length') | first > 0 %}
+          What holds back freezing:
+          {% for h in outputs.holders.rows %}- {{ h.kind }} {{ h.id }} (xmin age {{ h.xmin_age }}): {{ h.detail }}. Fix: {{ h.remedy }}
+          {% else %}- nothing older than {{ inputs.holder_min_age }} transactions: autovacuum should catch up, or run VACUUM (FREEZE) on the oldest tables
+          {% endfor %}Oldest tables in {{ outputs.check_server.row.database }}: {% for t in outputs.oldest_tables.rows %}{{ t.qualified }} (age {{ t.xid_age }}, {{ t.size }}{% if (t.vacuum_phase ?? '') != '' %}, vacuum running: {{ t.vacuum_phase }}{% endif %}){% if not loop.last %}, {% endif %}{% endfor %}
+          {% endif %}
+
+  - id: propose
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.track.rows | jq('[.[] | select(.propose)] | length') | first > 0 }}"
+    then:
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Actions available for {{ outputs.check_server.row.database }} (choose within 2 hours, nothing happens otherwise): {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+          {% if outputs.holders.rows | jq('[.[] | select(.kind == "session")] | length') | first > 0 %}- Terminate blocking sessions: {% for h in outputs.holders.rows %}{% if h.kind == 'session' %}pid {{ h.id }} {% endif %}{% endfor %}{% if not outputs.check_server.row.can_terminate %}(this role lacks pg_signal_backend; it can only end its own sessions){% endif %}
+          {% endif %}{% if outputs.databases.rows | jq('[.[] | select(.level != "ok")] | length') | first > 0 %}- Freeze the oldest tables: VACUUM (FREEZE) on {% for t in outputs.oldest_tables.rows %}{{ t.qualified }}{% if not loop.last %}, {% endif %}{% endfor %}
+          {% endif %}{% if outputs.sequences.rows | jq('[.[] | select(.widenable and .level != "ok")] | length') | first > 0 %}- Widen sequences: ALTER SEQUENCE ... AS bigint for {% for s in outputs.sequences.rows %}{% if s.widenable and s.level != 'ok' %}{{ s.sequence }} {% endif %}{% endfor %}
+          {% endif %}{% if outputs.holders.rows | jq('[.[] | select(.kind != "session")] | length') | first > 0 %}Prepared transactions, replication slots and standbys are never touched by this flow: resolve them with the commands in the report.
+          {% endif %}
+      - id: wait_for_decision
+        type: io.kestra.plugin.core.flow.Pause
+        description: No answer within 2 hours means nothing is done.
+        pauseDuration: PT2H
+        behavior: RESUME
+        onResume:
+          - id: actions
+            type: MULTISELECT
+            values:
+              - Terminate blocking sessions
+              - Freeze the oldest tables
+              - Widen sequences
+            required: false
+
+      - id: terminate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Terminate blocking sessions' }}"
+        then:
+          - id: terminate_sessions
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Ends only the sessions that were shown, and only if they are still in the same transaction.
+            url: "{{ secret('POSTGRES_URL') }}"
+            username: "{{ secret('POSTGRES_USER') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            parameters:
+              proposed: "{{ outputs.holders.rows | jq('[.[] | select(.kind == \"session\") | {pid: .id, guard}]') | first | toJson }}"
+            sql: |
+              SELECT p->>'pid' AS pid,
+                     CASE WHEN a.pid IS NULL THEN 'skipped: the session already ended'
+                          WHEN CAST(a.xact_start AS TEXT) IS DISTINCT FROM p->>'guard' THEN 'skipped: it started a new transaction since the proposal'
+                          WHEN pg_terminate_backend(a.pid) THEN 'terminated'
+                          ELSE 'NOT terminated: permission denied or already gone' END AS result
+              FROM jsonb_array_elements(CAST(:proposed AS jsonb)) p
+              LEFT JOIN pg_stat_activity a ON a.pid = CAST(p->>'pid' AS int)
+
+      - id: freeze
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Freeze the oldest tables' }}"
+        then:
+          - id: freeze_tables
+            type: io.kestra.plugin.core.flow.Loop
+            description: One VACUUM (FREEZE) per table, each isolated so a failure does not stop the others.
+            values: "{{ outputs.oldest_tables.rows | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {{ fromJson(item.value).qualified }}: {% if outputs.age_after is defined %}age {{ fromJson(item.value).xid_age }} → {{ outputs.age_after.row.xid_age }}{% else %}NOT frozen, see the execution logs{% endif %}
+            tasks:
+              - id: freeze_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: vacuum_freeze
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    timeout: PT2H
+                    sql: "VACUUM (FREEZE) {{ fromJson(item.value).qualified }}"
+                  - id: age_after
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    parameters:
+                      qualified: "{{ fromJson(item.value).qualified }}"
+                    sql: |
+                      SELECT greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS xid_age
+                      FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+                      WHERE c.oid = CAST(CAST(:qualified AS text) AS regclass)
+
+      - id: widen
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Widen sequences' }}"
+        then:
+          - id: widen_sequences
+            type: io.kestra.plugin.core.flow.Loop
+            description: ALTER SEQUENCE ... AS bigint, only where the owning column is already bigint (an instant catalog change; the maximum follows the new type).
+            values: "{{ outputs.sequences.rows | jq('[.[] | select(.widenable and .level != \"ok\")]') | first | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  sequence {{ fromJson(item.value).sequence }}: {% if outputs.widened is defined %}now {{ outputs.widened.row.data_type }}, {{ outputs.widened.row.used_percent }}% used{% else %}NOT widened, see the execution logs{% endif %}
+            tasks:
+              - id: widen_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: alter_sequence
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    sql: "ALTER SEQUENCE {{ fromJson(item.value).qualified }} AS bigint"
+                  - id: widened
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    parameters:
+                      sequence: "{{ fromJson(item.value).sequence }}"
+                    sql: |
+                      SELECT CAST(data_type AS TEXT) AS data_type, CAST(round(100.0 * coalesce(last_value, 0) / max_value, 6) AS TEXT) AS used_percent
+                      FROM pg_sequences WHERE schemaname || '.' || sequencename = :sequence
+
+      - id: recheck
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: Read the database ages again after the actions.
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH
+        sql: |
+          SELECT datname, CAST(round(100.0 * greatest(age(datfrozenxid), mxid_age(datminmxid)) / {{ vars.limit }}, 4) AS TEXT) AS used_percent,
+                 age(datfrozenxid) AS xid_age
+          FROM pg_database WHERE datallowconn ORDER BY greatest(age(datfrozenxid), mxid_age(datminmxid)) DESC
+
+      - id: notify_outcome
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {% if (outputs.wait_for_decision.onResume.actions ?? []) | length == 0 %}No action chosen for {{ outputs.check_server.row.database }}; nothing was changed.{% else %}Actions on {{ outputs.check_server.row.database }}: {{ outputs.wait_for_decision.onResume.actions | join(', ') }}
+          {% for r in outputs.terminate_sessions.rows ?? [] %}- pid {{ r.pid }}: {{ r.result }}
+          {% endfor %}{% for r in outputs.freeze_tables.outputs ?? [] %}- {{ r.outputs.result }}
+          {% endfor %}{% for r in outputs.widen_sequences.outputs ?? [] %}- {{ r.outputs.result }}
+          {% endfor %}Database ages now: {% for d in outputs.recheck.rows %}{{ d.datname }} {{ d.used_percent }}% (xid age {{ d.xid_age }}){% if not loop.last %}, {% endif %}{% endfor %}{% if outputs.holders.rows | jq('[.[] | select(.kind != "session")] | length') | first > 0 %}
+          Still holding back freezing until resolved by hand: {% for h in outputs.holders.rows %}{% if h.kind != 'session' %}{{ h.kind }} {{ h.id }} {% endif %}{% endfor %}{% endif %}{% endif %}
+
+      - id: any_failed
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ {'f': outputs.freeze_tables.outputs ?? [], 'w': outputs.widen_sequences.outputs ?? [], 't': outputs.terminate_sessions.rows ?? []} | jq('[(.f[], .w[] | .outputs.result), (.t[] | .result) | select(contains(\"NOT \"))] | length') | first > 0 }}"
+        then:
+          - id: partial
+            type: io.kestra.plugin.core.execution.Exit
+            state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      PostgreSQL wraparound guard failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: databases
+    type: JSON
+    description: Transaction ID and MultiXact age of each database, as a share of the limit, with its level.
+    value: "{{ outputs.databases.rows ?? [] }}"
+  - id: sequences
+    type: JSON
+    description: Every ascending sequence with its usage, rate, days left and level.
+    value: "{{ outputs.sequences.rows ?? [] }}"
+
+extend:
+  title: Prevent PostgreSQL Transaction ID Wraparound and Sequence Exhaustion
+  shortDescription: Track how close each database is to transaction ID wraparound and each sequence to its limit, find what blocks freezing, and with on-call approval terminate blockers, freeze tables or widen sequences.
+  metaTitle: PostgreSQL Wraparound and Sequence Exhaustion Guard with Kestra
+  metaDescription: Detect xid wraparound risk, the sessions and slots blocking freeze, and int sequences running out, then fix them.
+  description: |
+    Two PostgreSQL limits stop writes with no gradual degradation:
+    - **Transaction ID wraparound.** When a database's oldest unfrozen transaction ID gets within about 3 million of 2^31, PostgreSQL refuses new writes until it is vacuumed in single-user mode, which can take hours. Autovacuum normally prevents this. It fails when something holds back the xmin horizon: a session left idle in a transaction, a forgotten prepared transaction, an abandoned replication slot, or a standby with hot_standby_feedback.
+    - **Sequence exhaustion.** An `integer` (serial) key stops at 2,147,483,647. Inserts then fail with "nextval: reached maximum value of sequence".
+
+    Both build up slowly and are easy to see days ahead, if someone looks. This blueprint looks every hour, explains the cause, and turns the safe fixes into a one-click decision.
+
+    ## How it works
+
+    1. `hourly_check` (`Schedule`) or `alertmanager` (`Webhook`, for postgres_exporter alerts) starts a run.
+    2. `check_server` fails fast if the database is unreachable and checks whether the role may terminate other sessions. `version_guard` (`If`) requires PostgreSQL 13+.
+    3. `databases` measures transaction ID and MultiXact age for every database in the cluster, as a share of the 2^31 limit.
+    4. `holders` lists what keeps the xmin horizon back, each with its age and the specific fix:
+       - sessions with an open transaction;
+       - prepared transactions;
+       - replication slots;
+       - standbys sending hot_standby_feedback.
+    5. `oldest_tables` lists the tables of this database with the oldest relfrozenxid (TOAST included), their size, and whether autovacuum is working on them.
+    6. `sequences` measures every ascending sequence against the smaller of its own maximum and its column's type. It keeps samples to compute the consumption rate and the days left, and flags sequences where only the sequence is too small because the column is already `bigint`.
+    7. `track` turns levels (`ok` / `warn` / `critical`) into changes, so each database or sequence is reported once per change.
+    8. `propose` asks on-call (`Pause`, 2 hours, multi-select):
+       - **Terminate blocking sessions**;
+       - **Freeze the oldest tables** with `VACUUM (FREEZE)`;
+       - **Widen sequences** with `ALTER SEQUENCE ... AS bigint` where the column already allows it.
+    9. The chosen actions run, then `recheck` reads the ages again and `notify_outcome` reports the before and after, plus anything still holding the horizon back.
+
+    ## Error handling
+
+    - **Actions only touch what was shown, as it was shown.** A session is terminated only if it is still in the same transaction (same `xact_start`): "skipped: the session already ended" or "skipped: it started a new transaction since the proposal".
+    - **Each freeze is isolated.** Each `VACUUM (FREEZE)` runs in its own `Sequential` with `allowFailure`, so a table dropped meanwhile or a lock timeout is reported as "NOT frozen" while the others proceed. The run then ends `WARNING`.
+    - **Dangerous fixes stay manual.** Prepared transactions and replication slots are never touched. The report gives the exact command (`ROLLBACK PREPARED 'gid'`, drop the slot) because only a human can tell whether the data is still needed. Integer columns are never rewritten: the report says the table needs a planned migration to `bigint`.
+    - **No alert storms.** A level change is reported once, a critical database is proposed again only after `ask_again_hours`, and a sequence that drops back under the warning level is reported as such. A conditional `UPDATE` keeps overlapping runs from reporting the same change twice.
+    - **Clear failures.** `check_server` retries, unsupported versions fail with a message, and the `errors` alert names the task and cause.
+
+    ## What this blueprint teaches about Kestra
+
+    - A `Pause` with a `MULTISELECT` form, where each choice gates its own `If` branch.
+    - Turning several diagnostic queries into one change-detection step with jq inside Pebble and a single Postgres statement.
+    - Running maintenance statements (`VACUUM`, `ALTER SEQUENCE`) from the JDBC plugin, one item at a time in a `Loop` with per-item isolation and outputs.
+    - Keeping time series in a small table to turn a level into a forecast ("about 14.8 days left").
+
+    ## Prerequisites
+
+    - PostgreSQL 13 or later.
+    - A role with `pg_monitor` (diagnosis), `pg_signal_backend` (terminating sessions), and ownership of the tables and sequences it should freeze or widen (or the `MAINTAIN` privilege on PostgreSQL 17+).
+    - A Slack incoming webhook.
+
+    Database ages are cluster-wide; tables and sequences are those of the database in `POSTGRES_URL`. Run a copy per database that holds large tables.
+
+    ### Secrets
+
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: the database to watch (two small state tables are created in it).
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `xid_warn_percent`, `xid_critical_percent` (FLOAT, default 25 / 50): share of the 2^31 limit.
+    - `sequence_warn_percent`, `sequence_critical_percent` (FLOAT, default 75 / 90).
+    - `holder_min_age` (INT, default 10,000,000): report holders at least this many transactions old.
+    - `top_tables` (INT, default 5), `ask_again_hours` (INT, default 6), `kestra_url` (STRING).
+
+    ### Outputs
+
+    - `databases` (JSON): age and level of each database.
+    - `sequences` (JSON): usage, rate, days left and level of each sequence.
+
+    ## Quick start
+
+    1. Add the secrets and run the flow once: it creates `wraparound_watch` and `sequence_samples` and stays quiet if everything is healthy.
+    2. Leave the hourly schedule on; after a day the sequence report includes consumption rates and days left.
+    3. Point your postgres_exporter alerts at the `alertmanager` webhook and change its key.
+    4. When a sequence on an `integer` column passes the warning level, schedule the `bigint` migration while there is still time.
+
+    ## Plugins used
+
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Approval Gates
+  ctaText: Read the Pause task documentation
+  ctaLink: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause
+  demo: false
+  ee: false
