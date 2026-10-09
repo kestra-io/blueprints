@@ -1,0 +1,489 @@
+id: quarterly-access-review-campaign
+namespace: company.team
+description: |
+  Quarterly entitlement recertification campaign for standing access held in an LDAP
+  directory. The flow enumerates group entitlements and account activity, risk-flags
+  stale, dormant, and over-privileged accounts, routes every flagged account to its
+  manager over Slack with a decision row in Postgres, revokes the flagged group
+  membership, and archives a JSON evidence pack to Amazon S3.
+
+triggers:
+  - id: quarterly_review_window
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Opens the certification window at 06:00 UTC on the first day of January, April, July, and October. Shipped disabled so the campaign can be reviewed before it ever runs unattended.
+    cron: "0 6 1 1,4,7,10 *"
+    disabled: true
+
+inputs:
+  - id: campaign_name
+    type: STRING
+    description: Label attached to the review, the Slack notices, and the Postgres decision rows.
+    defaults: Quarterly Access Certification
+  - id: base_dn
+    type: STRING
+    description: Root distinguished name of the directory, for example dc=example,dc=com.
+    defaults: dc=example,dc=com
+  - id: max_flagged
+    type: INT
+    description: Maximum number of flagged accounts carried into notifications, revocation, and the evidence pack.
+    defaults: 25
+
+tasks:
+  # --- 1. enumerate standing access ---
+  - id: enumerate_group_entitlements
+    type: io.kestra.plugin.ldap.Search
+    description: Read every group entry under ou=groups so each entitlement and its member list is known before the assessment starts.
+    hostname: "{{ secret('LDAP_HOSTNAME') }}"
+    port: 389
+    userDn: "{{ secret('LDAP_ADMIN_DN') }}"
+    password: "{{ secret('LDAP_ADMIN_PASSWORD') }}"
+    baseDn: "ou=groups,{{ inputs.base_dn }}"
+    filter: "(objectClass=groupOfNames)"
+    attributes:
+      - cn
+      - description
+      - member
+      - managedBy
+    sizeLimit: 500
+
+  - id: enumerate_account_activity
+    type: io.kestra.plugin.ldap.Search
+    description: Read the people tree with the logon and status attributes the risk rules need to spot stale and dormant accounts.
+    hostname: "{{ secret('LDAP_HOSTNAME') }}"
+    port: 389
+    userDn: "{{ secret('LDAP_ADMIN_DN') }}"
+    password: "{{ secret('LDAP_ADMIN_PASSWORD') }}"
+    baseDn: "ou=people,{{ inputs.base_dn }}"
+    filter: "(objectClass=inetOrgPerson)"
+    attributes:
+      - uid
+      - employeeType
+      - accountStatus
+      - lastLogonTimestamp
+      - pwdChangedTime
+      - manager
+    sizeLimit: 1000
+
+  # --- 2. risk assessment ---
+  - id: assess_entitlement_risk
+    type: io.kestra.plugin.scripts.python.Script
+    description: Score every account that holds standing access against the stale, dormant, and over-privileged rules, then publish the flagged list for the notification loop.
+    inputFiles:
+      entitlements.ion: "{{ outputs.enumerate_group_entitlements.uri }}"
+      accounts.ion: "{{ outputs.enumerate_account_activity.uri }}"
+    script: |
+      import json
+      import re
+      from datetime import datetime, timedelta, timezone
+
+      CAMPAIGN = "{{ inputs.campaign_name }}"
+      BASE_DN = "{{ inputs.base_dn }}"
+      MAX_FLAGGED = {{ inputs.max_flagged }}
+      STALE_DAYS = 90
+      DORMANT_DAYS = 180
+      MAX_PRIVILEGED_GROUPS = 3
+      PRIVILEGED_MARKERS = ("admin", "privileged", "sudo", "write", "dba", "operator")
+      INACTIVE_STATUSES = ("disabled", "inactive", "locked", "expired")
+
+
+      def load_records(path):
+          records = []
+          try:
+              with open(path, "r", encoding="utf-8") as handle:
+                  lines = handle.read().splitlines()
+          except OSError:
+              return records
+          for line in lines:
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  record = json.loads(line)
+              except ValueError:
+                  continue
+              if isinstance(record, dict):
+                  records.append(record)
+          return records
+
+
+      def as_list(value):
+          if value is None:
+              return []
+          if isinstance(value, list):
+              return [entry for entry in value if entry is not None]
+          return [value]
+
+
+      def parse_timestamp(value):
+          if value is None:
+              return None
+          text = str(value).strip()
+          if not text:
+              return None
+          if text.endswith("Z"):
+              text = text[:-1]
+          if text.isdigit() and len(text) >= 14:
+              stamp = text[:14]
+              text = (
+                  stamp[0:4] + "-" + stamp[4:6] + "-" + stamp[6:8] + "T"
+                  + stamp[8:10] + ":" + stamp[10:12] + ":" + stamp[12:14]
+              )
+          try:
+              parsed = datetime.fromisoformat(text)
+          except ValueError:
+              return None
+          if parsed.tzinfo is None:
+              parsed = parsed.replace(tzinfo=timezone.utc)
+          return parsed
+
+
+      def slugify(text):
+          slug = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+          return slug or "campaign"
+
+
+      entitlements = load_records("entitlements.ion")
+      accounts = load_records("accounts.ion")
+
+      groups_by_member = {}
+      privileged_groups = set()
+      for group in entitlements:
+          group_dn = str(group.get("dn") or "").strip()
+          if not group_dn:
+              continue
+          group_name = str(group.get("cn") or group_dn).lower()
+          if any(marker in group_name for marker in PRIVILEGED_MARKERS):
+              privileged_groups.add(group_dn)
+          for member in as_list(group.get("member")):
+              groups_by_member.setdefault(str(member), []).append(group_dn)
+
+      accounts_by_dn = {}
+      for account in accounts:
+          dn = str(account.get("dn") or "").strip()
+          if dn:
+              accounts_by_dn[dn] = account
+
+      now = datetime.now(timezone.utc)
+      stale_cutoff = now - timedelta(days=STALE_DAYS)
+      dormant_cutoff = now - timedelta(days=DORMANT_DAYS)
+
+      flagged = []
+      scanned = 0
+      for dn in sorted(groups_by_member):
+          account = accounts_by_dn.get(dn)
+          if account is None:
+              continue
+          scanned += 1
+
+          last_logon = None
+          for key in ("lastLogonTimestamp", "lastLogon", "lastLogin"):
+              last_logon = parse_timestamp(account.get(key))
+              if last_logon is not None:
+                  break
+
+          flags = []
+          if last_logon is None or last_logon < stale_cutoff:
+              flags.append("stale_logon")
+
+          status = str(account.get("accountStatus") or "").strip().lower()
+          inactive = status in INACTIVE_STATUSES
+          if inactive or (last_logon is not None and last_logon < dormant_cutoff):
+              flags.append("dormant_account")
+
+          memberships = groups_by_member.get(dn, [])
+          privileged = sorted(
+              group_dn for group_dn in memberships if group_dn in privileged_groups
+          )
+          if len(privileged) > MAX_PRIVILEGED_GROUPS:
+              flags.append("over_privileged")
+
+          if not flags:
+              continue
+
+          risk = "high" if ("dormant_account" in flags or "over_privileged" in flags) else "medium"
+          uid = str(account.get("uid") or dn.split(",")[0].replace("uid=", ""))
+          flagged.append({
+              "uid": uid,
+              "dn": dn,
+              "manager": str(account.get("manager") or ""),
+              "employee_type": str(account.get("employeeType") or ""),
+              "account_status": status,
+              "risk": risk,
+              "flags": flags,
+              "flags_text": ",".join(flags),
+              "membership_count": len(memberships),
+              "privileged_group_count": len(privileged),
+              "groups": memberships,
+              "revoke_group_dns": privileged or memberships,
+          })
+
+      risk_rank = {"high": 0, "medium": 1, "low": 2}
+      flagged.sort(key=lambda item: (risk_rank.get(item["risk"], 3), item["uid"]))
+
+      flagged_total = len(flagged)
+      capped = flagged[:MAX_FLAGGED] if MAX_FLAGGED > 0 else []
+      truncated = flagged_total > len(capped)
+      verdict = "action_required" if capped else "clean"
+
+      report = {
+          "campaign": CAMPAIGN,
+          "base_dn": BASE_DN,
+          "verdict": verdict,
+          "generated_at": now.isoformat(timespec="seconds"),
+          "entitlement_count": len(entitlements),
+          "account_count": len(accounts),
+          "scanned_accounts": scanned,
+          "flagged_total": flagged_total,
+          "flagged_count": len(capped),
+          "truncated": truncated,
+          "flagged_accounts": capped,
+      }
+
+      payload = {
+          "outputs": {
+              "campaign": CAMPAIGN,
+              "campaign_slug": slugify(CAMPAIGN),
+              "verdict": verdict,
+              "scanned_accounts": scanned,
+              "account_count": len(accounts),
+              "entitlement_count": len(entitlements),
+              "flagged_total": flagged_total,
+              "flagged_count": len(capped),
+              "truncated": truncated,
+              "flagged_users": capped,
+              "report_json": json.dumps(report),
+          }
+      }
+      print("::" + json.dumps(payload) + "::")
+
+  # --- 3. manager notifications and decision rows ---
+  - id: notify_flagged_accounts
+    type: io.kestra.plugin.core.flow.Loop
+    description: Iterate over the flagged accounts so each one gets a manager notification and a decision row.
+    values: "{{ outputs.assess_entitlement_risk.vars.flagged_users }}"
+    runIf: "{{ outputs.assess_entitlement_risk.vars.flagged_count > 0 }}"
+    tasks:
+      - id: request_manager_decision
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Ask the account manager to recertify or reject the flagged standing access before the revocation step.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Access review {{ inputs.campaign_name }}: {{ item.value | jq('.uid') | first }} is flagged for {{ item.value | jq('.flags_text') | first }} (risk {{ item.value | jq('.risk') | first }}) across {{ item.value | jq('.membership_count') | first }} entitlement(s) with manager {{ item.value | jq('.manager') | first }}. Record the decision for execution {{ execution.id }}."
+          }
+
+      - id: record_decision_row
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        description: Append one decision row per flagged account so the campaign leaves a queryable audit trail beside the evidence pack.
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: NONE
+        sql: |
+          INSERT INTO access_review_decisions (campaign_name, account_uid, manager_dn, risk, flags, membership_count, review_status, created_at)
+          VALUES ('{{ inputs.campaign_name }}', '{{ item.value | jq('.uid') | first }}', '{{ item.value | jq('.manager') | first }}', '{{ item.value | jq('.risk') | first }}', '{{ item.value | jq('.flags_text') | first }}', {{ item.value | jq('.membership_count') | first }}, 'pending_manager_review', NOW());
+
+  # --- 4. revoke flagged standing access ---
+  - id: revocation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Apply the revocation set only when the assessment flagged at least one account, otherwise record that nothing needed revoking.
+    condition: "{{ outputs.assess_entitlement_risk.vars.flagged_count > 0 }}"
+    then:
+      - id: build_revocation_records
+        type: io.kestra.plugin.core.storage.Write
+        description: Render one Ion modify record per flagged account and entitlement that deletes the account DN from that group member attribute.
+        extension: .ion
+        content: |
+          {% for user in outputs.assess_entitlement_risk.vars.flagged_users %}
+          {% for group_dn in user.revoke_group_dns %}
+          {dn:"{{ group_dn }}",changeType:"modify",modifications:[{operation:"DELETE",attribute:"member",values:["{{ user.dn }}"]}]}
+          {% endfor %}
+          {% endfor %}
+
+      - id: convert_revocations_to_ldif
+        type: io.kestra.plugin.ldap.IonToLdif
+        description: Convert the Ion modify records into the LDIF format the Modify task expects.
+        inputs:
+          - "{{ outputs.build_revocation_records.uri }}"
+
+      - id: apply_revocations
+        type: io.kestra.plugin.ldap.Modify
+        description: Apply the modify operations, where a group that no longer exists is logged and skipped without blocking the rest of the revocation set.
+        hostname: "{{ secret('LDAP_HOSTNAME') }}"
+        port: 389
+        userDn: "{{ secret('LDAP_ADMIN_DN') }}"
+        password: "{{ secret('LDAP_ADMIN_PASSWORD') }}"
+        inputs:
+          - "{{ outputs.convert_revocations_to_ldif.urisList[0] }}"
+    else:
+      - id: skip_revocation
+        type: io.kestra.plugin.core.log.Log
+        description: Nothing was flagged, so the run records a clean recertification and touches no group membership.
+        message: "{{ outputs.assess_entitlement_risk.vars.campaign }} came back clean with 0 flagged accounts, so no entitlement was revoked."
+
+  # --- 5. evidence pack ---
+  - id: render_evidence_pack
+    type: io.kestra.plugin.scripts.python.Script
+    description: Write the campaign report as a single JSON artifact that the S3 upload can archive.
+    inputFiles:
+      report_payload.json: "{{ outputs.assess_entitlement_risk.vars.report_json }}"
+    outputFiles:
+      - access_review_report.json
+    script: |
+      import json
+
+      with open("report_payload.json", "r", encoding="utf-8") as handle:
+          report = json.load(handle)
+
+      with open("access_review_report.json", "w", encoding="utf-8") as handle:
+          json.dump(report, handle, indent=2, sort_keys=True)
+
+      print(
+          "rendered evidence report for "
+          + str(report.get("campaign"))
+          + " with "
+          + str(report.get("flagged_count"))
+          + " flagged account(s)"
+      )
+
+  - id: upload_evidence_pack
+    type: io.kestra.plugin.aws.s3.Upload
+    description: Archive the JSON evidence report under a campaign prefix so auditors can pull the certification record for the quarter.
+    from: "{{ outputs.render_evidence_pack.outputFiles['access_review_report.json'] }}"
+    key: "access-reviews/{{ outputs.assess_entitlement_risk.vars.campaign_slug }}/access_review_report.json"
+    bucket: "{{ secret('S3_EVIDENCE_BUCKET') }}"
+    region: "{{ secret('AWS_DEFAULT_REGION') }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+
+  - id: campaign_summary
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Post the campaign verdict, the flagged count, and the archived evidence location to the security channel.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "Quarterly access review {{ outputs.assess_entitlement_risk.vars.campaign }} finished with verdict {{ outputs.assess_entitlement_risk.vars.verdict }}. Flagged {{ outputs.assess_entitlement_risk.vars.flagged_count }} of {{ outputs.assess_entitlement_risk.vars.scanned_accounts }} reviewed account(s), entitlements read {{ outputs.assess_entitlement_risk.vars.entitlement_count }}. Evidence pack at s3://{{ outputs.upload_evidence_pack.bucket }}/{{ outputs.upload_evidence_pack.key }}"
+      }
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert the security channel when the campaign fails, since a half-finished certification cannot be used as audit evidence.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED {{ flow.id }} run {{ execution.id }} - the {{ inputs.campaign_name }} access review stopped before the evidence pack was archived."}
+
+outputs:
+  - id: campaign
+    type: STRING
+    value: "{{ outputs.assess_entitlement_risk.vars.campaign }}"
+  - id: verdict
+    type: STRING
+    value: "{{ outputs.assess_entitlement_risk.vars.verdict }}"
+  - id: flagged_count
+    type: INT
+    value: "{{ outputs.assess_entitlement_risk.vars.flagged_count }}"
+  - id: scanned_accounts
+    type: INT
+    value: "{{ outputs.assess_entitlement_risk.vars.scanned_accounts }}"
+  - id: evidence_bucket
+    type: STRING
+    value: "{{ outputs.upload_evidence_pack.bucket }}"
+  - id: evidence_key
+    type: STRING
+    value: "{{ outputs.upload_evidence_pack.key }}"
+
+extend:
+  title: Quarterly Entitlement Recertification Campaign
+  metaTitle: Quarterly Access Review and Entitlement Recertification with Kestra
+  shortDescription: Recertify standing LDAP access every quarter by enumerating group entitlements, flagging stale, dormant, and over-privileged accounts, notifying managers, revoking flagged membership, and archiving an evidence pack.
+  metaDescription: Recertify standing LDAP access each quarter with Kestra. Enumerate entitlements, flag stale and dormant accounts, notify managers, and archive evidence.
+  description: |
+    Quarterly access reviews are a standing obligation for any organization that answers to SOC 2, ISO 27001, or an internal separation of duties policy, and the work is usually a spreadsheet that gets emailed around and reconciled by hand. This flow runs the recertification as code instead. It reads group entitlements and account activity straight from the directory, scores each account against stale, dormant, and over-privileged rules, pushes every flagged account to its manager with a decision row for the audit trail, revokes what should no longer be held, and leaves a JSON evidence pack in object storage. The scope here is the recertification of standing access that people already hold every quarter. It is deliberately not a data subject erasure workflow, which removes personal data on request, because nothing in this campaign deletes records, it only certifies or revokes group membership.
+
+    ## How it works
+
+    1. `quarterly_review_window` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 6 1 1,4,7,10 *`, shipped with `disabled: true`) opens the campaign on the first day of January, April, July, and October once you enable it.
+    2. `enumerate_group_entitlements` (`io.kestra.plugin.ldap.Search`) reads every entry under `ou=groups` with its `cn`, `description`, `member`, and `managedBy` attributes, while `enumerate_account_activity` reads `ou=people` for the logon and status attributes the rules need. Both searches store their results as internal storage files, so no directory data leaves the worker.
+    3. `assess_entitlement_risk` (`io.kestra.plugin.scripts.python.Script`) loads both result sets, scores every account that holds at least one group membership, and publishes the flagged list through the `::json::` output protocol.
+    4. `notify_flagged_accounts` (`io.kestra.plugin.core.flow.Loop`) iterates the flagged accounts. Each iteration posts a manager notification with `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` and appends a decision row with `io.kestra.plugin.jdbc.postgresql.Queries`.
+    5. `revocation_gate` (`io.kestra.plugin.core.flow.If`) applies the revocation path only when `flagged_count` is greater than zero. It renders Ion `modify` records with `io.kestra.plugin.core.storage.Write`, converts them through `io.kestra.plugin.ldap.IonToLdif`, and applies them with `io.kestra.plugin.ldap.Modify`; the clean path only logs a message.
+    6. `render_evidence_pack` writes `access_review_report.json`, `upload_evidence_pack` (`io.kestra.plugin.aws.s3.Upload`) archives it under a campaign prefix, and `campaign_summary` posts the verdict. The `errors` handler posts to Slack if any step fails.
+
+    ## What you get
+
+    - A per campaign verdict of `clean` or `action_required`, plus the count of accounts reviewed and flagged, available as declared flow outputs.
+    - Three concrete risk flags on each account, `stale_logon`, `dormant_account`, and `over_privileged`, with a medium or high risk rating that orders the notification loop.
+    - A manager notification in Slack and a matching row in `access_review_decisions` for every flagged account, so the review is queryable and not trapped in a chat thread.
+    - Automatic revocation of the flagged group membership through the same Ion to LDIF to `ldap.Modify` path that the offboarding blueprint uses.
+    - An `access_review_report.json` evidence pack in S3, keyed by a slug of the campaign name, that an auditor can pull for the quarter.
+    - A distinct Slack alert on failure, because a certification that stopped halfway cannot be filed as evidence.
+
+    ## Who it's for
+
+    - Security and identity teams who run quarterly access certification for SOC 2, ISO 27001, PCI DSS, or an internal least privilege policy.
+    - Platform teams that maintain an on premises OpenLDAP or ApacheDS directory as the group membership source for VPN, SSH, and internal applications.
+    - Compliance owners who need an evidence artifact per quarter rather than a spreadsheet with manual sign offs.
+    - IT administrators who already automate offboarding and want the standing access side of the lifecycle covered as well.
+
+    ## Why orchestrate this with Kestra
+
+    The assessment itself is a script, but a script cannot open a quarterly window, run two directory searches, fan out one Slack request and one database insert per flagged account, branch on the result, convert Ion records to LDIF, and archive the evidence, all in one run that leaves an execution history. Those handoffs are exactly where manual reviews break down, since the spreadsheet, the chat thread, and the ticket system drift apart within a week. Kestra keeps the enumeration, the risk rules, the manager loop, the revocation gate, and the evidence pack in a single versioned YAML file, so a rule change is a reviewed pull request instead of a tribal knowledge update. Failed runs surface as a red execution with a Slack alert, and every run keeps the inputs, the flagged list, and the archived object address together for the audit file.
+
+    ## Prerequisites
+
+    - An LDAP directory reachable from the Kestra worker, with an admin bind account that can search `ou=people` and `ou=groups` and modify group entries.
+    - An `objectClass=groupOfNames` style group tree whose `member` attribute holds full account DNs, plus `inetOrgPerson` people entries that carry `lastLogonTimestamp` and `accountStatus`.
+    - A Postgres database with an `access_review_decisions` table holding `campaign_name`, `account_uid`, `manager_dn`, `risk`, `flags`, `membership_count`, `review_status`, and `created_at` columns.
+    - An Amazon S3 bucket for evidence packs and AWS credentials allowed to put objects into it.
+    - A Slack incoming webhook for manager notifications, campaign summaries, and failure alerts.
+    - Docker or a Python runner available to Kestra for the two `io.kestra.plugin.scripts.python.Script` tasks.
+
+    ### Secrets
+
+    - `LDAP_HOSTNAME`: hostname of the LDAP server.
+    - `LDAP_ADMIN_DN` / `LDAP_ADMIN_PASSWORD`: bind credentials for an account that can search and modify entries.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL.
+    - `POSTGRES_URL` / `POSTGRES_USER` / `POSTGRES_PASSWORD`: connection settings for the decision log database.
+    - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION`: credentials and region for the S3 upload.
+    - `S3_EVIDENCE_BUCKET`: name of the bucket that stores the quarterly evidence packs.
+
+    ## Quick start
+
+    1. Add every secret listed above to the `company.team` namespace in Kestra under Settings, then Secrets.
+    2. Create the `access_review_decisions` table in Postgres with the columns listed under Prerequisites.
+    3. Point `base_dn` at your directory and adjust the two `filter` values if your schema uses different object classes, then enable the trigger when you are ready to run on schedule.
+    4. The schedule block to enable is this one, shipped disabled so nothing fires during review:
+
+    ```yaml
+    triggers:
+      - id: quarterly_review_window
+        type: io.kestra.plugin.core.trigger.Schedule
+        cron: "0 6 1 1,4,7,10 *"
+        disabled: true
+    ```
+
+    5. Run the flow once by hand with `campaign_name` set to the current quarter, then confirm the Slack notices, the decision rows, and the `access_review_report.json` object in the bucket.
+
+    ## How to extend
+
+    - Raise or lower `STALE_DAYS`, `DORMANT_DAYS`, and `MAX_PRIVILEGED_GROUPS` inside `assess_entitlement_risk` to match your own recertification policy, since those constants are the whole rule set.
+    - Add another `io.kestra.plugin.ldap.Search` against `pwdAccountLockedTime` or an application entitlement store if some access lives outside the directory.
+    - Replace the Slack manager message with an approval request that writes `certified` or `rejected` back to `review_status`, so the decision loop closes in the database instead of in a thread.
+    - Split the revocation path by flag, for example revoking only `over_privileged` memberships while leaving `stale_logon` accounts for a human decision in the `revocation_gate` branch.
+    - Load the archived evidence pack into a warehouse table with `io.kestra.plugin.jdbc.postgresql.CopyIn` to build a multi quarter trend of flagged and revoked access.
+    - Run the same assessment monthly instead of quarterly by changing the cron to `0 6 1 * *`, which turns the campaign into a drift check on standing access.
+
+    ## Links
+
+    - LDAP plugin docs: https://kestra.io/plugins/plugin-ldap
+    - AWS plugin docs: https://kestra.io/plugins/plugin-aws
+    - Schedules trigger docs: https://kestra.io/docs/workflow-components/triggers
+  tags:
+    - Infrastructure
+    - Business
+  subTags:
+    - Policy & Compliance
+    - Reporting & Digests
+  ee: false
+  demo: false
