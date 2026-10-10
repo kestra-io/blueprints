@@ -1,0 +1,316 @@
+id: postgres-transactional-outbox-kafka-fanout
+namespace: company.streaming
+description: |
+  Reliable Transactional Outbox processor polling PostgreSQL for pending domain
+  events using FOR UPDATE SKIP LOCKED, fanning out records to Apache Kafka topics
+  with partition key routing, and updating delivery status atomically with Kestra.
+
+concurrency:
+  behavior: QUEUE
+  limit: 1
+
+triggers:
+  - id: periodic_outbox_poller
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: High-frequency schedule polling for pending outbox events. Shipped disabled by default.
+    cron: "* * * * *"
+    disabled: true
+
+  - id: on_demand_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Secured webhook trigger to flush outbox events immediately upon critical transaction commit.
+    key: "{{ secret('OUTBOX_WEBHOOK_KEY') }}"
+
+inputs:
+  - id: postgres_host
+    type: STRING
+    displayName: PostgreSQL Host
+    description: Hostname or endpoint of the PostgreSQL database cluster.
+    defaults: postgres
+
+  - id: postgres_port
+    type: INT
+    displayName: PostgreSQL Port
+    description: Port number for the PostgreSQL service.
+    defaults: 5432
+
+  - id: database_name
+    type: STRING
+    displayName: Database Name
+    description: Target PostgreSQL database containing the outbox table.
+    defaults: app_db
+
+  - id: batch_size
+    type: INT
+    displayName: Outbox Batch Size
+    description: Maximum number of pending events to lock and process per execution cycle.
+    defaults: 50
+
+  - id: kafka_topic_prefix
+    type: STRING
+    displayName: Kafka Topic Prefix
+    description: Prefix prepended to the aggregate type to form destination Kafka topic names.
+    defaults: cdc.events
+
+tasks:
+  - id: poll_pending_outbox_events
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Atomically claim an ordered prefix of pending outbox events using monotonic event sequencing and FOR UPDATE SKIP LOCKED to guarantee per-aggregate FIFO ordering.
+    url: "jdbc:postgresql://{{ inputs.postgres_host }}:{{ inputs.postgres_port }}/{{ inputs.database_name }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      WITH locked_candidates AS (
+        SELECT id, aggregate_type, aggregate_id, event_sequence
+        FROM outbox_events
+        WHERE status = 'PENDING'
+           OR (status = 'CLAIMED' AND claimed_at < NOW() - INTERVAL '15 minutes')
+        ORDER BY event_sequence ASC
+        LIMIT {{ inputs.batch_size }}
+        FOR UPDATE SKIP LOCKED
+      ),
+      eligible AS (
+        SELECT c.id
+        FROM locked_candidates c
+        WHERE NOT EXISTS (
+          -- Guarantee per-aggregate FIFO: exclude event if an earlier event for this aggregate is missing from this batch
+          SELECT 1
+          FROM outbox_events o2
+          WHERE o2.aggregate_type = c.aggregate_type
+            AND o2.aggregate_id = c.aggregate_id
+            AND o2.event_sequence < c.event_sequence
+            AND o2.status IN ('PENDING', 'CLAIMED')
+            AND o2.id NOT IN (SELECT id FROM locked_candidates)
+        )
+      ),
+      claimed AS (
+        UPDATE outbox_events o
+        SET status = 'CLAIMED',
+            claim_owner = '{{ execution.id }}',
+            claimed_at = NOW(),
+            updated_at = NOW()
+        FROM eligible
+        WHERE o.id = eligible.id
+        RETURNING
+          o.id::text AS event_id,
+          o.event_sequence,
+          o.aggregate_type,
+          o.aggregate_id,
+          o.event_type,
+          o.payload::text AS event_payload,
+          COALESCE(o.correlation_id, o.id::text) AS correlation_id,
+          o.claim_owner,
+          o.retry_count,
+          o.created_at
+      )
+      SELECT
+        event_id,
+        event_sequence,
+        aggregate_type,
+        aggregate_id,
+        event_type,
+        event_payload,
+        correlation_id,
+        claim_owner,
+        retry_count,
+        TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
+      FROM claimed
+      ORDER BY event_sequence ASC;
+
+  - id: evaluate_batch_content
+    type: io.kestra.plugin.core.flow.If
+    description: Verify whether the polled batch contains any pending events to dispatch.
+    condition: "{{ outputs.poll_pending_outbox_events.size > 0 }}"
+    then:
+      - id: dispatch_events_to_kafka
+        type: io.kestra.plugin.core.flow.Loop
+        description: Iterate over each claimed outbox event in strict chronological order, stream it to Kafka, and mark the record as dispatched.
+        values: "{{ outputs.poll_pending_outbox_events.rows }}"
+        tasks:
+          - id: publish_event_to_kafka
+            type: io.kestra.plugin.kafka.Produce
+            description: Stream event payload into Kafka partitioned by aggregate_id to guarantee per-entity FIFO ordering with event_id header for consumer idempotency.
+            topic: "{{ inputs.kafka_topic_prefix }}.{{ item.value.aggregate_type | lower }}"
+            properties:
+              bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP_SERVERS') }}"
+              acks: "all"
+              compression.type: "snappy"
+            keySerializer: STRING
+            valueSerializer: STRING
+            from:
+              key: "{{ item.value.aggregate_id }}"
+              value: "{{ item.value.event_payload }}"
+              headers:
+                event_id: "{{ item.value.event_id }}"
+                event_sequence: "{{ item.value.event_sequence }}"
+                event_type: "{{ item.value.event_type }}"
+                correlation_id: "{{ item.value.correlation_id }}"
+
+          - id: mark_event_dispatched
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Update outbox event state to DISPATCHED with fenced claim ownership check.
+            url: "jdbc:postgresql://{{ inputs.postgres_host }}:{{ inputs.postgres_port }}/{{ inputs.database_name }}"
+            username: "{{ secret('POSTGRES_USER') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: NONE
+            sql: |
+              UPDATE outbox_events
+              SET status = 'DISPATCHED',
+                  dispatched_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = '{{ item.value.event_id }}'::uuid
+                AND claim_owner = '{{ execution.id }}';
+
+      - id: log_dispatch_success
+        type: io.kestra.plugin.core.log.Log
+        description: Record dispatch volume metrics in execution logs.
+        message: "Successfully dispatched {{ outputs.poll_pending_outbox_events.size }} event(s) from PostgreSQL outbox to Kafka prefix '{{ inputs.kafka_topic_prefix }}'."
+
+    else:
+      - id: log_clean_backlog
+        type: io.kestra.plugin.core.log.Log
+        description: Record idle state when no pending events require dispatching.
+        message: "Outbox backlog clean: 0 pending events in '{{ inputs.database_name }}.outbox_events'."
+
+errors:
+  - id: alert_on_pipeline_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Pager alert dispatched to Slack when outbox polling or Kafka publishing encounters unhandled exceptions.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      :rotating_light: *Transactional Outbox Dispatcher FAILED*
+      *Workflow:* `{{ flow.id }}` in namespace `{{ flow.namespace }}`
+      *Execution ID:* `{{ execution.id }}`
+      *Database:* `{{ inputs.database_name }}` on `{{ inputs.postgres_host }}`
+      *Kafka Topic Prefix:* `{{ inputs.kafka_topic_prefix }}`
+      Check the Kestra execution logs immediately for database lock contention, network timeouts, or broker connectivity errors.
+
+extend:
+  title: "PostgreSQL Transactional Outbox Pattern with Kafka Fanout"
+  shortDescription: "Poll PostgreSQL outbox tables with SKIP LOCKED, reliably publish domain events to Apache Kafka, and track delivery status with Kestra."
+  metaTitle: "PostgreSQL Transactional Outbox to Kafka with Kestra"
+  metaDescription: "Implement the transactional outbox pattern with Kestra: poll Postgres outbox tables safely with SKIP LOCKED, publish to Kafka, and track delivery status."
+  description: |
+    In distributed systems and microservices architectures, updating a local database and publishing a streaming event in a single atomic transaction is impossible without distributed two-phase commits (2PC), which introduces significant latency and operational fragility. The **Transactional Outbox Pattern** solves this dual-write dilemma: microservices commit domain data and corresponding integration events into a local `outbox_events` relational table within the same ACID transaction. An asynchronous worker then polls the outbox and reliably relays the events to an event streaming broker like Apache Kafka.
+
+    This blueprint implements a production-grade Transactional Outbox relay using Kestra. It uses PostgreSQL's native `FOR UPDATE SKIP LOCKED` inside an atomic Common Table Expression (CTE) to lease batches of pending events (`status = 'CLAIMED'`) with fenced execution tokens (`claim_owner = execution.id`), maintains monotonic event sequencing (`event_sequence`) to guarantee strict per-aggregate FIFO order even across multi-event batches and simultaneous transaction commits, streams records to topic partitions keyed by `aggregate_id`, includes explicit `event_id` and `event_sequence` headers for consumer idempotency, marks events as `DISPATCHED`, and alerts on-call engineers via Slack if broker connectivity or database operations fail.
+
+    ## Outbox Table Schema
+
+    Before running this workflow, create the `outbox_events` table in your PostgreSQL database:
+
+    ```sql
+    -- Required for gen_random_uuid() on PostgreSQL 10–12 (built into PostgreSQL 13+)
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+    CREATE TABLE IF NOT EXISTS outbox_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_sequence BIGINT GENERATED ALWAYS AS IDENTITY,
+        aggregate_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        event_type VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        correlation_id VARCHAR(128),
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        claim_owner VARCHAR(64),
+        retry_count INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
+        dispatched_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_outbox_aggregate_fifo
+    ON outbox_events (aggregate_type, aggregate_id, event_sequence ASC)
+    WHERE status IN ('PENDING', 'CLAIMED');
+
+    CREATE INDEX IF NOT EXISTS idx_outbox_polling_queue
+    ON outbox_events (event_sequence ASC)
+    WHERE status IN ('PENDING', 'CLAIMED');
+    ```
+
+    ## How it works
+
+    1. **Execution Serialization:** The workflow specifies `concurrency: { behavior: QUEUE, limit: 1 }` so overlapping scheduled intervals or incoming webhooks serialize neatly, preventing multi-producer race conditions across batches.
+    2. **Atomic Batch Claiming with Contiguous Prefix Drainage:** `poll_pending_outbox_events` (`io.kestra.plugin.jdbc.postgresql.Query`) runs an atomic `UPDATE ... FROM CTE RETURNING` statement. The query:
+       - Locks up to `batch_size` candidate rows ordered by monotonic `event_sequence ASC` with `FOR UPDATE SKIP LOCKED`.
+       - Drains multiple contiguous pending events per aggregate within the same batch while preserving strict FIFO: a candidate event is only excluded if an earlier event for that same aggregate is missing from the locked candidate set (e.g. held by an active external lock or in-flight claim).
+       - Fences the claim by assigning `claim_owner = '{{ execution.id }}'` and recording `claimed_at = NOW()`.
+       - Guarantees deterministic iteration ordering by returning the leased records through an outer `SELECT ... ORDER BY event_sequence ASC`.
+       - Automatically recovers stale leases where `claimed_at < NOW() - INTERVAL '15 minutes'`.
+    3. **Backlog Evaluation:** `evaluate_batch_content` (`io.kestra.plugin.core.flow.If`) evaluates `outputs.poll_pending_outbox_events.size > 0`. If the outbox is empty, the flow logs a clean state and finishes cleanly with minimal overhead.
+    4. **Event Streaming:** `dispatch_events_to_kafka` (`io.kestra.plugin.core.flow.Loop`) iterates through each claimed event sequentially using `item.value`:
+       - `publish_event_to_kafka` (`io.kestra.plugin.kafka.Produce`) publishes the record via the `from` property to `{{ inputs.kafka_topic_prefix }}.{{ aggregate_type }}` using `aggregate_id` as the message key for hash-based partition locality and `acks: all` for high durability. It explicitly includes `event_id`, `event_sequence`, `event_type`, and `correlation_id` in the Kafka message headers to empower downstream consumers with end-to-end idempotency and deduplication.
+       - `mark_event_dispatched` (`io.kestra.plugin.jdbc.postgresql.Query`) updates the record status to `DISPATCHED` fenced with `claim_owner = '{{ execution.id }}'` and records `dispatched_at = NOW()`.
+    5. **Audit Logging:** `log_dispatch_success` (`io.kestra.plugin.core.log.Log`) outputs the count of successfully relayed messages.
+    6. **Failure Pager:** `alert_on_pipeline_failure` in the `errors` block posts an immediate incident alert to Slack with execution context and connection parameters.
+
+    ## What you get
+
+    - Guaranteed at-least-once delivery from PostgreSQL to Apache Kafka without dual-write inconsistency.
+    - Zero lock contention between workers via PostgreSQL's non-blocking `SKIP LOCKED` and atomic lease transitions.
+    - Strict per-aggregate FIFO ordering guaranteed through monotonic sequence numbers, contiguous prefix batching, and serialized concurrency.
+    - Idempotent consumer contract with `event_id` and `event_sequence` in Kafka record headers.
+    - Observability and delivery tracking directly in database records (`dispatched_at` timestamps).
+    - Fail-safe alerting with detailed execution tracing.
+
+    ## Who it's for
+
+    - Backend and Software Engineers implementing domain-driven microservices.
+    - Data Platform Engineers building Change Data Capture (CDC) and event streaming backbones.
+    - DevOps and Site Reliability Engineers needing resilient, self-healing message relays.
+
+    ## Why orchestrate this with Kestra
+
+    Building custom background daemons in Go, Python, or Java to poll outbox tables requires writing custom connection pools, backoff retry loops, Kafka producer boilerplate, and monitoring hooks. Kestra provides declarative, cloud-native orchestration with built-in connection retries, secret masking, fine-grained concurrency control, and Slack alerting out of the box.
+
+    ## Prerequisites
+
+    - A PostgreSQL database (v10+, with `pgcrypto` enabled for `gen_random_uuid()` on PostgreSQL 10–12) with the `outbox_events` table configured.
+    - An accessible Apache Kafka cluster (or Confluent Cloud, Aiven, Redpanda).
+    - A Slack Incoming Webhook for operational alerting.
+
+    ### Secrets
+
+    Configure the following secrets in your Kestra namespace:
+
+    - `POSTGRES_USER`: Database user credentials with `SELECT` and `UPDATE` privileges on `outbox_events`.
+    - `POSTGRES_PASSWORD`: Database user password.
+    - `KAFKA_BOOTSTRAP_SERVERS`: Comma-separated list of Kafka broker endpoints (e.g. `broker1:9092,broker2:9092`).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for error alerts.
+    - `OUTBOX_WEBHOOK_KEY`: Secret authentication key for the manual webhook trigger.
+
+    ## Quick start
+
+    1. Populate the required secrets (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `KAFKA_BOOTSTRAP_SERVERS`, `SLACK_WEBHOOK_URL`, `OUTBOX_WEBHOOK_KEY`) in your Kestra namespace.
+    2. Run the DDL script above in your PostgreSQL database to enable `pgcrypto` (if on PostgreSQL 10–12) and create `outbox_events` and its partial index.
+    3. Insert a test event into `outbox_events`:
+       ```sql
+       INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+       VALUES ('order', 'ORD-10492', 'OrderCreated', '{"order_id": "ORD-10492", "customer_id": "CUST-881", "total": 149.50}');
+       ```
+    4. Execute the flow manually in the Kestra UI to verify end-to-end publishing and state transition to `DISPATCHED`.
+    5. Enable `periodic_outbox_poller` to poll on an ongoing schedule.
+
+    ## How to extend
+
+    - **Dead-Letter Handling:** Extend with an error branch that increments `retry_count` and marks records as `POISON` if JSON deserialization fails.
+    - **Cloud Storage Archival:** Chain an `io.kestra.plugin.aws.s3.Upload` or `io.kestra.plugin.gcp.gcs.Upload` task to sweep old `DISPATCHED` records into Parquet archives after 30 days.
+    - **Multi-Tenant Routing:** Prepend tenant identifiers from `item.value` to route events across dynamic tenant Kafka topics.
+
+    ## Links
+
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgresql)
+    - [Kestra Kafka Plugin Documentation](https://kestra.io/plugins/plugin-kafka)
+    - [Martin Fowler on the Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+    - [This blueprint was created by Vedant817](https://github.com/Vedant817)
+  tags:
+    - Data
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Realtime & Streaming
+    - Databases
+  ee: false
+  demo: false
