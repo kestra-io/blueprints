@@ -1,0 +1,736 @@
+id: redis-unexpiring-key-growth-guard
+namespace: company.team
+
+description: |
+  Find the Redis key prefixes that are accumulating keys with no expiry and how fast.
+  One code path that writes SET without EX turns a cache into a permanent store. The keys are
+  tiny, so nothing looks wrong until the instance reaches maxmemory and the eviction policy
+  starts throwing away keys that do matter. Or writes start failing with OOM. This flow walks
+  the keyspace with SCAN in batches (never KEYS, which blocks the server for the whole
+  keyspace), buckets keys by prefix, counts the ones whose TTL is -1, samples MEMORY USAGE for
+  a bytes estimate and compares every prefix against a KV baseline from the previous run so a
+  prefix that keeps growing is told apart from one that is legitimately permanent. It can then
+  set a TTL on a named prefix with EXPIRE, behind a Pause, then re-scans to prove it landed.
+
+inputs:
+  - id: host
+    type: STRING
+    displayName: Redis host
+    defaults: redis-cache
+
+  - id: port
+    type: INT
+    displayName: Redis port
+    defaults: 6379
+
+  - id: database
+    type: INT
+    displayName: Database index
+    defaults: 0
+
+  - id: delimiter
+    type: STRING
+    displayName: Key segment separator
+    description: The character your key names use between segments. Must not be a space.
+    defaults: ":"
+
+  - id: prefix_depth
+    type: INT
+    displayName: Segments that make a prefix
+    description: >-
+      2 buckets session:web:abc under session:web. 1 buckets it under session. Keys with fewer
+      separators than this are bucketed on the deepest separator they have.
+    defaults: 2
+
+  - id: scan_count
+    type: INT
+    displayName: Keys per SCAN batch
+    description: COUNT hint for each SCAN cursor step. Smaller batches do less work per step.
+    defaults: 500
+
+  - id: max_keys
+    type: INT
+    displayName: Keys examined per run
+    description: >-
+      Ceiling on the walk. The run stops here and reports the scan as partial rather than
+      walking a huge keyspace. Raise it once you know how many keys you hold.
+    defaults: 20000
+
+  - id: memory_sample_every
+    type: INT
+    displayName: MEMORY USAGE sample rate
+    description: One key in N per prefix is measured. The average is applied to the rest.
+    defaults: 25
+
+  - id: min_keys_to_flag
+    type: INT
+    displayName: Smallest prefix worth reporting
+    description: A prefix with fewer unexpiring keys than this is reported as OK.
+    defaults: 100
+
+  - id: growth_warn_pct
+    type: FLOAT
+    displayName: Growth that counts as rising
+    description: Percent increase in unexpiring keys since the baseline that makes a prefix unbounded.
+    defaults: 5.0
+
+  - id: allow_prefixes
+    type: JSON
+    displayName: Prefixes that are legitimately permanent
+    description: >-
+      Keys under these prefixes are meant to live forever, so they are never a finding and
+      never expired. An entry also covers everything below it.
+    defaults: '["config", "feature:flags", "schema:registry"]'
+
+  - id: remediate_prefixes
+    type: JSON
+    displayName: Prefixes to put a TTL on
+    description: >-
+      Only these prefixes are touched. Within them, only the ones that are also a finding. An empty
+      list means report and stop.
+    defaults: '[]'
+
+  - id: expire_ttl_seconds
+    type: INT
+    displayName: TTL applied by EXPIRE
+    description: Seconds. 604800 is 7 days.
+    defaults: 604800
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration to wait for an answer before the pause expires.
+    defaults: "PT2H"
+
+  - id: network
+    type: STRING
+    displayName: Docker network for redis-cli
+    description: Leave empty unless Redis is only reachable on a named Docker network.
+    defaults: ""
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow EXPIRE. Still needs dry_run false and an approval.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any key is given a TTL.
+    defaults: true
+
+variables:
+  baseline_key: "redis_nottl_baseline_{{ inputs.host | replace({'.': '_', '-': '_'}) }}_{{ inputs.database }}"
+
+  scan_lua: |
+    local delim = ARGV[1]
+    local depth = tonumber(ARGV[2])
+    local batch = tonumber(ARGV[3])
+    local maxkeys = tonumber(ARGV[4])
+    local every = tonumber(ARGV[5])
+    local match = ARGV[6]
+    local function bucket(k)
+      local last = nil
+      local start = 1
+      for i = 1, depth do
+        local p = string.find(k, delim, start, true)
+        if not p then break end
+        last = p
+        start = p + 1
+      end
+      if last == nil then return k end
+      return string.sub(k, 1, last - 1)
+    end
+    local acc = {}
+    local cursor = '0'
+    local examined = 0
+    repeat
+      local step = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', batch)
+      cursor = step[1]
+      for _, k in ipairs(step[2]) do
+        examined = examined + 1
+        local b = bucket(k)
+        local e = acc[b]
+        if e == nil then
+          e = { total = 0, nottl = 0, sampled = 0, bytes = 0 }
+          acc[b] = e
+        end
+        e.total = e.total + 1
+        if redis.call('TTL', k) == -1 then e.nottl = e.nottl + 1 end
+        if every <= 1 or (e.total % every) == 1 then
+          local m = redis.call('MEMORY', 'USAGE', k)
+          if m then
+            e.sampled = e.sampled + 1
+            e.bytes = e.bytes + m
+          end
+        end
+      end
+    until cursor == '0' or examined >= maxkeys
+    local out = {}
+    for b, e in pairs(acc) do
+      out[#out + 1] = { prefix = b, total = e.total, nottl = e.nottl, sampled = e.sampled, bytes = e.bytes }
+    end
+    local res = { examined = examined, truncated = (cursor ~= '0') and 1 or 0, prefixes = out }
+    if #out == 0 then res.prefixes = nil end
+    return cjson.encode(res)
+
+  expire_lua: |
+    local delim = ARGV[1]
+    local depth = tonumber(ARGV[2])
+    local batch = tonumber(ARGV[3])
+    local maxkeys = tonumber(ARGV[4])
+    local match = ARGV[5]
+    local target = ARGV[6]
+    local ttl = tonumber(ARGV[7])
+    local blocked = {}
+    for i = 8, #ARGV do blocked[ARGV[i]] = true end
+    local function bucket(k)
+      local last = nil
+      local start = 1
+      for i = 1, depth do
+        local p = string.find(k, delim, start, true)
+        if not p then break end
+        last = p
+        start = p + 1
+      end
+      if last == nil then return k end
+      return string.sub(k, 1, last - 1)
+    end
+    if blocked[target] then
+      return cjson.encode({ refused = 1, target = target, reason = 'prefix is allowlisted' })
+    end
+    local cursor = '0'
+    local examined, matched, expired, had_ttl, other = 0, 0, 0, 0, 0
+    repeat
+      local step = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', batch)
+      cursor = step[1]
+      for _, k in ipairs(step[2]) do
+        examined = examined + 1
+        local b = bucket(k)
+        if b == target and not blocked[b] then
+          matched = matched + 1
+          if redis.call('TTL', k) == -1 then
+            redis.call('EXPIRE', k, ttl)
+            expired = expired + 1
+          else
+            had_ttl = had_ttl + 1
+          end
+        else
+          other = other + 1
+        end
+      end
+    until cursor == '0' or examined >= maxkeys
+    return cjson.encode({ refused = 0, target = target, ttl = ttl, examined = examined,
+      matched = matched, expired = expired, had_ttl = had_ttl, skipped_other = other,
+      truncated = (cursor ~= '0') and 1 or 0 })
+
+tasks:
+  - id: scan_keyspace
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: >-
+      Read-only. SCAN in batches of scan_count, bucket every key by prefix, count the ones whose
+      TTL is -1 and sample MEMORY USAGE. KEYS is never used: it builds the whole key list in one
+      reply and blocks the server for as long as that takes, with no ceiling.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    inputFiles:
+      ttl_scan.lua: "{{ vars.scan_lua }}"
+    commands:
+      - "--eval ttl_scan.lua , {{ inputs.delimiter }} {{ inputs.prefix_depth }} {{ inputs.scan_count }} {{ inputs.max_keys }} {{ inputs.memory_sample_every }} *"
+
+  - id: read_memory
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: Read-only. used_memory and maxmemory, so the report can state the headroom left.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    commands:
+      - INFO memory
+
+  - id: read_keyspace
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: >-
+      Read-only. The db line gives keys and expires for the whole database in constant time, so
+      keys minus expires is an exact count of unexpiring keys to check the sampled walk against.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    commands:
+      - INFO keyspace
+
+  - id: assess
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      Classify every prefix against the baseline, work out the growth rate and the headroom, then
+      resolve which requested prefixes may actually be expired.
+    values:
+      items: >-
+        {{ {'s': fromJson(outputs.scan_keyspace.vars.command_1), 'mem': outputs.read_memory.vars.command_1,
+            'ks': outputs.read_keyspace.vars.command_1, 'b': (kv(render(vars.baseline_key), errorOnMissing=false) ?? {}),
+            'allow': inputs.allow_prefixes, 'rem': inputs.remediate_prefixes, 'mink': inputs.min_keys_to_flag,
+            'warn': inputs.growth_warn_pct, 'delim': inputs.delimiter, 'db': inputs.database, 'host': inputs.host,
+            'armed': (inputs.auto_remediate and not inputs.dry_run)} | jq('
+          . as $i
+          | (now | floor) as $nowS
+          | ($i.mem | split("\\n") | map(select(contains(":")) | gsub("\\r"; "") | split(":")) | map({(.[0]): (.[1] // "")}) | add // {}) as $mem
+          | ($i.ks | split("\\n") | map(gsub("\\r"; "")) | map(select(startswith("db" + ($i.db | tostring) + ":"))) | .[0] // "") as $ksline
+          | (if $ksline == "" then {} else ($ksline | split(":") | .[1] | split(",") | map(split("=")) | map({(.[0]): (.[1] // "0")}) | add) end) as $ks
+          | (($mem.used_memory // "0") | tonumber) as $used
+          | (($mem.maxmemory // "0") | tonumber) as $maxm
+          | (($ks.keys // "0") | tonumber) as $dbkeys
+          | (($ks.expires // "0") | tonumber) as $dbexp
+          | ($i.b // {}) as $b
+          | (($b.at // 0) > 0) as $hasbase
+          | ($nowS - ($b.at // 0)) as $elapsed
+          | ($b.prefixes // {}) as $bp
+          | (($i.s.truncated // 0) == 1) as $partial
+          | [ ($i.s.prefixes // [])[]
+              | . as $p
+              | .nottl as $n
+              | (if (.sampled // 0) > 0 then ((.bytes / .sampled) | floor) else 0 end) as $avg
+              | ($bp[$p.prefix]) as $was
+              | ((($i.allow // []) | map(. as $a | select($p.prefix == $a or ($p.prefix | startswith($a + $i.delim)))) | length) > 0) as $allowed
+              | (if $was == null or $partial then null else ($n - $was) end) as $delta
+              | (if ($was // 0) > 0 and $delta != null then ((($delta * 1000) / $was) | floor) / 10 else null end) as $pct
+              | (if $elapsed >= 60 and ($delta // 0) > 0 then ((($delta * 3600) / $elapsed) | floor) else null end) as $rate
+              | (if $allowed then "ALLOWLISTED"
+                 elif $n == 0 or $n < $i.mink then "OK"
+                 elif $partial or ($hasbase | not) then "NO_TTL_STATIC"
+                 elif $was == null then "GROWING_UNBOUNDED"
+                 elif $delta > 0 and ($was == 0 or ((($delta * 100) / $was) >= $i.warn)) then "GROWING_UNBOUNDED"
+                 else "NO_TTL_STATIC" end) as $state
+              | {prefix: $p.prefix, total: $p.total, nottl: $n, state: $state, avg_bytes: $avg,
+                 nottl_bytes: ($avg * $n), was: $was, delta: $delta, pct: $pct, per_hour: $rate} ] as $rows
+          | [$rows[] | select(.state == "GROWING_UNBOUNDED" or .state == "NO_TTL_STATIC")] as $f
+          | [$f[] | .prefix] as $fnames
+          | (($i.rem // []) | map(. as $t | select(((($i.allow // []) | map(. as $a | select($t == $a or ($t | startswith($a + $i.delim)))) | length) > 0)))) as $refused
+          | (($i.rem // []) | map(. as $t | select((($refused | map(select(. == $t)) | length) == 0) and (($fnames | map(select(. == $t)) | length) > 0)))) as $targets
+          | (($i.rem // []) | map(. as $t | select(((($refused + $targets) | map(select(. == $t))) | length) == 0))) as $unknown
+          | ([$f[] | .nottl_bytes] | add // 0) as $leak
+          | ([$f[] | (if .per_hour == null then 0 else (.per_hour * .avg_bytes) end)] | add // 0) as $bph
+          | (if $maxm > 0 then ($maxm - $used) else 0 end) as $headroom
+          | (if $maxm > 0 then (((($maxm - $used) * 1000) / $maxm) | floor) / 10 else null end) as $headpct
+          | (if $bph > 0 and $headroom > 0 then ((($headroom / $bph) * 10) | floor) / 10 else null end) as $hours
+          | (if $i.armed and ($targets | length) > 0 then "Asking for approval to set a TTL on: " + ($targets | join(", ")) + "."
+             elif $i.armed then "Remediation is armed, but no requested prefix is both a finding and outside the allowlist, so nothing will change."
+             else "No change applied: this run is read-only." end) as $action
+          | (if $partial then " PARTIAL: only " + (($i.s.examined // 0) | tostring) + " keys were examined before the max_keys ceiling, while the database holds " + (($dbkeys - $dbexp) | tostring) + " keys with no expiry, so raise max_keys." else "" end) as $partnote
+          | {prefixes: $rows, findings: $fnames, targets: $targets, refused: $refused, unknown: $unknown,
+             action: $action, partial_note: $partnote,
+             slack: ("Redis unexpiring keys on " + $i.host + ": "
+                     + (if ($f | length) > 0 then ([$f[] | "\(.state) \(.prefix) \(.nottl) keys with no TTL" + (if .per_hour == null then "" else ", +\(.per_hour | tostring | sub("\\.0$"; ""))/hour" end)] | join("; "))
+                        else "no prefix flagged" end)
+                     + ". Headroom " + (($headpct // 0) | tostring) + "%." + $partnote + " " + $action),
+             examined: ($i.s.examined // 0), partial: $partial, has_baseline: $hasbase, elapsed_s: $elapsed,
+             used_bytes: $used, maxmemory_bytes: $maxm, headroom_bytes: $headroom, headroom_pct: $headpct,
+             nottl_bytes: $leak, bytes_per_hour: $bph, hours_to_full: $hours,
+             db_keys: $dbkeys, db_expires: $dbexp, db_nottl: ($dbkeys - $dbexp),
+             baseline: {at: $nowS, prefixes: (reduce $rows[] as $r ({}; .[$r.prefix] = $r.nottl))}}
+          ') | first | toJson }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ fromJson(outputs.assess.values.items) | jq('
+        "Scanned \(.examined) keys on database \(.db_keys) total, \(.db_nottl) of them with no expiry. "
+        + "\(.findings | length) prefixes flagged. "
+        + (if .partial then "PARTIAL: the max_keys ceiling was hit, so growth is not scored this run. " else "" end)
+        + (if .has_baseline then "Baseline is \(.elapsed_s)s old. " else "No baseline yet, so this run only records one. " end)
+        + ([.prefixes[] | "\(.state) \(.prefix): \(.nottl) of \(.total) keys unexpiring, about \(.nottl_bytes | tostring | sub("\\.0$"; "")) bytes"
+            + (if .delta == null then "" else " (\(.delta) since the baseline\(if .pct == null then "" else ", \(.pct)%" end)\(if .per_hour == null then "" else ", \(.per_hour | tostring | sub("\\.0$"; ""))/hour" end))" end)] | join("; "))
+        + ". Memory \(.used_bytes) of \(.maxmemory_bytes), headroom \(.headroom_pct // 0)%"
+        + (if .hours_to_full == null then "." else ", \(.hours_to_full) hours of headroom left at the measured growth." end)
+      ') | first }}
+
+  - id: baseline_gate
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      A partial walk is not a baseline. Overwriting the stored counts with a partial one would
+      make the next run measure growth against a different slice of the keyspace.
+    condition: "{{ fromJson(outputs.assess.values.items) | jq('if .partial then 0 else 1 end') | first > 0 }}"
+    then:
+      - id: record_baseline
+        type: io.kestra.plugin.core.kv.Set
+        description: >-
+          Store this run's unexpiring count per prefix so the next run has a growth rate. No ttl
+          is set on this key: an expired KV key throws on read and would lose the baseline
+          silently.
+        key: "{{ render(vars.baseline_key) }}"
+        kvType: JSON
+        value: "{{ fromJson(outputs.assess.values.items) | jq('.baseline') | first | toJson }}"
+    else:
+      - id: baseline_kept
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          The walk stopped at the max_keys ceiling, so the previous baseline is kept rather than
+          replaced with a partial count.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: Alert on a finding. Also alert on a partial scan, which is never evidence that a keyspace is clean.
+    condition: "{{ fromJson(outputs.assess.values.items) | jq('if (.findings | length) > 0 or .partial then 1 else 0 end') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': (fromJson(outputs.assess.values.items) | jq('.slack') | first)} | toJson }}
+
+      - id: planned
+        type: io.kestra.plugin.core.log.Log
+        description: What a remediation run would do, printed on every run including a dry one.
+        message: >-
+          {{ fromJson(outputs.assess.values.items) | jq('
+            "Would set a TTL on: " + (if (.targets | length) == 0 then "nothing" else (.targets | join(", ")) end)
+            + ". Refused because allowlisted: " + (if (.refused | length) == 0 then "none" else (.refused | join(", ")) end)
+            + ". Requested but not a finding: " + (if (.unknown | length) == 0 then "none" else (.unknown | join(", ")) end)
+            + ". " + .action
+          ') | first }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: EXPIRE runs only when auto_remediate is true, dry_run is false and a target survived the allowlist.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and (fromJson(outputs.assess.values.items) | jq('.targets | length') | first > 0) }}"
+        then:
+          - id: hold
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              A TTL on a live key means that key is deleted when the TTL runs out, so a human
+              answers first. With no answer, nothing is expired.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Set a TTL on the listed prefixes?
+                defaults: false
+              - id: note
+                type: STRING
+                displayName: Decision note
+                defaults: ""
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.hold.onResume.approved ?? false }}"
+            then:
+              - id: remediate_expire
+                type: io.kestra.plugin.core.flow.Loop
+                description: >-
+                  One prefix at a time. EXPIRE touches only keys whose own prefix equals the
+                  target and whose TTL is -1. The allowlist is passed in again so the script
+                  refuses an allowlisted target even if the flow asked for it.
+                concurrencyLimit: 1
+                values: "{{ fromJson(outputs.assess.values.items) | jq('.targets') | first | toJson }}"
+                tasks:
+                  - id: expire_prefix
+                    type: io.kestra.plugin.redis.cli.RedisCLI
+                    host: "{{ inputs.host }}"
+                    port: "{{ inputs.port }}"
+                    database: "{{ inputs.database }}"
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: "{{ inputs.network }}"
+                    inputFiles:
+                      ttl_expire.lua: "{{ vars.expire_lua }}"
+                    commands:
+                      - "--eval ttl_expire.lua , {{ inputs.delimiter }} {{ inputs.prefix_depth }} {{ inputs.scan_count }} {{ inputs.max_keys }} {{ item.value }}{{ inputs.delimiter }}* {{ item.value }} {{ inputs.expire_ttl_seconds }} {{ {'v': inputs.allow_prefixes} | jq('.v | join(\" \")') | first }}"
+
+                  - id: expired_count
+                    type: io.kestra.plugin.core.log.Log
+                    message: "{{ item.value }}: {{ outputs.expire_prefix.vars.command_1 }}"
+
+              - id: reverify
+                type: io.kestra.plugin.core.flow.Loop
+                description: Scan each targeted prefix again and report what the keys look like now.
+                concurrencyLimit: 1
+                values: "{{ fromJson(outputs.assess.values.items) | jq('.targets') | first | toJson }}"
+                outputs:
+                  - id: after
+                    type: STRING
+                    value: "{{ {'prefix': item.value, 'scan': outputs.rescan_prefix.vars.command_1} | toJson }}"
+                tasks:
+                  - id: rescan_prefix
+                    type: io.kestra.plugin.redis.cli.RedisCLI
+                    host: "{{ inputs.host }}"
+                    port: "{{ inputs.port }}"
+                    database: "{{ inputs.database }}"
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: "{{ inputs.network }}"
+                    inputFiles:
+                      ttl_scan.lua: "{{ vars.scan_lua }}"
+                    commands:
+                      - "--eval ttl_scan.lua , {{ inputs.delimiter }} {{ inputs.prefix_depth }} {{ inputs.scan_count }} {{ inputs.max_keys }} {{ inputs.memory_sample_every }} {{ item.value }}{{ inputs.delimiter }}*"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                description: Fail the run if any targeted prefix still holds a key with TTL -1.
+                condition: >-
+                  {{ {'r': (outputs.reverify.outputs | jq('map(.outputs.after | fromjson)') | first), 'b': (fromJson(outputs.assess.values.items).prefixes)} | jq('
+                    .b as $b | [.r[] | .prefix as $p
+                      | ((.scan | fromjson).prefixes // []) | map(select(.prefix == $p)) | (.[0].nottl // 0)] | add // 0
+                  ') | first > 0 }}
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      EXPIRE ran but at least one targeted prefix still holds keys with TTL -1.
+                      Either something is still writing keys with no expiry. Or the max_keys
+                      ceiling cut the walk short. Details:
+                      {{ outputs.reverify.outputs | jq('map(.outputs.after | fromjson | "\(.prefix) -> \(.scan)") | join(" | ")') | first }}
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      {{ {'r': (outputs.reverify.outputs | jq('map(.outputs.after | fromjson)') | first), 'b': (fromJson(outputs.assess.values.items).prefixes), 'ttl': inputs.expire_ttl_seconds} | jq('
+                        .b as $b | .ttl as $ttl
+                        | [.r[] | .prefix as $p
+                           | (($b | map(select(.prefix == $p)) | .[0].nottl) // 0) as $before
+                           | (((.scan | fromjson).prefixes // []) | map(select(.prefix == $p)) | .[0]) as $now
+                           | "\($p): \($before) keys with no TTL before, \(($now.nottl) // 0) after, \(($now.total) // 0) keys still present"]
+                        | join("; ") + ". TTL set to \($ttl)s, so those keys are deleted when it runs out."
+                      ') | first }}
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval not granted{{ (outputs.hold.onResume.note ?? '') == '' ? '' : (', note: ' ~ outputs.hold.onResume.note) }}.
+                  No key was given a TTL. The findings stay open.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          {{ fromJson(outputs.assess.values.items) | jq('
+            "Every prefix is either expiring its keys or allowlisted as permanent. "
+            + "\(.db_nottl) of the \(.db_keys) keys in the database have no expiry. All of them sit under an "
+            + "allowlisted prefix or under one below the min_keys_to_flag threshold."
+          ') | first }}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Redis unexpiring key growth guard failed on ' ~ inputs.host ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: every_six_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: >-
+      Shipped disabled. Its inputs always force safe mode. Six hours apart gives the baseline a long
+      enough gap that a slow leak shows up as growth.
+    cron: "35 */6 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Redis Unexpiring Key Growth Guard
+  shortDescription: Find the Redis key prefixes accumulating keys with no TTL and how fast they grow, compare them against a KV baseline and the maxmemory headroom, then set a TTL with EXPIRE behind an approval and re-scan to prove it landed.
+  metaTitle: Redis Unexpiring Key Growth Guard with Kestra
+  metaDescription: Catch Redis key prefixes growing without a TTL before maxmemory is reached, alert Slack, then set a TTL with EXPIRE behind an approval and verify.
+  description: |
+    A cache key written with `SET` and no `EX` never expires. One code path that forgets the
+    expiry turns a cache into a permanent store. The instance keeps growing until it reaches
+    `maxmemory`. At that point the eviction policy starts throwing away keys that do matter. Or
+    writes start failing with `OOM command not allowed`. The keys are individually tiny, so
+    nothing looks wrong. A memory alert only fires once the damage is done.
+
+    This blueprint reports the leading indicator instead: which key prefixes are accumulating
+    keys with no expiry, how many bytes they hold and how fast they are growing against the
+    previous run.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | Finding | Rule | Fix |
+    |---|---|---|
+    | `GROWING_UNBOUNDED` | Over `min_keys_to_flag` unexpiring keys plus up by more than `growth_warn_pct` since the baseline. Also any prefix that is new since the baseline | Fix the write path. `EXPIRE` behind an approval bounds what is already there |
+    | `NO_TTL_STATIC` | Over `min_keys_to_flag` unexpiring keys, but flat against the baseline | Allowlist it. Or give it a TTL |
+    | `ALLOWLISTED` | Matches `allow_prefixes`, so it is meant to live forever | Report only, never expired |
+    | `OK` | Nothing unexpiring. Or below `min_keys_to_flag` | None |
+
+    ## Safety
+
+    - The walk is `SCAN` with a `COUNT` per step and a `max_keys` ceiling. `KEYS` is never used:
+      it builds the whole key list in one reply and blocks the server for as long as that takes,
+      with no ceiling. A run that hits the ceiling does not score growth, because a partial walk
+      returns a different slice of the keyspace each time. It alerts instead of reporting the
+      keyspace as clean.
+    - `EXPIRE` needs `auto_remediate` true, `dry_run` false, the prefix named in
+      `remediate_prefixes`, a finding on that prefix, then a human answering the `Pause`. Five
+      conditions, all of them, before a key gets a TTL.
+    - `EXPIRE` only ever touches a key whose own prefix equals the target and whose `TTL` is
+      already -1. The allowlist is passed into the script a second time, so an allowlisted
+      prefix is refused inside Redis even if the flow asked for it.
+    - A TTL means deletion later. The log says exactly how many keys were changed and when they
+      will go. The re-scan fails the run if any targeted key still reports `TTL -1`.
+
+    ## How it works
+
+    1. `scan_keyspace` (`io.kestra.plugin.redis.cli.RedisCLI`) runs one Lua script through
+       `redis-cli --eval`. The script walks the keyspace with `SCAN`, buckets every key on its
+       first `prefix_depth` segments, counts the keys whose `TTL` is -1, samples
+       `MEMORY USAGE` on one key in `memory_sample_every`, then returns the whole table as JSON.
+    2. `read_memory` and `read_keyspace` read `INFO memory` and `INFO keyspace`. The `db` line
+       gives `keys` and `expires` for the whole database in constant time, so `keys - expires`
+       is an exact count of unexpiring keys to check the sampled walk against.
+    3. `assess` compares each prefix with the baseline in Kestra KV, classifies it, works out
+       the growth in keys, percent and keys per hour, estimates the bytes each prefix holds and
+       the hours of headroom left at that rate, then resolves which requested prefixes may
+       actually be expired.
+    4. `summary` logs the table. `baseline_gate` stores this run's counts with
+       `io.kestra.plugin.core.kv.Set` for the next run, unless the walk was partial, in which
+       case the previous baseline is kept.
+    5. `route` (`io.kestra.plugin.core.flow.If`): a clean full scan logs it and stops. A finding
+       or a partial scan sends `alert` to Slack. `planned` then prints what a remediation run
+       would change.
+       - `remediate_gate` opens only with `auto_remediate` true, `dry_run` false and a surviving
+         target. `hold` (`io.kestra.plugin.core.flow.Pause`) waits for an answer.
+       - On approval `remediate_expire` (`io.kestra.plugin.core.flow.Loop`,
+         `concurrencyLimit: 1`) runs `EXPIRE` one prefix at a time, `reverify` scans each
+         targeted prefix again. `verify_result` fails the run if any key there still has no
+         expiry. Without approval, `declined` records the decision and nothing changes.
+    6. `errors` posts to Slack when the flow fails.
+
+    ## What you get
+
+    - A per-prefix table of unexpiring keys with the bytes they hold, instead of one number for
+      the whole instance.
+    - The growth rate against the previous run, which is what separates a leak from a prefix
+      that is simply permanent.
+    - The hours of `maxmemory` headroom left if the measured growth continues.
+    - A bounded way to put a TTL on a leaking prefix, with the before and after counts and a
+      re-scan that fails the run when the change did not land.
+
+    ## Who it's for
+
+    - Teams running Redis as a cache where one write path has started skipping `EX`.
+    - SREs who have had an instance fill up, then evict session or lock keys or return
+      `OOM command not allowed`.
+    - Anyone who wants a prefix-level view of a keyspace without running `KEYS` on production.
+
+    ## Why orchestrate this with Kestra
+
+    The leading indicator is a difference between two points in time, so it needs somewhere to
+    keep the previous measurement. Kestra KV holds the per-prefix baseline between runs, the
+    schedule decides how far apart the two points are, the allowlist of permanent prefixes lives
+    next to the flow instead of in somebody's head. The destructive half sits behind
+    `auto_remediate`, `dry_run` and a `Pause` with the decision recorded on the execution.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against a Redis 7 container with `maxmemory 8mb` and a local HTTP sink
+    standing in for Slack, on the final file. Seeded: `session:web` 400 keys at `EX 3600`,
+    `cache:render` 1,150 and `leak:hot` 684 already bounded by an earlier run, `cache:pages`
+    leaking with no expiry, `idem:pay` 250 permanent keys, `config:app` 300 keys, allowlisted.
+    Every row was checked against `redis-cli` as well as the Kestra log.
+
+    | Run | Execution | Inputs | Result |
+    |---|---|---|---|
+    | 1 | `tTT3jInqrR11WgY186TLe` | defaults, only the expiring prefixes and no leaking one | 0 findings. 3,184 keys scanned, all 2,234 expiring keys counted, headroom 78.4%. A baseline is recorded |
+    | 2 | `6OzCjKufNyUqpof22UbA6g` | defaults, after seeding `cache:pages` | `cache:pages` `GROWING_UNBOUNDED` at 400 keys with no TTL, new since the baseline. `idem:pay` flat at 250, so `NO_TTL_STATIC`. `config:app` `ALLOWLISTED` |
+    | 3 | `70gsyqHwz5Jbf1iAUwsJVP` | defaults, 300 more leaking keys | `cache:pages` 700 unexpiring, +300 on the baseline, 75%, 7,297 per hour, 11.2 hours of headroom left at that rate |
+    | 4 | `3f1g26e1pguYl6Lx4fZReZ` | `auto_remediate: true`, `dry_run: true`, `remediate_prefixes: ["cache:pages"]` | `planned` reports it would set a TTL on `cache:pages` but nothing ran. `TTL cache:pages:p1` and `:p700` still -1, `DBSIZE` still 3,484 |
+    | 5 | `6Pdk9sHR7oojJ0Xzimg1Ek` | `auto_remediate: true`, `dry_run: false`, resumed with `approved: false` | Paused, then `declined`. `TTL cache:pages:p1` still -1, `DBSIZE` still 3,484 |
+    | 6 | `3BZZSzwjnonvahalCwkS6G` | the same, resumed with `approved: true` | 700 keys expired, re-scan reports 0 unexpiring with all 700 keys still present. `TTL` returns 604787, `DBSIZE` still 3,484, `expires` up by exactly 700 |
+    | 7 | `1SDxAIzlJVRVUD2lqG5g3W` | defaults, after the remediation | `cache:pages` back to `OK`, 0 of 700 unexpiring. 550 keys still have no expiry, all under `config:app` or `idem:pay` |
+    | 8 | `4aTALYb9E2j456HRKpVXG8` | `allow_prefixes` extended with `idem:pay` | 0 findings. `redis-cli TTL` confirms both allowlisted prefixes are still -1 |
+    | 9 | `5jJ3DzFP9YcJFVTYsb4ejc` | unreachable host `w19-nope` | `scan_keyspace` fails, the `errors` block posts to Slack, the execution is FAILED |
+    | 10 | `2XrGV4WxdR3jz1vJrLnTxe` | `max_keys: 500` | 500 of 3,484 keys examined. Reported as PARTIAL with the database-wide count of 550 unexpiring keys, alerted rather than called clean. The baseline was left alone |
+    | 11 | `372wrIIznavlzPT1wNiBeB` | `remediate_prefixes: ["leak:hot"]`, with a writer still creating keys with no TTL | `EXPIRE` ran, the re-scan found 8 keys back at `TTL -1`, `verify_result` failed the run and `errors` alerted |
+
+    ### Does the detector actually fail on a leak
+
+    Run 1 and run 2 isolate that. Nothing else on the instance changed between them except 400 new
+    keys under `cache:pages` with no TTL. The report went from 0 findings to `GROWING_UNBOUNDED`
+    on that prefix while `idem:pay` stayed flat at 250. `redis-cli` confirmed the leak directly:
+    `TTL cache:pages:p1` returned -1. `INFO keyspace` moved from 3,184 keys with 2,234 having
+    an expiry to 3,484 keys with 2,234. Run 3 measured the growth at 300 more keys in 148 seconds,
+    and run 6 removed it: 700 keys at TTL -1 before, 0 after, with `DBSIZE` unchanged.
+
+    ## Prerequisites
+
+    - A Redis 6 or later instance reachable from the containers the `RedisCLI` tasks start.
+      `EVAL`, `SCAN`, `TTL`, `MEMORY USAGE` and `EXPIRE` must be allowed for the user.
+    - Key names with a separator, for example `cache:render:<id>`. Prefix bucketing needs one.
+    - Local testing:
+      - `docker run -d --name redis-cache --network mynet redis:7-alpine redis-server --maxmemory 8mb`;
+      - seed a leak with `for i in $(seq 1 600); do redis-cli SET cache:render:$i v; done`;
+      - run the flow twice with `network: mynet` so the second run has a baseline.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block. In Kestra OSS, provide it as
+      the base64-encoded environment variable `SECRET_SLACK_WEBHOOK_URL`.
+    - A password-protected instance also wants `REDIS_PASSWORD`. Add
+      `password: "{{ secret('REDIS_PASSWORD') }}"` to each `RedisCLI` task.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `host`, `port`, `database` | `redis-cache`, `6379`, `0` | The instance to read |
+    | `delimiter` | `:` | Separator between key segments |
+    | `prefix_depth` | `2` | Segments that make a prefix |
+    | `scan_count` | `500` | `COUNT` hint per `SCAN` step |
+    | `max_keys` | `20000` | Ceiling on keys examined per run |
+    | `memory_sample_every` | `25` | One key in N is measured with `MEMORY USAGE` |
+    | `min_keys_to_flag` | `100` | Smallest prefix worth reporting |
+    | `growth_warn_pct` | `5.0` | Growth since the baseline that counts as rising |
+    | `allow_prefixes` | 3 examples | Prefixes that are legitimately permanent |
+    | `remediate_prefixes` | empty | Prefixes allowed to be expired |
+    | `expire_ttl_seconds` | `604800` | TTL applied by `EXPIRE` |
+    | `approval_timeout` | `PT2H` | How long the pause waits |
+    | `network` | empty | Docker network for the `redis-cli` containers |
+    | `auto_remediate` | `false` | Allow `EXPIRE` |
+    | `dry_run` | `true` | Must be `false` for a change to apply |
+
+    ## Quick start
+
+    1. Add the `SLACK_WEBHOOK_URL` secret.
+    2. Import the flow, set `host` and run it. The first run has no baseline, so it records one.
+    3. Run it again after a few hours and read the growth column.
+    4. Put the prefixes that are supposed to live forever into `allow_prefixes`.
+    5. For a prefix that is leaking, fix the write path. If you also need to bound what is
+       already there, set `remediate_prefixes`, `expire_ttl_seconds`, `auto_remediate: true` and
+       `dry_run: false`, then answer the pause.
+    6. Enable the `every_six_hours` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Point it at several instances by wrapping the read tasks in a `Loop` over a host list.
+    - Alert only when `hours_to_full` drops below a threshold, so a slow permanent prefix stays
+      quiet and a real leak pages someone.
+    - Write the baseline after remediation instead of before, if you would rather the next run
+      compare against the fixed state.
+    - Replace the `Pause` with a Slack approval. Or drop it for a prefix you are sure about.
+    - Use `io.kestra.plugin.redis.string.Ttl` for a spot check on a single named key from the
+      Kestra worker itself, without starting a container.
+
+    ## Links
+
+    - Redis `SCAN`: https://redis.io/docs/latest/commands/scan/
+    - Redis key expiration: https://redis.io/docs/latest/develop/using-commands/keyspace/
+    - Redis plugin: https://kestra.io/plugins/plugin-redis
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Redis
+    - Caching
+    - Monitoring
+  ee: false
+  demo: false
