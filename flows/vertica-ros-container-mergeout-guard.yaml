@@ -1,0 +1,297 @@
+id: vertica-ros-container-mergeout-guard
+namespace: company.team
+
+description: |
+  Find Vertica projections whose ROS container count is approaching the ROS pushback limit, alert
+  Slack, then optionally run mergeout to consolidate the containers and re-count to prove it worked.
+  Every COPY, INSERT and moveout writes a new ROS container. Trickle loads leave a projection with
+  hundreds of small containers. Every query has to open all of them, so scans get slower. Vertica
+  caps a projection at 1024 ROS containers per node (ROS pushback). Once that cap is hit new loads
+  are rejected. The guard reads v_monitor.projection_storage, reports the projections over the
+  threshold, then when asked runs DO_TM_TASK('mergeout', ...) one projection at a time, polls the
+  count back down and fails if any projection is still over the threshold.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: Vertica JDBC URL
+    defaults: "jdbc:vertica://vertica:5433/VMart"
+
+  - id: username
+    type: STRING
+    displayName: Vertica user
+    defaults: dbadmin
+
+  - id: password
+    type: STRING
+    displayName: Vertica password
+    description: Defaults to the VERTICA_PASSWORD secret. Pass a real value per run, since an empty override renders the missing secret.
+    defaults: "{{ secret('VERTICA_PASSWORD') }}"
+
+  - id: ros_container_threshold
+    type: INT
+    displayName: ROS container threshold
+    description: A projection is flagged when its ROS container count on a node is over this number. Vertica's hard pushback limit is 1024 per projection per node, so keep headroom below it.
+    defaults: 700
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for mergeout to run.
+    defaults: true
+
+  - id: verify_timeout
+    type: DURATION
+    displayName: Verify timeout
+    description: How long to wait for mergeout to bring the container count down. Mergeout is immediate on a single node and asynchronous on a cluster, so the re-count is polled up to this bound.
+    defaults: PT5M
+
+variables:
+  audit_sql: |
+    SELECT projection_schema,
+           projection_name,
+           anchor_table_schema,
+           anchor_table_name,
+           node_name,
+           ros_count,
+           ros_row_count,
+           ros_used_bytes,
+           'SELECT DO_TM_TASK(''mergeout'', ' || QUOTE_LITERAL(QUOTE_IDENT(projection_schema) || '.' || QUOTE_IDENT(projection_name)) || ')' AS mergeout_sql
+      FROM v_monitor.projection_storage
+     WHERE ros_count > {{ inputs.ros_container_threshold }}
+     ORDER BY ros_count DESC
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.vertica.Query
+    description: Read-only. Reads ROS container counts per projection per node from v_monitor.projection_storage and keeps the ones over the threshold, with the mergeout statement for each projection.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.username }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: mergeouts
+    type: io.kestra.plugin.core.output.OutputValues
+    description: One mergeout per flagged projection, de-duplicated across nodes since one projection reports a row per node.
+    values:
+      sql: "{{ outputs.audit.rows | jq('map(.mergeout_sql) | unique') | first | toJson }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Vertica ROS container audit on {{ inputs.jdbc_url }}: {{ outputs.audit.size }} projection(s) over the {{ inputs.ros_container_threshold }} container threshold.
+      {{ outputs.audit.rows | jq('map("\(.anchor_table_schema).\(.anchor_table_name) [\(.projection_name)@\(.node_name)] \(.ros_count) containers, \(.ros_row_count) rows") | join("; ")') | first }}.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.size > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Vertica ' ~ inputs.jdbc_url ~ ': ' ~ outputs.audit.size ~ ' projection(s) over ' ~ inputs.ros_container_threshold ~ ' ROS containers: ' ~ (outputs.audit.rows | jq('map("\(.anchor_table_schema).\(.anchor_table_name) (\(.ros_count) containers)") | join(", ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Running mergeout now.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: remediate
+            type: io.kestra.plugin.core.flow.Loop
+            description: Sequential on purpose. Mergeout takes a lock on the projection, so the flagged projections are consolidated one at a time.
+            concurrencyLimit: 1
+            values: "{{ outputs.mergeouts.values.sql }}"
+            tasks:
+              - id: mergeout
+                type: io.kestra.plugin.jdbc.vertica.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.username }}"
+                password: "{{ inputs.password }}"
+                fetchType: FETCH
+                sql: "{{ item.value }}"
+
+          - id: wait_for_merge
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: Poll the container count until every flagged projection is back under the threshold. On a single node mergeout is synchronous so the first poll already sees the drop. On a cluster it runs in the background, so this waits up to verify_timeout.
+            condition: "{{ outputs.poll_recount.size == 0 }}"
+            checkFrequency:
+              interval: PT5S
+              maxDuration: "{{ inputs.verify_timeout }}"
+            failOnMaxReached: false
+            tasks:
+              - id: poll_recount
+                type: io.kestra.plugin.jdbc.vertica.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.username }}"
+                password: "{{ inputs.password }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.audit_sql) }}"
+
+          - id: reaudit
+            type: io.kestra.plugin.jdbc.vertica.Query
+            description: Final authoritative read of the container counts after the poll, so a mergeout that did not land fails the run.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ inputs.username }}"
+            password: "{{ inputs.password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.audit_sql) }}"
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.reaudit.size > 0 }}"
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "ROS containers still over the threshold after mergeout: {{ outputs.reaudit.rows | jq('map(\"\\(.anchor_table_schema).\\(.anchor_table_name) \\(.ros_count) containers\") | join(\", \")') | first }}. The connecting user needs mergeout rights on the flagged projections. On a cluster the mergeout may still be catching up if verify_timeout was too short."
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: "Mergeout verified. {{ fromJson(outputs.mergeouts.values.sql) | length }} projection(s) back under the threshold."
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "No projection is over the ROS container threshold."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Vertica ROS container mergeout guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "0 3 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Vertica ROS Container Mergeout Guard
+  shortDescription: Detect Vertica projections whose ROS container count is nearing the pushback limit, alert Slack, then optionally run mergeout to consolidate them and re-count to confirm the drop.
+  metaTitle: Vertica ROS Container Mergeout Guard with Kestra
+  metaDescription: Detect Vertica projections nearing the 1024 ROS container pushback limit, alert Slack, run mergeout to consolidate them then re-count to prove the drop.
+  description: |
+    Vertica writes every COPY, INSERT and moveout as a new ROS container on disk. A projection fed by trickle loads ends up with hundreds of small containers. A query has to open all of them, so scans keep getting slower. Vertica caps a projection at 1024 ROS containers per node. That cap is ROS pushback. Once it is reached new loads to the projection are rejected until the Tuple Mover merges containers down.
+
+    This guard reads `v_monitor.projection_storage`, which carries `ros_count`, the number of ROS containers in each projection per node. It flags the projections over a threshold you set and alerts Slack. When you let it, it runs `DO_TM_TASK('mergeout', ...)` on each flagged projection one at a time. Mergeout runs the strata algorithm to merge the small containers into fewer large ones. The guard then polls the count back down and fails the run if any projection is still over the threshold.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | Finding | Meaning |
+    |---|---|
+    | ROS containers over threshold | A projection holds more ROS containers on a node than `ros_container_threshold`. Every scan opens all of them, so the projection slows down. At 1024 per node new loads start failing with ROS pushback. |
+
+    ## Safety
+
+    Mergeout consolidates ROS containers. It is not a purge. It does not reclaim the space held by deleted rows, which is a separate concern driven by delete vectors and `PURGE`. The guard stays read-only until `auto_remediate` is true and `dry_run` is false. The mergeout loop runs one projection at a time, since each mergeout locks its projection. Mergeout is synchronous on a single node and asynchronous on a cluster, so the re-count is polled up to `verify_timeout` and then read once more as a hard gate, so a mergeout that did not land fails the run.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.vertica.Query`, read-only) reads `v_monitor.projection_storage`, keeps the projections whose `ros_count` is over `ros_container_threshold` and builds a `DO_TM_TASK('mergeout', ...)` statement for each one.
+    2. `mergeouts` keeps the distinct mergeout statements, since a projection reports one row per node. `summary` logs the flagged projections with their container and row counts.
+    3. `route` (`io.kestra.plugin.core.flow.If`) branches on whether anything was flagged.
+       - clean: logs it.
+       - flagged: `alert` posts to Slack. `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false.
+         - `remediate` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs each mergeout in turn.
+         - `wait_for_merge` (`io.kestra.plugin.core.flow.LoopUntil`) polls the count until every flagged projection is back under the threshold, bounded by `verify_timeout`.
+         - `reaudit` and `verify_result` read the counts once more and fail the run if any projection is still over the threshold.
+    4. `errors` posts a Slack alert when any task fails.
+
+    ## What you get
+
+    - The projections that are slowing scans, with the ROS container count, the row count and the node for each one.
+    - A read-only default. Nothing is merged until you set `auto_remediate` true and `dry_run` false.
+    - Mergeout driven one projection at a time, so the locks do not pile up.
+    - A re-count that tolerates a cluster's asynchronous mergeout and still fails the run if the count did not drop.
+
+    ## Who it's for
+
+    - Teams loading Vertica in small frequent batches (streaming sinks, micro-batch ETL) that watch scans slow down.
+    - DBAs who run mergeout by hand and want it on a schedule with a safe default and a re-check.
+    - Teams trying the Vertica plugin who want an example that reads a system table and drives maintenance from it.
+
+    ## Why orchestrate this with Kestra
+
+    Vertica merges containers on its own through the Tuple Mover, but that can lag behind a projection under constant trickle loads. By the time pushback hits, loads are already failing. Running mergeout on demand means reading the container counts, picking the projections over the line, merging them one at a time, waiting for an asynchronous mergeout on a cluster and failing loudly when one did not land. Kestra runs that on a schedule, keeps the write behind two inputs, merges one projection at a time, verifies the result and keeps a history of every run.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against Vertica Community Edition 9.2 (database `docker`, schema `analytics`), with the shared HTTP sink standing in for Slack. A table `analytics.events` was loaded through many single-row direct inserts so its super projection accumulated ROS containers, with background mergeout turned off for the test. `v_monitor.projection_storage.ros_count` was read directly before and after each run.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | clean, threshold 100000 | SUCCESS (`6LdH4otMNvaPsYRHLmMIlZ`). audit returned 0 projections. Clean path logged |
+    | 2 | degraded, threshold 10, dry_run true | SUCCESS (`2x88LaPwQgUndJjnsT6sLT`). 1 projection flagged (`analytics.events` `events_super`, 61 containers, 250 rows). Slack alert sent. `ros_count` stayed at 61 |
+    | 3 | threshold 10, auto_remediate true, dry_run true | SUCCESS (`1DXzBfJdBbklp5QLbnkAMH`). Same report. dry_run held the mergeout back, so `ros_count` stayed at 61 |
+    | 4 | threshold 10, auto_remediate true, dry_run false | SUCCESS (`3rkthC4xqpstpLkzSMWoP8`). mergeout on `events_super`. The re-count came back clean. `ros_count` went 61 to 1, confirmed in vsql |
+    | 5 | threshold 10, dry_run true, after run 4 | SUCCESS (`6ZRJ8ccfpwYPtBDMRF7VTq`). 0 projections flagged at the same threshold that flagged 61 before. The detector flipped from drift to clean |
+    | 6 | threshold 0, auto_remediate true, dry_run false, verify_timeout PT15S | FAILED (`2Jz88dwct4zcXm07OdpX79`). mergeout ran (31 to 1), but the re-count still found 1 container over the impossible 0 threshold, so `verify_result` failed the run. The errors block alerted Slack |
+    | 7 | unreachable database | FAILED (`E5Dkc1Vr9xbrYOiVr0nRE`). audit could not connect, so the errors block posted the failure alert to Slack |
+
+    Run 2 against run 5 is the proof the detector can fail: the same threshold of 10 reported drift at 61 containers and clean at 1. Run 6 is the proof the verify gate can fail: mergeout genuinely consolidated 31 containers to 1, but an impossible threshold kept the re-count over the line, so the run failed instead of reporting success.
+
+    ## Prerequisites
+
+    - A reachable Vertica cluster and its JDBC URL in `jdbc_url`.
+    - For the audit, a user that can read `v_monitor.projection_storage`. For remediation, a user allowed to run `DO_TM_TASK('mergeout', ...)` on the flagged projections, which means owning them or being a superuser.
+    - Local testing: `docker run -d --name vertica jbfavre/vertica:latest` brings up a single node with database `docker` and user `dbadmin`.
+
+    ### Secrets
+
+    - `VERTICA_PASSWORD`: password for the Vertica user. The `password` input defaults to it.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:vertica://vertica:5433/VMart` | Vertica cluster to check |
+    | `username` | `dbadmin` | Vertica user |
+    | `password` | `{{ secret('VERTICA_PASSWORD') }}` | Password for that user |
+    | `ros_container_threshold` | `700` | Flag a projection over this many ROS containers per node |
+    | `auto_remediate` | `false` | Allow mergeout to run |
+    | `dry_run` | `true` | Must be `false` for mergeout to run |
+    | `verify_timeout` | `PT5M` | How long to wait for the count to drop after mergeout |
+
+    ## Quick start
+
+    1. Add the `VERTICA_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url`, `username` and `ros_container_threshold`.
+    3. Run it once with the defaults and read the flagged projections.
+    4. When you are ready to consolidate, run with `auto_remediate: true` and `dry_run: false`.
+    5. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Lower `ros_container_threshold` on projections where scan latency matters more than merge cost.
+    - Swap `DO_TM_TASK('mergeout', ...)` for `PURGE_PROJECTION` when the goal is reclaiming deleted-row space rather than merging containers.
+    - Partition large tables and let mergeout keep one container per inactive partition.
+    - Point the loop at a list of clusters to sweep a whole Vertica estate.
+    - Replace the Slack alert with PagerDuty, Microsoft Teams or email.
+
+    ## Links
+
+    - Vertica plugin: https://kestra.io/plugins/plugin-jdbc-vertica
+    - Vertica documentation: https://docs.vertica.com
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Maintenance & Optimization
+    - Storage
+  ee: false
+  demo: false
