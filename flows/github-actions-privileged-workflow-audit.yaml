@@ -1,0 +1,437 @@
+id: github-actions-privileged-workflow-audit
+namespace: company.team
+description: |
+  Check GitHub Actions files for broad token permissions and unsafe
+  pull_request_target checkouts. Save a report and send a Slack alert.
+
+inputs:
+  - id: repository
+    type: STRING
+    defaults: kestra-io/blueprints
+    description: Repository to check. Use owner/repo.
+  - id: reference
+    type: STRING
+    defaults: main
+    description: Branch or tag to check.
+  - id: max_workflows
+    type: INT
+    defaults: 50
+    description: Stop with an error if there are more workflow files than this limit.
+
+triggers:
+  - id: weekday_scan
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Run on weekdays. Enable this after a successful manual test.
+    cron: "0 8 * * 1-5"
+    disabled: true
+
+concurrency:
+  limit: 1
+
+tasks:
+  - id: list_workflows
+    type: io.kestra.plugin.core.http.Request
+    description: List .github/workflows from the GitHub Contents API.
+    uri: "https://api.github.com/repos/{{ inputs.repository }}/contents/.github/workflows?ref={{ inputs.reference }}"
+    method: GET
+    headers:
+      Accept: application/vnd.github+json
+      User-Agent: Kestra-Workflow-Privilege-Audit
+      Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+
+  - id: analyze_privileges
+    type: io.kestra.plugin.scripts.python.Script
+    description: Check each file by Git blob SHA. Save the findings as JSON.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
+    env:
+      REPOSITORY: "{{ inputs.repository }}"
+      REFERENCE: "{{ inputs.reference }}"
+      MAX_WORKFLOWS: "{{ inputs.max_workflows }}"
+      GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+    inputFiles:
+      workflow-list.json: "{{ outputs.list_workflows.body | toJson }}"
+    outputFiles:
+      - privilege-audit.json
+    script: |
+      """High-confidence GitHub Actions privilege audit for a Kestra blueprint.
+
+      This is intentionally a narrowly scoped audit, not an exhaustive security scanner.
+      """
+      import base64
+      import json
+      import os
+      import re
+      from pathlib import PurePosixPath
+      from urllib.parse import quote, urlsplit
+      from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+      import yaml
+      from yaml.nodes import MappingNode
+
+      MAX_FILE_BYTES = 1_000_000
+      REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+      REF_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+      CHECKOUT_RE = re.compile(r"^actions/checkout@", re.I)
+      HEAD_REF_RE = re.compile(
+          r"(?:github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref)", re.I
+      )
+      HEAD_REPO_RE = re.compile(r"github\.event\.pull_request\.head\.repo\.full_name", re.I)
+      SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+      class StrictWorkflowLoader(yaml.BaseLoader):
+          """Read GitHub's `on` key as text and reject duplicate YAML keys."""
+
+          def construct_mapping(self, node, deep=False):
+              if not isinstance(node, MappingNode):
+                  raise ValueError("Workflow YAML contains a non-mapping object")
+              result = {}
+              for key_node, value_node in node.value:
+                  key = self.construct_object(key_node, deep=deep)
+                  if not isinstance(key, str):
+                      raise ValueError("Workflow YAML contains a non-text key")
+                  if key in result:
+                      raise ValueError(f"Duplicate YAML key: {key}")
+                  result[key] = self.construct_object(value_node, deep=deep)
+              return result
+
+
+      def check_yaml_structure(value, ancestors=None, checked=None):
+          """Reject YAML merge keys and cycles without rewalking shared aliases."""
+          if not isinstance(value, (dict, list)):
+              return
+          ancestors = set() if ancestors is None else ancestors
+          checked = set() if checked is None else checked
+          identity = id(value)
+          if identity in ancestors:
+              raise ValueError("Recursive YAML alias is not supported")
+          if identity in checked:
+              return
+          if isinstance(value, dict) and "<<" in value:
+              raise ValueError("YAML merge keys need manual review; refusing incomplete audit")
+          ancestors.add(identity)
+          try:
+              children = value.values() if isinstance(value, dict) else value
+              for child in children:
+                  check_yaml_structure(child, ancestors, checked)
+          finally:
+              ancestors.remove(identity)
+          checked.add(identity)
+
+
+      def workflow_events(config):
+          triggers = config.get("on", {})
+          if isinstance(triggers, dict):
+              return set(map(str, triggers))
+          if isinstance(triggers, list):
+              return set(map(str, triggers))
+          if isinstance(triggers, str):
+              return {triggers}
+          return set()
+
+
+      def is_write_all(permissions):
+          return isinstance(permissions, str) and permissions.casefold() == "write-all"
+
+
+      def has_oidc_write(permissions):
+          return isinstance(permissions, dict) and str(permissions.get("id-token", "")).lower() == "write"
+
+
+      def analyze_workflow(content, filename):
+          # BaseLoader is deliberate: PyYAML SafeLoader (YAML 1.1) turns the GitHub
+          # Actions `on:` key into the boolean True, silently hiding event triggers.
+          root = yaml.load(content, Loader=StrictWorkflowLoader)
+          check_yaml_structure(root)
+          if not isinstance(root, dict):
+              raise ValueError(f"{filename}: workflow root must be a mapping")
+          if not root.get("on") or not workflow_events(root):
+              raise ValueError(f"{filename}: workflow must declare an event under on")
+          events = workflow_events(root)
+          target = "pull_request_target" in events
+          findings = []
+
+          def finding(rule, severity, job, detail):
+              findings.append({
+                  "file": filename,
+                  "job": job,
+                  "severity": severity,
+                  "rule": rule,
+                  "detail": detail,
+              })
+
+          global_perms = root.get("permissions")
+          if is_write_all(global_perms):
+              finding("WRITE_ALL", "HIGH", "(workflow)", "Workflow grants every writable GITHUB_TOKEN scope")
+
+          jobs = root.get("jobs", {})
+          if not isinstance(jobs, dict) or not jobs:
+              raise ValueError(f"{filename}: jobs must be a non-empty mapping")
+          for job_id, job in sorted(jobs.items()):
+              if not isinstance(job, dict):
+                  raise ValueError(f"{filename}: job {job_id} must be a mapping")
+              perms = job.get("permissions", global_perms)
+              if is_write_all(job.get("permissions")):
+                  finding("WRITE_ALL", "HIGH", job_id, "Job grants every writable GITHUB_TOKEN scope")
+              if target and has_oidc_write(perms):
+                  finding("PR_TARGET_OIDC", "WARN", job_id, "pull_request_target job can request an OIDC token; verify trust boundaries")
+              if not target:
+                  continue
+              steps = job.get("steps", [])
+              if not isinstance(steps, list):
+                  raise ValueError(f"{filename}: job {job_id} steps must be a list")
+              for index, step in enumerate(steps, start=1):
+                  if not isinstance(step, dict):
+                      raise ValueError(f"{filename}: job {job_id} step {index} must be a mapping")
+                  uses = str(step.get("uses", ""))
+                  args = step.get("with", {})
+                  if not isinstance(args, dict):
+                      raise ValueError(f"{filename}: job {job_id} step {index} with must be a mapping")
+                  checkout_ref = str(args.get("ref", ""))
+                  checkout_repo = str(args.get("repository", ""))
+                  if CHECKOUT_RE.match(uses) and (
+                      HEAD_REF_RE.search(checkout_ref)
+                      or HEAD_REF_RE.search(checkout_repo)
+                      or HEAD_REPO_RE.search(checkout_repo)
+                  ):
+                      finding(
+                          "PR_TARGET_UNTRUSTED_CHECKOUT", "HIGH", job_id,
+                          f"Step {index} checks out attacker-controlled PR code under pull_request_target",
+                      )
+          return findings
+
+
+      class GitHubOnlyRedirect(HTTPRedirectHandler):
+          """Keep an API token off other hosts when GitHub returns a redirect."""
+
+          def redirect_request(self, request, response, code, message, headers, new_url):
+              target = urlsplit(new_url)
+              if (target.scheme != "https" or target.hostname != "api.github.com"
+                      or target.port not in (None, 443)):
+                  raise ValueError("GitHub API redirect goes to an untrusted host")
+              return super().redirect_request(request, response, code, message, headers, new_url)
+
+
+      def github_json(url, token):
+          target = urlsplit(url)
+          if (target.scheme != "https" or target.hostname != "api.github.com"
+                  or target.port not in (None, 443)):
+              raise ValueError("Refusing non-GitHub API URL")
+          request = Request(url, headers={
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "User-Agent": "Kestra-Workflow-Privilege-Audit",
+          })
+          with build_opener(GitHubOnlyRedirect()).open(request, timeout=20) as response:
+              data = response.read(MAX_FILE_BYTES * 2 + 1)
+          if len(data) > MAX_FILE_BYTES * 2:
+              raise ValueError("API response exceeds safe size limit")
+          return json.loads(data)
+
+
+      def decode_workflow(result, filename, expected_sha=None):
+          if expected_sha is not None and (
+              not isinstance(result, dict) or result.get("sha") != expected_sha
+          ):
+              raise ValueError(f"{filename}: blob SHA does not match directory listing")
+          if not isinstance(result, dict) or result.get("encoding") != "base64":
+              raise ValueError(f"{filename}: unexpected GitHub contents response")
+          raw_b64 = "".join(str(result.get("content", "")).split())
+          raw = base64.b64decode(raw_b64, validate=True)
+          if len(raw) > MAX_FILE_BYTES:
+              raise ValueError(f"{filename}: content exceeds safe size limit")
+          return raw.decode("utf-8")
+
+
+      def audit(listing, repo, ref, token, max_files=50, fetch=None):
+          fetch = fetch or github_json
+          if (not REPO_RE.fullmatch(repo) or any(part in (".", "..") for part in repo.split("/"))
+                  or not REF_RE.fullmatch(ref) or any(part in (".", "..") for part in ref.split("/"))):
+              raise ValueError("repository or reference contains unsupported characters")
+          if not isinstance(listing, list):
+              raise ValueError("GitHub directory response is not a list")
+          # The Contents API returns at most 1,000 entries. Never treat a
+          # possibly truncated directory response as a complete audit.
+          if len(listing) >= 1000:
+              raise ValueError("Directory may be truncated (GitHub Contents API limit)")
+          workflows = sorted(
+              (x for x in listing if isinstance(x, dict) and x.get("type") == "file"
+               and str(x.get("name", "")).lower().endswith((".yml", ".yaml"))),
+              key=lambda x: x["name"],
+          )
+          if not 1 <= max_files <= 100:
+              raise ValueError("max_files must be between 1 and 100")
+          if not workflows:
+              raise ValueError("No workflow YAML files found; refusing false clean result")
+          if len(workflows) > max_files:
+              raise ValueError(f"Refusing partial audit: {len(workflows)} workflow files exceed max_files={max_files}")
+          findings = []
+          scanned_files = []
+          seen_names = set()
+          for entry in workflows:
+              name = str(entry["name"])
+              if name != PurePosixPath(name).name or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", name, re.I):
+                  raise ValueError("Unexpected workflow filename")
+              if name in seen_names:
+                  raise ValueError(f"{name}: duplicate file in directory listing")
+              seen_names.add(name)
+              size = entry.get("size")
+              if type(size) is not int or size < 0 or size > MAX_FILE_BYTES:
+                  raise ValueError(f"{name}: declared size exceeds limit or is invalid")
+              sha = entry.get("sha")
+              if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+                  raise ValueError(f"{name}: missing or invalid Git blob SHA")
+              # Git blobs are immutable. A branch update cannot change the file
+              # after it appears in the Contents API directory response.
+              url = ("https://api.github.com/repos/" + quote(repo, safe="/")
+                     + "/git/blobs/" + sha)
+              contents = decode_workflow(fetch(url, token), name, sha)
+              scanned_files.append({"file": name, "blob_sha": sha})
+              findings.extend(analyze_workflow(contents, name))
+          return {
+              "repository": repo,
+              "reference": ref,
+              "workflows_checked": len(workflows),
+              "high_findings": sum(x["severity"] == "HIGH" for x in findings),
+              "warnings": sum(x["severity"] == "WARN" for x in findings),
+              "findings": findings,
+              "scanned_files": scanned_files,
+              "audit_scope": "Write-all and selected pull_request_target checkout patterns. This is not a full security audit.",
+          }
+
+
+      def main():
+          with open("workflow-list.json", encoding="utf-8") as f:
+              listing = json.load(f)
+          if isinstance(listing, str):
+              listing = json.loads(listing)
+          result = audit(
+              listing,
+              os.environ["REPOSITORY"],
+              os.environ["REFERENCE"],
+              os.environ["GITHUB_TOKEN"],
+              int(os.environ.get("MAX_WORKFLOWS", "50")),
+          )
+          with open("privilege-audit.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, sort_keys=True)
+          print(f"Checked {result['workflows_checked']} workflows; "
+                f"{result['high_findings']} high findings; {result['warnings']} warnings")
+          # Kestra script output protocol. Do not put API tokens into outputs.
+          summary = {k: v for k, v in result.items() if k not in ("findings", "scanned_files")}
+          print("::" + json.dumps({"outputs": summary}) + "::")
+
+
+      if __name__ == "__main__":
+          main()
+
+  - id: privilege_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Send a Slack alert only when there are HIGH findings.
+    condition: "{{ outputs.analyze_privileges.vars.high_findings > 0 }}"
+    then:
+      - id: notify_security
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send the result. Review the JSON report for details.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "GitHub Actions audit: {{ outputs.analyze_privileges.vars.high_findings }} HIGH finding(s) in {{ inputs.repository }} at {{ inputs.reference }}. Checked {{ outputs.analyze_privileges.vars.workflows_checked }} files. See privilege-audit.json in Kestra execution {{ execution.id }}."
+          }
+    else:
+      - id: log_audit_result
+        type: io.kestra.plugin.core.log.Log
+        description: Record the scan result. Do not send a high-severity alert.
+        message: "Checked {{ outputs.analyze_privileges.vars.workflows_checked }} files in {{ inputs.repository }}. HIGH={{ outputs.analyze_privileges.vars.high_findings }}. WARN={{ outputs.analyze_privileges.vars.warnings }}."
+
+errors:
+  - id: notify_scan_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Tell reviewers that the scan did not finish.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "GitHub Actions audit failed for {{ inputs.repository }} in Kestra execution {{ execution.id }}. No clean result is available. Check the task logs."
+      }
+
+outputs:
+  - id: report_uri
+    type: STRING
+    description: Kestra URI for the JSON report.
+    value: "{{ outputs.analyze_privileges.outputFiles['privilege-audit.json'] }}"
+  - id: high_findings
+    type: INT
+    description: Number of HIGH findings.
+    value: "{{ outputs.analyze_privileges.vars.high_findings }}"
+
+extend:
+  title: Check GitHub Actions Permissions and Pull Request Checkouts
+  shortDescription: Check write-all permissions and pull_request_target checkouts. Save a JSON report and alert Slack.
+  metaTitle: GitHub Actions Permission Audit
+  metaDescription: Check GitHub Actions files for broad token access and unsafe pull request checkouts. Save a JSON report and alert Slack.
+  description: |
+    This flow checks a repository's GitHub Actions files. It reports these cases:
+
+    - WRITE_ALL: A workflow or job sets `permissions: write-all`.
+    - PR_TARGET_UNTRUSTED_CHECKOUT: A `pull_request_target` job checks out code
+      from a pull request head ref or repository.
+    - PR_TARGET_OIDC: A `pull_request_target` job can request an OIDC token.
+      This is a warning. Review the job before you change it.
+
+    ## How it works
+
+    1. List the YAML files in `.github/workflows` at the selected reference.
+    2. Fetch each listed file by its Git blob SHA. This keeps the files
+       the same even when the branch changes during the scan.
+    3. Read the YAML files and write `privilege-audit.json`.
+    4. Send a Slack alert if a HIGH finding exists. Log the other results.
+    5. If an API call or file check fails, stop. Do not report a clean scan.
+
+    ## Before you run
+
+    - Use a Kestra worker that can run a Python container.
+    - Give the worker network access to GitHub and PyPI.
+    - Set `GITHUB_TOKEN` as a Kestra secret. Grant read access to Contents.
+    - Set `SLACK_WEBHOOK_URL` as a Kestra secret.
+    - Set `repository` to owner/repo and `reference` to a branch or tag.
+
+    ## Inputs
+
+    - `repository`: Repository name. Default: `kestra-io/blueprints`.
+    - `reference`: Branch or tag. Default: `main`.
+    - `max_workflows`: Maximum file count. Default: `50`.
+
+    ## Outputs
+
+    - `outputs.report_uri`: JSON report location. Each file has a blob SHA.
+    - `outputs.high_findings`: Number of HIGH findings.
+
+    ## First test
+
+    1. Run the flow manually.
+    2. Open the JSON report and check the file count.
+    3. Test the HIGH and error paths in a test repository.
+    4. Enable the schedule only after the tests pass.
+
+    ## Limits
+
+    This is not a full GitHub Actions security scan. It does not check
+    indirect code execution, reusable workflows, or third-party actions.
+    A clean result only means that these rules found no issue.
+    The flow stops when it cannot check all listed files.
+
+    ## References
+
+    - https://docs.github.com/en/rest/repos/contents
+    - https://docs.github.com/en/rest/git/blobs
+    - https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
+    - https://kestra.io/plugins/plugin-scripts
+    - https://kestra.io/plugins/plugin-slack
+  tags:
+    - Infrastructure
+  subTags:
+    - Security
+    - Monitoring & Alerting
+  ee: false
+  demo: false
