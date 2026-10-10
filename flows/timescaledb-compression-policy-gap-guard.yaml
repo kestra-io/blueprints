@@ -1,0 +1,504 @@
+id: timescaledb-compression-policy-gap-guard
+namespace: company.team
+
+description: |
+  Find TimescaleDB hypertables whose chunks are never going to be compressed. Three gaps cost disk every
+  day. A hypertable can have no compression policy at all. Its policy job can be failing or paused. Chunks can sit
+  past the policy window because the policy was added after the data. Report the uncompressed
+  bytes at risk per hypertable, then optionally enable columnstore, compress the backlog chunks one
+  at a time and turn the policy on and read the catalog again to prove it landed.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: TimescaleDB speaks the PostgreSQL wire protocol, so this is a plain PostgreSQL JDBC URL.
+    defaults: "jdbc:postgresql://localhost:5432/metrics"
+
+  - id: schemas
+    type: STRING
+    displayName: Schemas to scan
+    description: Comma separated list of schemas holding the hypertables.
+    defaults: "public"
+
+  - id: fallback_compress_after
+    type: STRING
+    displayName: Window for hypertables with no policy
+    description: >-
+      Used for a hypertable that has no compression policy, both to measure how much data is already
+      past that age and as the window of the policy the flow can add.
+    defaults: "7 days"
+
+  - id: grace_period
+    type: STRING
+    displayName: Grace period
+    description: >-
+      A chunk counts as late only once it is older than the window plus the policy schedule interval
+      plus this. It stops a chunk that crossed the boundary minutes ago from being reported.
+    defaults: "1 hour"
+
+  - id: max_chunks_per_hypertable
+    type: INT
+    displayName: Chunk ceiling per hypertable
+    description: Oldest chunks first. A large backlog is cleared over several runs instead of one long one.
+    defaults: 25
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for anything to be compressed.
+    defaults: true
+
+variables:
+  scan_cte: |
+    WITH scoped AS (
+      SELECT h.hypertable_schema AS sch, h.hypertable_name AS tbl, h.compression_enabled, h.num_chunks,
+             format('%I.%I', h.hypertable_schema, h.hypertable_name) AS fqn
+        FROM timescaledb_information.hypertables h
+       WHERE h.hypertable_schema = ANY (string_to_array('{{ inputs.schemas }}', ','))
+         AND h.primary_dimension_type IN ('timestamp with time zone'::regtype, 'timestamp without time zone'::regtype, 'date'::regtype)
+    ), pol AS (
+      SELECT j.hypertable_schema AS sch, j.hypertable_name AS tbl, j.job_id, j.scheduled, j.schedule_interval,
+             j.config ->> 'compress_after' AS window_text, s.last_run_status, s.last_successful_finish,
+             coalesce(s.total_failures, 0) AS total_failures, coalesce(s.total_runs, 0) AS total_runs, s.next_start
+        FROM timescaledb_information.jobs j
+        LEFT JOIN timescaledb_information.job_stats s ON s.job_id = j.job_id
+       WHERE j.proc_name IN ('policy_compression', 'policy_columnstore')
+    ), win AS (
+      SELECT sc.*, p.job_id, coalesce(p.scheduled, false) AS scheduled, p.last_run_status, p.last_successful_finish,
+             coalesce(p.total_failures, 0) AS total_failures, coalesce(p.total_runs, 0) AS total_runs, p.next_start,
+             coalesce(nullif(p.window_text, '')::interval, '{{ inputs.fallback_compress_after }}'::interval) AS compress_after,
+             greatest(coalesce(p.schedule_interval, INTERVAL '0'), '{{ inputs.grace_period }}'::interval) AS grace
+        FROM scoped sc
+        LEFT JOIN pol p ON p.sch = sc.sch AND p.tbl = sc.tbl
+    ), marked AS (
+      SELECT w.sch, w.tbl, w.fqn, format('%I.%I', c.chunk_schema, c.chunk_name) AS chunk_fqn,
+             c.is_compressed, c.range_end,
+             pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass) AS bytes,
+             (NOT c.is_compressed AND c.range_end < now() - w.compress_after - w.grace) AS past_window
+        FROM win w
+        JOIN timescaledb_information.chunks c
+          ON c.hypertable_schema = w.sch AND c.hypertable_name = w.tbl
+    ), agg AS (
+      SELECT sch, tbl,
+             count(*) FILTER (WHERE is_compressed) AS compressed_chunks,
+             count(*) FILTER (WHERE NOT is_compressed) AS uncompressed_chunks,
+             count(*) FILTER (WHERE past_window) AS past_window_chunks,
+             coalesce(sum(bytes) FILTER (WHERE past_window), 0) AS bytes_at_risk,
+             min(range_end) FILTER (WHERE past_window) AS oldest_late_chunk
+        FROM marked
+       GROUP BY 1, 2
+    ), cls AS (
+      SELECT w.*, coalesce(a.compressed_chunks, 0) AS compressed_chunks,
+             coalesce(a.uncompressed_chunks, 0) AS uncompressed_chunks,
+             coalesce(a.past_window_chunks, 0) AS past_window_chunks,
+             coalesce(a.bytes_at_risk, 0) AS bytes_at_risk, a.oldest_late_chunk, d.total_bytes,
+             CASE
+               WHEN w.job_id IS NULL THEN 'NO_POLICY'
+               WHEN NOT w.scheduled OR w.last_run_status = 'Failed' OR NOT w.compression_enabled THEN 'POLICY_FAILING'
+               WHEN coalesce(a.past_window_chunks, 0) > 0 THEN 'CHUNKS_PAST_WINDOW'
+               ELSE 'OK'
+             END AS status
+        FROM win w
+        LEFT JOIN agg a ON a.sch = w.sch AND a.tbl = w.tbl
+        LEFT JOIN LATERAL hypertable_detailed_size(w.fqn::regclass) d ON true
+    )
+
+  audit_sql: |
+    {{ vars.scan_cte }}
+    SELECT c.fqn AS hypertable, c.status, c.compression_enabled, c.job_id, c.scheduled,
+           c.compress_after::text AS compress_after, c.last_run_status, c.total_failures, c.total_runs,
+           c.next_start, c.last_successful_finish, c.num_chunks, c.compressed_chunks, c.uncompressed_chunks,
+           c.past_window_chunks, least(c.past_window_chunks, {{ inputs.max_chunks_per_hypertable }}) AS chunks_this_run,
+           c.bytes_at_risk, pg_size_pretty(c.bytes_at_risk) AS size_at_risk,
+           c.total_bytes AS hypertable_bytes, pg_size_pretty(c.total_bytes) AS hypertable_size,
+           c.oldest_late_chunk,
+           CASE c.status
+             WHEN 'NO_POLICY' THEN 'No compression policy, so every chunk stays uncompressed forever'
+             WHEN 'POLICY_FAILING' THEN format('Policy job %s cannot compress (scheduled=%s, last run=%s, lifetime failures=%s, columnstore enabled=%s)', c.job_id, c.scheduled, coalesce(c.last_run_status, 'never ran'), c.total_failures, c.compression_enabled)
+             WHEN 'CHUNKS_PAST_WINDOW' THEN format('%s chunks are older than the %s window and still uncompressed', c.past_window_chunks, c.compress_after)
+             ELSE 'Policy present, job healthy, nothing past the window'
+           END AS reason
+      FROM cls c
+     ORDER BY c.bytes_at_risk DESC, c.fqn
+
+  plan_sql: |
+    {{ vars.scan_cte }}
+    SELECT hypertable, status, step, action, target, sql FROM (
+      SELECT c.fqn AS hypertable, c.status, 1 AS step, 'ENABLE_COLUMNSTORE' AS action, c.fqn AS target,
+             format('ALTER TABLE %s SET (timescaledb.compress)', c.fqn) AS sql, 0::bigint AS seq
+        FROM cls c
+       WHERE c.status <> 'OK' AND NOT c.compression_enabled
+       UNION ALL
+      SELECT m.fqn, c.status, 2, 'COMPRESS_CHUNK', m.chunk_fqn,
+             format('SELECT compress_chunk(%L, if_not_compressed => true)', m.chunk_fqn), m.rn
+        FROM (
+          SELECT *, row_number() OVER (PARTITION BY sch, tbl ORDER BY range_end) AS rn
+            FROM marked WHERE past_window
+        ) m
+        JOIN cls c ON c.sch = m.sch AND c.tbl = m.tbl
+       WHERE m.rn <= {{ inputs.max_chunks_per_hypertable }}
+       UNION ALL
+      SELECT c.fqn, c.status, 3, 'ADD_POLICY', c.fqn,
+             format('SELECT add_compression_policy(%L, INTERVAL %L, if_not_exists => true)', c.fqn, c.compress_after::text), 0
+        FROM cls c
+       WHERE c.job_id IS NULL
+       UNION ALL
+      SELECT c.fqn, c.status, 4, 'RESUME_JOB', c.job_id::text,
+             format('SELECT alter_job(%s, scheduled => true)', c.job_id), 0
+        FROM cls c
+       WHERE c.status <> 'OK' AND c.job_id IS NOT NULL AND NOT c.scheduled
+    ) p
+     ORDER BY step, hypertable, seq, target
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Joins the hypertable list, the policy jobs with their run statistics and every chunk,
+      then classifies each hypertable as NO_POLICY, POLICY_FAILING, CHUNKS_PAST_WINDOW or OK.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per statement the remediation would run, in order, with the chunk ceiling
+      applied. Nothing here is executed unless auto_remediate is true and dry_run is false.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.plan_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      TimescaleDB compression audit on {{ inputs.jdbc_url }}: {{ outputs.audit.size }} hypertables scanned,
+      {{ outputs.audit.rows | jq('map(select(.status != "OK")) | length') | first }} with a gap,
+      {{ outputs.audit.rows | jq('map(.bytes_at_risk) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB uncompressed and past the window.
+      {% for r in outputs.audit.rows %}{{ r.status }} {{ r.hypertable }} ({{ r.compressed_chunks }}/{{ r.num_chunks }} chunks compressed, {{ r.size_at_risk }} at risk): {{ r.reason }}. {% endfor %}
+      Plan: {{ outputs.plan.size }} statements
+      ({{ outputs.plan.rows | jq('group_by(.action) | map("\(length) \(.[0].action)") | join(", ")') | first }}).
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.rows | jq('map(select(.status != \"OK\")) | length') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'TimescaleDB ' ~ inputs.jdbc_url ~ ': ' ~ (outputs.audit.rows | jq('map(select(.status != "OK")) | length') | first) ~ ' hypertables will not compress, ' ~ (outputs.audit.rows | jq('map(.bytes_at_risk) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first) ~ ' MB past the window. ' ~ (outputs.audit.rows | jq('map(select(.status != "OK") | "\(.status) \(.hypertable) (\(.past_window_chunks) late chunks, \(.size_at_risk))") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Remediating now.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.plan.size > 0 }}"
+        then:
+          - id: enable_columnstore
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              Columnstore has to be enabled on the hypertable before any chunk of it can be compressed,
+              and add_compression_policy refuses a hypertable without it.
+            concurrencyLimit: 1
+            values: "{{ outputs.plan.rows | jq('map(select(.action == \"ENABLE_COLUMNSTORE\") | .sql)') | first | toJson }}"
+            tasks:
+              - id: enable_one
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: NONE
+                sql: "{{ item.value }}"
+
+          - id: compress_backlog
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One compress_chunk at a time, oldest chunk first. Sequential, because each call rewrites a
+              chunk and takes an exclusive lock on it. A parallel burst would queue behind itself.
+            concurrencyLimit: 1
+            values: "{{ outputs.plan.rows | jq('map(select(.action == \"COMPRESS_CHUNK\") | .sql)') | first | toJson }}"
+            tasks:
+              - id: compress_one
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: NONE
+                sql: "{{ item.value }}"
+
+          - id: enable_policy
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              The policy is added or resumed last, so the backlog is cleared under the flow's own ceiling
+              rather than by a job that starts within seconds and competes for the same chunk locks.
+            concurrencyLimit: 1
+            values: "{{ outputs.plan.rows | jq('map(select(.action == \"ADD_POLICY\" or .action == \"RESUME_JOB\") | .sql)') | first | toJson }}"
+            tasks:
+              - id: policy_one
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: NONE
+                sql: "{{ item.value }}"
+
+          - id: recheck
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Reads the catalog again for exactly the chunks and hypertables the plan named.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: >-
+              SELECT
+                (SELECT count(*) FROM timescaledb_information.chunks c
+                  WHERE format('%I.%I', c.chunk_schema, c.chunk_name) = ANY (ARRAY[{{ outputs.plan.rows | jq('map(select(.action == "COMPRESS_CHUNK") | .target) | map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",")') | first }}]::text[])
+                    AND NOT c.is_compressed) AS chunks_still_uncompressed,
+                (SELECT count(*) FROM timescaledb_information.chunks c
+                  WHERE format('%I.%I', c.chunk_schema, c.chunk_name) = ANY (ARRAY[{{ outputs.plan.rows | jq('map(select(.action == "COMPRESS_CHUNK") | .target) | map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",")') | first }}]::text[])
+                    AND c.is_compressed) AS chunks_compressed,
+                (SELECT count(*) FROM timescaledb_information.hypertables h
+                  WHERE format('%I.%I', h.hypertable_schema, h.hypertable_name) = ANY (ARRAY[{{ outputs.plan.rows | jq('map(select(.action != "COMPRESS_CHUNK") | .hypertable) | unique | map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",")') | first }}]::text[])
+                    AND (NOT h.compression_enabled
+                         OR NOT EXISTS (SELECT 1 FROM timescaledb_information.jobs j
+                                         WHERE j.proc_name IN ('policy_compression', 'policy_columnstore')
+                                           AND j.hypertable_schema = h.hypertable_schema
+                                           AND j.hypertable_name = h.hypertable_name
+                                           AND j.scheduled))) AS policies_not_in_place
+
+          - id: compression_stats
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Bytes before and after for every compressed chunk of the hypertables the plan touched.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            sql: >-
+              SELECT t.ht AS hypertable, count(*) AS compressed_chunks,
+                     sum(s.before_compression_total_bytes) AS before_bytes,
+                     sum(s.after_compression_total_bytes) AS after_bytes,
+                     pg_size_pretty(sum(s.before_compression_total_bytes)) AS before_size,
+                     pg_size_pretty(sum(s.after_compression_total_bytes)) AS after_size,
+                     round(100.0 * (1 - sum(s.after_compression_total_bytes)::numeric / nullif(sum(s.before_compression_total_bytes), 0)), 1) AS saved_pct
+                FROM unnest(ARRAY[{{ outputs.plan.rows | jq('map(.hypertable) | unique | map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",")') | first }}]::text[]) t(ht)
+                CROSS JOIN LATERAL chunk_compression_stats(t.ht::regclass) s
+               WHERE s.compression_status = 'Compressed'
+               GROUP BY 1
+               ORDER BY 1
+
+          - id: reaudit
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.audit_sql) }}"
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.recheck.row.chunks_still_uncompressed > 0 or outputs.recheck.row.policies_not_in_place > 0 }}"
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  Remediation did not land: {{ outputs.recheck.row.chunks_still_uncompressed }} of the targeted chunks
+                  are still uncompressed and {{ outputs.recheck.row.policies_not_in_place }} hypertables still have
+                  columnstore disabled or no scheduled policy. Still reported:
+                  {{ outputs.reaudit.rows | jq('map(select(.status != "OK") | "\(.status) \(.hypertable) (\(.past_window_chunks) late chunks)") | join(", ")') | first }}.
+                  Check the compress_backlog sub-execution logs for the statement that failed.
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Compressed and verified {{ outputs.recheck.row.chunks_compressed }} chunks across
+                  {{ outputs.plan.rows | jq('map(select(.action == "COMPRESS_CHUNK") | .hypertable) | unique | length') | first }} hypertables.
+                  Columnstore and a scheduled policy are in place on every hypertable the plan touched.
+                  Compressed data on those hypertables: {{ outputs.compression_stats.rows | jq('map(.before_bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB
+                  before, {{ outputs.compression_stats.rows | jq('map(.after_bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB after,
+                  {{ outputs.compression_stats.rows | jq('((map(.before_bytes) | add // 0) - (map(.after_bytes) | add // 0)) | . / 1048576 | . * 10 | floor | . / 10') | first }} MB reclaimed.
+                  Per hypertable: {{ outputs.compression_stats.rows | jq('map("\(.hypertable) \(.before_size) to \(.after_size), \(.saved_pct)% saved") | join("; ")') | first }}.
+                  Left for the next run: {{ outputs.reaudit.rows | jq('if (map(select(.status != "OK")) | length) == 0 then "nothing" else map(select(.status != "OK") | "\(.status) \(.hypertable) (\(.past_window_chunks) late chunks)") | join(", ") end') | first }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every hypertable has a scheduled compression policy, a healthy policy job and no chunk past its window."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'TimescaleDB compression policy gap guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: TimescaleDB Compression Policy Gap Guard
+  shortDescription: Find TimescaleDB hypertables with no compression policy, a failing policy job or chunks left past the policy window, report the uncompressed bytes at risk, then compress the backlog and verify it landed.
+  metaTitle: TimescaleDB Compression Policy Gap Guard with Kestra
+  metaDescription: Detect TimescaleDB hypertables that never compress, report uncompressed bytes at risk, compress the backlog chunks and verify against the catalog.
+  description: |
+    A hypertable keeps its rows in chunks. Compression is what keeps the volume from filling. Two things go wrong quietly. A hypertable gets created without a compression policy, so every chunk it ever writes stays uncompressed. Or a policy exists but the chunks past its window are still uncompressed, because the job is failing, somebody paused it or the policy was added long after the data. Nothing errors. The dashboards stay green until the disk is full.
+
+    This blueprint reads `timescaledb_information.hypertables`, `timescaledb_information.jobs`, `timescaledb_information.job_stats` and `timescaledb_information.chunks`, classifies each hypertable and reports the uncompressed bytes sitting past the window. It can then enable columnstore, compress those chunks one at a time, turn the policy on and read the catalog again to confirm every targeted chunk is compressed.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    The four states it separates and what each one means on a real cluster:
+
+    | Status | What the catalog shows | Why it costs money |
+    |---|---|---|
+    | `NO_POLICY` | No row in `timescaledb_information.jobs` with `proc_name` `policy_compression` | Nothing will ever compress. Storage grows with raw row size forever |
+    | `POLICY_FAILING` | A policy row exists, but `scheduled` is false or `last_run_status` is `Failed` or `compression_enabled` is false on the hypertable | The policy sits in the inventory so the hypertable looks covered while it compresses nothing |
+    | `CHUNKS_PAST_WINDOW` | A policy is present and its job is healthy, yet chunks with `range_end` older than `compress_after` are still `is_compressed = false` | A backlog the job is not clearing, usually because the policy arrived after the data or the window was shortened |
+    | `OK` | Policy present, job healthy, nothing past the window | Recent chunks inside the window are uncompressed by design and are not reported |
+
+    `compression_enabled` false while a policy job exists is its own trap. `ALTER TABLE ... SET (timescaledb.compress = false)` is accepted while the policy stays in place. The job then fails on every run with `columnstore policy failure`.
+
+    `total_failures` is a lifetime counter, so it is reported as context but never sets the status. A job that failed once in March and has succeeded every night since is not a failing job. Treating it as one would leave the hypertable flagged forever.
+
+    ## Safety
+
+    - Read-only unless `auto_remediate` is true and `dry_run` is false. The audit and the plan are two `SELECT` queries.
+    - The plan is printed before anything runs, one line per statement, so the change is reviewable from the log of a dry run.
+    - Compression is ordered: columnstore is enabled first, then the backlog chunks are compressed oldest first with a per hypertable ceiling, then the policy is added or resumed. The policy comes last so its job does not compete with the flow for the same chunk locks.
+    - `compress_chunk` runs with `if_not_compressed => true`, so a chunk another job already compressed is a notice rather than a failure.
+    - Nothing is dropped, deleted or decompressed. The worst case of a wrong window is a chunk compressed earlier than intended, which `decompress_chunk` reverses.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) joins the hypertable list, the compression policy jobs with their run statistics, plus every chunk. It returns one row per hypertable with the status, the chunk counts, the uncompressed bytes past the window from `pg_total_relation_size`, the hypertable total from `hypertable_detailed_size()` and a plain reason.
+    2. `plan` returns one row per remediation statement, ordered, with the chunk ceiling applied. Nothing in it runs unless both gates are open.
+    3. `summary` logs every hypertable, the megabytes at risk and the plan.
+    4. `route` (`io.kestra.plugin.core.flow.If`):
+       - **clean:** logs it.
+       - **gaps found:** `alert` posts to Slack.
+         - `remediate_gate` opens only when `auto_remediate` is true and `dry_run` is false.
+         - `enable_columnstore`, `compress_backlog` and `enable_policy` each run their statements with `concurrencyLimit: 1`.
+         - `recheck` counts, from the catalog, how many of the named chunks are still uncompressed and how many touched hypertables still lack columnstore or a scheduled policy.
+         - `compression_stats` reads `chunk_compression_stats()` for the bytes before and after.
+         - `verify_result` fails the run when a targeted chunk is still uncompressed or a policy is still not in place. Otherwise it logs the bytes reclaimed and what is left for the next run.
+    5. `errors` alerts Slack when the database cannot be reached.
+
+    ## What you get
+
+    - A per hypertable verdict that separates "no policy" from "policy that is not working" from "backlog", instead of one compression ratio number.
+    - The uncompressed bytes already past the window, so the gap is a figure rather than a feeling.
+    - A backlog cleared in bounded runs, oldest chunk first, with the policy switched on only after the backlog is gone.
+    - A run that fails when the compression did not actually land, checked against the catalog rather than against the exit code of the statement.
+
+    ## Who it's for
+
+    - Teams running TimescaleDB for metrics, events or IoT history, where storage is the main bill.
+    - Platform teams who inherited hypertables created by several services over several years.
+    - Anyone who found out a policy had been paused for months only when the volume alert fired.
+
+    ## Why orchestrate this with Kestra
+
+    The gap appears whenever somebody adds a hypertable, shortens a window or pauses a job, so a one time check is worth little. Kestra runs the audit every morning, sends the hypertables that will not compress and the bytes at risk to Slack and keeps the fix behind `auto_remediate` and `dry_run`. Compression is slow and holds a lock per chunk, which is exactly the shape a scheduled, sequential, bounded, re-verified run handles better than a cron script.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against TimescaleDB 2.30.2 on PostgreSQL 16, with a local HTTP sink standing in for Slack. Four hypertables, each 57,601 rows over 20 days in 21 daily chunks, built into one state each:
+
+    | Hypertable | State built | Catalog before |
+    |---|---|---|
+    | `sensor_readings` | Never given a policy | 0 of 21 chunks compressed, 13 past a 7 day window |
+    | `app_events` | Policy 1007 present, columnstore switched off underneath it | Last run `Failed`, 0 of 21 compressed |
+    | `metrics_raw` | Policy 1006 created with a 60 day window, then shortened to 2 days | Last run `Success`, 0 of 21 compressed, 17 past the window |
+    | `api_latency` | Policy 1005 with a 2 day window, caught up | 18 of 21 compressed, the 3 recent chunks inside the window |
+
+    | Run | Execution | Inputs | Result |
+    |---|---|---|---|
+    | 1 | `4V8nRTG6TMTKeyHenYBT0q` | defaults | 3 gaps, 16.4 MB at risk. `NO_POLICY`, `POLICY_FAILING` and `CHUNKS_PAST_WINDOW` each reported once, `api_latency` `OK`. Plan 50 statements. Alert sent |
+    | 2 | `4AYCHqqkUTB7XTz7vSKZx7` | `auto_remediate: true`, `dry_run: true` | Identical report, with `psql` confirming the same 21 uncompressed chunks on every table |
+    | 3 | `4Gpn0YnQWGt7mWJzuV021m` | `auto_remediate: true`, `dry_run: false` | 47 chunks compressed, columnstore and the missing policy added. `chunk_compression_stats()`: 16.4 MB to 5.2 MB, 11.1 MB reclaimed, 66.5 to 68.9 percent saved |
+    | 4 | `ijhRop8EGYNVrYQaVysNa` | `auto_remediate: true`, `dry_run: false`, one late chunk held under a competing write lock | 20 of 21 compressed, `recheck` reports the blocked chunk still uncompressed, `verify_result` fails the run, `errors` alerts |
+    | 5 | `6uoPb7cVFZe2xwatqlvnYe` | same, lock released | The last chunk compressed, gate passes |
+    | 6 | `6U2vN1KblZz9usmJmE5ufV` | defaults | Clean, all four hypertables `OK` |
+    | 7 | `4c3CN9TGPP7EhwROgpWI6H` | defaults, after `remove_compression_policy` and a full decompress | `NO_POLICY` caught again, 21 of 21 chunks uncompressed in `psql`, 13 past the window |
+    | 8 | `2sNCG840IGRcuTZjPf1pw7` then `2kYzV7ZSMxJK9obKjns659` | detect, then remediate | Policy dropped back to unsigned plus a paused job on another table: `NO_POLICY` and `POLICY_FAILING` reported, then 13 chunks compressed and the paused job resumed, 10 MB to 3.5 MB |
+    | 9 | `4lTHU6u9wy81LXsAL6FDsP` | unreachable database | Audit fails, `errors` alerts |
+
+    Every number in the table was read back from `psql` against `timescaledb_information.chunks` and `chunk_compression_stats()`, not from the Kestra log alone.
+
+    ## Prerequisites
+
+    - TimescaleDB 2.x. The flow uses `timescaledb_information` views, `hypertable_detailed_size()`, `chunk_compression_stats()`, `add_compression_policy()`, `compress_chunk()` and `alter_job()`, all present in 2.9 and later.
+    - The audit needs a role that can read the information views and call the size functions. Remediation needs the owner of the hypertables.
+    - Time partitioned hypertables only. A hypertable partitioned on an integer column is skipped, because its `compress_after` is a number of units rather than an interval.
+    - Local testing:
+      - `docker run -d --name ts -p 5432:5432 -e POSTGRES_PASSWORD=ts -e POSTGRES_DB=metrics timescale/timescaledb:latest-pg16`;
+      - create a hypertable, load a few weeks of rows, then leave one without a policy.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` / `POSTGRES_PASSWORD`: credentials used by every query.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/metrics` | TimescaleDB database |
+    | `schemas` | `public` | Comma separated schemas to scan |
+    | `fallback_compress_after` | `7 days` | Window used for a hypertable that has no policy |
+    | `grace_period` | `1 hour` | Added to the window before a chunk counts as late |
+    | `max_chunks_per_hypertable` | `25` | Ceiling on chunks compressed per hypertable per run |
+    | `auto_remediate` | `false` | Allow the plan to run |
+    | `dry_run` | `true` | Must be `false` for anything to be compressed |
+
+    ## Quick start
+
+    1. Add the `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow, set `jdbc_url` and `schemas`.
+    3. Run it with the defaults and read the plan in the `summary` log.
+    4. Pick a `fallback_compress_after` that matches your retention, then run with `auto_remediate: true` and `dry_run: false`.
+    5. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Add a `Pause` before `compress_backlog` when the bytes at risk cross a threshold, so a first large backlog gets an approval.
+    - Also check the retention policies in the same pass, since a hypertable with neither compression nor retention is the real storage risk.
+    - Loop over several JDBC URLs to cover every database of a fleet from one run.
+    - Record the per hypertable bytes into a table and chart how the compressed share moves week to week.
+    - Set `compress_segmentby` per hypertable before enabling columnstore, since the default picks no segmenting column and the ratio depends on it.
+
+    ## Links
+
+    - Compression and the columnstore: https://docs.tigerdata.com/use-timescale/latest/compression/
+    - Compression policy API: https://docs.tigerdata.com/api/latest/compression/add_compression_policy/
+    - Informational views: https://docs.tigerdata.com/api/latest/informational-views/
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Storage
+    - Maintenance & Optimization
+  ee: false
+  demo: false
