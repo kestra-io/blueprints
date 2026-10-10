@@ -1,0 +1,309 @@
+id: neo4j-index-population-failure-recovery-guard
+namespace: company.team
+
+description: |
+  Find Neo4j schema indexes left in a non-ONLINE state: FAILED after a population
+  error or stuck POPULATING after a crash mid build. Such an index is still listed
+  but never serves a lookup, so queries silently fall back to full scans. The flow
+  reports them to Slack and can drop then recreate each one from the index own
+  definition, wait for population to finish, then re-check that every index is ONLINE.
+
+inputs:
+  - id: url
+    type: STRING
+    displayName: Neo4j Bolt URL
+    defaults: "bolt://localhost:7687"
+
+  - id: user
+    type: STRING
+    displayName: Neo4j user
+    defaults: "neo4j"
+
+  - id: password
+    type: STRING
+    displayName: Neo4j password
+    description: Defaults to the NEO4J_PASSWORD secret. Override only for local testing.
+    defaults: "{{ secret('NEO4J_PASSWORD') }}"
+
+  - id: await_timeout_seconds
+    type: INT
+    displayName: Seconds to wait for recreated indexes to come online
+    defaults: 120
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for DROP INDEX or CREATE INDEX to run.
+    defaults: true
+
+variables:
+  audit_cypher: |
+    SHOW INDEXES YIELD name, state, type, owningConstraint, failureMessage, createStatement
+    WHERE state <> 'ONLINE'
+    RETURN name AS index_name, state, type,
+           owningConstraint IS NULL AS remediable,
+           coalesce(owningConstraint, '') AS owning_constraint,
+           left(coalesce(failureMessage, ''), 300) AS failure,
+           'DROP INDEX `' + replace(name, '`', '``') + '` IF EXISTS' AS drop_statement,
+           createStatement AS create_statement
+    ORDER BY index_name
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.neo4j.Query
+    description: Read-only. SHOW INDEXES is Neo4j own schema metadata, filtered to indexes not in the ONLINE state. Each row carries that index createStatement, so a recreate uses Neo4j exact definition rather than a reconstructed one.
+    url: "{{ inputs.url }}"
+    username: "{{ inputs.user }}"
+    password: "{{ inputs.password }}"
+    query: "{{ vars.audit_cypher }}"
+    storeType: FETCH
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Neo4j index audit on {{ inputs.url }}: {{ outputs.audit.size }} indexes not ONLINE.
+      {% for r in outputs.audit.rows %}{{ r.index_name }} ({{ r.state }}, {{ r.type }}): {{ r.create_statement }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.size > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Neo4j ' ~ inputs.url ~ ': ' ~ outputs.audit.size ~ ' indexes not ONLINE, still listed but not serving lookups: ' ~ (outputs.audit.rows | jq('map(.index_name + " (" + .state + ")") | join(", ")') | first) ~ '.' ~ (outputs.audit.rows | jq('map(select(.remediable == false)) | length') | first > 0 ? ' Some back a constraint so this guard leaves them alone, rebuild the constraint instead.' : '') ~ (inputs.auto_remediate and not inputs.dry_run ? ' Dropping then recreating now.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: remediate
+            type: io.kestra.plugin.core.flow.Loop
+            concurrencyLimit: 1
+            description: One index at a time, remediation of non-ONLINE indexes. Drop then recreate from the index own createStatement. A FAILED index keeps its name, so CREATE INDEX IF NOT EXISTS is a silent no-op, the drop has to run first.
+            values: "{{ outputs.audit.rows | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {{ fromJson(item.value).index_name }}: {% if fromJson(item.value).remediable %}drop and recreate issued{% else %}skipped, owned by constraint {{ fromJson(item.value).owning_constraint }}{% endif %}
+            tasks:
+              - id: one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: drop_index
+                    type: io.kestra.plugin.neo4j.Query
+                    runIf: "{{ fromJson(item.value).remediable }}"
+                    url: "{{ inputs.url }}"
+                    username: "{{ inputs.user }}"
+                    password: "{{ inputs.password }}"
+                    query: "{{ fromJson(item.value).drop_statement }}"
+                    storeType: NONE
+
+                  - id: recreate_index
+                    type: io.kestra.plugin.neo4j.Query
+                    runIf: "{{ fromJson(item.value).remediable }}"
+                    url: "{{ inputs.url }}"
+                    username: "{{ inputs.user }}"
+                    password: "{{ inputs.password }}"
+                    query: "{{ fromJson(item.value).create_statement }}"
+                    storeType: NONE
+
+          - id: settle
+            type: io.kestra.plugin.neo4j.Query
+            allowFailure: true
+            description: Wait for the recreated indexes to finish building. db.awaitIndexes throws if one enters FAILED again, which is allowed here. The re-audit below is the authoritative check.
+            url: "{{ inputs.url }}"
+            username: "{{ inputs.user }}"
+            password: "{{ inputs.password }}"
+            query: "CALL db.awaitIndexes({{ inputs.await_timeout_seconds }})"
+            storeType: NONE
+
+          - id: reaudit
+            type: io.kestra.plugin.neo4j.Query
+            url: "{{ inputs.url }}"
+            username: "{{ inputs.user }}"
+            password: "{{ inputs.password }}"
+            query: "{{ vars.audit_cypher }}"
+            storeType: FETCH
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            description: Fail if any index this run tried to remediate is still not ONLINE. Constraint-owned indexes are not counted here, they were never touched.
+            condition: >-
+              {{ {'before': outputs.audit.rows, 'after': (outputs.reaudit.rows ?? [])} | jq('([.before[] | select(.remediable == true) | .index_name]) as $b | ([.after[].index_name]) as $a | [$b[] | select(. as $x | ($a | index($x)) != null)] | length') | first > 0 }}
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Indexes still not ONLINE after drop and recreate: {{ outputs.reaudit.rows | jq('map(.index_name + \" (\" + .state + \")\") | join(\", \")') | first }}. The cause that failed population is still present, for example a property value too large to index. Fix the data or the definition then re-run."
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  {% for r in outputs.remediate.outputs %}{{ r.outputs.result }}. {% endfor %}Indexes not ONLINE left: {{ outputs.reaudit.size }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every Neo4j index is ONLINE."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Neo4j index population guard failed on ' ~ inputs.url ~ ' (execution ' ~ execution.id ~ '). Index state unknown, check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled, always in safe mode.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Neo4j Index Population Failure Recovery Guard
+  shortDescription: Find Neo4j indexes left FAILED or stuck POPULATING, alert Slack, drop and recreate each one from its own definition, wait for population, then verify every index is ONLINE.
+  metaTitle: Neo4j Index Population Failure Recovery Guard with Kestra
+  metaDescription: Find Neo4j indexes left FAILED or stuck POPULATING, alert Slack, drop and recreate each from its own definition, then verify every index is ONLINE.
+  description: |
+    A Neo4j schema index does not always come up ONLINE. A population error, such as a
+    property value too large to index, leaves it `FAILED`. A crash during the build can
+    leave it stuck `POPULATING`. Either way the index stays in the catalog and is still
+    maintained on every write, but it never serves a lookup. Queries that should use it
+    fall back to a full label scan and get slower, with nothing in an error log to say
+    why. Neo4j does not recover a `FAILED` index on its own, even once the cause is gone:
+    it stays `FAILED` until someone drops and recreates it.
+
+    This blueprint lists every index that is not ONLINE. It alerts Slack and can drop
+    then recreate each one from the index own `createStatement`, so the rebuild uses
+    Neo4j exact definition for any index type. It waits for population to finish, then
+    audits again and fails the run if an index it rebuilt is still not ONLINE.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | State | What it means | What this guard does |
+    |---|---|---|
+    | `FAILED` | Population hit an error and gave up. Still written on every change, never read | Drop and recreate from its own definition, then verify ONLINE |
+    | `POPULATING` | Still building or stuck mid build after a crash | Same path. A legitimate build in progress also shows this, so run the guard outside large index builds |    | owned by a constraint | A non-ONLINE index that backs a constraint | Reported, not touched. `DROP INDEX` refuses it, the constraint must be rebuilt instead |
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.neo4j.Query`, read-only, `storeType: FETCH`) runs `SHOW INDEXES ... WHERE state <> 'ONLINE'`. For each index it returns the state, the type, whether it is remediable (not owned by a constraint), the failure message, a `DROP INDEX ... IF EXISTS` statement with the name back-quoted and the index own `createStatement`.
+    2. `summary` logs every finding with its exact definition.
+    3. `route` (`io.kestra.plugin.core.flow.If` on `outputs.audit.size > 0`):
+       - **clean:** `clean` logs that every index is ONLINE.
+       - **findings:** `alert` posts the list to Slack, noting any constraint-owned indexes it will not touch and whether it is about to remediate.
+         - `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false.
+         - `remediate` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) takes one index at a time. For a remediable index it runs the drop then the recreate. A constraint-owned index is skipped.
+         - `settle` calls `db.awaitIndexes` to wait for the recreated indexes to build.
+         - `reaudit` runs the same `SHOW INDEXES` check again. `verify_result` fails the run if any index this run tried to remediate is still not ONLINE.
+    4. `errors` alerts Slack when the flow itself fails, for example an unreachable instance or bad credentials, so a failed audit is never read as "no problem".
+
+    ## What you get
+
+    - A direct list of the indexes Neo4j is maintaining but never using, from its own `SHOW INDEXES` state, not guessed from query plans.
+    - A rebuild that uses each index own definition, so range, text, point, full-text and lookup indexes all come back with the right type and options.
+    - A guard that never drops a constraint-backed index by mistake, because `DROP INDEX` refuses those and the flow filters them out first.
+    - Two independent gates (`auto_remediate`, `dry_run`) between a finding and any schema change.
+    - Proof the fix landed: the run fails loudly if a rebuilt index did not reach ONLINE, so a stubborn root cause is surfaced rather than hidden.
+
+    ## Who it's for
+
+    - Teams running Neo4j that add indexes through migrations, where a single failed build leaves a silent gap in coverage.
+    - Platform and data engineers who have seen a query slow down for no visible reason and traced it to an index that was never ONLINE.
+    - Anyone evaluating the Neo4j plugin who wants a worked example of `Query` driving schema introspection (`SHOW INDEXES`) and schema change (`DROP INDEX`, `CREATE INDEX`) in one flow.
+
+    ## Why orchestrate this with Kestra
+
+    Spotting a non-ONLINE index is one query. Fixing it safely is a sequence: capture each index real definition, drop and recreate one at a time, wait for population, then check the result and fail if it did not take. Kestra runs that sequence on a schedule behind two gates, keeps constraint-backed indexes out of it, alerts Slack on both the finding and a failure, then keeps an execution history of what was rebuilt and where.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against Neo4j 5.26.31 Community, with a local HTTP sink standing in for Slack. A `FAILED` index was produced for real by indexing an oversized property: a `Doc` node was given a 200000 character `blob`, then `CREATE INDEX ... FOR (n:Doc) ON (n.blob)` drove the index to `FAILED` (property value too large to index). `cypher-shell` confirmed the state before and after every run.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults, clean graph | 0 indexes not ONLINE, `clean` logged. No alert |
+    | 2 | defaults, one FAILED index | 1 index reported, alert sent. No change. `cypher-shell` shows it still FAILED |
+    | 3 | `auto_remediate: true`, `dry_run: true` | Same report, remediation held. `cypher-shell` shows the index untouched, still FAILED |
+    | 4 | `auto_remediate: true`, `dry_run: false`, root cause fixed first | Dropped and recreated. `settle` waited, `reaudit` clean, `verify_result` passed. `cypher-shell` shows the index ONLINE |
+    | 5 | `auto_remediate: true`, `dry_run: false`, oversized value still present | Dropped and recreated, population FAILED again, `verify_result` failed the run with the index name and state. `errors` alert sent |
+    | 6 | unreachable URL | `audit` failed, `errors` alert sent |
+
+    Exact execution ids and the before and after state counts are in the pull request notes.
+
+    ## Prerequisites
+
+    - A reachable Neo4j 4.x or 5.x instance. `SHOW INDEXES` and its `createStatement` column are available on Community and Enterprise.
+    - For the audit, any user that can run `SHOW INDEXES`. For remediation, a user allowed to `DROP INDEX` and `CREATE INDEX`.
+    - A Slack incoming webhook for alerts.
+    - Local testing:
+      - `docker run -d --name neo4j -p 7687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5`;
+      - create a node with an oversized property then index it to force a FAILED index: `CREATE (:Doc {blob: 'x'}); MATCH (n:Doc) SET n.blob = reduce(s='', i IN range(1,20000) | s + 'ABCDEFGHIJ'); CREATE INDEX doc_blob_idx FOR (n:Doc) ON (n.blob);`.
+
+    ### Secrets
+
+    - `NEO4J_PASSWORD`: password for the Neo4j user, the default for the `password` input.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`, for example `SECRET_NEO4J_PASSWORD=$(echo -n 'testpassword' | base64)`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `url` | `bolt://localhost:7687` | Bolt endpoint |
+    | `user` | `neo4j` | Neo4j user |
+    | `password` | `{{ secret('NEO4J_PASSWORD') }}` | Password, from the secret by default |
+    | `await_timeout_seconds` | `120` | How long `db.awaitIndexes` waits for a rebuild |
+    | `auto_remediate` | `false` | Allow drop and recreate |
+    | `dry_run` | `true` | Must be `false` for any schema change to run |
+
+    ## Quick start
+
+    1. Add the `NEO4J_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `url` and `user`.
+    3. Run it once with the defaults and read the indexes that are not ONLINE.
+    4. Fix the root cause of each failure first, for example remove or shrink a property value too large to index.
+    5. Run it with `auto_remediate: true` and `dry_run: false` to drop and recreate the indexes, outside peak hours since a rebuild reads the whole label.
+    6. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Add a `Pause` before `remediate` for human approval on production graphs.
+    - Narrow the audit to one database with `SHOW INDEXES` run against a specific database in a multi-database setup.
+    - Loop over several Bolt URLs to check every instance of a cluster.
+    - Treat a long-running `POPULATING` as healthy by excluding indexes whose `populationPercent` is climbing, so only truly stuck ones alert.
+    - Route constraint-owned findings to a separate flow that rebuilds the constraint.
+
+    ## Links
+
+    - Neo4j SHOW INDEXES: https://neo4j.com/docs/cypher-manual/current/indexes/managing-indexes/
+    - Neo4j CREATE INDEX: https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/managing-indexes/
+    - Neo4j plugin: https://kestra.io/plugins/plugin-neo4j
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Maintenance & Optimization
+    - Performance
+  ee: false
+  demo: false
+
+
+
+
+
+
