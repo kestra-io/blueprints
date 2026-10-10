@@ -1,0 +1,540 @@
+id: citus-shard-imbalance-rebalance-guard
+namespace: company.team
+
+description: |
+  Measure how a Citus cluster spreads its distributed shards over the workers that accept them.
+  Report a worker that holds nothing, which is what a freshly added node looks like, plus a byte
+  skew above a threshold. Print the exact moves Citus would make as a dry run, then optionally
+  run the rebalance behind an approval, poll it to completion and read the placement again,
+  failing the run if the skew did not improve or a worker is still empty.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: Coordinator JDBC URL
+    description: The Citus coordinator. Worker nodes are read from its metadata.
+    defaults: "jdbc:postgresql://localhost:5432/citus"
+
+  - id: skew_threshold
+    type: FLOAT
+    displayName: Byte skew that counts as imbalanced
+    description: Largest worker bytes divided by smallest worker bytes. 1.25 means the hottest worker may hold a quarter more than the coldest before the cluster is called imbalanced.
+    defaults: 1.25
+
+  - id: min_total_mb
+    type: INT
+    displayName: Floor on total shard bytes
+    description: Below this, skew is not worth moving data for. An empty worker is still reported under the floor.
+    defaults: 10
+
+  - id: rebalance_strategy
+    type: SELECT
+    displayName: Rebalance strategy
+    description: Citus built-in strategies. by_disk_size balances bytes, by_shard_count balances the number of shards.
+    values:
+      - by_disk_size
+      - by_shard_count
+    defaults: by_disk_size
+
+  - id: shard_transfer_mode
+    type: SELECT
+    displayName: Shard transfer mode
+    description: >-
+      auto uses logical replication when the shard has a replica identity, which needs
+      wal_level=logical on the workers. block_writes copies the shard with writes blocked on it
+      and works on any wal_level. force_logical always uses logical replication.
+    values:
+      - auto
+      - block_writes
+      - force_logical
+    defaults: auto
+
+  - id: max_shard_moves
+    type: INT
+    displayName: Maximum shard moves
+    description: Cap on the moves in one rebalance, so a large cluster can be levelled over several windows.
+    defaults: 1000000
+
+  - id: rebalance_timeout
+    type: DURATION
+    displayName: Rebalance timeout
+    description: How long to poll citus_rebalance_status before failing the run. The rebalance keeps going in the background, so a timeout is a reporting limit, not a cancel.
+    defaults: PT30M
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow the flow to start a rebalance. Off means report only.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any shard moves.
+    defaults: true
+
+variables:
+  placement_sql: |
+    WITH node AS (
+      SELECT n.groupid, n.nodename, n.nodeport, n.shouldhaveshards
+        FROM pg_dist_node n
+       WHERE n.noderole = 'primary' AND n.isactive AND n.groupid <> 0
+    ), shard_size AS (
+      SELECT shard_id, max(size) AS bytes FROM citus_shard_sizes() GROUP BY shard_id
+    ), rebalanceable AS (
+      SELECT logicalrelid, (repmodel <> 't' AND colocationid <> 0) AS movable FROM pg_dist_partition
+    ), placed AS (
+      SELECT p.groupid,
+             count(*) FILTER (WHERE r.movable) AS shard_count,
+             count(*) FILTER (WHERE NOT r.movable) AS pinned_shards,
+             coalesce(sum(z.bytes) FILTER (WHERE r.movable), 0) AS bytes
+        FROM pg_dist_placement p
+        JOIN pg_dist_shard s ON s.shardid = p.shardid
+        JOIN rebalanceable r ON r.logicalrelid = s.logicalrelid
+        LEFT JOIN shard_size z ON z.shard_id = p.shardid
+       WHERE p.shardstate = 1
+       GROUP BY p.groupid
+    ), per_node AS (
+      SELECT n.nodename, n.nodeport, n.shouldhaveshards,
+             coalesce(pl.shard_count, 0) AS shard_count,
+             coalesce(pl.pinned_shards, 0) AS pinned_shards,
+             coalesce(pl.bytes, 0) AS bytes
+        FROM node n LEFT JOIN placed pl ON pl.groupid = n.groupid
+    )
+
+  assess_sql: |
+    {{ render(vars.placement_sql) }}, agg AS (
+      SELECT count(*) AS worker_count,
+             count(*) FILTER (WHERE shouldhaveshards) AS target_count,
+             coalesce(sum(bytes), 0) AS total_bytes,
+             coalesce(sum(shard_count), 0) AS total_shards,
+             coalesce(sum(pinned_shards), 0) AS pinned_shards,
+             coalesce(max(bytes) FILTER (WHERE shouldhaveshards), 0) AS max_bytes,
+             coalesce(min(bytes) FILTER (WHERE shouldhaveshards), 0) AS min_bytes,
+             count(*) FILTER (WHERE shouldhaveshards AND shard_count = 0) AS empty_count
+        FROM per_node
+    ), job AS (
+      SELECT job_id, state::text AS state FROM citus_rebalance_status()
+       WHERE state::text IN ('scheduled', 'running', 'cancelling', 'failing')
+       ORDER BY job_id DESC LIMIT 1
+    )
+    SELECT
+      CASE
+        WHEN (SELECT count(*) FROM job) > 0 THEN 'REBALANCE_IN_PROGRESS'
+        WHEN a.target_count < 2 THEN 'OK'
+        WHEN a.empty_count > 0 AND a.total_bytes > 0 THEN 'EMPTY_WORKER'
+        WHEN a.total_bytes >= {{ inputs.min_total_mb }}::bigint * 1048576
+             AND a.max_bytes::numeric / greatest(a.min_bytes, 1) > {{ inputs.skew_threshold }} THEN 'IMBALANCED'
+        ELSE 'OK'
+      END AS state,
+      a.worker_count, a.target_count, a.total_shards, a.pinned_shards, a.empty_count,
+      a.total_bytes, pg_size_pretty(a.total_bytes) AS total_size,
+      a.max_bytes, pg_size_pretty(a.max_bytes) AS max_size,
+      a.min_bytes, pg_size_pretty(a.min_bytes) AS min_size,
+      least(a.max_bytes::numeric * 10000 / greatest(a.min_bytes, 1), 100000000)::bigint AS skew_bp,
+      CASE WHEN a.min_bytes = 0 THEN 'unbounded (a worker holds nothing)'
+           ELSE to_char(a.max_bytes::numeric / a.min_bytes, 'FM999999990.00') || 'x' END AS skew_ratio,
+      to_char(100.0 * a.max_bytes / greatest(a.total_bytes, 1), 'FM990.0') AS max_share_pct,
+      to_char(100.0 / greatest(a.target_count, 1), 'FM990.0') AS fair_share_pct,
+      coalesce((SELECT string_agg(nodename || ':' || nodeport, ', ' ORDER BY nodename)
+                  FROM per_node WHERE shouldhaveshards AND shard_count = 0), '') AS empty_workers,
+      coalesce((SELECT nodename || ':' || nodeport FROM per_node WHERE shouldhaveshards
+                 ORDER BY bytes DESC, nodename LIMIT 1), '') AS hottest_worker,
+      coalesce((SELECT nodename || ':' || nodeport FROM per_node WHERE shouldhaveshards
+                 ORDER BY bytes ASC, nodename LIMIT 1), '') AS coldest_worker,
+      coalesce((SELECT job_id FROM job), 0) AS running_job_id,
+      coalesce((SELECT state FROM job), '') AS running_job_state,
+      CASE WHEN a.target_count < 2
+             THEN 'Only ' || a.target_count || ' worker accepts shards, so there is nothing to balance.'
+           WHEN a.empty_count = 0 AND a.total_bytes < {{ inputs.min_total_mb }}::bigint * 1048576
+             THEN 'Total shard bytes are under the {{ inputs.min_total_mb }} MB floor, so skew is ignored.'
+           ELSE '' END AS note
+      FROM agg a
+
+  distribution_sql: |
+    {{ render(vars.placement_sql) }}
+    SELECT nodename || ':' || nodeport AS worker, shouldhaveshards AS accepts_shards,
+           shard_count, pinned_shards, bytes, pg_size_pretty(bytes) AS size,
+           to_char(100.0 * bytes / greatest((SELECT sum(bytes) FROM per_node), 1), 'FM990.0') AS share_pct
+      FROM per_node ORDER BY bytes DESC, nodename
+
+tasks:
+  - id: distribution
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per active primary worker, built from pg_dist_placement, pg_dist_shard,
+      pg_dist_partition and citus_shard_sizes so a worker holding nothing still gets a row.
+      Reference table and Citus local table shards are counted separately as pinned, because the
+      rebalancer never moves them.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.distribution_sql) }}"
+
+  - id: assess
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Classify the cluster as REBALANCE_IN_PROGRESS, EMPTY_WORKER, IMBALANCED or OK,
+      and return the numbers behind the verdict.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.assess_sql) }}"
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Citus placement on {{ inputs.jdbc_url }} is {{ outputs.assess.row.state }}.
+      {{ outputs.assess.row.total_shards }} movable shards holding {{ outputs.assess.row.total_size }} over
+      {{ outputs.assess.row.target_count }} of {{ outputs.assess.row.worker_count }} active workers.
+      Hottest {{ outputs.assess.row.hottest_worker }} at {{ outputs.assess.row.max_size }}
+      ({{ outputs.assess.row.max_share_pct }}% of bytes against a fair share of {{ outputs.assess.row.fair_share_pct }}%),
+      coldest {{ outputs.assess.row.coldest_worker }} at {{ outputs.assess.row.min_size }}, skew {{ outputs.assess.row.skew_ratio }}
+      against a threshold of {{ inputs.skew_threshold }}x.
+      {{ outputs.assess.row.empty_workers == '' ? '' : 'Workers holding no movable shard: ' ~ outputs.assess.row.empty_workers ~ '. ' }}{{ outputs.assess.row.running_job_id > 0 ? 'Rebalance job ' ~ outputs.assess.row.running_job_id ~ ' is ' ~ outputs.assess.row.running_job_state ~ '. ' : '' }}{{ outputs.assess.row.note }}
+      {% for r in outputs.distribution.rows %}[{{ r.worker }} shards={{ r.shard_count }} {{ r.size }} {{ r.share_pct }}%{{ r.pinned_shards > 0 ? ' pinned=' ~ r.pinned_shards : '' }}{{ r.accepts_shards ? '' : ' draining' }}] {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.assess.row.state != 'OK' }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Citus ' ~ inputs.jdbc_url ~ ' is ' ~ outputs.assess.row.state ~ '. ' ~ outputs.assess.row.total_shards ~ ' movable shards holding ' ~ outputs.assess.row.total_size ~ ' over ' ~ outputs.assess.row.target_count ~ ' workers. Hottest ' ~ outputs.assess.row.hottest_worker ~ ' at ' ~ outputs.assess.row.max_size ~ ' (' ~ outputs.assess.row.max_share_pct ~ '% of bytes), coldest ' ~ outputs.assess.row.coldest_worker ~ ' at ' ~ outputs.assess.row.min_size ~ ', skew ' ~ outputs.assess.row.skew_ratio ~ '.' ~ (outputs.assess.row.empty_workers == '' ? '' : ' Holding nothing: ' ~ outputs.assess.row.empty_workers ~ '.') ~ (inputs.auto_remediate and not inputs.dry_run ? ' Rebalance pending approval.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: already_running
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.assess.row.state == 'REBALANCE_IN_PROGRESS' }}"
+        then:
+          - id: leave_it_alone
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Rebalance job {{ outputs.assess.row.running_job_id }} is {{ outputs.assess.row.running_job_state }}.
+              Citus runs one rebalance at a time, so this run reports and stops. Re-run once the job finishes.
+        else:
+          - id: plan
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: >-
+              The dry run. get_rebalance_table_shards_plan returns the moves Citus would make and
+              changes nothing. Its own shard_size column is always 0, so the real size comes from
+              citus_shard_sizes.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            sql: >-
+              SELECT p.table_name::text AS table_name, p.shardid,
+                     p.sourcename || ':' || p.sourceport AS source,
+                     p.targetname || ':' || p.targetport AS target,
+                     coalesce(z.bytes, 0) AS bytes, pg_size_pretty(coalesce(z.bytes, 0)) AS size
+                FROM get_rebalance_table_shards_plan(NULL, NULL, {{ inputs.max_shard_moves }},
+                       '{}'::bigint[], false, '{{ inputs.rebalance_strategy }}') p
+                LEFT JOIN (SELECT shard_id, max(size) AS bytes FROM citus_shard_sizes() GROUP BY shard_id) z
+                  ON z.shard_id = p.shardid
+               ORDER BY coalesce(z.bytes, 0) DESC, p.shardid
+
+          - id: log_plan
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Planned moves with strategy {{ inputs.rebalance_strategy }}: {{ outputs.plan.size }} shards,
+              {{ outputs.plan.rows | jq('map(.bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB.
+              {% for r in outputs.plan.rows %}{{ r.table_name }} shard {{ r.shardid }} ({{ r.size }}) {{ r.source }} to {{ r.target }}. {% endfor %}
+
+          - id: remediate_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.plan.size > 0 }}"
+            then:
+              - id: approve
+                type: io.kestra.plugin.core.flow.Pause
+                description: Resume the execution to run the moves listed by log_plan. Kill it to cancel. A shard move copies data between workers, so it is never applied without this.
+
+              - id: start_rebalance
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: citus_rebalance_start queues the moves as a background job and returns its id straight away.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: >-
+                  SELECT coalesce(citus_rebalance_start('{{ inputs.rebalance_strategy }}', false,
+                    '{{ inputs.shard_transfer_mode }}'), 0) AS job_id
+
+              - id: wait_rebalance
+                type: io.kestra.plugin.core.flow.LoopUntil
+                description: Poll the job every 10 seconds until Citus reports it finished, failed or cancelled.
+                condition: "{{ outputs.poll_rebalance.row.terminal }}"
+                checkFrequency:
+                  interval: PT10S
+                  maxDuration: "{{ inputs.rebalance_timeout }}"
+                failOnMaxReached: true
+                tasks:
+                  - id: poll_rebalance
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('POSTGRES_USERNAME') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    sql: >-
+                      WITH j AS (
+                        SELECT state::text AS state, details FROM citus_rebalance_status()
+                         WHERE job_id = {{ outputs.start_rebalance.row.job_id }}
+                      )
+                      SELECT coalesce((SELECT state FROM j), 'missing') AS state,
+                             coalesce((SELECT state FROM j), 'missing')
+                               NOT IN ('scheduled', 'running', 'cancelling', 'failing') AS terminal,
+                             coalesce((SELECT details::text FROM j), 'none') AS details
+
+              - id: job_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.poll_rebalance.row.state != 'finished' }}"
+                then:
+                  - id: job_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      Rebalance job {{ outputs.start_rebalance.row.job_id }} ended as
+                      {{ outputs.poll_rebalance.row.state }} with details {{ outputs.poll_rebalance.row.details }}.
+                      citus_rebalance_status only reports the newest rebalance job, so a state of missing means
+                      another rebalance replaced this one. Read pg_dist_background_task on the coordinator.
+
+              - id: redistribution
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Read the placement again, after the moves.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.distribution_sql) }}"
+
+              - id: reassess
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: >-
+                  The same assessment query, wrapped so the before numbers decide whether the move
+                  helped. improved is false unless every worker that accepts shards now holds at least
+                  one and the skew either dropped or reached OK.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: >-
+                  WITH after AS (
+                    {{ render(vars.assess_sql) }}
+                  )
+                  SELECT a.*, {{ outputs.assess.row.skew_bp }} AS before_skew_bp,
+                         {{ outputs.assess.row.empty_count }} AS before_empty_count,
+                         (a.empty_count = 0
+                          AND (a.skew_bp < {{ outputs.assess.row.skew_bp }} OR a.state = 'OK')) AS improved
+                    FROM after a
+
+              - id: verify
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.reassess.row.improved }}"
+                then:
+                  - id: rebalanced
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Rebalance job {{ outputs.start_rebalance.row.job_id }} moved {{ outputs.plan.size }} shards.
+                      Skew {{ outputs.assess.row.skew_ratio }} before, {{ outputs.reassess.row.skew_ratio }} after.
+                      Hottest worker share {{ outputs.assess.row.max_share_pct }}% before,
+                      {{ outputs.reassess.row.max_share_pct }}% after against a fair share of
+                      {{ outputs.reassess.row.fair_share_pct }}%. Workers holding nothing:
+                      {{ outputs.assess.row.empty_count }} before, {{ outputs.reassess.row.empty_count }} after.
+                      Cluster is now {{ outputs.reassess.row.state }}.
+                      {{ outputs.reassess.row.state == 'OK' ? '' : 'Bytes are still skewed past skew_threshold, which happens when citus.rebalancer_by_disk_size_base_cost, 100MB by default, dominates the real shard sizes and turns by_disk_size into a shard count balance. ' }}{% for r in outputs.redistribution.rows %}[{{ r.worker }} shards={{ r.shard_count }} {{ r.size }} {{ r.share_pct }}%] {% endfor %}
+                else:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      Rebalance job {{ outputs.start_rebalance.row.job_id }} reported finished, but the placement
+                      did not improve. Skew {{ outputs.assess.row.skew_ratio }} before,
+                      {{ outputs.reassess.row.skew_ratio }} after. Workers holding no movable shard:
+                      {{ outputs.assess.row.empty_count }} before, {{ outputs.reassess.row.empty_count }} after.
+                      Cluster is {{ outputs.reassess.row.state }}. Check pg_dist_background_task for skipped moves.
+            else:
+              - id: reported_only
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  {{ outputs.plan.size }} shard moves reported, none applied.
+                  {{ outputs.plan.size > 0 ? 'auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ '.' : 'Citus itself plans no move, so there is nothing to apply. The ' ~ inputs.rebalance_strategy ~ ' strategy finds this placement acceptable while the byte skew is ' ~ outputs.assess.row.skew_ratio ~ '. by_disk_size adds citus.rebalancer_by_disk_size_base_cost, 100MB by default, to every shard group before it compares nodes, so a cluster whose shards are smaller than that balances on shard count instead of bytes. Lower that setting on the coordinator. Raise skew_threshold instead if this placement should read as OK.' }}
+    else:
+      - id: balanced
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          Placement is within {{ inputs.skew_threshold }}x across {{ outputs.assess.row.target_count }} workers,
+          and every worker that accepts shards holds at least one. {{ outputs.assess.row.note }}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Citus shard imbalance guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "0 2 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Citus Shard Imbalance and Rebalance Guard
+  shortDescription: Measure per-worker shard count and bytes on a Citus cluster, report an empty worker or a byte skew over a threshold, print the moves Citus would make, then rebalance behind an approval and verify the skew improved.
+  metaTitle: Citus Shard Imbalance and Rebalance Guard with Kestra
+  metaDescription: Detect an empty Citus worker or skewed shard bytes, print the rebalance plan, run citus_rebalance_start behind an approval and verify the skew improved.
+  description: |
+    Add a worker to a Citus cluster and it starts empty. Citus does not move shards on its own, so the new node idles while the old ones carry every query and every byte. The same thing builds up without a new node, when a few large tenants land on the same worker. Queries then wait on the hottest worker, that worker fills its disk first while the cluster looks like it has room because the total is averaged over nodes that are not being used.
+
+    This blueprint reads the shard placement from the coordinator, works out the per-worker shard count and bytes. It reports a worker holding nothing or a byte skew over a threshold. It prints the exact moves Citus would make, which is a real dry run rather than a guess, then runs the rebalance behind an approval, polls it to completion and reads the placement again. A rebalance that did not improve the skew fails the run. So does one that leaves a worker empty.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    Four things the obvious version of this check gets wrong:
+
+    - `citus_shards` joins `pg_dist_node` on `groupid`, so on a cluster with a read replica every shard on the primary's group is counted again for the replica. Verified: a coordinator with three primary workers and one streaming replica behind the first. `citus_shards` returned 5 rows and reported `w19-citus-r1` as a fourth worker holding 7 shards at 20 MB, which reads as a four-way cluster that is out of balance. This flow reads `pg_dist_placement` and filters `pg_dist_node` to `noderole = 'primary'`, so the same cluster comes back as 3 workers, 12 shards, 63 MB, skew 1.18x and `OK`.
+    - A reference table is copied to every worker and a Citus local table lives on one. The rebalancer moves neither. Counting them hides a genuinely empty worker, because a new node receives reference tables as soon as it joins. Shards are split into movable and pinned. Only movable ones count toward skew.
+    - `shouldhaveshards = false` marks a node that is being drained on purpose. It is meant to be empty, so it is excluded from the emptiness check and reported as draining.
+    - **A rebalance that starts does not guarantee improvement.** `by_disk_size` adds `citus.rebalancer_by_disk_size_base_cost`, 100MB by default, to every shard group before it compares nodes. On a cluster whose shards are smaller than that constant, the constant dominates, the strategy degenerates into a shard count balance and the moves it picks can make the byte skew worse. Reproduced on a two-worker cluster: 7 shards at 33 MB against 5 at 31 MB, a byte skew of 1.07x, came back as 6 shards at 20 MB against 6 at 44 MB, a skew of 2.21x, with the job reporting `finished`. Citus's own `get_rebalance_table_shards_plan` returned zero moves at that same placement. This is why the flow re-reads the placement after the move and fails the run when the skew did not drop. Lower the setting on the coordinator (`ALTER DATABASE ... SET citus.rebalancer_by_disk_size_base_cost = '1MB'`) or pass it in the JDBC URL as `?options=-c%20citus.rebalancer_by_disk_size_base_cost%3D1MB`, to make `by_disk_size` compare real bytes.
+
+    ## Safety
+
+    - `get_rebalance_table_shards_plan` changes nothing. The whole detection path, including the plan, is read-only.
+    - A move runs only when `auto_remediate` is true, `dry_run` is false and the plan has at least one move. Even then it runs only after a `Pause` is resumed.
+    - A rebalance already in flight stops the run. Citus runs one at a time.
+    - `shard_transfer_mode` is explicit. `block_writes` works on any `wal_level`, `auto` needs `wal_level=logical` on the workers.
+    - The run fails when the placement did not improve, because a finished rebalance is not the same thing as a balanced cluster.
+
+    ## How it works
+
+    1. `distribution` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) returns one row per active primary worker from `pg_dist_placement`, `pg_dist_shard`, `pg_dist_partition` and `citus_shard_sizes()`, with its movable shard count, pinned shard count, bytes and share of the total. A worker holding nothing still gets a row, which is the whole point.
+    2. `assess` classifies the cluster from the same data plus `citus_rebalance_status()`:
+
+       | State | Meaning |
+       |---|---|
+       | `REBALANCE_IN_PROGRESS` | A rebalance job is scheduled, running, cancelling or failing |
+       | `EMPTY_WORKER` | A worker that accepts shards holds no movable shard while the cluster holds data |
+       | `IMBALANCED` | Largest worker bytes over smallest is above `skew_threshold` and the cluster is over the `min_total_mb` floor |
+       | `OK` | Everything else, including a single-worker cluster and a cluster under the floor |
+
+    3. `report` logs the verdict, the hottest and coldest worker, the skew, the fair share and the full per-worker table.
+    4. `route` (`io.kestra.plugin.core.flow.If`):
+       - **OK:** `balanced` logs it.
+       - **anything else:** `alert` posts to Slack.
+         - `already_running` stops the run when a rebalance is in flight.
+         - `plan` calls `get_rebalance_table_shards_plan` for the exact moves, with each shard's real size taken from `citus_shard_sizes()`. `log_plan` prints them.
+         - `remediate_gate` continues only with `auto_remediate` true, `dry_run` false and a non-empty plan. Otherwise `reported_only` says what would have moved.
+         - `approve` (`io.kestra.plugin.core.flow.Pause`) waits for a human.
+         - `start_rebalance` calls `citus_rebalance_start`, which queues the moves as a background job and returns its id.
+         - `wait_rebalance` (`io.kestra.plugin.core.flow.LoopUntil`) polls `citus_rebalance_status()` every 10 seconds up to `rebalance_timeout`. `job_result` fails the run on any end state other than `finished`.
+         - `redistribution` and `reassess` read the placement again. `reassess` wraps the assessment query with the before numbers, so `improved` is decided in SQL rather than by comparing rendered strings.
+         - `verify` fails the run unless every worker that accepts shards now holds a shard and the skew either dropped or reached `OK`.
+    5. `errors` alerts Slack when the coordinator cannot be read.
+
+    ## What you get
+
+    - Per-worker shard count, bytes and share of the total, with empty workers named.
+    - The exact shard moves Citus would make, with each shard's real size, before anything is touched.
+    - A rebalance that only runs after a human resumes it, polled to completion rather than fired and forgotten.
+    - A re-read of the placement that fails the run when the move did not help.
+
+    ## Who it's for
+
+    - Teams scaling a Citus cluster out, where the step after `citus_add_node` is the one people forget.
+    - Platform teams whose multi-tenant shards grow unevenly because a few tenants are much larger than the rest.
+    - Anyone who wants a record of what moved, when, with the before and after distribution.
+
+    ## Why orchestrate this with Kestra
+
+    Shard placement drifts every time a node joins, a tenant grows or a table is distributed. Kestra reads the placement on a schedule, sends the skew and the empty workers to Slack, holds the data move behind an approval and keeps the plan, the job id and the before and after distribution on the execution. The read-only path is safe to run every night, which is how imbalance gets found before a worker's disk does.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against Citus 12.1 on PostgreSQL 16.6, one coordinator and three workers, with a local HTTP sink standing in for Slack. Two distributed tables, `events` (8 shards, 200000 rows) and `orders` (4 shards, 50000 rows), plus one reference table, were created while only the first worker was registered, then the second and third workers were added so they held nothing. That is the real trigger for this check.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults | `EMPTY_WORKER`. 12 movable shards, 63 MB, all on `w1`, `w2` holding nothing. Hottest share 100.0% against a fair share of 50.0%. Alert sent, 6 moves planned at 43.6 MB, nothing applied |
+    | 2 | `auto_remediate: true`, `dry_run: true` | Same plan, nothing applied. `psql` confirms 12 shards still on `w1` and zero rebalance jobs in `pg_dist_background_job` |
+    | 3 | `auto_remediate: true`, `dry_run: false` | Paused, resumed, job 1 started, polled to `finished`. 6 shards moved, but `w1` ended at 20 MB against `w2` at 44 MB, a 2.22x byte skew. `verify` passed only because the emptiness condition had cleared |
+    | 4 | `skew_threshold: 1.01`, `auto_remediate: true`, `dry_run: false` | **The failure path.** Plan had 1 move, job 3 reported `finished` and the cluster went from 1.07x to 2.21x. `remediation_failed` fired with the before and after numbers and the `errors` block alerted Slack |
+    | 5 | `jdbc_url` with `citus.rebalancer_by_disk_size_base_cost=1MB` | Job 4 moved 1 shard: skew 2.21x to 1.07x, `w1` 7 shards at 33 MB against `w2` 5 at 31 MB. `verify` passed with the cluster `OK` |
+    | 6 | defaults | `OK` at 1.07x. `psql` agrees |
+    | 7 | defaults, after a third worker joined with no shards | `EMPTY_WORKER` caught: `w3` at 0 bytes while `w1` held 33 MB and `w2` 31 MB. 3 moves planned, nothing applied |
+    | 8 | same `base_cost` option, `auto_remediate: true`, `dry_run: false` | Job 7 moved 3 shards. `w3` 23 MB, `w2` 20 MB, `w1` 20 MB, skew 1.18x, `verify` passed |
+    | 9 | defaults | `OK` across 3 workers |
+    | 10 | `min_total_mb: 4096`, `skew_threshold: 1.01` | `OK` with the floor note at a 2.22x byte skew, which proves the floor suppresses skew and not emptiness |
+    | 11 | defaults, cluster with `w2` drained via `citus_drain_node` | `OK`, `w2` reported as `draining` and excluded, `w1` shown at 100.0% of a fair share of 100.0% |
+    | 12 | defaults, `w2` marked ready again while still empty | `EMPTY_WORKER` caught for the second time |
+    | 13 | `auto_remediate: true`, `dry_run: false`, default `base_cost`, plan empty | `reported_only` refused to start a rebalance Citus itself would not plan and named the base cost as the reason |
+    | 14 | defaults, a rebalance already running | `REBALANCE_IN_PROGRESS` with the job id and state. The run stopped without queuing a second one |
+    | 15 | defaults, a read replica registered behind `w1` | `OK`, 3 workers, 12 shards, 63 MB. `citus_shards` on the same cluster reports 5 rows and a phantom fourth worker |
+    | 16 | unreachable coordinator | `errors` alert sent |
+
+    Every placement number was checked against `citus_shards`, `pg_dist_node` and `pg_dist_background_job` from `psql` on the coordinator, not only from the Kestra logs.
+
+    ## Prerequisites
+
+    - A Citus cluster, version 11 or later, reached through its coordinator. `citus_rebalance_start` and `citus_rebalance_status` need Citus 11 or later.
+    - A role that can read `pg_dist_*` and the Citus views for the detection path. Rebalancing needs a superuser or a role with `rebalance_table_shards` rights.
+    - `shard_transfer_mode: auto` or `force_logical` needs `wal_level = logical` on the workers and every shard needs a replica identity, which a primary key provides. Use `block_writes` when either is missing.
+    - The background task daemon has to be running on the coordinator, which it is by default. `citus.max_background_task_executors` caps how many moves run at once.
+    - `citus.rebalancer_by_disk_size_base_cost` defaults to 100MB. Lower it before trusting `by_disk_size` on a cluster of small shards. Alternatively use `by_shard_count` and judge the result from the byte report this flow prints.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` / `POSTGRES_PASSWORD`: credentials for the coordinator.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/citus` | Coordinator |
+    | `skew_threshold` | `1.25` | Largest worker bytes over smallest that counts as imbalanced |
+    | `min_total_mb` | `10` | Below this total, skew is ignored |
+    | `rebalance_strategy` | `by_disk_size` | `by_disk_size` or `by_shard_count` |
+    | `shard_transfer_mode` | `auto` | `auto`, `block_writes` or `force_logical` |
+    | `max_shard_moves` | `1000000` | Cap on moves in one pass |
+    | `rebalance_timeout` | `PT30M` | How long to poll the job |
+    | `auto_remediate` | `false` | Allow a rebalance to start |
+    | `dry_run` | `true` | Must be `false` before any shard moves |
+
+    ## Quick start
+
+    1. Add the `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url` to your coordinator.
+    3. Run it once with the defaults and read the per-worker table and the planned moves.
+    4. Run it with `auto_remediate: true` and `dry_run: false`, then resume the `approve` task to apply the plan.
+    5. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Set `max_shard_moves` to a handful and run it nightly, so a large cluster levels out over a week instead of in one long move.
+    - Register a custom strategy in `pg_dist_rebalance_strategy` that weighs CPU or query volume instead of bytes, then pass its name as `rebalance_strategy`.
+    - Lower `citus.rebalancer_by_disk_size_base_cost` on the coordinator and record what it was, so the day a cluster's shards grow past the constant does not change the plan without anyone noticing.
+    - Run the detection path against each colocation group separately, so one huge table does not hide skew in a small one.
+    - Pair it with a flow that calls `citus_drain_node` before a worker is decommissioned and use the same verify step to prove the node is empty.
+    - Record each run's skew in the KV store, so a cluster that drifts back within days shows up as a tenant problem rather than a placement problem.
+
+    ## Links
+
+    - Citus cluster management and rebalancing: https://docs.citusdata.com/en/stable/admin_guide/cluster_management.html
+    - Citus shard rebalancer functions: https://docs.citusdata.com/en/stable/develop/api_udf.html
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - PostgreSQL
+    - Maintenance & Optimization
+  ee: false
+  demo: false
