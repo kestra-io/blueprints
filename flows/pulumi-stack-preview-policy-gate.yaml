@@ -1,0 +1,467 @@
+id: pulumi-stack-preview-policy-gate
+namespace: company.team
+
+description: |
+  Gate a Pulumi apply behind a plan ratchet: run pulumi preview on a stack,
+  evaluate every changing resource against forbidden types, destructive
+  changes, and blast-radius limits, and when the plan violates policy open a
+  GitHub issue, alert Slack, and hold for human approval before pulumi up -
+  clean plans proceed straight through.
+
+triggers:
+  - id: ci_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: CI calls this after a merge to the IaC repository to gate the apply.
+
+  - id: nightly_recheck
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic preview-only re-check of the standing stack (enable as needed).
+    cron: "0 5 * * *"
+    disabled: true
+
+inputs:
+  - id: repository_url
+    type: STRING
+    displayName: Git repository URL
+    description: HTTPS URL of the IaC repository containing the Pulumi program.
+    defaults: https://github.com/your-org/your-iac-repo.git
+
+  - id: branch
+    type: STRING
+    displayName: Branch
+    description: Branch checked out for preview and apply.
+    defaults: main
+
+  - id: iac_path
+    type: STRING
+    displayName: Pulumi project path
+    description: Path to the Pulumi project inside the repository.
+    defaults: "."
+
+  - id: stack
+    type: STRING
+    displayName: Pulumi stack
+    description: Stack gated by this flow.
+    defaults: dev
+
+  - id: forbidden_types
+    type: JSON
+    displayName: Forbidden resource types
+    description: Types that may not be created, updated, or replaced - exact match (aws:iam:Role) or prefix (aws:iam).
+    defaults: |
+      ["aws:iam:Role", "aws:iam:RolePolicy", "aws:s3:BucketPolicy", "aws:ec2:SecurityGroup"]
+
+  - id: allow_deletes
+    type: BOOL
+    displayName: Allow deletes
+    description: When false, delete and replace operations in the preview are violations.
+    defaults: false
+
+  - id: max_changes
+    type: INT
+    displayName: Max changes
+    description: Blast-radius ratchet - previews changing more resources than this become violations.
+    defaults: 50
+
+  - id: github_repository
+    type: STRING
+    displayName: GitHub repository for issues
+    description: owner/repo form where policy violations file issues.
+    defaults: your-org/your-iac-repo
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration before the human approval expires and the run fails.
+    defaults: P2D
+
+tasks:
+  - id: workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the preview container and the policy evaluator read the same plan file.
+    tasks:
+      - id: clone_repository
+        type: io.kestra.plugin.git.Clone
+        description: Check out the IaC repository at the configured branch.
+        url: "{{ inputs.repository_url }}"
+        branch: "{{ inputs.branch }}"
+        username: "{{ secret('GITHUB_USERNAME') }}"
+        password: "{{ secret('GITHUB_TOKEN') }}"
+
+      - id: run_preview
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Run pulumi preview in the official Pulumi container and save the machine-readable plan as preview.json.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: pulumi/pulumi:latest
+        env:
+          PULUMI_ACCESS_TOKEN: "{{ secret('PULUMI_ACCESS_TOKEN') }}"
+          PULUMI_CONFIG_PASSPHRASE: "{{ secret('PULUMI_CONFIG_PASSPHRASE') }}"
+        commands:
+          - pulumi stack select {{ inputs.stack }} -C {{ inputs.iac_path }}
+          - pulumi preview -C {{ inputs.iac_path }} --stack {{ inputs.stack }} --json > preview.json
+
+      - id: evaluate_preview
+        type: io.kestra.plugin.scripts.python.Script
+        description: Ratchet the plan against policy - forbidden types, destructive changes, blast radius - and refuse to treat an unreadable preview as clean.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PREVIEW_JSON: preview.json
+          STACK: "{{ inputs.stack }}"
+          FORBIDDEN_TYPES: "{{ inputs.forbidden_types | toJson }}"
+          ALLOW_DELETES: "{{ inputs.allow_deletes }}"
+          MAX_CHANGES: "{{ inputs.max_changes }}"
+        script: |
+          import json
+          import os
+
+          def type_from_urn(urn):
+              parts = str(urn).split("::")
+              return parts[2] if len(parts) >= 4 else str(urn)
+
+          def load_preview(path):
+              if not os.path.exists(path) or os.path.getsize(path) == 0:
+                  raise SystemExit(
+                      "preview.json is missing or empty - the policy gate cannot evaluate "
+                      "an unreadable plan and will not treat it as clean"
+                  )
+              with open(path) as handle:
+                  return json.load(handle)
+
+          def norm_changes(changes):
+              out = {"create": [], "update": [], "delete": [], "replace": [], "same": []}
+              aliases = {
+                  "create": "create", "creates": "create",
+                  "update": "update", "updates": "update",
+                  "delete": "delete", "deletes": "delete",
+                  "replace": "replace", "replaces": "replace",
+                  "same": "same", "sames": "same",
+              }
+              if isinstance(changes, dict):
+                  for key, value in changes.items():
+                      canon = aliases.get(str(key).lower())
+                      if canon and isinstance(value, list):
+                          out[canon].extend(value)
+              return out
+
+          def entry_type(entry):
+              if isinstance(entry, str):
+                  return type_from_urn(entry)
+              if not isinstance(entry, dict):
+                  return ""
+              for holder in (entry, entry.get("after"), entry.get("before")):
+                  if isinstance(holder, dict):
+                      t = holder.get("type")
+                      if isinstance(t, str) and t:
+                          return t
+                      u = holder.get("urn")
+                      if isinstance(u, str) and u:
+                          return type_from_urn(u)
+              return ""
+
+          def matches(forbidden, rtype):
+              if not rtype:
+                  return False
+              for pattern in forbidden:
+                  if rtype == pattern or rtype.startswith(pattern.rstrip(":") + ":"):
+                      return True
+              return False
+
+          def evaluate(ops, forbidden, allow_deletes, max_changes):
+              violations = []
+              forbidden_hits = []
+              for opname in ("create", "update", "replace"):
+                  for entry in ops[opname]:
+                      rtype = entry_type(entry)
+                      if matches(forbidden, rtype) and rtype not in forbidden_hits:
+                          forbidden_hits.append(rtype)
+              if forbidden_hits:
+                  violations.append(
+                      "forbidden resource types would change: " + ", ".join(sorted(forbidden_hits))
+                  )
+              destructive = len(ops["delete"]) + len(ops["replace"])
+              if not allow_deletes and destructive > 0:
+                  violations.append(
+                      "%d destructive change(s) (delete/replace) in the plan but allow_deletes is false"
+                      % destructive
+                  )
+              changing = (
+                  len(ops["create"]) + len(ops["update"])
+                  + len(ops["delete"]) + len(ops["replace"])
+              )
+              if changing > max_changes:
+                  violations.append(
+                      "blast radius %d changing resources exceeds max_changes %d"
+                      % (changing, max_changes)
+                  )
+              return violations, changing
+
+          def build_report(violations, ops, stack):
+              lines = [
+                  "## Pulumi preview policy gate",
+                  "",
+                  "Stack: `" + str(stack) + "`",
+                  "",
+                  "| Operation | Count |",
+                  "|---|---|",
+              ]
+              for key in ("create", "update", "replace", "delete", "same"):
+                  lines.append("| " + key + " | " + str(len(ops[key])) + " |")
+              lines.append("")
+              if violations:
+                  lines.append("### Violations")
+                  for index, item in enumerate(violations, start=1):
+                      lines.append(str(index) + ". " + item)
+              else:
+                  lines.append("No policy violations - plan is within the ratchet.")
+              return "\n".join(lines)
+
+          def main():
+              forbidden = json.loads(os.environ.get("FORBIDDEN_TYPES") or "[]")
+              allow_deletes = str(os.environ.get("ALLOW_DELETES") or "false").lower() == "true"
+              max_changes = int(os.environ.get("MAX_CHANGES") or "50")
+              stack = os.environ.get("STACK") or "unknown"
+              preview = load_preview(os.environ.get("PREVIEW_JSON") or "preview.json")
+              ops = norm_changes((preview.get("changes") if isinstance(preview, dict) else None) or {})
+              violations, changing = evaluate(ops, forbidden, allow_deletes, max_changes)
+              counts = {key: len(ops[key]) for key in ops}
+              print(
+                  "stack %s: %d changing resource(s), %d violation(s)"
+                  % (stack, changing, len(violations))
+              )
+              print(
+                  "::"
+                  + json.dumps(
+                      {
+                          "outputs": {
+                              "violations": violations,
+                              "violation_count": len(violations),
+                              "changing_count": changing,
+                              "change_counts": counts,
+                              "stack": stack,
+                              "report_markdown": build_report(violations, ops, stack),
+                          }
+                      }
+                  )
+                  + "::"
+              )
+
+          if __name__ == "__main__":
+              main()
+
+  - id: violation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Violations file an issue, alert Slack, and wait for a human; clean plans skip straight to apply.
+    condition: "{{ outputs.evaluate_preview.vars.violation_count > 0 }}"
+    then:
+      - id: open_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: File the violations as a GitHub issue so the ratchet breach lands in the team backlog.
+        jwtToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "Pulumi policy gate: {{ outputs.evaluate_preview.vars.violation_count }} violation(s) in stack {{ inputs.stack }}"
+        body: |
+          {{ outputs.evaluate_preview.vars.report_markdown }}
+
+          Execution: {{ execution.id }}
+          Branch: `{{ inputs.branch }}`
+          Policy: forbidden types `{{ inputs.forbidden_types | toJson }}`, allow_deletes={{ inputs.allow_deletes }}, max_changes={{ inputs.max_changes }}
+        labels:
+          - pulumi
+          - policy-gate
+
+      - id: notify_violations
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the platform channel what the ratchet caught and that approval is waiting.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          *Pulumi policy gate needs review* ({{ execution.id }})
+          {{ outputs.evaluate_preview.vars.violation_count }} violation(s) in stack `{{ inputs.stack }}`:
+          {{ outputs.evaluate_preview.vars.report_markdown }}
+          Approve in Kestra to continue to `pulumi up`, or deny to stop with nothing applied.
+
+      - id: human_approval
+        type: io.kestra.plugin.ee.flow.HumanTask
+        description: Route the violating plan to the platform approvers - only that group can resume it.
+        assignment:
+          groups:
+            - platform-approvers
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        behavior: FAIL
+        onResume:
+          - id: decision
+            type: SELECT
+            values:
+              - approve
+              - deny
+            defaults: deny
+            description: Allow or refuse the apply.
+          - id: reviewer_note
+            type: STRING
+            defaults: ""
+            description: Rationale stored with the execution for auditors.
+
+      - id: approval_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Continue to apply only on an explicit approval from the group.
+        condition: "{{ (outputs.human_approval.onResume is defined) and outputs.human_approval.onResume.decision == 'approve' }}"
+        then:
+          - id: log_approved
+            type: io.kestra.plugin.core.log.Log
+            description: Record the approval so the apply is attributable.
+            message: "Approved by platform-approvers: {{ outputs.human_approval.onResume.reviewer_note ?? 'no note' }}"
+        else:
+          - id: notify_denied
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Record the denial with the reviewer note.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "Pulumi apply *denied* for stack {{ inputs.stack }} - note: {{ outputs.human_approval.onResume.reviewer_note ?? 'none given' }}. Nothing was applied."
+
+          - id: stop_on_denial
+            type: io.kestra.plugin.core.execution.Fail
+            description: Fail the execution so CI stops before apply.
+            errorMessage: "Pulumi apply denied by human review - see reviewer note in execution logs."
+
+    else:
+      - id: log_clean
+        type: io.kestra.plugin.core.log.Log
+        description: No violations - the ratchet cleared the plan without a human.
+        message: "Policy gate cleared stack {{ inputs.stack }} with {{ outputs.evaluate_preview.vars.changing_count }} changing resource(s) and zero violations."
+
+  - id: apply_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: Second checkout used only after the gate passes - preview and apply never share a scratch directory.
+    tasks:
+      - id: clone_for_apply
+        type: io.kestra.plugin.git.Clone
+        description: Check out the same repository and branch for the apply.
+        url: "{{ inputs.repository_url }}"
+        branch: "{{ inputs.branch }}"
+        username: "{{ secret('GITHUB_USERNAME') }}"
+        password: "{{ secret('GITHUB_TOKEN') }}"
+
+      - id: apply_stack
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Apply the plan with pulumi up - reached only when policy or a human cleared it.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: pulumi/pulumi:latest
+        env:
+          PULUMI_ACCESS_TOKEN: "{{ secret('PULUMI_ACCESS_TOKEN') }}"
+          PULUMI_CONFIG_PASSPHRASE: "{{ secret('PULUMI_CONFIG_PASSPHRASE') }}"
+        commands:
+          - pulumi up -C {{ inputs.iac_path }} --stack {{ inputs.stack }} --yes
+
+  - id: announce_applied
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Confirm the apply with the path taken - straight through or human-approved.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      *Pulumi apply complete* - stack `{{ inputs.stack }}` changed {{ outputs.evaluate_preview.vars.changing_count }} resource(s).
+      Review path: {{ outputs.human_approval is defined ? 'human-approved (' ~ (outputs.human_approval.onResume.reviewer_note ?? 'no note') ~ ')' : 'auto (clean plan)' }}.
+      Execution: {{ execution.id }}.
+
+outputs:
+  - id: stack
+    type: STRING
+    description: Stack that was previewed and gated.
+    value: "{{ outputs.evaluate_preview.vars.stack }}"
+
+  - id: violation_count
+    type: INT
+    description: Policy violations found in the preview.
+    value: "{{ outputs.evaluate_preview.vars.violation_count }}"
+
+  - id: violations
+    type: JSON
+    description: Human-readable violation list from the ratchet.
+    value: "{{ outputs.evaluate_preview.vars.violations }}"
+
+  - id: change_counts
+    type: JSON
+    description: Per-operation resource counts from the preview.
+    value: "{{ outputs.evaluate_preview.vars.change_counts }}"
+
+  - id: report_markdown
+    type: STRING
+    description: Markdown report embedded in the GitHub issue and Slack alert.
+    value: "{{ outputs.evaluate_preview.vars.report_markdown }}"
+
+  - id: human_decision
+    type: STRING
+    description: Reviewer verdict when a violating plan needed approval.
+    value: "{{ outputs.human_approval is defined ? outputs.human_approval.onResume.decision : 'not-required' }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when the gate itself errors so a broken preview is never mistaken for a clean plan.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "pulumi-stack-preview-policy-gate ERRORED in flow {{ flow.id }} (execution {{ execution.id }}) - check the execution logs; do not treat a failed preview as a passing gate."
+
+extend:
+  title: Pulumi Preview Policy Gate with Human Approval
+  metaTitle: Pulumi Preview Policy Gate
+  metaDescription: pulumi preview gated by forbidden types, delete rules, and blast-radius limits - violations open a GitHub issue and wait for approval before pulumi up.
+  shortDescription: Policy ratchet around pulumi preview that issues, alerts, and holds for approval before applying violating plans.
+  description: |
+    ## How it works
+    1. `ci_webhook` (event-based `Webhook`) receives the post-merge call from CI, or `nightly_recheck` (shipped disabled) re-gates a standing stack.
+    2. `workspace` (`core.flow.WorkingDirectory`) opens one shared filesystem: `clone_repository` (`git.Clone`) checks out the IaC repository, and `run_preview` (`scripts.shell.Commands` with a Docker `taskRunner` on `pulumi/pulumi:latest`, shape from `terraform-infracost-budget-gate`) selects the stack and writes `pulumi preview --json` to `preview.json`.
+    3. `evaluate_preview` (`scripts.python.Script`, Process runner) reads the plan and applies three ratchet rules: no `forbidden_types` may be created, updated, or replaced (exact or prefix match on the resource type parsed from each entry's `type`/`urn`, tolerant of both singular op-key spellings and before/after wrappers); `delete`/`replace` operations are violations unless `allow_deletes` is true; and more than `max_changes` changing resources trips the blast-radius limit. A missing or empty `preview.json` raises immediately - a broken gate never looks like a cheap change. Results return through Kestra's `::json::` outputs protocol as `violations`, `change_counts`, and a `report_markdown` table (read back via the script `vars` namespace).
+    4. `violation_gate` (`core.flow.If`) branches on `violation_count`: over zero, `open_issue` (`github.issues.Create`) files a labeled `pulumi`/`policy-gate` issue carrying the report, `notify_violations` posts it to Slack, and `human_approval` (`io.kestra.plugin.ee.flow.HumanTask`) assigns the decision to the `platform-approvers` group with `behavior: FAIL` and a structured `onResume` (approve/deny plus reviewer note). `approval_gate` checks `(outputs.human_approval.onResume is defined) and ... == 'approve'` (the proven condition shape from `iac-opa-policy-gate-human-approval`) and fails the run on denial or timeout. Clean plans take the `else` branch and just log.
+    5. Only executions that passed the gate reach `apply_workspace` - a second `WorkingDirectory` that re-clones the repository so preview and apply never share scratch state - where `apply_stack` runs `pulumi up --yes` in the same container image, and `announce_applied` reports the resource count and the review path taken.
+    6. Outputs expose `stack`, `violation_count`, `violations`, `change_counts`, `report_markdown`, and `human_decision` (with an `is defined` fallback to `not-required`); `errors` alerts Slack with wording that a failed preview must never be read as a passing gate.
+
+    ## What you get
+    - Plan-as-policy: risky resource types, destructive operations, and oversized changes are caught before `pulumi up`, not discovered after.
+    - Violations become GitHub issues with the full report, so exceptions are worked like any other backlog item.
+    - Durable human approval for violating plans, attributable to a group with a stored rationale; clean plans never wait on anyone.
+    - One execution history containing the plan, the decision, and the apply.
+
+    ## Who it's for
+    Platform teams running Pulumi who want a policy ratchet between merge and apply, and regulated environments that must show who approved an infrastructure exception and why.
+
+    ## Why orchestrate this with Kestra
+    A CI step can fail a plan, but it cannot hold a durable approval for two days, file the backlog ticket, alert the right channel, and resume exactly where it left off - and it certainly cannot prove afterwards which human waved the exception through. Kestra keeps the pause, the issue, the Slack thread, and the apply in one replayable execution.
+
+    ## Prerequisites
+    - A Pulumi project in the target repository and a logged-in backend (token and state passphrase configurable via secrets).
+    - Docker available to the worker for the Pulumi container and a GitHub token that can clone the repository and open issues.
+    - A Slack incoming webhook and a `platform-approvers` group in Kestra.
+    - Tuned `forbidden_types`, `allow_deletes`, and `max_changes` inputs for your environment.
+
+    ### Secrets
+    - `GITHUB_USERNAME`: Git username for cloning the IaC repository.
+    - `GITHUB_TOKEN`: GitHub token with repository read and issue-create rights.
+    - `PULUMI_ACCESS_TOKEN`: Pulumi access token for the backend and org services.
+    - `PULUMI_CONFIG_PASSPHRASE`: Passphrase decrypting stack configuration secrets.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for gate notifications.
+
+    ## Quick start
+    1. Set the five secrets and create the `platform-approvers` group.
+    2. Point `repository_url`/`github_repository` at the IaC repo and `stack` at the stack to gate.
+    3. Run with default inputs on a plan that creates an `aws:iam:Role`: the issue files, Slack posts the report, and the HumanTask waits.
+    4. Resume with `approve` + a note and watch `pulumi up` run; resume with `deny` and the run fails with nothing applied.
+    5. Wire `ci_webhook` into the pipeline so every merge is gated the same way.
+
+    ## How to extend
+    - Add rules to `evaluate` - forbid public exposure (`0.0.0.0/0` ingress), require tags, or ratchet monthly cost via Infracost alongside the plan.
+    - Replace the single gate with severity tiers: auto-apply warnings, require approval only for hard denials, mirroring the OPA blueprint.
+    - Post the issue URL back to the PR with `github.pulls.Create` or a comment task once you confirm the issue output field in your plugin version.
+    - Keep a plan history in S3 to trend blast radius per stack over time.
+
+    ## Links
+    - [Pulumi CLI preview and up](https://www.pulumi.com/docs/cli/)
+    - [Human tasks (EE)](https://kestra.io/docs/workflow-components/human-tasks)
+    - Related Kestra blueprints: `iac-opa-policy-gate-human-approval`, `terraform-infracost-budget-gate`, `git-terraform`
+
+    - This blueprint has been created by [RudraMalvankar](https://github.com/RudraMalvankar)
+  ee: false
+  demo: false
+  tags:
+    - Infrastructure
+  subTags:
+    - Infrastructure Automation
+    - Policy & Compliance

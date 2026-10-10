@@ -1,0 +1,354 @@
+id: evm-rpc-failover
+namespace: company.team
+description: |
+  Probe every EVM JSON-RPC provider you pay for, detect the ones that are
+  down, rate limited, lagging, on the wrong chain or serving a different
+  fork, and keep the name of the healthy provider to use in the Kestra KV
+  store. Other flows read it with kv(); failover and failback use
+  hysteresis so a single slow answer does not cause flapping.
+
+triggers:
+  - id: rpc_errors_seen
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from your application when it sees RPC errors, to re-check immediately instead of waiting for the next minute.
+    key: rpc-failover-change-me
+  - id: every_minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: providers
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - Primary=EVM_RPC_PRIMARY
+      - Backup=EVM_RPC_BACKUP
+      - Fallback=EVM_RPC_FALLBACK
+    description: Providers in order of preference, as `Label=SECRET_NAME`. Each secret holds the provider URL (with its API key).
+  - id: chain_id
+    type: INT
+    defaults: 1
+    description: The chain every provider must serve.
+  - id: max_lag_blocks
+    type: INT
+    defaults: 5
+    description: A provider more than this many blocks behind the highest head is lagging.
+  - id: fail_after
+    type: INT
+    defaults: 2
+    description: Consecutive unhealthy checks before switching away from the active provider.
+  - id: recover_after
+    type: INT
+    defaults: 5
+    description: Consecutive healthy checks before switching back to a more preferred provider.
+  - id: timeout_seconds
+    type: FLOAT
+    defaults: 5
+    description: Answers slower than this count as a timeout.
+  - id: kv_prefix
+    type: STRING
+    defaults: evm_rpc_mainnet
+    description: KV keys written are `<prefix>_active` (read this from other flows) and `<prefix>_state`.
+
+tasks:
+  - id: validate_providers
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.providers | jq('[.[] | select(test(\"^[^=,]+=[A-Za-z0-9_-]+$\") | not)] | length') | first > 0 or inputs.providers | length < 2 }}"
+    then:
+      - id: invalid_providers
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "List at least two providers as Label=SECRET_NAME. Not valid: {{ inputs.providers | jq('[.[] | select(test(\"^[^=,]+=[A-Za-z0-9_-]+$\") | not)] | join(\", \")') | first }}"
+
+  - id: probe
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Probe all providers in parallel (chain id, head, latency), then compare the hash each one
+      reports for the same recent block, so a provider on a different fork is caught.
+      Decide which provider is active, with hysteresis, from the state kept in the KV store.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      providers.json: >-
+        [{% for p in inputs.providers %}{"label": {{ p | split('=') | first | trim | toJson }}, "secret": {{ p | split('=') | last | trim | toJson }},
+        "url": {{ secret(p | split('=') | last | trim) | toJson }}}{% if not loop.last %}, {% endif %}{% endfor %}]
+      state.json: "{{ (kv(inputs.kv_prefix ~ '_state', errorOnMissing=false) ?? {}) | toJson }}"
+      settings.json: "{{ {'chain_id': inputs.chain_id, 'max_lag': inputs.max_lag_blocks, 'fail_after': inputs.fail_after, 'recover_after': inputs.recover_after, 'timeout': inputs.timeout_seconds} | toJson }}"
+    outputFiles:
+      - result.json
+    script: |
+      import json, time, urllib.error, urllib.request
+      from collections import Counter
+      from concurrent.futures import ThreadPoolExecutor
+      from datetime import datetime, timezone
+
+      providers = json.load(open("providers.json"))
+      state = json.load(open("state.json")) or {}
+      cfg = json.load(open("settings.json"))
+      now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+      def call(url, batch):
+          req = urllib.request.Request(url, data=json.dumps(batch).encode(), headers={"Content-Type": "application/json"})
+          start = time.monotonic()
+          try:
+              with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+                  body = json.loads(r.read())
+          except urllib.error.HTTPError as e:
+              reason = {429: "rate limited (HTTP 429)", 401: "unauthorized (HTTP 401): check the API key",
+                        403: "forbidden (HTTP 403): check the API key"}.get(e.code, f"HTTP {e.code}")
+              return None, reason, None
+          except (TimeoutError, OSError) as e:  # timeouts, refused or dropped connections
+              text = str(getattr(e, "reason", e))
+              return None, "timeout" if "timed out" in text else f"unreachable ({text})", None
+          except ValueError:
+              return None, "invalid JSON answer", None
+          ms = round((time.monotonic() - start) * 1000)
+          if not isinstance(body, list):
+              return None, "answer is not a JSON-RPC batch: " + json.dumps(body)[:120], ms
+          results = {r.get("id"): r for r in body}
+          for r in body:
+              if "error" in r:
+                  return None, "JSON-RPC error: " + str(r["error"].get("message")), ms
+          return {k: v["result"] for k, v in results.items()}, None, ms
+
+      def head_probe(p):
+          res, err, ms = call(p["url"], [{"jsonrpc": "2.0", "id": "chain", "method": "eth_chainId", "params": []},
+                                         {"jsonrpc": "2.0", "id": "head", "method": "eth_blockNumber", "params": []}])
+          row = {"label": p["label"], "secret": p["secret"], "latency_ms": ms, "status": "ok", "detail": None}
+          if err:
+              row.update(status="error", detail=err)
+          else:
+              row["chain_id"], row["head"] = int(res["chain"], 16), int(res["head"], 16)
+              if row["chain_id"] != cfg["chain_id"]:
+                  row.update(status="wrong chain", detail=f"serves chain {row['chain_id']}, expected {cfg['chain_id']}")
+          return row
+
+      with ThreadPoolExecutor(len(providers)) as pool:
+          rows = list(pool.map(head_probe, providers))
+
+      # Lag against the highest head among providers on the right chain
+      live = [r for r in rows if r["status"] == "ok"]
+      top = max((r["head"] for r in live), default=None)
+      for r in live:
+          r["lag"] = top - r["head"]
+          if r["lag"] > cfg["max_lag"]:
+              r.update(status="lagging", detail=f"{r['lag']} blocks behind")
+
+      # Fork check: every in-sync provider reports the hash of the same block; the majority wins
+      synced = [r for r in rows if r["status"] == "ok"]
+      if len(synced) >= 2:
+          height = hex(min(r["head"] for r in synced))
+          def hash_probe(r):
+              p = next(x for x in providers if x["label"] == r["label"])
+              res, err, _ = call(p["url"], [{"jsonrpc": "2.0", "id": "b", "method": "eth_getBlockByNumber", "params": [height, False]}])
+              return r, (res or {}).get("b", {}) and res["b"]["hash"], err
+          with ThreadPoolExecutor(len(synced)) as pool:
+              hashes = list(pool.map(hash_probe, synced))
+          counts = Counter(h for _, h, _ in hashes if h)
+          majority, votes = counts.most_common(1)[0] if counts else (None, 0)
+          for r, h, err in hashes:
+              r["block_checked"], r["hash"] = int(height, 16), h
+              if err:
+                  r.update(status="error", detail=err)
+              elif votes > len(hashes) / 2 and h != majority:
+                  r.update(status="forked", detail=f"block {int(height, 16)} is {h[:12]}… on this provider, {majority[:12]}… on the others")
+
+      # Streaks and the active provider
+      streaks = state.get("streaks", {})
+      for r in rows:
+          s = streaks.get(r["label"], {"bad": 0, "good": 0})
+          s = {"bad": 0, "good": s["good"] + 1} if r["status"] == "ok" else {"bad": s["bad"] + 1, "good": 0}
+          streaks[r["label"]] = s
+          r["bad_streak"], r["good_streak"] = s["bad"], s["good"]
+          r["previous_status"] = state.get("status", {}).get(r["label"])
+
+      order = [p["label"] for p in providers]
+      by_label = {r["label"]: r for r in rows}
+      previous = state.get("active")
+      active, reason = previous if previous in by_label else None, None
+      if active is None:
+          active = next((l for l in order if by_label[l]["status"] == "ok"), order[0])
+          reason = "first check" if previous is None else f"{previous} is no longer in the provider list"
+      elif by_label[active]["bad_streak"] >= cfg["fail_after"]:
+          candidate = next((l for l in order if by_label[l]["status"] == "ok"), None)
+          if candidate:
+              reason = f"{active}: {by_label[active]['detail']} for {by_label[active]['bad_streak']} checks"
+              active = candidate
+      else:
+          better = next((l for l in order[:order.index(active)] if by_label[l]["good_streak"] >= cfg["recover_after"]), None)
+          if better:
+              reason = f"{better} healthy for {by_label[better]['good_streak']} checks"
+              active = better
+
+      result = {
+          "rows": rows, "active": active, "previous_active": previous, "switched": active != previous, "reason": reason,
+          "active_secret": by_label[active]["secret"],
+          "all_down": not any(r["status"] == "ok" for r in rows),
+          "changes": [r["label"] for r in rows if r["previous_status"] is not None and r["previous_status"] != r["status"]],
+          "state": {"active": active, "streaks": streaks, "status": {r["label"]: r["status"] for r in rows},
+                    "active_since": now if active != previous else state.get("active_since", now), "checked_at": now},
+      }
+      json.dump(result, open("result.json", "w"))
+      print(f"active {active}; " + "; ".join(f"{r['label']}: {r['status']}" for r in rows))
+
+  - id: result
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      decision: "{{ read(outputs.probe.outputFiles['result.json']) }}"
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.kv_prefix }}_state"
+    value: "{{ fromJson(outputs.result.values.decision).state | toJson }}"
+    kvType: JSON
+
+  - id: switch
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.result.values.decision).switched }}"
+    then:
+      - id: publish_active
+        type: io.kestra.plugin.core.kv.Set
+        description: Other flows use secret(kv('<prefix>_active').secret) as their RPC URL.
+        key: "{{ inputs.kv_prefix }}_active"
+        value: >-
+          {{ {'label': fromJson(outputs.result.values.decision).active, 'secret': fromJson(outputs.result.values.decision).active_secret,
+              'since': fromJson(outputs.result.values.decision).state.active_since, 'reason': fromJson(outputs.result.values.decision).reason} | toJson }}
+        kvType: JSON
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.result.values.decision).switched or fromJson(outputs.result.values.decision).changes | length > 0 }}"
+    then:
+      - id: notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {% set d = fromJson(outputs.result.values.decision) %}{% if d.switched and (d.previous_active ?? '') != '' %}FAILOVER: RPC for chain {{ inputs.chain_id }} switched from {{ d.previous_active }} to {{ d.active }} ({{ d.reason }}).
+          {% elseif d.switched %}RPC for chain {{ inputs.chain_id }}: using {{ d.active }} ({{ d.reason }}).
+          {% endif %}{% for r in d.rows %}{% if d.changes contains r.label or d.switched %}- {{ r.label }}: {{ r.status }}{% if (r.detail ?? '') != '' %}, {{ r.detail }}{% endif %}{% if (r.latency_ms ?? '') != '' %} ({{ r.latency_ms }} ms{% if (r.head ?? '') != '' %}, head {{ r.head }}{% endif %}){% endif %}{% if (r.previous_status ?? '') != '' and r.previous_status != r.status %}, was {{ r.previous_status }}{% endif %}
+          {% endif %}{% endfor %}
+
+  - id: all_down
+    type: io.kestra.plugin.core.flow.If
+    description: The KV store keeps the last active provider; the run fails so the errors handler pages someone.
+    condition: "{{ fromJson(outputs.result.values.decision).all_down }}"
+    then:
+      - id: no_healthy_provider
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "No healthy RPC provider for chain {{ inputs.chain_id }}: {% for r in fromJson(outputs.result.values.decision).rows %}{{ r.label }} {{ r.status }} ({{ r.detail }}){% if not loop.last %}; {% endif %}{% endfor %}. Still pointing at {{ fromJson(outputs.result.values.decision).active }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      RPC failover check failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+
+outputs:
+  - id: active
+    type: STRING
+    description: Label of the provider in use after this check.
+    value: "{{ outputs.result is defined ? fromJson(outputs.result.values.decision).active : '' }}"
+  - id: providers
+    type: JSON
+    description: Every provider with its status, head, lag, latency and streaks.
+    value: "{{ outputs.result is defined ? fromJson(outputs.result.values.decision).rows : [] }}"
+
+extend:
+  title: Fail Over Between EVM RPC Providers Automatically
+  shortDescription: Probe several JSON-RPC providers every minute, catch the ones that are down, rate limited, lagging, on the wrong chain or on a different fork, and publish the healthy one in the KV store for every other flow to use.
+  metaTitle: EVM RPC Provider Failover with Kestra
+  metaDescription: Detect lagging, forked or rate-limited EVM RPC providers and switch the provider your flows use, with hysteresis.
+  description: |
+    Wallets, indexers, payment services and bots all depend on an RPC provider, and providers fail in ways a plain uptime check misses. They fall behind the chain and serve stale balances. They start answering HTTP 429 under load. A misconfigured endpoint can point at another network. And now and then one ends up on a minority fork. This blueprint compares all your providers against each other every minute, picks the one to use, and publishes it in the Kestra KV store, so every other flow can switch with no code change.
+
+    ## How it works
+
+    1. `every_minute` (`Schedule`) runs the check; `rpc_errors_seen` (`Webhook`) lets your application request an immediate re-check when it sees errors. `concurrency` cancels a run if the previous one is still going.
+    2. `probe` (Python, standard library only) calls every provider in parallel for its chain id and head block, with a timeout, and classifies failures:
+       - unreachable, timeout, HTTP 429, HTTP 401/403;
+       - invalid answers and JSON-RPC errors;
+       - **wrong chain:** a chain id other than `chain_id`;
+       - **lagging:** more than `max_lag_blocks` behind the highest head.
+    3. The providers that pass are asked for the hash of the same recent block. One that disagrees with the majority is **forked**.
+    4. Hysteresis decides the active provider, from streaks kept in the KV store:
+       - switch away only after `fail_after` consecutive bad checks;
+       - switch back to a more preferred provider only after `recover_after` consecutive good checks.
+    5. `save_state` writes the streaks; `publish_active` writes `<kv_prefix>_active` when the choice changes.
+    6. `report` posts failovers, failbacks and any provider whose status changed. `all_down` fails the run when no provider is healthy, which pages through the `errors` handler; the KV store keeps pointing at the last active provider.
+
+    ### Use the active provider in other flows
+
+    ```yaml
+    uri: "{{ secret(kv('evm_rpc_mainnet_active').secret) }}"
+    ```
+
+    The KV store holds the secret's name, never the URL, so API keys stay in your secret backend.
+
+    ## Error handling
+
+    - **No flapping.** One slow answer or one 429 does not move traffic, and failback waits for a sustained recovery.
+    - **Errors that are not outages are named**, so the alert says what to fix: "rate limited (HTTP 429)", "unauthorized (HTTP 401): check the API key", "serves chain 5, expected 1", "18 blocks behind", "block 1234 is 0xab12… on this provider, 0x9f3c… on the others".
+    - **Fork detection needs a majority** of in-sync providers, so with two providers that disagree nobody is declared forked by mistake.
+    - **Nothing healthy, nothing changed.** When every provider fails, the active provider stays as it was and the run fails with every provider's reason.
+    - **Bad configuration fails before probing:** a malformed provider list, fewer than two providers, or a missing secret.
+
+    ## What this blueprint teaches about Kestra
+
+    - The KV store as a small service registry: one flow writes the decision, every other flow reads it with `kv()` and resolves the URL with `secret()`.
+    - State machines across executions (streaks and hysteresis) kept in the KV store.
+    - Dynamic secrets: `secret()` with a name that comes from an input.
+    - `concurrency` with `behavior: CANCEL` for a check that runs every minute.
+
+    ## Prerequisites
+
+    - Two or more JSON-RPC endpoints for the same chain, each stored as a secret.
+    - A Slack incoming webhook.
+    - Python 3 on the Kestra worker (included in the Kestra image) for the Process task runner.
+
+    ### Secrets
+
+    - One secret per provider, named in `providers` (for example `EVM_RPC_PRIMARY`).
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `providers` (ARRAY): `Label=SECRET_NAME`, most preferred first.
+    - `chain_id` (INT, default 1), `max_lag_blocks` (INT, default 5).
+    - `fail_after` (INT, default 2), `recover_after` (INT, default 5): hysteresis.
+    - `timeout_seconds` (FLOAT, default 5).
+    - `kv_prefix` (STRING, default `evm_rpc_mainnet`): use one per chain.
+
+    ### Outputs
+
+    - `active` (STRING): the provider in use after the check.
+    - `providers` (JSON): each provider's status, head, lag, latency and streaks.
+
+    ## Quick start
+
+    1. Add one secret per provider and list them in `providers`, most preferred first.
+    2. Run the flow once: it publishes `evm_rpc_mainnet_active`.
+    3. Replace hard-coded RPC URLs in your other flows with `secret(kv('evm_rpc_mainnet_active').secret)`.
+    4. Copy the flow per chain, with its own `chain_id` and `kv_prefix`.
+
+    ## Plugins used
+
+    - [KV Store tasks](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Python script task](https://kestra.io/plugins/plugin-script-python)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Business
+  subTags:
+    - Monitoring & Alerting
+    - Incident Response
+  ctaText: Read the KV Store documentation
+  ctaLink: https://kestra.io/docs/concepts/kv-store
+  demo: false
+  ee: false

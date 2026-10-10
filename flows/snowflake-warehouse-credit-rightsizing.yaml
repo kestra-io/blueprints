@@ -1,0 +1,375 @@
+id: snowflake-warehouse-credit-rightsizing
+namespace: company.team
+
+description: |
+  Find Snowflake warehouses that burned credits without running a single query
+  over a lookback window, report the idle burn to Slack, and - dry-run by
+  default - suspend them one by one with allowlist-gated ALTER WAREHOUSE, so
+  forgotten warehouses stop draining the credit budget every night.
+
+triggers:
+  - id: nightly_rightsizing
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Nightly rightsizing sweep over Account Usage (enable as needed).
+    cron: "0 6 * * *"
+    disabled: true
+
+  - id: on_demand_scan
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: On-demand rightsizing run, e.g. at the end of the month or after a team reorg.
+
+inputs:
+  - id: lookback_days
+    type: INT
+    displayName: Lookback days
+    description: Window inspected in warehouse metering and query history.
+    defaults: 14
+
+  - id: min_credits_to_act
+    type: FLOAT
+    displayName: Min credits to act
+    description: Idle warehouses below this credit burn are reported but not suspended - avoids acting on noise.
+    defaults: 1.0
+
+  - id: exempt_warehouses
+    type: JSON
+    displayName: Exempt warehouses
+    description: Warehouse names never suspended - DR, reporting, or anything a human still needs cold.
+    defaults: |
+      ["REPORTING_WH", "ETL_WH"]
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true (default) candidates are reported only; set false to actually suspend them.
+    defaults: true
+
+tasks:
+  - id: fetch_warehouse_usage
+    type: io.kestra.plugin.jdbc.snowflake.Query
+    description: Credits burned per warehouse over the lookback window from Account Usage metering history.
+    url: "{{ secret('SNOWFLAKE_JDBC_URL') }}"
+    username: "{{ secret('SNOWFLAKE_USER') }}"
+    password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        warehouse_name,
+        ROUND(SUM(credits_used), 3) AS credits_used
+      FROM snowflake.account_usage.warehouse_metering_history
+      WHERE start_time >= DATEADD(day, -{{ inputs.lookback_days }}, CURRENT_TIMESTAMP())
+      GROUP BY warehouse_name
+      ORDER BY credits_used DESC
+
+  - id: fetch_query_activity
+    type: io.kestra.plugin.jdbc.snowflake.Query
+    description: Query and user counts per warehouse over the same window - the other half of the idle test.
+    url: "{{ secret('SNOWFLAKE_JDBC_URL') }}"
+    username: "{{ secret('SNOWFLAKE_USER') }}"
+    password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        warehouse_name,
+        COUNT(*) AS query_count,
+        COUNT(DISTINCT user_name) AS user_count
+      FROM snowflake.account_usage.query_history
+      WHERE start_time >= DATEADD(day, -{{ inputs.lookback_days }}, CURRENT_TIMESTAMP())
+      GROUP BY warehouse_name
+
+  - id: analyze_rightsizing
+    type: io.kestra.plugin.scripts.python.Script
+    description: Join metering against query activity, apply the idle-burn rules, and sanitize names before anything reaches an ALTER statement.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      METERING_ROWS: "{{ outputs.fetch_warehouse_usage.rows | toJson }}"
+      ACTIVITY_ROWS: "{{ outputs.fetch_query_activity.rows | toJson }}"
+      EXEMPT_WAREHOUSES: "{{ inputs.exempt_warehouses | toJson }}"
+      MIN_CREDITS: "{{ inputs.min_credits_to_act }}"
+      LOOKBACK_DAYS: "{{ inputs.lookback_days }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+    script: |
+      import json
+      import os
+      import re
+
+      def to_float(value, default=0.0):
+          try:
+              return float(value)
+          except (TypeError, ValueError):
+              return default
+
+      def to_int(value, default=0):
+          try:
+              return int(float(value))
+          except (TypeError, ValueError):
+              return default
+
+      def sanitize(name):
+          text = str(name or "").strip()
+          if not text or not re.match(r"^[A-Za-z0-9_$]+$", text):
+              return None
+          return text
+
+      def pick(row, *keys):
+          for key in keys:
+              if key in row and row[key] is not None:
+                  return row[key]
+          return None
+
+      def join_usage(metering_rows, activity_rows, exempt, min_credits):
+          exempt_upper = {str(x).strip().upper() for x in (exempt or []) if str(x).strip()}
+          credits = {}
+          for row in metering_rows if isinstance(metering_rows, list) else []:
+              if not isinstance(row, dict):
+                  continue
+              name = sanitize(pick(row, "warehouse_name", "WAREHOUSE_NAME"))
+              if name:
+                  credits[name] = credits.get(name, 0.0) + to_float(pick(row, "credits_used", "CREDITS_USED"))
+          queries = {}
+          users = {}
+          for row in activity_rows if isinstance(activity_rows, list) else []:
+              if not isinstance(row, dict):
+                  continue
+              name = sanitize(pick(row, "warehouse_name", "WAREHOUSE_NAME"))
+              if name:
+                  queries[name] = to_int(pick(row, "query_count", "QUERY_COUNT"))
+                  users[name] = to_int(pick(row, "user_count", "USER_COUNT"))
+          candidates = []
+          table = []
+          for name in sorted(credits):
+              burned = round(credits[name], 3)
+              count = queries.get(name, 0)
+              user_count = users.get(name, 0)
+              if name.upper() in exempt_upper:
+                  verdict = "exempt (never suspended)"
+              elif count == 0 and burned >= min_credits:
+                  verdict = "IDLE BURN - suspend candidate"
+                  candidates.append({"name": name, "credits": burned, "query_count": 0})
+              elif count == 0:
+                  verdict = "idle but below min_credits_to_act"
+              else:
+                  verdict = "active"
+              table.append({"warehouse": name, "credits": burned, "queries": count, "users": user_count, "verdict": verdict})
+          for name in sorted(set(queries) - set(credits)):
+              table.append({"warehouse": name, "credits": 0.0, "queries": queries[name], "users": users.get(name, 0), "verdict": "no metering rows"})
+          candidates.sort(key=lambda item: -item["credits"])
+          return candidates, table
+
+      def build_report(candidates, table, lookback, min_credits, dry_run):
+          lines = [
+              "## Snowflake warehouse credit rightsizing",
+              "",
+              "Lookback: " + str(lookback) + " day(s), min_credits_to_act: " + str(min_credits) + ", dry_run: " + str(dry_run),
+              "",
+              "| Warehouse | Credits | Queries | Users | Verdict |",
+              "|---|---|---|---|---|",
+          ]
+          for row in table:
+              lines.append(
+                  "| {warehouse} | {credits} | {queries} | {users} | {verdict} |".format(**row)
+              )
+          lines.append("")
+          if candidates:
+              lines.append("### Suspend candidates (" + str(len(candidates)) + ")")
+              for index, item in enumerate(candidates, start=1):
+                  lines.append(str(index) + ". `" + item["name"] + "` - " + str(item["credits"]) + " credits, 0 queries")
+          else:
+              lines.append("No suspend candidates - every warehouse is active or exempt.")
+          return "\n".join(lines)
+
+      def main():
+          try:
+              metering = json.loads(os.environ.get("METERING_ROWS") or "[]")
+          except Exception:
+              metering = []
+          try:
+              activity = json.loads(os.environ.get("ACTIVITY_ROWS") or "[]")
+          except Exception:
+              activity = []
+          try:
+              exempt = json.loads(os.environ.get("EXEMPT_WAREHOUSES") or "[]")
+          except Exception:
+              exempt = []
+          min_credits = to_float(os.environ.get("MIN_CREDITS"), 1.0)
+          lookback = to_int(os.environ.get("LOOKBACK_DAYS"), 14)
+          dry_run = str(os.environ.get("DRY_RUN") or "true").lower() == "true"
+          candidates, table = join_usage(metering, activity, exempt, min_credits)
+          print(
+              "checked %d warehouse(s), %d suspend candidate(s), dry_run=%s"
+              % (len(table), len(candidates), dry_run)
+          )
+          print(
+              "::"
+              + json.dumps(
+                      {
+                          "outputs": {
+                              "candidates": candidates,
+                              "candidate_count": len(candidates),
+                              "checked_count": len(table),
+                              "table": table,
+                              "dry_run": dry_run,
+                              "report_markdown": build_report(candidates, table, lookback, min_credits, dry_run),
+                          }
+                      }
+                  )
+              + "::"
+          )
+
+      if __name__ == "__main__":
+          main()
+
+  - id: action_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Candidates always get a Slack report; suspensions only happen when the gate and dry-run settings allow it.
+    condition: "{{ outputs.analyze_rightsizing.vars.candidate_count > 0 }}"
+    then:
+      - id: announce_candidates
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the idle-burn table and the candidate list to the FinOps channel.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          *Snowflake idle burn found* ({{ execution.id }})
+          {{ outputs.analyze_rightsizing.vars.candidate_count }} suspend candidate(s) of {{ outputs.analyze_rightsizing.vars.checked_count }} warehouse(s) checked.
+          {{ outputs.analyze_rightsizing.vars.report_markdown }}
+
+      - id: execute_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Dry run reports only - the ALTER statements run only when dry_run is false.
+        condition: "{{ inputs.dry_run == false }}"
+        then:
+          - id: suspend_warehouses
+            type: io.kestra.plugin.core.flow.Loop
+            description: Suspend each candidate serially - account-wide DDL, one warehouse at a time.
+            values: "{{ outputs.analyze_rightsizing.vars.candidates }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: suspend_warehouse
+                type: io.kestra.plugin.jdbc.snowflake.Query
+                description: Suspend the idle warehouse - names were sanitized by the analyzer before reaching this loop.
+                url: "{{ secret('SNOWFLAKE_JDBC_URL') }}"
+                username: "{{ secret('SNOWFLAKE_USER') }}"
+                password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+                fetchType: NONE
+                sql: 'ALTER WAREHOUSE "{{ item.value.name }}" SUSPEND'
+        else:
+          - id: log_dry_run
+            type: io.kestra.plugin.core.log.Log
+            description: Dry run - report only, nothing suspended.
+            message: "Dry run: {{ outputs.analyze_rightsizing.vars.candidate_count }} candidate(s) reported, none suspended. Set dry_run to false to apply."
+
+    else:
+      - id: log_no_action
+        type: io.kestra.plugin.core.log.Log
+        description: Every warehouse in the window is active or exempt.
+        message: "Rightsizing sweep clean: {{ outputs.analyze_rightsizing.vars.checked_count }} warehouse(s) checked, zero idle-burn candidates."
+
+  - id: announce_summary
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Final tally for the channel - what was checked, what was found, and whether anything was suspended.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      *Snowflake rightsizing sweep complete* ({{ execution.id }})
+      Checked {{ outputs.analyze_rightsizing.vars.checked_count }} warehouse(s), found {{ outputs.analyze_rightsizing.vars.candidate_count }} suspend candidate(s), dry_run={{ inputs.dry_run }}.
+      {{ inputs.dry_run ? 'Report only - no warehouses were touched.' : 'Candidates were suspended via ALTER WAREHOUSE (see execution tasks).' }}
+
+outputs:
+  - id: checked_count
+    type: INT
+    description: Warehouses evaluated in the lookback window.
+    value: "{{ outputs.analyze_rightsizing.vars.checked_count }}"
+
+  - id: candidate_count
+    type: INT
+    description: Idle-burn warehouses eligible for suspension.
+    value: "{{ outputs.analyze_rightsizing.vars.candidate_count }}"
+
+  - id: candidates
+    type: JSON
+    description: Candidate list with per-warehouse credit burn and zero-query evidence.
+    value: "{{ outputs.analyze_rightsizing.vars.candidates }}"
+
+  - id: usage_table
+    type: JSON
+    description: Full per-warehouse usage table with verdicts, including exempt and active warehouses.
+    value: "{{ outputs.analyze_rightsizing.vars.table }}"
+
+  - id: report_markdown
+    type: STRING
+    description: Markdown report posted to Slack for the sweep.
+    value: "{{ outputs.analyze_rightsizing.vars.report_markdown }}"
+
+  - id: dry_run
+    type: BOOL
+    description: Whether the sweep ran in report-only mode.
+    value: "{{ inputs.dry_run }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when the sweep itself errors so an Account Usage outage is not mistaken for a clean bill of health.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "snowflake-warehouse-credit-rightsizing ERRORED in flow {{ flow.id }} (execution {{ execution.id }}) - the sweep did not complete; check execution logs before assuming there is no idle burn."
+
+extend:
+  title: Snowflake Warehouse Credit Rightsizing with Dry-Run Gate
+  metaTitle: Snowflake Warehouse Credit Rightsizing
+  metaDescription: Join warehouse metering against query history, report warehouses burning credits with zero queries to Slack, and suspend them via allowlist-gated dry-run.
+  shortDescription: Idle-burn detector for Snowflake warehouses that reports to Slack and (optionally) suspends candidates with ALTER WAREHOUSE.
+  description: |
+    ## How it works
+    1. `nightly_rightsizing` (`Schedule`, shipped disabled) or `on_demand_scan` (event-based `Webhook`) starts the sweep.
+    2. Two `jdbc.snowflake.Query` tasks pull Account Usage in parallel with the same lookback input: `fetch_warehouse_usage` aggregates `warehouse_metering_history` into `credits_used` per warehouse, and `fetch_query_activity` counts queries and distinct users per warehouse from `query_history`. Both use `fetchType: FETCH` and the row shape `outputs.<task>.rows`.
+    3. `analyze_rightsizing` (`scripts.python.Script`, Process runner) joins the two result sets through Kestra's `::json::` outputs protocol: warehouses with **zero queries** over the window whose credit burn is at or above `min_credits_to_act` become suspend candidates; warehouses on `exempt_warehouses` are never candidates (matched case-insensitively); active warehouses and sub-threshold idlers are reported with verdicts. Every warehouse name is sanitized against `^[A-Za-z0-9_$]+$` before it can reach an `ALTER` statement, and the task emits `candidates`, `checked_count`, a full `table`, and a `report_markdown` grid - read back via `outputs.<task>.vars.<field>`.
+    4. `action_gate` (`If candidate_count > 0`) always posts the report to Slack via `messageText`, then `execute_gate` (second `If inputs.dry_run == false`) decides: in dry-run (the default) it logs how many candidates were reported and touches nothing; otherwise `suspend_warehouses` (`core.flow.Loop`, `concurrencyLimit: 1`) walks the candidates serially and runs `ALTER WAREHOUSE "name" SUSPEND` per warehouse with `fetchType: NONE`. Zero-candidate runs take the `else` branch and log the clean sweep. `announce_summary` always closes with checked/candidate/dry-run counts.
+    5. Outputs expose `checked_count`, `candidate_count`, `candidates`, `usage_table`, `report_markdown`, and `dry_run`; `errors` posts to Slack with wording that an errored sweep must not be read as "no idle burn".
+
+    ## What you get
+    - Nightly visibility into which warehouses are burning credits with zero queries - the classic forgotten-warehouse leak.
+    - A report-only default (`dry_run: true`) so the first runs are pure observability; flipping one input starts the suspensions.
+    - An exemption list for warehouses that must stay warm (DR, month-end reporting) that no automation can touch.
+    - Safe DDL: sanitized names, serial execution, and an errors alert that keeps Account Usage outages distinct from clean sweeps.
+
+    ## Who it's for
+    FinOps owners and Snowflake platform teams watching credit burn, and anyone who has ever found a 24/7 warehouse that nobody had queried in a month.
+
+    ## Why orchestrate this with Kestra
+    The findings live in two Account Usage views that have to be joined, alerted, approved-or-not, and re-run on a schedule - exactly the shape of work that rots as a notebook or a cron box. Kestra schedules the sweep, keeps the Slack report and the DDL in one execution history, and makes the dry-run flag a first-class input your auditors can see.
+
+    ## Prerequisites
+    - A Snowflake account with `ACCOUNT_USAGE` visibility and rights to run `ALTER WAREHOUSE`.
+    - Warehouse metering and query history retained for the chosen lookback window.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `SNOWFLAKE_JDBC_URL`: JDBC connection URL, e.g. `jdbc:snowflake://<account>.snowflakecomputing.com`.
+    - `SNOWFLAKE_USER`: Service user with ACCOUNT_USAGE read and warehouse-alter rights (the latter needed only when `dry_run` is false).
+    - `SNOWFLAKE_PASSWORD`: Password for the service user.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for sweep reports.
+
+    ## Quick start
+    1. Set the four secrets and run with defaults: the sweep reports candidates in Slack and suspends nothing.
+    2. Read `candidates` and `report_markdown` in the execution outputs; tune `min_credits_to_act` and `exempt_warehouses` to your estate.
+    3. Re-run with `dry_run: false` when the list looks right - each candidate is suspended serially and the summary confirms it.
+    4. Enable `nightly_rightsizing` so the sweep runs while the team sleeps.
+
+    ## How to extend
+    - Add a second action tier: resume (not suspend) warehouses with `query_count > 0` but suspiciously large sizes, using `ALTER WAREHOUSE ... RESUME` after a HumanTask approval.
+    - Write `usage_table` to a Snowflake table for month-over-month rightsizing trends.
+    - Pair with `snowflake-cost-anomaly-detector` (spend spikes) for a full FinOps loop: spikes from running warehouses, idle burn from stopped ones.
+    - Escalate to a `github.issues.Create` ticket when a candidate survives three consecutive sweeps.
+
+    ## Links
+    - [WAREHOUSE_METERING_HISTORY](https://docs.snowflake.com/en/sql-reference/functions/warehouse_metering_history)
+    - [QUERY_HISTORY](https://docs.snowflake.com/en/sql-reference/account-usage/query_history)
+    - Related Kestra blueprints: `snowflake-cost-anomaly-detector`, `kubecost-namespace-rightsizing-chargeback`, `gcp-billing-budget-forecast-guard`
+
+    - This blueprint has been created by [RudraMalvankar](https://github.com/RudraMalvankar)
+  ee: false
+  demo: false
+  tags:
+    - Cloud
+  subTags:
+    - Data Warehouses
+    - FinOps & Cost Management

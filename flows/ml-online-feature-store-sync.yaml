@@ -1,0 +1,325 @@
+id: ml-online-feature-store-sync
+namespace: company.team
+
+description: |
+  Turn a Kafka stream of feature events into a serving-ready online store in
+  Redis and a queryable offline snapshot in DuckDB/parquet, with schema-drift
+  and freshness gates so models never train or serve on silently broken
+  features.
+
+triggers:
+  - id: on_feature_event
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    description: Consume each feature event as it arrives and start one execution per message. Enable once your broker and topic are set.
+    topic: feature-updates
+    properties:
+      bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP_SERVERS') }}"
+    groupId: kestra-feature-store
+    valueDeserializer: JSON
+    disabled: true
+
+inputs:
+  - id: required_features
+    type: STRING
+    displayName: Required features
+    description: Comma-separated feature names every event must carry as numbers before anything is written to the serving store.
+    defaults: "clicks,purchases,amount_sum"
+
+  - id: window_seconds
+    type: INT
+    displayName: Window seconds
+    description: Tumbling window size used to bucket events - event times are floored to this multiple of the epoch.
+    defaults: 600
+
+  - id: max_lag_seconds
+    type: INT
+    displayName: Max lag seconds
+    description: Events older than this are flagged stale and page the channel instead of poisoning the online store.
+    defaults: 900
+
+tasks:
+  - id: compute_window_features
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the event against the required feature contract, bucket it into the tumbling window, derive serving features, and measure freshness lag.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      EVENT_JSON: "{{ trigger.value | toJson }}"
+      REQUIRED_FEATURES: "{{ inputs.required_features }}"
+      WINDOW_SECONDS: "{{ inputs.window_seconds }}"
+      MAX_LAG_SECONDS: "{{ inputs.max_lag_seconds }}"
+    script: |
+      import json
+      import os
+      import time
+      from datetime import datetime, timezone
+
+      def emit(outputs):
+          print("::" + json.dumps({"outputs": outputs}) + "::")
+
+      def parse_int(name, default):
+          try:
+              value = int(float(os.environ.get(name, "") or default))
+              return value if value > 0 else default
+          except Exception:
+              return default
+
+      def now_epoch():
+          raw = (os.environ.get("NOW_EPOCH", "") or "").strip()
+          if raw:
+              try:
+                  return float(raw)
+              except Exception:
+                  pass
+          return time.time()
+
+      def parse_time(raw):
+          if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+              return float(raw)
+          text = str(raw or "").strip()
+          if not text:
+              return None
+          try:
+              return float(text)
+          except Exception:
+              pass
+          try:
+              if text.endswith("Z"):
+                  text = text[:-1] + "+00:00"
+              return datetime.fromisoformat(text).timestamp()
+          except Exception:
+              return None
+
+      def iso(epoch):
+          return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+      window_seconds = parse_int("WINDOW_SECONDS", 600)
+      max_lag_seconds = parse_int("MAX_LAG_SECONDS", 900)
+      required = [f.strip() for f in (os.environ.get("REQUIRED_FEATURES", "") or "").split(",") if f.strip()]
+
+      raw = (os.environ.get("EVENT_JSON", "") or "").strip()
+      malformed = False
+      event = None
+      if not raw:
+          malformed = True
+      else:
+          try:
+              parsed = json.loads(raw)
+              event = parsed if isinstance(parsed, dict) else None
+          except Exception:
+              event = None
+          malformed = event is None
+
+      drift = []
+      features = {}
+      rows = []
+      entity = ""
+      bucket_start = ""
+      bucket_end = ""
+      lag_seconds = 0
+      stale = False
+
+      if malformed:
+          drift = ["malformed_event"]
+      else:
+          entity = str(event.get("entity_id") or event.get("id") or "").strip()
+          if not entity:
+              drift.append("entity_id")
+
+          window = event.get("window") if isinstance(event.get("window"), dict) else {}
+          event_epoch = parse_time(event.get("event_time"))
+          if event_epoch is None:
+              drift.append("event_time")
+              event_epoch = now_epoch()
+
+          bucket = (int(event_epoch) // window_seconds) * window_seconds
+          bucket_start = iso(bucket)
+          bucket_end = iso(bucket + window_seconds)
+
+          for name in required:
+              if name not in window:
+                  drift.append(name)
+                  continue
+              value = window[name]
+              if isinstance(value, bool) or not isinstance(value, (int, float)):
+                  drift.append(name)
+                  continue
+              features[name] = float(value)
+
+          purchases = features.get("purchases")
+          clicks = features.get("clicks")
+          amount_sum = features.get("amount_sum")
+          if purchases is not None and amount_sum is not None:
+              features["amount_per_purchase"] = round(amount_sum / purchases, 4) if purchases > 0 else 0.0
+          if purchases is not None and clicks is not None:
+              features["conversion_rate"] = round(purchases / clicks, 6) if clicks > 0 else 0.0
+
+          lag_seconds = max(0, int(now_epoch() - event_epoch))
+          stale = lag_seconds > max_lag_seconds
+
+          if features and not drift:
+              rows = [{
+                  "entity_key": entity,
+                  "bucket_start": bucket_start,
+                  "bucket_end": bucket_end,
+                  "lag_seconds": lag_seconds,
+                  "features": features,
+              }]
+
+      with open("features.ndjson", "w", encoding="utf-8") as out:
+          for row in rows:
+              out.write(json.dumps(row) + "\n")
+
+      emit({
+          "entity_key": entity or "unknown",
+          "features": features,
+          "drift_fields": drift,
+          "stale": stale,
+          "lag_seconds": lag_seconds,
+          "bucket_start": bucket_start,
+          "bucket_end": bucket_end,
+          "feature_count": len(features),
+          "malformed": malformed,
+      })
+
+  - id: route_schema
+    type: io.kestra.plugin.core.flow.If
+    description: Missing, non-numeric, or malformed events page the channel and skip both stores - a broken contract must never reach serving.
+    condition: "{{ outputs.compute_window_features.vars.drift_fields | length > 0 }}"
+    then:
+      - id: slack_drift
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Report which features broke the contract for this event.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Feature store schema drift on {{ trigger.topic }}: entity {{ outputs.compute_window_features.vars.entity_key }} failed on {{ outputs.compute_window_features.vars.drift_fields | join(', ') }}. Online and offline writes skipped for this event (execution {{ execution.id }})."
+          }
+    else:
+      - id: write_online
+        type: io.kestra.plugin.redis.string.Set
+        description: Publish the derived feature vector so online models can serve from Redis.
+        url: "{{ secret('REDIS_URL') }}"
+        key: "feat:{{ outputs.compute_window_features.vars.entity_key }}"
+        value: "{{ outputs.compute_window_features.vars.features | toJson }}"
+
+      - id: export_offline
+        type: io.kestra.plugin.jdbc.duckdb.Query
+        description: Archive this window as a parquet snapshot for training and backfills.
+        inputFiles:
+          features.ndjson: "{{ outputs.compute_window_features.outputFiles['features.ndjson'] }}"
+        outputFiles:
+          - features.parquet
+        sql: |
+          COPY (
+            SELECT * FROM read_json_auto('features.ndjson')
+          ) TO 'features.parquet' (FORMAT PARQUET)
+
+  - id: route_freshness
+    type: io.kestra.plugin.core.flow.If
+    description: Events older than the freshness budget page the channel - training on a stale window is worse than skipping it.
+    condition: "{{ outputs.compute_window_features.vars.stale == true }}"
+    then:
+      - id: slack_stale
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Flag the freshness breach with the measured lag.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Feature store freshness breach: entity {{ outputs.compute_window_features.vars.entity_key }} arrived {{ outputs.compute_window_features.vars.lag_seconds }}s late (max {{ inputs.max_lag_seconds }}s) for window {{ outputs.compute_window_features.vars.bucket_start }} (execution {{ execution.id }})."
+          }
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    description: One line per event so the execution history doubles as an ingest log.
+    message: "feature_store entity={{ outputs.compute_window_features.vars.entity_key }} window={{ outputs.compute_window_features.vars.bucket_start }} features={{ outputs.compute_window_features.vars.feature_count }} drift={{ outputs.compute_window_features.vars.drift_fields | length }} stale={{ outputs.compute_window_features.vars.stale }} lag={{ outputs.compute_window_features.vars.lag_seconds }}s"
+
+errors:
+  - id: slack_errors
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Page the channel when the flow itself fails - a silent consumer is a silent training-set hole.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "ml-online-feature-store-sync FAILED on {{ trigger.topic | default('unknown source') }} (execution {{ execution.id }}): {{ flowRevision is defined and error is defined ? error : 'see execution logs' }}"
+      }
+
+outputs:
+  - id: entity_key
+    type: STRING
+    value: "{{ outputs.compute_window_features.vars.entity_key }}"
+  - id: features_written
+    type: BOOL
+    value: "{{ outputs.write_online is defined ? true : false }}"
+  - id: drift_fields
+    type: JSON
+    value: "{{ outputs.compute_window_features.vars.drift_fields }}"
+  - id: stale
+    type: BOOL
+    value: "{{ outputs.compute_window_features.vars.stale }}"
+  - id: lag_seconds
+    type: INT
+    value: "{{ outputs.compute_window_features.vars.lag_seconds }}"
+  - id: bucket_start
+    type: STRING
+    value: "{{ outputs.compute_window_features.vars.bucket_start }}"
+
+extend:
+  title: ML Online Feature Store Sync with Drift and Freshness Gates
+  metaTitle: ML Online Feature Store Sync
+  shortDescription: Sync Kafka feature events into a Redis online store and DuckDB offline snapshots with drift and freshness gates.
+  description: |
+    ## How it works
+    - The `on_feature_event` trigger (`io.kestra.plugin.kafka.RealtimeTrigger`) subscribes to the `feature-updates` topic with a JSON deserializer and starts one execution per feature event using the `kestra-feature-store` consumer group.
+    - `compute_window_features` (`scripts.python.Script`, Process runner) parses the event, checks every name in `required_features` is present and numeric, floors `event_time` into the `window_seconds` tumbling bucket, derives serving features (`amount_per_purchase`, `conversion_rate`), measures lag against `max_lag_seconds`, and writes one parquet-ready row to `features.ndjson`. Everything returns through Kestra's `::json::` outputs protocol.
+    - `route_schema` (`core.flow.If`) branches on the drift list: a broken contract posts the failing feature names to Slack and skips both stores.
+    - The clean path runs `write_online` (`redis.string.Set`, key `feat:<entity>`) so online models can serve from Redis, then `export_offline` (`duckdb.Query`) archives the window as `features.parquet` for training and backfills.
+    - `route_freshness` (`core.flow.If`) pages the channel when the event arrived later than `max_lag_seconds`, and `log_summary` leaves one ingest line per event in the execution history.
+    - Any flow-level failure lands in Slack through the `errors` handler.
+
+    ## What you get
+    - A serving-ready feature vector in Redis under `feat:<entity_id>` on every healthy event.
+    - A per-window parquet snapshot (`features.parquet`) archived through Kestra's internal storage.
+    - Schema-drift alerts naming the exact missing or non-numeric features, freshness alerts with the measured lag, and a one-line ingest log per execution.
+    - Outputs for `entity_key`, `features_written`, `drift_fields`, `stale`, `lag_seconds`, and `bucket_start` so downstream flows can gate on this one.
+
+    ## Who it's for
+    - ML platform teams that already emit feature events to Kafka but serve features out of ad-hoc Redis writes and CSV exports, and data scientists who need a trustworthy offline copy of exactly what was served.
+
+    ## Why orchestrate this with Kestra
+    - The windowed compute, the two writes, and the two gates are four moving parts that usually end up as a consumer service nobody owns. As a Kestra flow each event gets retries, a history, Slack alerts, and a readable `If` branch for the drift and freshness policies instead of buried `if` statements in Python.
+
+    ## Prerequisites
+    - A Kafka broker reachable from Kestra workers and a topic (default `feature-updates`) carrying JSON events shaped like `{"entity_id": "...", "event_time": "...", "window": {"clicks": 0, "purchases": 0, "amount_sum": 0.0}}`.
+    - A Redis instance reachable from Kestra workers for the online store.
+    - Python on the Kestra worker (the flow uses the Process runner, so only the standard library matters).
+
+    ### Secrets
+    - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker list for the trigger.
+    - `REDIS_URL` - Redis connection URL for the online store write.
+    - `SLACK_WEBHOOK_URL` - Incoming webhook used for drift, freshness, and error alerts.
+
+    ## Quick start
+    - Set the three secrets above, create the topic, and set `required_features` to your contract (defaults cover `clicks,purchases,amount_sum`).
+    - Enable the trigger (it ships `disabled: true`), publish one event, and watch the execution show the Redis key `feat:<entity>` plus a `features.parquet` output.
+    - Publish an event missing a required feature and confirm the drift alert fires and both stores are skipped.
+
+    ## How to extend
+    - Point `export_offline` at a persistent DuckDB file (mount a volume) to accumulate a cumulative store instead of per-window snapshots.
+    - Add a second `If` that joins this flow's outputs with a model-registry flow (for example `mlops-model-promotion-drift-watchdog`) to block promotions on drift.
+    - Swap the Redis write for a feature-serving API call, or loop over multiple entities per event by turning `route_schema` into a `core.flow.Loop`.
+
+    ## Links
+    - [Kafka triggers in Kestra](https://kestra.io/plugins/plugin-kafka)
+    - [Redis plugin](https://kestra.io/plugins/plugin-redis)
+    - [DuckDB plugin](https://kestra.io/plugins/plugin-duckdb)
+
+    - This blueprint has been created by [RudraMalvankar](https://github.com/RudraMalvankar)
+  metaDescription: Turn Kafka feature events into Redis online features and DuckDB offline snapshots with schema-drift and freshness gates in Kestra.
+  tags:
+    - Data
+    - AI
+  subTags:
+    - Agents & Structured Output
+  ee: false
+  demo: false
