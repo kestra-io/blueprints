@@ -1,0 +1,453 @@
+id: timescaledb-continuous-aggregate-refresh-lag-guard
+namespace: company.team
+
+description: |
+  Find TimescaleDB continuous aggregates whose materialized rollup has drifted behind the raw
+  hypertable. A refresh policy can be missing, paused or failing. When it is, the aggregate keeps
+  serving stale numbers while nothing errors. This blueprint reads the materialization
+  watermark of each continuous aggregate, compares it with the latest row in the raw hypertable
+  and classifies each one as NO_POLICY, PAUSED, LAGGING or OK. It alerts Slack and can resume a
+  paused policy, catch the aggregate up with refresh_continuous_aggregate, add a policy where one
+  is missing, then read the watermark again and fail the run if the rollup is still behind.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: TimescaleDB speaks the PostgreSQL wire protocol, so this is a plain PostgreSQL JDBC URL.
+    defaults: "jdbc:postgresql://localhost:5432/metrics"
+
+  - id: db_user
+    type: STRING
+    displayName: Database user
+    defaults: postgres
+
+  - id: db_password
+    type: STRING
+    displayName: Database password
+    description: Defaults to the TIMESCALE_PASSWORD secret. Override per run only for local testing.
+    defaults: "{{ secret('TIMESCALE_PASSWORD') }}"
+
+  - id: schemas
+    type: STRING
+    displayName: Schemas to scan
+    description: Comma separated list of schemas holding the continuous aggregate views.
+    defaults: "public"
+
+  - id: grace_period
+    type: STRING
+    displayName: Grace period
+    description: >-
+      Added to the policy end offset plus its schedule interval before an aggregate counts as
+      lagging. It stops a healthy aggregate that is one cycle behind from being reported.
+    defaults: "1 hour"
+
+  - id: fallback_start_offset
+    type: STRING
+    displayName: Start offset for an aggregate with no policy
+    description: >-
+      Window the flow refreshes and the start offset of the policy it adds for a continuous
+      aggregate that has no refresh policy at all.
+    defaults: "3 days"
+
+  - id: fallback_end_offset
+    type: STRING
+    displayName: End offset for an aggregate with no policy
+    description: End offset of the policy added for an aggregate with no policy and part of the allowed lag.
+    defaults: "1 hour"
+
+  - id: fallback_schedule_interval
+    type: STRING
+    displayName: Schedule interval for an aggregate with no policy
+    description: Schedule interval of the policy added for an aggregate with no policy and part of the allowed lag.
+    defaults: "1 hour"
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for any refresh or policy change to run.
+    defaults: true
+
+variables:
+  scan_cte: |
+    WITH params AS (
+      SELECT '{{ inputs.grace_period }}'::interval AS grace,
+             '{{ inputs.fallback_start_offset }}'::interval AS fb_start,
+             '{{ inputs.fallback_end_offset }}'::interval AS fb_end,
+             '{{ inputs.fallback_schedule_interval }}'::interval AS fb_sched
+    ), base AS (
+      SELECT ca.view_schema AS sch, ca.view_name AS vname,
+             format('%I.%I', ca.view_schema, ca.view_name) AS view_fqn,
+             ca.hypertable_schema AS raw_sch, ca.hypertable_name AS raw_tbl,
+             h.id AS mat_id, dim.column_name AS time_col,
+             j.job_id, coalesce(j.scheduled, false) AS scheduled, j.schedule_interval,
+             (j.config ->> 'end_offset') AS end_offset_txt,
+             s.last_run_status, s.last_successful_finish, s.next_start,
+             coalesce(s.total_failures, 0) AS total_failures
+        FROM timescaledb_information.continuous_aggregates ca
+        JOIN _timescaledb_catalog.hypertable h
+          ON h.schema_name = ca.materialization_hypertable_schema
+         AND h.table_name = ca.materialization_hypertable_name
+        JOIN timescaledb_information.dimensions dim
+          ON dim.hypertable_schema = ca.hypertable_schema
+         AND dim.hypertable_name = ca.hypertable_name
+         AND dim.dimension_number = 1
+        LEFT JOIN timescaledb_information.jobs j
+          ON j.proc_name = 'policy_refresh_continuous_aggregate'
+         AND j.hypertable_schema = ca.view_schema AND j.hypertable_name = ca.view_name
+        LEFT JOIN timescaledb_information.job_stats s ON s.job_id = j.job_id
+       WHERE ca.view_schema = ANY (string_to_array('{{ inputs.schemas }}', ','))
+         AND dim.column_type::text = 'timestamp with time zone'
+    ), wm AS (
+      SELECT b.*,
+             CASE WHEN _timescaledb_functions.cagg_watermark(b.mat_id) IN (-9223372036854775808, 9223372036854775807)
+                  THEN NULL
+                  ELSE _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(b.mat_id)) END AS wm_ts,
+             (xpath('/row/m/text()',
+                query_to_xml(format('SELECT max(%I)::text AS m FROM %I.%I', b.time_col, b.raw_sch, b.raw_tbl),
+                             false, true, '')))[1]::text::timestamptz AS raw_max
+        FROM base b
+    ), cls AS (
+      SELECT w.*,
+             coalesce(nullif(w.end_offset_txt, '')::interval, (SELECT fb_end FROM params)) AS end_offset,
+             coalesce(w.schedule_interval, (SELECT fb_sched FROM params)) AS sched
+        FROM wm w
+    ), fin AS (
+      SELECT c.*,
+             (coalesce(c.end_offset, INTERVAL '0') + coalesce(c.sched, INTERVAL '0') + (SELECT grace FROM params)) AS allowed_lag,
+             CASE
+               WHEN c.job_id IS NULL THEN 'NO_POLICY'
+               WHEN NOT c.scheduled THEN 'PAUSED'
+               WHEN c.wm_ts IS NULL THEN 'LAGGING'
+               WHEN c.raw_max - c.wm_ts > (coalesce(c.end_offset, INTERVAL '0') + coalesce(c.sched, INTERVAL '0') + (SELECT grace FROM params)) THEN 'LAGGING'
+               ELSE 'OK'
+             END AS status
+        FROM cls c
+    )
+
+  audit_sql: |
+    {{ vars.scan_cte }}
+    SELECT view_fqn AS cagg, status, raw_sch || '.' || raw_tbl AS hypertable,
+           CASE WHEN status = 'NO_POLICY' THEN NULL ELSE wm_ts::text END AS watermark,
+           raw_max::text AS latest_data,
+           CASE WHEN status = 'NO_POLICY' THEN 'no refresh policy'
+                WHEN wm_ts IS NULL THEN 'never materialized'
+                ELSE justify_hours(raw_max - wm_ts)::text END AS lag_text,
+           justify_hours(allowed_lag)::text AS allowed_lag,
+           job_id, scheduled,
+           coalesce(last_run_status, 'never ran') AS last_run_status,
+           coalesce(last_successful_finish::text, 'never') AS last_success, total_failures,
+           CASE status
+             WHEN 'NO_POLICY' THEN 'No refresh policy on this continuous aggregate, so its watermark never advances and the rollup drifts further behind the raw data over time'
+             WHEN 'PAUSED' THEN format('Refresh policy job %s is paused (scheduled is false). Last successful refresh finished %s, so the rollup is %s behind the latest raw row', job_id, coalesce(last_successful_finish::text, 'never'), justify_hours(raw_max - wm_ts)::text)
+             WHEN 'LAGGING' THEN format('Watermark %s is %s behind the latest raw row %s. Last refresh run %s, last success %s', wm_ts::text, justify_hours(raw_max - wm_ts)::text, raw_max::text, coalesce(last_run_status, 'never ran'), coalesce(last_successful_finish::text, 'never'))
+             ELSE 'Watermark is within the allowed window of the latest raw row'
+           END AS reason
+      FROM fin
+     ORDER BY (status <> 'OK') DESC, cagg
+
+  plan_sql: |
+    {{ vars.scan_cte }}
+    SELECT step, action, view_fqn AS cagg, status, sql FROM (
+      SELECT 1 AS step, 'RESUME_JOB' AS action, view_fqn, status,
+             format('SELECT alter_job(%s, scheduled => true)', job_id) AS sql
+        FROM fin WHERE status = 'PAUSED' AND job_id IS NOT NULL
+      UNION ALL
+      SELECT 2, 'REFRESH', view_fqn, status,
+             format('CALL refresh_continuous_aggregate(%L, %s, NULL)', view_fqn,
+                    CASE WHEN status = 'NO_POLICY' OR wm_ts IS NULL
+                         THEN format('now() - INTERVAL %L', (SELECT fb_start FROM params)::text)
+                         ELSE format('%L::timestamptz', wm_ts) END)
+        FROM fin WHERE status <> 'OK'
+      UNION ALL
+      SELECT 3, 'ADD_POLICY', view_fqn, status,
+             format('SELECT add_continuous_aggregate_policy(%L, start_offset => INTERVAL %L, end_offset => INTERVAL %L, schedule_interval => INTERVAL %L)',
+                    view_fqn, (SELECT fb_start FROM params)::text, (SELECT fb_end FROM params)::text, (SELECT fb_sched FROM params)::text)
+        FROM fin WHERE status = 'NO_POLICY'
+    ) p
+     ORDER BY step, cagg
+
+  recheck_sql: |
+    {{ vars.scan_cte }}
+    SELECT count(*) FILTER (WHERE status <> 'OK') AS still_bad,
+           count(*) FILTER (WHERE status = 'OK') AS now_ok,
+           coalesce(string_agg(CASE WHEN status <> 'OK' THEN view_fqn || ' (' || status || ')' END, ', '), 'none') AS still_bad_list
+      FROM fin
+     WHERE view_fqn = ANY (ARRAY[{{ outputs.audit.rows | jq('map(select(.status != "OK") | .cagg) | map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",")') | first }}]::text[])
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Reads each continuous aggregate watermark, the raw hypertable latest time and the
+      refresh policy job statistics, then classifies each aggregate as NO_POLICY, PAUSED, LAGGING or OK.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.db_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per statement the remediation would run, in order. Nothing here is executed
+      unless auto_remediate is true and dry_run is false.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.db_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.plan_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      TimescaleDB continuous aggregate refresh audit on {{ inputs.jdbc_url }}:
+      {{ outputs.audit.size }} aggregates scanned,
+      {{ outputs.audit.rows | jq('map(select(.status != "OK")) | length') | first }} behind.
+      {% for r in outputs.audit.rows %}{{ r.status }} {{ r.cagg }} (lag {{ r.lag_text }}): {{ r.reason }}. {% endfor %}
+      Plan: {{ outputs.plan.size }} statements
+      ({{ outputs.plan.rows | jq('if length == 0 then "none" else group_by(.action) | map("\(length) \(.[0].action)") | join(", ") end') | first }}).
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.rows | jq('map(select(.status != \"OK\")) | length') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'TimescaleDB ' ~ inputs.jdbc_url ~ ': ' ~ (outputs.audit.rows | jq('map(select(.status != "OK")) | length') | first) ~ ' continuous aggregates are behind the raw data. ' ~ (outputs.audit.rows | jq('map(select(.status != "OK") | "\(.status) \(.cagg) (lag \(.lag_text), last success \(.last_success))") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Catching them up now.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.plan.size > 0 }}"
+        then:
+          - id: remediate
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              Remediation runs one statement per iteration, sequentially. Each iteration is its own
+              single-statement query, which is required because refresh_continuous_aggregate commits
+              internally and cannot run inside a transaction block. Order is resume, then refresh,
+              then add a policy, so a new policy does not compete with the manual catch up.
+            concurrencyLimit: 1
+            values: "{{ outputs.plan.rows | jq('map(.sql)') | first | toJson }}"
+            tasks:
+              - id: run_statement
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.db_password }}"
+                fetchType: NONE
+                sql: "{{ item.value }}"
+
+          - id: recheck
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Reads the watermark and policy state again for exactly the aggregates the plan targeted.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ inputs.db_user }}"
+            password: "{{ inputs.db_password }}"
+            fetchType: FETCH_ONE
+            sql: "{{ render(vars.recheck_sql) }}"
+
+          - id: reaudit
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ inputs.db_user }}"
+            password: "{{ inputs.db_password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.audit_sql) }}"
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.recheck.row.still_bad > 0 }}"
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  Refresh catch up did not land: {{ outputs.recheck.row.still_bad }} of the targeted
+                  continuous aggregates are still behind ({{ outputs.recheck.row.still_bad_list }}).
+                  Check the remediate sub-execution logs for the statement that failed and confirm
+                  the connecting role owns the aggregates and may call refresh_continuous_aggregate.
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Caught up and verified {{ outputs.recheck.row.now_ok }} continuous aggregates.
+                  Every targeted aggregate now has a scheduled refresh policy and a watermark within
+                  the allowed window. Left for the next run:
+                  {{ outputs.reaudit.rows | jq('if (map(select(.status != "OK")) | length) == 0 then "nothing" else map(select(.status != "OK") | "\(.status) \(.cagg)") | join(", ") end') | first }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every continuous aggregate has a scheduled refresh policy and a watermark within the allowed window of the raw data."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'TimescaleDB continuous aggregate refresh lag guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "15 * * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: TimescaleDB Continuous Aggregate Refresh Lag Guard
+  shortDescription: Find TimescaleDB continuous aggregates whose refresh policy is missing, paused or lagging the raw hypertable, alert Slack, catch them up with refresh_continuous_aggregate and verify the watermark.
+  metaTitle: TimescaleDB Continuous Aggregate Refresh Lag Guard with Kestra
+  metaDescription: Detect TimescaleDB continuous aggregates lagging the raw hypertable, catch them up with refresh_continuous_aggregate and verify the watermark.
+  description: |
+    A TimescaleDB continuous aggregate is a materialized rollup of a hypertable, kept current by a refresh policy that runs on a schedule. When the policy is missing, paused or failing, the aggregate keeps answering queries with old numbers and nothing errors. A dashboard reading the aggregate looks healthy while it sits hours or days behind the raw data.
+
+    This blueprint reads the materialization watermark of every continuous aggregate, the latest row in its raw hypertable and the refresh policy job statistics. It compares the watermark with the latest raw time and reports each aggregate that is behind, with the reason drawn from `last_run_status` and `last_successful_finish`. It can then resume a paused policy, catch the aggregate up with `refresh_continuous_aggregate`, add a policy where one is missing, then read the watermark again to confirm the rollup is current.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | Status | What the catalog shows | Why it matters |
+    |---|---|---|
+    | `NO_POLICY` | No `policy_refresh_continuous_aggregate` job for the view | The watermark never advances on its own, so the rollup drifts further behind over time |
+    | `PAUSED` | A refresh job exists but `scheduled` is false | Somebody paused it, so the aggregate stops updating while it still looks configured |
+    | `LAGGING` | The watermark is further behind the latest raw row than the end offset plus the schedule interval plus the grace | The job runs but cannot keep up, often because it is failing or the data outruns the policy |
+    | `OK` | The watermark is within that allowed window | Recent buckets inside the end offset are not materialized yet by design, so they are not reported |
+
+    The watermark is the exclusive upper bound of the materialized region, read with `cagg_watermark` and turned into a timestamp with `to_timestamp`. A healthy real time aggregate sits about one end offset behind the newest row, so the allowed lag is the policy end offset plus its schedule interval plus a grace period.
+
+    `last_run_status` and `last_successful_finish` are reported for every flagged aggregate, so a failing job shows up as the cause of the lag rather than as a separate signal to chase.
+
+    ## Safety
+
+    - Read-only unless `auto_remediate` is true and `dry_run` is false. The audit and the plan are two `SELECT` queries.
+    - The plan is printed before anything runs, one line per statement, so the change is reviewable from a dry run log.
+    - `refresh_continuous_aggregate` commits inside its own transaction, so each statement runs on its own and never inside a transaction block.
+    - Nothing is dropped or deleted. A refresh materializes buckets that the aggregate already defines.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) joins `timescaledb_information.continuous_aggregates`, the raw hypertable time dimension, the `policy_refresh_continuous_aggregate` jobs and their `job_stats`. For each aggregate it reads the watermark, the latest raw row and classifies it as `NO_POLICY`, `PAUSED`, `LAGGING` or `OK`.
+    2. `plan` returns one row per remediation statement, ordered resume, refresh, add policy. Nothing in it runs unless both gates are open.
+    3. `summary` logs every aggregate, its lag and the plan.
+    4. `route` (`io.kestra.plugin.core.flow.If`):
+       - **clean:** logs it.
+       - **behind:** `alert` posts to Slack.
+         - `remediate_gate` opens only when `auto_remediate` is true and `dry_run` is false.
+         - `remediate` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs each statement in turn, one single statement per query.
+         - `recheck` counts, from the catalog, how many targeted aggregates are still behind.
+         - `reaudit` reads the full picture again for the log.
+         - `verify_result` fails the run when a targeted aggregate is still behind. Otherwise it logs what was caught up and what is left.
+    5. `errors` alerts Slack when the database cannot be reached.
+
+    ## What you get
+
+    - A per aggregate verdict that separates no policy from a paused policy from a policy that cannot keep up.
+    - The real time lag between each rollup and its raw data, read from the watermark and the hypertable, not inferred from a job timestamp.
+    - A catch up checked against the watermark afterwards, so the run fails if the rollup is still behind.
+    - Aggregates that are current left untouched.
+
+    ## Who it's for
+
+    - Teams serving dashboards and APIs from TimescaleDB continuous aggregates.
+    - Platform teams who inherited aggregates built by several services, some with a policy and some without.
+    - Anyone who found a rollup was days stale only when a customer asked why a number looked wrong.
+
+    ## Why orchestrate this with Kestra
+
+    A refresh policy can be paused during an incident and never resumed. It can also quietly fail while the aggregate keeps serving old rows. Kestra runs the audit on a schedule, sends the aggregates that are behind and their lag to Slack and keeps the catch up behind `auto_remediate` and `dry_run`. A refresh can be slow and holds its own locks, which is the shape a scheduled, sequential, re-verified run handles better than a cron script.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against TimescaleDB 2.30.2 on PostgreSQL 16, with a local HTTP sink standing in for Slack. One raw hypertable `conditions` holds 30 days of hourly rows. Four continuous aggregates were built into one state each:
+
+    | Continuous aggregate | State built | Watermark before |
+    |---|---|---|
+    | `cagg_ok` | Policy present, refreshed to the latest bucket | `2026-10-10 09:00`, within the window |
+    | `cagg_lag` | Policy scheduled, refreshed only up to 7 days ago | `2026-10-03 08:00`, 7 days behind |
+    | `cagg_paused` | Policy exists, then `scheduled` set to false | `2026-10-05 08:00`, 5 days behind |
+    | `cagg_nopolicy` | Continuous aggregate with no refresh policy | never materialized |
+
+    | Run | Execution | Inputs | Result |
+    |---|---|---|---|
+    | 1 | `2S7v2o2nhIgyU9BDqcR0eW` | defaults | 4 scanned, 3 behind: `LAGGING cagg_lag`, `NO_POLICY cagg_nopolicy`, `PAUSED cagg_paused`, with `cagg_ok` OK. Plan 5 statements (1 RESUME_JOB, 3 REFRESH, 1 ADD_POLICY). Alert sent. `psql` confirmed every watermark unchanged afterwards |
+    | 2 | `2EBTgS37wMShvjvxvBQHvY` | `auto_remediate: true`, `dry_run: false` | The 5 statements ran. The three lagging watermarks advanced to `2026-10-10 09:00`, `cagg_paused` was resumed, `cagg_nopolicy` gained job 1008. `recheck` reported 0 still behind. Run succeeded |
+    | 3 | `6622zszHqRUBTqgSDnPGmq` | defaults | 4 scanned, 0 behind. Clean branch, no alert |
+    | 4 | `1G0woKZ1fBOcrvP6Rfv53A` | defaults, after inserting hourly rows 3 days past the watermark | 4 behind. Every watermark `2026-10-10 09:00`, now `2 days 23:54:26` behind the latest raw row `2026-10-13 08:54`. The detector caught the new lag. Plan 4 REFRESH |
+    | 5 | `4mUKCY8Z7Jo6sKaotFYQ1j` | `auto_remediate: true`, `dry_run: false` | 4 refreshed. `psql`: every watermark advanced to `2026-10-13 09:00`. `recheck` 0 still behind. Run succeeded |
+    | 6 | `3HXdQO6ZQsCESrBb8uZ10v` | unreachable database | `audit` failed with a connection error. `errors` posted to Slack. Run `FAILED` |
+
+    Every watermark figure was read back from `psql` with `cagg_watermark` and `to_timestamp`, not from the Kestra log alone. Runs 3 then 4 are the before and after of one healthy system: clean, then lagging once rows arrived past the watermark. That is the proof the check can fail.
+
+    ## Prerequisites
+
+    - TimescaleDB 2.x. The flow uses `timescaledb_information` views, `cagg_watermark`, `to_timestamp`, `refresh_continuous_aggregate` and `add_continuous_aggregate_policy`.
+    - Continuous aggregates built on a hypertable whose time dimension is `timestamp with time zone`, the common case. Aggregates on a plain timestamp, date or integer dimension are skipped.
+    - The audit needs a role that can read the information views and call `cagg_watermark`. Remediation needs the owner of the aggregates.
+    - Local testing:
+      - `docker run -d --name ts -p 5432:5432 -e POSTGRES_PASSWORD=ts -e POSTGRES_DB=metrics timescale/timescaledb:latest-pg16`;
+      - create a hypertable, a continuous aggregate and a refresh policy, then pause the policy or insert rows past the last refresh.
+
+    ### Secrets
+
+    - `TIMESCALE_PASSWORD`: the database password, read by the `db_password` input default.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/metrics` | TimescaleDB database |
+    | `db_user` | `postgres` | Database user |
+    | `db_password` | `secret('TIMESCALE_PASSWORD')` | Database password |
+    | `schemas` | `public` | Comma separated schemas to scan |
+    | `grace_period` | `1 hour` | Added to the allowed lag |
+    | `fallback_start_offset` | `3 days` | Window refreshed and start offset of a policy added for an aggregate with none |
+    | `fallback_end_offset` | `1 hour` | End offset of a policy added for an aggregate with none |
+    | `fallback_schedule_interval` | `1 hour` | Schedule interval of a policy added for an aggregate with none |
+    | `auto_remediate` | `false` | Allow the plan to run |
+    | `dry_run` | `true` | Must be `false` for anything to run |
+
+    ## Quick start
+
+    1. Add the `TIMESCALE_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow, set `jdbc_url` and `schemas`.
+    3. Run it with the defaults and read the plan in the `summary` log.
+    4. Agree the fallback offsets with the owners, then run with `auto_remediate: true` and `dry_run: false`.
+    5. Enable the `hourly` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Add a `Pause` before `remediate` when the lag crosses a threshold, so a large catch up gets an approval.
+    - Refresh a bounded window per run for a very large backlog and let later runs finish it.
+    - Loop over several JDBC URLs to cover every database of a fleet from one run.
+    - Record the per aggregate lag into a table and chart how freshness moves over time.
+    - Extend the scan to aggregates built on top of another aggregate.
+
+    ## Links
+
+    - Continuous aggregates: https://docs.tigerdata.com/use-timescale/latest/continuous-aggregates/
+    - Refresh policies: https://docs.tigerdata.com/api/latest/continuous-aggregates/add_continuous_aggregate_policy/
+    - refresh_continuous_aggregate: https://docs.tigerdata.com/api/latest/continuous-aggregates/refresh_continuous_aggregate/
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Day 2 Operations
+    - Observability & Performance
+  ee: false
+  demo: false
