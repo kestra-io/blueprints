@@ -1,0 +1,423 @@
+id: idempotent-incremental-file-to-database-loader
+namespace: company.data
+
+description: |
+  Poll an S3-compatible bucket for CSV files and load each file version into PostgreSQL.
+  A processing ledger records file versions and prevents a successfully processed version
+  from being loaded again. Failed versions remain eligible for a later retry.
+
+variables:
+  bucket: incoming-data
+  prefix: customers/
+  region: us-east-1
+  # For Docker Compose, Kestra must share a network with the service named minio.
+  # For AWS S3, remove endpointOverride, compatibilityMode and forcePathStyle.
+  s3_endpoint: http://minio:9000
+
+inputs:
+  - id: lease_minutes
+    type: INT
+    defaults: 30
+    description: Minutes after which a PROCESSING claim may be reclaimed.
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: "{{ secret('POSTGRES_JDBC_URL') }}"
+      username: "{{ secret('POSTGRES_USERNAME') }}"
+      password: "{{ secret('POSTGRES_PASSWORD') }}"
+
+tasks:
+  - id: init_schema
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Create the target table and file-version ledger.
+    sql: |
+      CREATE TABLE IF NOT EXISTS public.customer_data (
+        customer_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        city TEXT,
+        loaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS public.file_processing_log (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        bucket TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        etag TEXT NOT NULL,
+        size_bytes BIGINT NOT NULL,
+        last_modified TIMESTAMPTZ,
+        status TEXT NOT NULL CHECK (status IN ('PROCESSING', 'SUCCESS', 'FAILED')),
+        attempts INT NOT NULL DEFAULT 1,
+        source_rows INT,
+        duplicate_rows INT,
+        rows_inserted INT,
+        rows_updated INT,
+        execution_id TEXT,
+        error_message TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        completed_at TIMESTAMPTZ,
+        CONSTRAINT file_processing_log_version_uq UNIQUE (bucket, object_key, etag, size_bytes)
+      );
+
+      ALTER TABLE public.file_processing_log
+        ADD COLUMN IF NOT EXISTS duplicate_rows INT;
+
+      CREATE INDEX IF NOT EXISTS idx_file_processing_log_status
+        ON public.file_processing_log (status, started_at);
+
+  - id: process_files
+    type: io.kestra.plugin.core.flow.Loop
+    description: Process each object reported by the S3 trigger sequentially.
+    values: "{{ trigger.objects }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: process_one
+        type: io.kestra.plugin.core.flow.Sequential
+        allowFailure: true
+        tasks:
+          - id: claim_file
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Claim this file version unless it already succeeded or has a live claim.
+            fetchType: FETCH
+            parameters:
+              bucket: "{{ vars.bucket }}"
+              object_key: "{{ taskrun.value.key }}"
+              etag: "{{ taskrun.value.etag }}"
+              size_bytes: "{{ taskrun.value.size }}"
+              last_modified: "{{ taskrun.value.lastModified }}"
+              execution_id: "{{ execution.id }}"
+              lease_minutes: "{{ inputs.lease_minutes }}"
+            sql: |
+              INSERT INTO public.file_processing_log
+                (bucket, object_key, etag, size_bytes, last_modified, status, execution_id)
+              VALUES
+                (:bucket, :object_key, trim(both '"' from :etag), CAST(:size_bytes AS BIGINT),
+                 NULLIF(:last_modified, '')::TIMESTAMPTZ, 'PROCESSING', :execution_id)
+              ON CONFLICT (bucket, object_key, etag, size_bytes) DO UPDATE
+                SET status = 'PROCESSING',
+                    attempts = public.file_processing_log.attempts + 1,
+                    started_at = now(),
+                    completed_at = NULL,
+                    error_message = NULL,
+                    execution_id = EXCLUDED.execution_id
+                WHERE public.file_processing_log.status = 'FAILED'
+                   OR (public.file_processing_log.status = 'PROCESSING'
+                       AND public.file_processing_log.started_at <
+                           now() - make_interval(mins => CAST(:lease_minutes AS INT)))
+              RETURNING id, attempts;
+
+          - id: if_claimed
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.claim_file.size > 0 }}"
+            then:
+              - id: create_staging
+                type: io.kestra.plugin.jdbc.postgresql.Queries
+                description: Create a per-execution staging table.
+                sql: |
+                  CREATE TABLE public.stg_{{ execution.id | replace('-', '') | lower }} (
+                    row_num BIGINT GENERATED ALWAYS AS IDENTITY,
+                    customer_id TEXT,
+                    name TEXT,
+                    email TEXT,
+                    city TEXT
+                  );
+
+              - id: load_staging
+                type: io.kestra.plugin.jdbc.postgresql.CopyIn
+                description: Bulk-load CSV data into the isolated staging table. The first CSV row is treated as a header.
+                from: "{{ taskrun.value.uri }}"
+                table: "public.stg_{{ execution.id | replace('-', '') | lower }}"
+                format: CSV
+                header: true
+                columns:
+                  - customer_id
+                  - name
+                  - email
+                  - city
+
+              - id: validate_staging
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Reject empty files and rows with missing required fields or invalid email addresses.
+                fetchType: FETCH_ONE
+                sql: |
+                  WITH data AS (
+                    SELECT * FROM public.stg_{{ execution.id | replace('-', '') | lower }}
+                  )
+                  SELECT
+                    count(*)::INT AS row_count,
+                    count(*) FILTER (
+                      WHERE NULLIF(trim(customer_id), '') IS NULL
+                         OR NULLIF(trim(name), '') IS NULL
+                         OR NULLIF(trim(email), '') IS NULL
+                    )::INT AS missing_fields,
+                    count(*) FILTER (
+                      WHERE NULLIF(trim(email), '') IS NOT NULL
+                        AND trim(email) !~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+                    )::INT AS bad_emails,
+                    CASE
+                      WHEN count(*) = 0 THEN 'CSV has a header but no data rows'
+                      WHEN count(*) FILTER (
+                        WHERE NULLIF(trim(customer_id), '') IS NULL
+                           OR NULLIF(trim(name), '') IS NULL
+                           OR NULLIF(trim(email), '') IS NULL
+                      ) > 0 THEN 'One or more rows have an empty customer_id, name or email'
+                      WHEN count(*) FILTER (
+                        WHERE NULLIF(trim(email), '') IS NOT NULL
+                          AND trim(email) !~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+                      ) > 0 THEN 'One or more rows have an invalid email'
+                      ELSE NULL
+                    END AS error
+                  FROM data;
+
+              - id: if_valid
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.validate_staging.row.error is null }}"
+                then:
+                  - id: commit_batch
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: Upsert target rows and mark the owned ledger claim successful in one SQL statement.
+                    fetchType: FETCH
+                    parameters:
+                      ledger_id: "{{ outputs.claim_file.rows[0].id }}"
+                      execution_id: "{{ execution.id }}"
+                    sql: |
+                      WITH owner AS (
+                        SELECT id
+                        FROM public.file_processing_log
+                        WHERE id = CAST(:ledger_id AS BIGINT)
+                          AND execution_id = :execution_id
+                          AND status = 'PROCESSING'
+                        FOR UPDATE
+                      ),
+                      src AS (
+                        SELECT trim(customer_id) AS customer_id,
+                               trim(name) AS name,
+                               trim(email) AS email,
+                               NULLIF(trim(city), '') AS city,
+                               row_num
+                        FROM public.stg_{{ execution.id | replace('-', '') | lower }}
+                      ),
+                      dedup AS (
+                        SELECT DISTINCT ON (customer_id) customer_id, name, email, city
+                        FROM src
+                        ORDER BY customer_id, row_num DESC
+                      ),
+                      upserted AS (
+                        INSERT INTO public.customer_data (customer_id, name, email, city, loaded_at)
+                        SELECT customer_id, name, email, city, now()
+                        FROM dedup
+                        WHERE EXISTS (SELECT 1 FROM owner)
+                        ON CONFLICT (customer_id) DO UPDATE
+                          SET name = EXCLUDED.name,
+                              email = EXCLUDED.email,
+                              city = EXCLUDED.city,
+                              loaded_at = EXCLUDED.loaded_at
+                        RETURNING (xmax = 0) AS inserted
+                      )
+                      UPDATE public.file_processing_log AS log
+                      SET status = 'SUCCESS',
+                          completed_at = now(),
+                          error_message = NULL,
+                          source_rows = (SELECT count(*) FROM src),
+                          duplicate_rows = (SELECT count(*) FROM src) - (SELECT count(*) FROM dedup),
+                          rows_inserted = (SELECT count(*) FILTER (WHERE inserted) FROM upserted),
+                          rows_updated = (SELECT count(*) FILTER (WHERE NOT inserted) FROM upserted)
+                      FROM owner
+                      WHERE log.id = owner.id
+                      RETURNING log.id, log.status;
+
+                  - id: verify_commit
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: Ensure this execution still owned the claim and committed SUCCESS.
+                    fetchType: FETCH
+                    parameters:
+                      ledger_id: "{{ outputs.claim_file.rows[0].id }}"
+                      execution_id: "{{ execution.id }}"
+                    sql: |
+                      SELECT id FROM public.file_processing_log
+                      WHERE id = CAST(:ledger_id AS BIGINT)
+                        AND execution_id = :execution_id
+                        AND status = 'SUCCESS';
+
+                  - id: if_commit_missing
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ outputs.verify_commit.size == 0 }}"
+                    then:
+                      - id: fail_lost_claim
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: "{{ taskrun.value.key }}: processing claim was lost before commit; no successful ledger commit was confirmed."
+
+                  - id: drop_staging_after_success
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    sql: "DROP TABLE IF EXISTS public.stg_{{ execution.id | replace('-', '') | lower }};"
+
+                else:
+                  - id: reject_invalid_file
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "{{ taskrun.value.key }}: {{ outputs.validate_staging.row.error }}"
+
+            else:
+              - id: skip_file
+                type: io.kestra.plugin.core.log.Log
+                message: "Skipping {{ taskrun.value.key }}: this file version already succeeded or is currently claimed."
+
+        errors:
+          - id: mark_failed
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Mark only a claim owned by this execution as failed, so it can be retried.
+            parameters:
+              bucket: "{{ vars.bucket }}"
+              object_key: "{{ taskrun.value.key }}"
+              etag: "{{ taskrun.value.etag }}"
+              size_bytes: "{{ taskrun.value.size }}"
+              execution_id: "{{ execution.id }}"
+              error_message: "File load failed; inspect the Kestra execution logs."
+            sql: |
+              UPDATE public.file_processing_log
+              SET status = 'FAILED',
+                  error_message = left(:error_message, 500),
+                  completed_at = now()
+              WHERE bucket = :bucket
+                AND object_key = :object_key
+                AND etag = trim(both '"' from :etag)
+                AND size_bytes = CAST(:size_bytes AS BIGINT)
+                AND execution_id = :execution_id
+                AND status = 'PROCESSING';
+
+          - id: drop_staging_after_failure
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            sql: "DROP TABLE IF EXISTS public.stg_{{ execution.id | replace('-', '') | lower }};"
+
+          - id: notify_file_failure
+            type: io.kestra.plugin.core.log.Log
+            message: "File {{ taskrun.value.key }} failed in execution {{ execution.id }}. Check Kestra logs and public.file_processing_log."
+
+  - id: summary
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Summarize file versions claimed by this execution.
+    fetchType: FETCH_ONE
+    parameters:
+      execution_id: "{{ execution.id }}"
+      files_detected: "{{ trigger.objects | length }}"
+    sql: |
+      SELECT
+        CAST(:files_detected AS INT) AS files_detected,
+        CAST(count(*) FILTER (WHERE status = 'SUCCESS') AS INT) AS files_succeeded,
+        CAST(count(*) FILTER (WHERE status = 'FAILED') AS INT) AS files_failed,
+        CAST(GREATEST(CAST(:files_detected AS INT) - count(*), 0) AS INT) AS files_skipped,
+        CAST(COALESCE(sum(source_rows) FILTER (WHERE status = 'SUCCESS'), 0) AS INT) AS source_rows,
+        CAST(COALESCE(sum(duplicate_rows) FILTER (WHERE status = 'SUCCESS'), 0) AS INT) AS duplicate_rows,
+        CAST(COALESCE(sum(rows_inserted) FILTER (WHERE status = 'SUCCESS'), 0) AS INT) AS rows_inserted,
+        CAST(COALESCE(sum(rows_updated) FILTER (WHERE status = 'SUCCESS'), 0) AS INT) AS rows_updated
+      FROM public.file_processing_log
+      WHERE execution_id = :execution_id;
+
+outputs:
+  - id: files_detected
+    type: INT
+    value: "{{ outputs.summary.row.files_detected }}"
+  - id: files_succeeded
+    type: INT
+    value: "{{ outputs.summary.row.files_succeeded }}"
+  - id: files_failed
+    type: INT
+    value: "{{ outputs.summary.row.files_failed }}"
+  - id: files_skipped
+    type: INT
+    value: "{{ outputs.summary.row.files_skipped }}"
+  - id: source_rows
+    type: INT
+    value: "{{ outputs.summary.row.source_rows }}"
+  - id: duplicate_rows
+    type: INT
+    value: "{{ outputs.summary.row.duplicate_rows }}"
+  - id: rows_inserted
+    type: INT
+    value: "{{ outputs.summary.row.rows_inserted }}"
+  - id: rows_updated
+    type: INT
+    value: "{{ outputs.summary.row.rows_updated }}"
+
+errors:
+  - id: log_flow_failure
+    type: io.kestra.plugin.core.log.Log
+    message: "Flow {{ flow.id }} failed in execution {{ execution.id }}. Check the execution logs."
+
+triggers:
+  - id: watch_bucket
+    type: io.kestra.plugin.aws.s3.Trigger
+    description: Poll an S3-compatible bucket for CSV files.
+    interval: PT1M
+    bucket: "{{ vars.bucket }}"
+    prefix: "{{ vars.prefix }}"
+    regexp: ".*\\.csv$"
+    action: NONE
+    on: CREATE_OR_UPDATE
+    maxFiles: 25
+    stateTtl: PT1H
+    region: "{{ vars.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_KEY_ID') }}"
+    endpointOverride: "{{ vars.s3_endpoint }}"
+    compatibilityMode: true
+    forcePathStyle: true
+
+extend:
+  title: Idempotent Incremental CSV Loader from S3 to PostgreSQL
+  metaTitle: Idempotent Incremental CSV Loader from S3 to PostgreSQL with Kestra
+  shortDescription: Load CSV file versions from S3 or MinIO into PostgreSQL with a processing ledger, staging, validation, upserts and retry tracking.
+  description: |
+    ## Overview
+    This blueprint polls an S3-compatible bucket for CSV files and tracks each file version in PostgreSQL.
+    A successful version is skipped on later detections; failed versions remain eligible for retry.
+
+    ## How it works
+    1. `init_schema` creates the target table and processing ledger.
+    2. `watch_bucket` detects matching CSV objects.
+    3. `process_files` handles each detected object sequentially.
+    4. `claim_file` atomically claims a version identified by bucket, key, ETag and size.
+    5. The CSV is copied to an isolated staging table and validated.
+    6. Valid rows are upserted into `public.customer_data`; the ledger is marked `SUCCESS` in the same SQL statement.
+    7. Failed processing is recorded as `FAILED` when the current execution still owns the claim.
+
+    ## Prerequisites
+    - Kestra with the AWS S3 and PostgreSQL plugins available.
+    - PostgreSQL and an S3-compatible bucket with list/read access.
+    - A database user allowed to create and drop tables in the `public` schema.
+
+    ## Secrets
+    Configure `POSTGRES_JDBC_URL`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_KEY_ID` in Kestra.
+
+    ## CSV format
+    The CSV must contain a header row with `customer_id,name,email,city`. The required data fields are `customer_id`, `name`, and `email`.
+    Repeated customer IDs within one file resolve to the last row. Across different files, the most recently processed file can update an existing customer.
+
+    ## Local testing
+    For MinIO, set `s3_endpoint` to the MinIO service URL reachable from the Kestra container and use MinIO credentials as the S3 secrets. Create the `incoming-data` bucket and upload a CSV such as:
+
+    ```csv
+    customer_id,name,email,city
+    C001,Asha Rao,asha@example.com,Mumbai
+    C002,Ben Lee,ben@example.com,Pune
+    ```
+
+    Test a first load, a repeated detection of the same object version, an invalid CSV, and a retry after a failed load. Confirm the target table and ledger directly in PostgreSQL.
+
+    ## Important limitations
+    ETag plus object size is a practical version key, but an ETag is not guaranteed to be a content hash for every S3 upload/encryption mode. This blueprint's retry behavior also depends on the trigger detecting the object again or an operator replaying the execution. Validate trigger state and plugin properties against the Kestra version used for deployment.
+
+    ## Links
+    - [S3 Trigger](https://kestra.io/plugins/plugin-aws/aws-s3/io.kestra.plugin.aws.s3.trigger)
+    - [PostgreSQL CopyIn](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.copyin)
+    - [PostgreSQL Query](https://kestra.io/plugins/plugin-jdbc-postgres/tasks/io.kestra.plugin.jdbc.postgresql.query)
+  metaDescription: Poll S3 for CSV files and load file versions into PostgreSQL with a ledger, staging, validation, upserts and retry tracking.
+  tags:
+    - Data
+    - Cloud
+  subTags:
+    - ELT & Data Landing
+    - File & Data Processing Basics
+    - AWS Services
+  ee: false
+  demo: false
