@@ -1,0 +1,518 @@
+id: github-actions-hardening-sweep
+namespace: company.team
+description: |
+  Audit every GitHub Actions workflow across an organization with zizmor, resolve
+  every action referenced by a movable tag to its commit SHA, report the risk
+  week over week, and open SHA-pinning pull requests after approval.
+
+labels:
+  team: security
+  use-case: ci-supply-chain
+
+triggers:
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Sweep every Monday morning. Shipped disabled; enable it once a dry run looks right for your owner.
+    cron: "0 7 * * 1"
+    disabled: true
+
+inputs:
+  - id: owner
+    type: STRING
+    displayName: GitHub owner
+    description: The organization or user whose repositories are swept.
+    defaults: your-org
+  - id: repositories
+    type: STRING
+    displayName: Repositories (optional)
+    description: Comma-separated repository names to limit the sweep to. Empty means every repository of the owner that is not archived or a fork.
+    defaults: ""
+  - id: max_repos
+    type: INT
+    displayName: Max repositories
+    description: The most repositories scanned in one run.
+    defaults: 30
+  - id: skip_action_owners
+    type: STRING
+    displayName: Action owners not to pin
+    description: Comma-separated owners whose actions are left on tags, for example your own organization.
+    defaults: ""
+  - id: min_severity
+    type: SELECT
+    displayName: Minimum severity in the report
+    values:
+      - low
+      - medium
+      - high
+    defaults: medium
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Scan, resolve SHAs and report, but do not ask for approval or open pull requests.
+    defaults: true
+
+tasks:
+  - id: list_repos
+    type: io.kestra.plugin.core.http.Download
+    description: List the owner's repositories that are not archived or forks. Saved as a file, so repository descriptions are never evaluated as templates.
+    uri: "https://api.github.com/search/repositories?per_page=100&q={{ ('user:' ~ inputs.owner ~ ' archived:false fork:false') | urlencode }}"
+    headers:
+      Accept: application/vnd.github+json
+      Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+      User-Agent: kestra-github-actions-hardening-sweep
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 3
+
+  - id: select_repos
+    type: io.kestra.plugin.scripts.python.Script
+    description: Apply the optional repository list and the limit. Names that are not found, archived or forks are reported instead of scanned.
+    dependencies:
+      - kestra
+    inputFiles:
+      search.json: "{{ outputs.list_repos.uri }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      wanted = [r.strip() for r in {{ inputs.repositories | toJson }}.split(",") if r.strip()]
+      items = [i for i in json.load(open("search.json")).get("items", []) if not i["archived"] and not i["fork"]]
+      by_name = {i["name"]: i for i in items}
+      if wanted:
+          chosen = [by_name[n] for n in wanted if n in by_name]
+          unavailable = [n for n in wanted if n not in by_name]
+      else:
+          chosen, unavailable = sorted(items, key=lambda i: i["pushed_at"], reverse=True), []
+      chosen = chosen[:int({{ inputs.max_repos }})]
+      Kestra.outputs({
+          "repos": [{"repo": i["full_name"], "branch": i["default_branch"]} for i in chosen],
+          "unavailable": unavailable,
+      })
+
+  - id: audit
+    type: io.kestra.plugin.core.flow.Loop
+    description: Scan four repositories at a time. A repository that fails is reported as not scanned and the sweep continues.
+    values: "{{ outputs.select_repos.vars.repos }}"
+    concurrencyLimit: 4
+    transmitFailed: false
+    tasks:
+      - id: repo_workspace
+        type: io.kestra.plugin.core.flow.WorkingDirectory
+        tasks:
+          - id: clone
+            type: io.kestra.plugin.git.Clone
+            url: "https://github.com/{{ fromJson(item.value).repo }}.git"
+            username: "{{ secret('GITHUB_TOKEN') }}"
+            password: "{{ secret('GITHUB_TOKEN') }}"
+            branch: "{{ fromJson(item.value).branch }}"
+            directory: repo
+
+          - id: scan_and_pin
+            type: io.kestra.plugin.scripts.python.Script
+            description: Run zizmor offline on every workflow and composite action, then rewrite each tag or branch reference to the commit SHA GitHub resolves for it.
+            dependencies:
+              - kestra
+              - requests
+              - zizmor
+            env:
+              GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+            outputFiles:
+              - edited/**
+            script: |
+              import base64, json, os, re, shutil, subprocess
+              from importlib.metadata import distribution
+              from pathlib import Path
+              import requests
+              from kestra import Kestra
+
+              # The zizmor package ships a binary that is not always on PATH, so locate it from the package record.
+              zizmor = shutil.which("zizmor") or next(str(distribution("zizmor").locate_file(f)) for f in distribution("zizmor").files if f.name == "zizmor")
+
+              skip = {o.strip().lower() for o in {{ inputs.skip_action_owners | toJson }}.split(",") if o.strip()}
+              session = requests.Session()
+              session.headers.update({"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github.sha"})
+
+              scan = subprocess.run([zizmor, "--offline", "--no-exit-codes", "--format", "json", "repo"], capture_output=True, text=True)
+              if scan.returncode != 0:
+                  raise SystemExit(f"zizmor failed: {scan.stderr[-500:]}")
+              findings = []
+              for f in json.loads(scan.stdout or "[]"):
+                  location = f["locations"][0]
+                  key = location["symbolic"]["key"]
+                  local = key.get("Local", {}) if isinstance(key, dict) else {}
+                  path = local.get("verbatim_path") or local.get("given_path") or str(key)
+                  findings.append({
+                      "rule": f["ident"], "severity": f["determinations"]["severity"].lower(),
+                      "confidence": f["determinations"]["confidence"].lower(), "summary": f["desc"], "docs": f["url"],
+                      "file": path.removeprefix("repo/"), "line": location["concrete"]["location"]["start_point"]["row"] + 1,
+                  })
+
+              USES = re.compile(r"""^(?P<pre>\s*(?:-\s*)?uses:\s*)(?P<q>['"]?)(?P<action>[\w.-]+/[\w./-]+)@(?P<ref>[^\s'"#]+)(?P=q)(?P<post>\s*(?:#.*)?)$""")
+              cache, pins, unresolved = {}, [], []
+
+              def resolve(action, ref):
+                  owner, name = action.split("/")[:2]
+                  if (owner, name, ref) not in cache:
+                      r = session.get(f"https://api.github.com/repos/{owner}/{name}/commits/{ref}", timeout=30)
+                      sha = r.text.strip() if r.status_code == 200 else ""
+                      cache[(owner, name, ref)] = sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+                  return cache[(owner, name, ref)]
+
+              files = sorted(set(Path("repo/.github/workflows").glob("*.y*ml")) | {p for p in Path("repo").rglob("action.y*ml") if ".git" not in p.parts})
+              for file in files:
+                  relative = str(file.relative_to("repo"))
+                  lines, changed = file.read_text(encoding="utf-8").splitlines(keepends=True), False
+                  for i, line in enumerate(lines):
+                      m = USES.match(line.rstrip("\r\n"))
+                      if not m or re.fullmatch(r"[0-9a-f]{40}", m["ref"]) or m["action"].split("/")[0].lower() in skip:
+                          continue
+                      sha = resolve(m["action"], m["ref"])
+                      if not sha:
+                          unresolved.append(f"{relative}: {m['action']}@{m['ref']}")
+                          continue
+                      ending = line[len(line.rstrip("\r\n")):]
+                      lines[i] = f"{m['pre']}{m['q']}{m['action']}@{sha}{m['q']} # {m['ref']}{ending}"
+                      pins.append({"file": relative, "action": m["action"], "ref": m["ref"], "sha": sha})
+                      changed = True
+                  if changed:
+                      target = Path("edited", relative)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_text("".join(lines), encoding="utf-8")
+
+              counts = {s: sum(1 for f in findings if f["severity"] == s) for s in ("high", "medium", "low", "informational")}
+              Kestra.outputs({
+                  "workflow_files": len(files),
+                  "counts": counts,
+                  "pin_count": len(pins),
+                  # Base64 keeps workflow text, including GitHub expressions, inert in Kestra templates.
+                  "findings_b64": base64.b64encode(json.dumps(findings).encode()).decode(),
+                  "pins_b64": base64.b64encode(json.dumps(pins).encode()).decode(),
+                  "unresolved": unresolved,
+              })
+    outputs:
+      - id: repo
+        type: STRING
+        value: "{{ fromJson(item.value).repo }}"
+      - id: branch
+        type: STRING
+        value: "{{ fromJson(item.value).branch }}"
+      - id: result_b64
+        type: STRING
+        value: "{{ outputs.scan_and_pin.vars | toJson | base64encode }}"
+      - id: files
+        type: JSON
+        value: "{{ outputs.scan_and_pin.outputFiles | toJson }}"
+
+  - id: report
+    type: io.kestra.plugin.scripts.python.Script
+    description: Build report.md, the Slack summary, the new baseline and the list of repositories that can get a pinning pull request.
+    dependencies:
+      - kestra
+    inputFiles:
+      selected.json: "{{ outputs.select_repos.vars.repos | toJson }}"
+      repos.json: "{{ loopOutputs(outputs.audit.outputs, 'repo') | toJson }}"
+      branches.json: "{{ loopOutputs(outputs.audit.outputs, 'branch') | toJson }}"
+      results.json: "{{ loopOutputs(outputs.audit.outputs, 'result_b64') | toJson }}"
+      files.json: "{{ loopOutputs(outputs.audit.outputs, 'files') | toJson }}"
+      baseline.json: "{{ (kv('actions-hardening-' ~ (inputs.owner | slugify), errorOnMissing=false) ?? {}) | toJson }}"
+    outputFiles:
+      - report.md
+    script: |
+      import base64, json
+      from kestra import Kestra
+
+      levels = ["low", "medium", "high"]
+      shown = levels[levels.index({{ inputs.min_severity | toJson }}):]
+      baseline = json.load(open("baseline.json"))
+      results = {}
+      for repo, branch, encoded, files in zip(*(json.load(open(f)) for f in ("repos.json", "branches.json", "results.json", "files.json"))):
+          data = json.loads(base64.b64decode(encoded)) if repo and encoded else {}
+          if "findings_b64" in data:  # a failed iteration has no scan result and is reported as not scanned
+              data.update(branch=branch, files=files or {}, findings=json.loads(base64.b64decode(data["findings_b64"])), pins=json.loads(base64.b64decode(data["pins_b64"])))
+              results[repo] = data
+      not_scanned = [r["repo"] for r in json.load(open("selected.json")) if r["repo"] not in results] + {{ outputs.select_repos.vars.unavailable | toJson }}
+
+      def delta(repo, level):
+          before = baseline.get(repo, {}).get(level)
+          now = results[repo]["counts"][level]
+          return "" if before is None or before == now else f" ({now - before:+d})"
+
+      lines = ["# GitHub Actions hardening report", "",
+               "| Repository | Workflows | High | Medium | Low | Actions to pin |", "|---|---|---|---|---|---|"]
+      for repo, r in sorted(results.items(), key=lambda kv: (-kv[1]["counts"]["high"], kv[0])):
+          c = r["counts"]
+          lines.append(f"| {repo} | {r['workflow_files']} | {c['high']}{delta(repo, 'high')} | {c['medium']}{delta(repo, 'medium')} | {c['low']}{delta(repo, 'low')} | {r['pin_count']} |")
+      for repo, r in sorted(results.items()):
+          picked = sorted((f for f in r["findings"] if f["severity"] in shown), key=lambda f: (-levels.index(f["severity"]), f["file"], f["line"]))
+          if picked or r["pins"] or r["unresolved"]:
+              lines += ["", f"## {repo}"]
+              lines += [f"- **{f['severity']}** `{f['rule']}` in `{f['file']}` line {f['line']}: {f['summary']} ([docs]({f['docs']}))" for f in picked]
+              lines += [f"- pin `{p['action']}@{p['ref']}` to `{p['sha'][:12]}` in `{p['file']}`" for p in r["pins"]]
+              lines += [f"- could not resolve `{u}`, pin it by hand" for u in r["unresolved"]]
+      if not_scanned:
+          lines += ["", "## Not scanned", *[f"- {n}" for n in not_scanned]]
+      open("report.md", "w").write("\n".join(lines) + "\n")
+
+      totals = {level: sum(r["counts"][level] for r in results.values()) for level in levels}
+      before_high = sum(v.get("high", 0) for k, v in baseline.items() if k in results)
+      trend = "" if not baseline else f" ({totals['high'] - before_high:+d} since last run)"
+      summary = (f"🔐 *GitHub Actions hardening for {{ inputs.owner }}*: {len(results)} repositories scanned, "
+                 f"{totals['high']} high{trend}, {totals['medium']} medium, {totals['low']} low findings. "
+                 f"{sum(r['pin_count'] for r in results.values())} action reference(s) can be pinned to a commit SHA"
+                 + (f". Not scanned: {', '.join(not_scanned)}." if not_scanned else "."))
+
+      candidates = []
+      for repo, r in sorted(results.items()):
+          if r["pins"] and r["files"]:
+              table = "\n".join(f"| `{p['file']}` | `{p['action']}` | `{p['ref']}` | `{p['sha']}` |" for p in r["pins"])
+              body = ("Tags and branches can be moved to new code at any time; that is how the tj-actions/changed-files compromise "
+                      "leaked secrets from thousands of repositories in 2025. Pinning every action to a full commit SHA keeps exactly "
+                      "the code you run today. The original tag stays as a comment so update tools such as Dependabot keep working.\n\n"
+                      "| File | Action | Was | Now pinned to |\n|---|---|---|---|\n" + table +
+                      "\n\nBehaviour is unchanged: each SHA is the commit the tag points to right now.")
+              candidates.append({"repo": repo, "branch": r["branch"], "pins": r["pin_count"], "files": r["files"],
+                                 "body_b64": base64.b64encode(body.encode()).decode()})
+
+      Kestra.outputs({
+          "summary": summary,
+          "repos_scanned": len(results),
+          "not_scanned": not_scanned,
+          "totals": totals,
+          "pins_total": sum(r["pin_count"] for r in results.values()),
+          "baseline": {repo: r["counts"] for repo, r in results.items()},
+          "pr_candidates": candidates,
+      })
+
+  - id: post_report
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Share the sweep summary on every run.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "{{ outputs.report.vars.summary }} Report: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 3
+
+  - id: save_baseline
+    type: io.kestra.plugin.core.kv.Set
+    description: Keep this run's counts per repository, so the next report shows what changed.
+    key: "actions-hardening-{{ inputs.owner | slugify }}"
+    kvType: JSON
+    value: "{{ outputs.report.vars.baseline | toJson }}"
+
+  - id: propose_fixes
+    type: io.kestra.plugin.core.flow.If
+    description: Ask before opening pull requests, and only when there is something to pin and this is not a dry run.
+    condition: "{{ not inputs.dry_run and outputs.report.vars.pr_candidates | length > 0 }}"
+    then:
+      - id: ask_reviewer
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the team pinning pull requests are waiting for a decision.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "📌 {{ outputs.report.vars.pins_total }} action reference(s) in {{ outputs.report.vars.pr_candidates | length }} repositories can be pinned to commit SHAs. Review report.md and decide: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 3
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Review report.md, then choose whether to open one pinning pull request per repository. Without a decision within three days the execution is cancelled.
+        pauseDuration: P3D
+        behavior: CANCEL
+        onResume:
+          - id: decision
+            type: SELECT
+            displayName: Decision
+            values:
+              - Open pinning PRs
+              - Report only
+            defaults: Open pinning PRs
+          - id: note
+            type: STRING
+            displayName: Note for the pull requests (optional)
+            required: false
+
+      - id: open_prs
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approval.onResume.decision == 'Open pinning PRs' }}"
+        then:
+          - id: per_repository
+            type: io.kestra.plugin.core.flow.Loop
+            description: One pinning pull request per repository, three at a time. Repositories that already have one open are skipped.
+            values: "{{ outputs.report.vars.pr_candidates }}"
+            concurrencyLimit: 3
+            tasks:
+              - id: existing_pr
+                type: io.kestra.plugin.core.http.Request
+                uri: "https://api.github.com/repos/{{ fromJson(item.value).repo }}/pulls?state=open&head={{ fromJson(item.value).repo | split('/') | first }}:security/pin-actions"
+                headers:
+                  Accept: application/vnd.github+json
+                  Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+                  User-Agent: kestra-github-actions-hardening-sweep
+                retry:
+                  type: exponential
+                  interval: PT10S
+                  maxInterval: PT2M
+                  maxAttempts: 3
+
+              - id: only_if_new
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ fromJson(outputs.existing_pr.body) | length == 0 }}"
+                then:
+                  - id: push_branch
+                    type: io.kestra.plugin.git.PushExecutionFiles
+                    description: Commit only the pinned workflow files to security/pin-actions. delete is off, so nothing else in the repository changes.
+                    url: "https://github.com/{{ fromJson(item.value).repo }}.git"
+                    username: "{{ secret('GITHUB_TOKEN') }}"
+                    password: "{{ secret('GITHUB_TOKEN') }}"
+                    branch: security/pin-actions
+                    gitDirectory: .
+                    delete: false
+                    authorName: Kestra Actions hardening
+                    commitMessage: "ci: pin {{ fromJson(item.value).pins }} GitHub Actions to commit SHAs"
+                    filesMap: "{ {% for file in fromJson(item.value).files %}{{ file.key | replace({'edited/': ''}) | toJson }}: {{ file.value | toJson }}{% if not loop.last %}, {% endif %}{% endfor %} }"
+                    retry:
+                      type: exponential
+                      interval: PT10S
+                      maxInterval: PT2M
+                      maxAttempts: 3
+
+                  - id: open_pr
+                    type: io.kestra.plugin.github.pulls.Create
+                    oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+                    repository: "{{ fromJson(item.value).repo }}"
+                    sourceBranch: security/pin-actions
+                    targetBranch: "{{ fromJson(item.value).branch }}"
+                    title: "ci: pin {{ fromJson(item.value).pins }} GitHub Actions to commit SHAs"
+                    body: |
+                      {{ fromJson(item.value).body_b64 | base64decode }}
+
+                      {{ outputs.approval.onResume.note ?? '' }}
+                    retry:
+                      type: exponential
+                      interval: PT10S
+                      maxInterval: PT2M
+                      maxAttempts: 3
+            outputs:
+              - id: pull_request
+                type: STRING
+                value: "{{ outputs.open_pr.pullRequestUrl ?? ('already open: ' ~ fromJson(outputs.existing_pr.body)[0].html_url) }}"
+
+          - id: announce_prs
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "📌 Pinning pull requests: {{ loopOutputs(outputs.per_repository.outputs, 'pull_request') | join(', ') }}"
+            retry:
+              type: exponential
+              interval: PT10S
+              maxInterval: PT2M
+              maxAttempts: 3
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert with the failed task, the error and a link. Nothing is pushed before approval, so the run can simply be retried.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    messageText: |
+      ❌ *GitHub Actions hardening sweep FAILED* for {{ inputs.owner }} (flow {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}).
+      Failed task: {{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}. Error: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'see the execution logs' }}
+      {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: report
+    type: STRING
+    displayName: Report
+    description: Internal storage URI of report.md.
+    value: "{{ outputs.report.outputFiles['report.md'] ?? 'none' }}"
+  - id: high_findings
+    type: INT
+    displayName: High-severity findings
+    value: "{{ outputs.report.vars.totals.high ?? 0 }}"
+  - id: actions_to_pin
+    type: INT
+    displayName: Action references to pin
+    value: "{{ outputs.report.vars.pins_total ?? 0 }}"
+
+extend:
+  shortDescription: Audit every GitHub Actions workflow in an organization with zizmor, track risk week over week, and open SHA-pinning PRs after approval.
+  title: GitHub Actions Hardening Sweep with zizmor, SHA Pinning and Approval
+  metaTitle: GitHub Actions Hardening Sweep with zizmor
+  description: |
+    In March 2025, attackers moved the version tags of `tj-actions/changed-files` to malicious code, and more than 23,000 repositories leaked CI secrets in their logs. Any workflow that uses an action by tag (`@v4`) runs whatever that tag points to today. The standard fix is pinning every action to a full commit SHA, but doing that and keeping watch across dozens of repositories by hand doesn't happen. This blueprint sweeps a whole organization every week. It's for security and platform teams that own CI across many repositories.
+
+    ## How it works
+    1. `list_repos` (`io.kestra.plugin.core.http.Download`) lists the owner's repositories that aren't archived or forks, and `select_repos` (`io.kestra.plugin.scripts.python.Script`) applies the optional repository list and `max_repos`. Names that are missing, archived or forks are reported as not scanned.
+    2. `audit` (`io.kestra.plugin.core.flow.Loop`, four repositories at a time, `transmitFailed: false` so one broken repository doesn't stop the sweep) clones each repository (`io.kestra.plugin.git.Clone`). `scan_and_pin` then:
+       - runs [zizmor](https://docs.zizmor.sh) offline on every workflow and composite action. zizmor finds unpinned actions, dangerous triggers such as `pull_request_target`, template injection, excessive permissions, credential persistence and more;
+       - resolves every action referenced by a tag or branch to its commit SHA through the GitHub API, and rewrites it as `owner/repo@<sha> # <tag>`. Local actions, `docker://` images and `skip_action_owners` are left alone.
+    3. `report` writes `report.md`: a per-repository table, the findings at or above `min_severity` with links to zizmor's documentation, the pins, and the repositories not scanned. Each count shows its change since the previous run, read from the KV store. `post_report` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts the summary, and `save_baseline` (`io.kestra.plugin.core.kv.Set`) stores this run's counts.
+    4. When this isn't a dry run and something can be pinned, `ask_reviewer` posts a link and `approval` (`io.kestra.plugin.core.flow.Pause`) waits for a decision: open pinning PRs, or report only. Without a decision within three days, the execution is cancelled.
+    5. On approval, `per_repository` (`Loop`, three at a time) skips repositories that already have an open `security/pin-actions` PR. For the rest, `push_branch` (`io.kestra.plugin.git.PushExecutionFiles`, `delete: false`) commits only the edited workflow files, `open_pr` (`io.kestra.plugin.github.pulls.Create`) opens the PR, and `announce_prs` posts the links.
+    6. `alert_failure` posts any failure to Slack.
+
+    The pinning PRs change no behaviour: each SHA is the commit the tag points to at the time of the sweep, and the tag stays as a comment so Dependabot and Renovate keep proposing updates. Other findings are listed for a person to fix, because zizmor's automatic fixes for them change behaviour.
+
+    ## Prerequisites
+    - Docker on the worker for the Python script tasks. zizmor is installed from PyPI at run time.
+    - Secrets:
+      - `GITHUB_TOKEN`: a token that can read the owner's repositories. For the pinning PRs, it also needs **Contents: read and write** and **Pull requests: read and write** on those repositories. It's also used as the HTTPS username for cloning, which GitHub accepts.
+      - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the report, the review request and failure alerts.
+
+    ### Inputs
+    - `owner` (STRING, default `your-org`): the organization or user to sweep.
+    - `repositories` (STRING, default empty): comma-separated repository names to limit the sweep to. Empty means every repository that isn't archived or a fork.
+    - `max_repos` (INT, default `30`): the most repositories scanned in one run.
+    - `skip_action_owners` (STRING, default empty): action owners to leave on tags, for example your own organization.
+    - `min_severity` (SELECT `low`, `medium` or `high`, default `medium`): the lowest severity listed in the report. The counts always include everything.
+    - `dry_run` (BOOL, default `true`): scan, resolve SHAs and report, but no approval request and no PRs. The report and the KV baseline are still produced.
+
+    ## Quick start
+    1. Add the two secrets and save the flow.
+    2. Run it manually with `owner` set and `dry_run` left on. Read `report.md` in the `report` outputs.
+    3. Run it again with `dry_run` set to `false`, approve, and review the pinning PRs.
+    4. Enable the `weekly` trigger to sweep every Monday. Set its inputs if your defaults differ.
+
+    ## Outputs
+    - `{{ outputs.report }}` / `{{ outputs.report.outputFiles['report.md'] }}`: the full report.
+    - `{{ outputs.high_findings }}` / `{{ outputs.report.vars.totals }}`: findings per severity across all repositories.
+    - `{{ outputs.actions_to_pin }}` / `{{ outputs.report.vars.pins_total }}`: action references that can be pinned.
+    - `{{ outputs.report.vars.not_scanned }}`: repositories that were missing, archived, forks or failed to scan.
+    - `{{ loopOutputs(outputs.per_repository.outputs, 'pull_request') }}`: the pinning PRs.
+    - KV key `actions-hardening-<owner>`: this run's counts per repository, the baseline for the next run.
+
+    ## Common pitfalls
+    - The repository list comes from GitHub search, which returns at most 100 repositories per owner. Use `repositories` to pick specific ones in larger organizations.
+    - A tag that GitHub can't resolve, such as a deleted tag or a private action the token can't read, is listed in the report to pin by hand.
+    - While a `security/pin-actions` PR is open in a repository, that repository is skipped. Merge or close it, and the next sweep proposes the rest.
+    - zizmor runs offline, so audits that need the GitHub API, such as known-vulnerable actions, are not included.
+
+    ## How to extend
+    - Pass `--gh-token` to zizmor for its online audits, such as known-vulnerable or impostor commits.
+    - Open issues instead of PRs for findings that need a person, with `io.kestra.plugin.github.issues.Create`.
+    - Fail a pipeline when high findings increase, by comparing `outputs.report.vars.totals.high` with the baseline.
+
+    ## Links
+    - zizmor audits: https://docs.zizmor.sh/audits/
+    - GitHub security hardening for Actions: https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions
+    - tj-actions/changed-files incident (CVE-2025-30066): https://github.com/advisories/ghsa-mrrh-fwg8-r2c3
+    - Loop task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop
+    - Git plugin: https://kestra.io/plugins/plugin-git
+    - GitHub plugin: https://kestra.io/plugins/plugin-github
+    - This blueprint has been created by [Biplab Bera](https://github.com/bishalbera)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - CI/CD & Deployment
+  ee: false
+  demo: false
+  metaDescription: Audit every GitHub Actions workflow in an org with zizmor, track risk week over week, and open SHA-pinning PRs after approval.
