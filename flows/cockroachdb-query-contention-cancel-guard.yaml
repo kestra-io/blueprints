@@ -1,0 +1,404 @@
+id: cockroachdb-query-contention-cancel-guard
+namespace: company.team
+
+description: |
+  Find CockroachDB statements that have been running past a threshold or are stuck in a lock
+  conflict, tell the lock holder blocking others apart from the statement waiting on it. After
+  approval it cancels the worst offender with CANCEL QUERY, then reads the running statements again
+  and fails the run if that query is still there.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: Any CockroachDB node over the Postgres wire protocol. The SQL port is 26257 by default.
+    defaults: "jdbc:postgresql://localhost:26257/defaultdb?sslmode=require"
+
+  - id: db_user
+    type: STRING
+    displayName: SQL user
+    description: The role the queries connect as. It needs VIEWACTIVITY to see other sessions and CANCELQUERY to cancel them.
+    defaults: "root"
+
+  - id: password
+    type: STRING
+    displayName: SQL password
+    description: Read from the COCKROACH_PASSWORD secret by default. An insecure local cluster ignores it.
+    defaults: "{{ secret('COCKROACH_PASSWORD') }}"
+
+  - id: long_running_seconds
+    type: INT
+    displayName: Long-running threshold (seconds)
+    description: A statement whose elapsed time is at least this is flagged, whether or not it is in a lock conflict.
+    defaults: 300
+
+  - id: min_waiters
+    type: INT
+    displayName: Minimum blocked transactions
+    description: A running statement whose transaction holds a contended lock with at least this many waiters is flagged even when it is not yet long-running.
+    defaults: 1
+
+  - id: min_recent_contention_events
+    type: INT
+    displayName: Minimum recent contention events
+    description: >-
+      Optional. When above 0, a running statement whose transaction has been the blocker in at least
+      this many events in crdb_internal.cluster_contention_events is also flagged. Those events are
+      recorded after a wait resolves, so this is recent history rather than the live picture. 0 turns it off.
+    defaults: 0
+
+  - id: excluded_applications
+    type: ARRAY
+    itemType: STRING
+    displayName: Application names never cancelled
+    description: Statements whose application_name is in this list are listed but never chosen for cancellation. CockroachDB internal statements are always excluded.
+    defaults: []
+
+  - id: settle_duration
+    type: DURATION
+    displayName: Settle time before re-read
+    description: How long to wait after CANCEL QUERY before reading the running statements again.
+    defaults: PT5S
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any statement is cancelled.
+    defaults: true
+
+variables:
+  audit_sql: |
+    WITH running AS (
+      SELECT q.query_id, q.txn_id, q.node_id, q.user_name,
+             coalesce(q.application_name, '') AS application_name,
+             extract(EPOCH FROM (now() - q.start))::INT8 AS elapsed_seconds,
+             left(regexp_replace(q.query, '\s+', ' ', 'g'), 160) AS query
+        FROM crdb_internal.cluster_queries q
+       WHERE q.query_id IS NOT NULL
+         AND q.query NOT ILIKE '%crdb_internal.cluster_queries%'
+         AND q.query NOT ILIKE '%crdb_internal.cluster_contention_events%'
+         AND q.query NOT ILIKE '%crdb_internal.cluster_locks%'
+         AND coalesce(q.application_name, '') NOT LIKE '$ internal%'
+         AND coalesce(q.application_name, '') NOT IN ({{ inputs.excluded_applications | jq('if length == 0 then "\u0027__kestra_no_exclusion__\u0027" else map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",") end') | first }})
+    ), held AS (
+      SELECT g.txn_id,
+             count(DISTINCT g.lock_key)::INT8 AS contended_locks_held,
+             count(DISTINCT w.txn_id)::INT8 AS waiters_blocked,
+             coalesce(max(extract(EPOCH FROM g.duration)), 0)::INT8 AS max_hold_seconds
+        FROM crdb_internal.cluster_locks g
+        LEFT JOIN crdb_internal.cluster_locks w ON w.lock_key = g.lock_key AND NOT w.granted
+       WHERE g.granted AND g.contended
+       GROUP BY g.txn_id
+    ), waiting AS (
+      SELECT txn_id,
+             count(DISTINCT lock_key)::INT8 AS locks_waiting_on,
+             coalesce(max(extract(EPOCH FROM duration)), 0)::INT8 AS max_wait_seconds
+        FROM crdb_internal.cluster_locks
+       WHERE NOT granted
+       GROUP BY txn_id
+    ), hist AS (
+      SELECT txn_id, coalesce(sum(count), 0)::INT8 AS blocked_events_recent
+        FROM crdb_internal.cluster_contention_events
+       GROUP BY txn_id
+    )
+    SELECT r.query_id, r.txn_id::STRING AS txn_id, r.node_id, r.user_name, r.application_name,
+           r.elapsed_seconds, r.query,
+           coalesce(h.waiters_blocked, 0)::INT8 AS waiters_blocked,
+           coalesce(h.contended_locks_held, 0)::INT8 AS contended_locks_held,
+           coalesce(h.max_hold_seconds, 0)::INT8 AS lock_hold_seconds,
+           coalesce(w.locks_waiting_on, 0)::INT8 AS locks_waiting_on,
+           coalesce(w.max_wait_seconds, 0)::INT8 AS lock_wait_seconds,
+           coalesce(he.blocked_events_recent, 0)::INT8 AS blocked_events_recent,
+           CASE
+             WHEN coalesce(h.waiters_blocked, 0) > 0 THEN 'BLOCKER'
+             WHEN coalesce(w.locks_waiting_on, 0) > 0 THEN 'WAITING'
+             ELSE 'LONG_RUNNING'
+           END AS category
+      FROM running r
+      LEFT JOIN held h ON h.txn_id = r.txn_id
+      LEFT JOIN waiting w ON w.txn_id = r.txn_id
+      LEFT JOIN hist he ON he.txn_id = r.txn_id
+     WHERE r.elapsed_seconds >= {{ inputs.long_running_seconds }}
+        OR coalesce(h.waiters_blocked, 0) >= {{ inputs.min_waiters }}
+        OR ({{ inputs.min_recent_contention_events }} > 0 AND coalesce(he.blocked_events_recent, 0) >= {{ inputs.min_recent_contention_events }})
+     ORDER BY coalesce(h.waiters_blocked, 0) DESC, r.elapsed_seconds DESC, r.query_id
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Lists running statements from crdb_internal.cluster_queries (the table behind SHOW
+      CLUSTER STATEMENTS) past the elapsed threshold or in a live lock conflict, with the holder of a
+      contended lock marked BLOCKER and the statement waiting on it marked WAITING.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      CockroachDB statement guard on {{ inputs.jdbc_url }}: {{ outputs.audit.size }} statement(s) over
+      {{ inputs.long_running_seconds }}s or holding a contended lock.
+      {% for r in outputs.audit.rows %}{{ r.category }} query_id {{ r.query_id }} ({{ r.user_name }}/{{ r.application_name }}) running {{ r.elapsed_seconds }}s, blocking {{ r.waiters_blocked }} transaction(s) for up to {{ r.lock_hold_seconds }}s, waiting on {{ r.locks_waiting_on }} lock(s) for up to {{ r.lock_wait_seconds }}s, {{ r.blocked_events_recent }} recent contention event(s): {{ r.query }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.size > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'CockroachDB ' ~ inputs.jdbc_url ~ ': ' ~ outputs.audit.size ~ ' statement(s) over ' ~ inputs.long_running_seconds ~ 's or in a lock conflict. ' ~ (outputs.audit.rows | jq('map("\(.category) \(.query_id) \(.elapsed_seconds)s blocking \(.waiters_blocked) waiting_on \(.locks_waiting_on): \(.query)") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Asking for approval to cancel the worst offender.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: target
+        type: io.kestra.plugin.core.output.OutputValues
+        description: The worst offender is the first row, a blocker before a plain long runner, then longest first.
+        values:
+          query_id: "{{ outputs.audit.rows | jq('.[0].query_id') | first }}"
+          txn_id: "{{ outputs.audit.rows | jq('.[0].txn_id') | first }}"
+          category: "{{ outputs.audit.rows | jq('.[0].category') | first }}"
+          query: "{{ outputs.audit.rows | jq('.[0].query') | first }}"
+          waiters_blocked: "{{ outputs.audit.rows | jq('.[0].waiters_blocked') | first }}"
+          elapsed_seconds: "{{ outputs.audit.rows | jq('.[0].elapsed_seconds') | first }}"
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: approve
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Cancelling a statement rolls back its transaction, so the run holds here. A long analytics
+              query may be legitimate. A blocker should be cancelled only when its waiters matter more
+              than its own work. Resume with approved true to cancel the worst offender.
+            pauseDuration: PT1H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Approve the cancel
+                description: Set true to run CANCEL QUERY against the worst offender.
+                defaults: false
+              - id: change_ticket
+                type: STRING
+                displayName: Change record
+                defaults: ""
+
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approve.onResume.approved ?? false }}"
+            then:
+              - id: cancel
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: CANCEL QUERY against the single chosen query_id. allowFailure, since the statement may have ended on its own between the audit and here.
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.password }}"
+                fetchType: NONE
+                sql: "CANCEL QUERY '{{ outputs.target.values.query_id }}'"
+
+              - id: settle
+                type: io.kestra.plugin.core.flow.Sleep
+                description: Give the cancellation a moment to land before reading the running statements again.
+                duration: "{{ inputs.settle_duration }}"
+
+              - id: reaudit
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Read-only re-verify. Is the cancelled query_id still in the running statements?
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.password }}"
+                fetchType: FETCH_ONE
+                sql: "SELECT count(*)::INT8 AS still_running FROM crdb_internal.cluster_queries WHERE query_id = '{{ outputs.target.values.query_id }}'"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.reaudit.row.still_running > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      CANCEL QUERY did not stop {{ outputs.target.values.query_id }}
+                      ({{ outputs.target.values.category }}). It is still running. The connecting role
+                      needs CANCELQUERY. A user cannot cancel an admin's statement. Check the cancel task log.
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Cancelled {{ outputs.target.values.category }} statement {{ outputs.target.values.query_id }}
+                      after {{ outputs.target.values.elapsed_seconds }}s, which was blocking
+                      {{ outputs.target.values.waiters_blocked }} transaction(s). It is no longer running.
+                      Change record {{ outputs.approve.onResume.change_ticket == '' ? 'not given' : outputs.approve.onResume.change_ticket }}.
+            else:
+              - id: approval_declined
+                type: io.kestra.plugin.core.log.Log
+                message: "Approval declined. No statement cancelled. The worst offender {{ outputs.target.values.query_id }} is still running."
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "No statement is over {{ inputs.long_running_seconds }}s or holding a contended lock on {{ inputs.jdbc_url }}."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'CockroachDB query contention cancel guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). A cluster that cannot answer the audit is itself worth looking at. Check the logs.'} | toJson }}
+
+triggers:
+  - id: every_5_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled. Always runs in safe mode.
+    cron: "*/5 * * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: CockroachDB Query Contention and Cancel Guard
+  shortDescription: Find CockroachDB statements running past a threshold or stuck in a lock conflict, tell the lock holder apart from the statement waiting on it, then after approval cancel the worst offender with CANCEL QUERY and verify it is gone.
+  metaTitle: CockroachDB Query Contention and Cancel Guard with Kestra
+  metaDescription: Audit long-running and lock-contended CockroachDB statements, alert Slack, cancel the worst offender with CANCEL QUERY after approval and verify it stopped.
+  description: |
+    A single statement can hold a CockroachDB cluster back. A runaway query with a bad plan runs for minutes. An application that opens a transaction, takes a write lock on a row, then waits on a slow network call keeps that lock the whole time. Every other transaction that needs the same row queues behind it. The cluster stays up and most keys answer normally, so a dashboard of cluster health shows nothing. One table slows to a crawl and nobody can see why.
+
+    The hard part is telling the two apart. A statement that has been running for two minutes might be a report that is simply slow. It might instead be a transaction holding a contended lock while a dozen others wait on it. The first wants to be left alone. The second wants to be cancelled, because cancelling it rolls back its transaction and frees everyone waiting.
+
+    This blueprint reads the running statements and the live lock table together. It flags a statement that is over a time threshold. It also flags a statement whose transaction holds a contended lock with waiters even when it is not yet long-running. It marks each one as the blocker, a waiter or a plain long runner. With approval, it cancels the worst offender with `CANCEL QUERY`, then reads the running statements again and fails the run if that query is still there.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | Category | Meaning | What to do |
+    |---|---|---|
+    | `BLOCKER` | The statement's transaction holds a contended lock that other transactions are waiting on | Cancelling it rolls back the transaction and frees the waiters |
+    | `WAITING` | The statement is blocked waiting on a lock another transaction holds | Cancel the blocker, not this one. Cancelling the waiter only clears the victim |
+    | `LONG_RUNNING` | Over the time threshold with no lock conflict | Usually a slow or runaway query. Judge it before cancelling |
+
+    - Running statements come from `crdb_internal.cluster_queries`, the table behind `SHOW CLUSTER STATEMENTS`. It carries the `query_id` that `CANCEL QUERY` takes and the `txn_id` used for the joins.
+    - The live lock picture comes from `crdb_internal.cluster_locks`. A row with `granted` true and `contended` true is a held lock with waiters. A row with `granted` false is a transaction waiting. Joining it to the running statements by `txn_id` is what separates a blocker from its victim.
+    - `crdb_internal.cluster_contention_events` adds recent history: how many times a transaction has been the blocker in a resolved contention event. Those events are recorded after a wait ends, so they lag the live picture. The guard reads them for context and treats them as a detection signal only when `min_recent_contention_events` is above 0.
+
+    ## Safety
+
+    - Every read is against a `crdb_internal` system view. Nothing touches user data.
+    - A statement is cancelled only when `auto_remediate` is true, when `dry_run` is false and when a human resumes the `Pause`.
+    - Exactly one statement is cancelled per run, the worst offender, chosen as the blocker with the most waiters first, then the longest running.
+    - The only write the flow ever issues is `CANCEL QUERY '<query_id>'`. It never drops anything and never cancels a session or a transaction wholesale.
+    - CockroachDB internal statements (`application_name` starting with `$ internal`) are always excluded. So is anything named in `excluded_applications`.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) lists running statements over `long_running_seconds` or holding a contended lock with at least `min_waiters` waiters. It joins `cluster_queries` to `cluster_locks` for the live blocker and waiter picture. It also joins `cluster_contention_events` for recent history. It labels each row `BLOCKER`, `WAITING` or `LONG_RUNNING`. Rows come back worst first.
+    2. `summary` logs every row with its elapsed time, how many transactions it blocks and how long it has held or waited on a lock.
+    3. `route` (`io.kestra.plugin.core.flow.If`):
+       - **clean:** nothing is over the threshold or contended, so it logs that.
+       - **findings:** `alert` posts the statements to Slack. `target` pins the worst offender's `query_id`.
+         - `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false.
+         - `approve` (`io.kestra.plugin.core.flow.Pause`, `behavior: FAIL`) holds for up to an hour and records who approved and under which change record.
+         - `cancel` runs `CANCEL QUERY` against the one chosen `query_id`.
+         - `settle` waits, then `reaudit` reads the running statements again. `verify_result` fails the run if that `query_id` is still there.
+    4. `errors` alerts Slack when the audit itself cannot run.
+
+    ## What you get
+
+    - One list that separates a statement blocking others from a statement waiting on one, which a plain count of long-running queries cannot do.
+    - A single, named cancellation per run, behind a human approval, rather than a blanket kill of every long query.
+    - A re-read of the running statements as proof, so a green run means the query is gone rather than assumed gone.
+    - CockroachDB internal work and any application you name left alone.
+
+    ## Who it's for
+
+    - Teams running CockroachDB who have watched one table slow down while the cluster looked healthy.
+    - Platform engineers who need to cancel a runaway or a lock holder safely, with an approval and a record, not an ad hoc `CANCEL QUERY` typed at 2am.
+    - Anyone evaluating the PostgreSQL plugin against CockroachDB who wants an example that reads the lock tables and drives `CANCEL QUERY`.
+
+    ## Why orchestrate this with Kestra
+
+    Contention is a moving target. A statement that is fine on one run is a blocker on the next. Kestra runs the same audit every few minutes, keeps each run with its numbers and sends the statements to Slack. The cancel is disruptive, so it sits behind `auto_remediate`, `dry_run` and a `Pause` that records the approver and the change record. The run reports success only after a second read shows the statement stopped.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against CockroachDB v24.1 (`cockroachdb/cockroach:latest-v24.1`, single node, insecure), with a local HTTP sink standing in for Slack. The worst offender was confirmed with `cockroach sql` running `SHOW CLUSTER STATEMENTS` and `SELECT ... FROM crdb_internal.cluster_locks`, not only from the Kestra log.
+
+    | Run | Cluster state | Result |
+    |---|---|---|
+    | 1 | No long statement | Clean. 0 rows. Clean branch logged |
+    | 2 | A `SELECT pg_sleep(600)` running | 1 row, `LONG_RUNNING`, elapsed over the threshold. Alert sent, no change |
+    | 3 | One transaction holding a write lock while a second blocks on the same row | 2 rows, the holder `BLOCKER` with 1 waiter, the blocked `UPDATE` `WAITING`. Worst offender was the blocker |
+    | 4 | Same as run 3, `auto_remediate: true`, `dry_run: true` | Same report. Both statements still running when checked with `cockroach sql` |
+    | 5 | Same as run 3, `auto_remediate: true`, `dry_run: false`, approval declined | `Pause` resumed with `approved: false`. Nothing cancelled, both still running |
+    | 6 | Same as run 3, approved | `CANCEL QUERY` on the blocker. The re-read showed `still_running: 0`, the waiter acquired the lock and committed, `cluster_locks` for the row went empty |
+    | 7 | Unreachable host | `errors` alert sent |
+
+    ## Prerequisites
+
+    - A CockroachDB cluster reachable over the Postgres wire protocol, which is what the PostgreSQL plugin speaks to it.
+    - The SQL role needs `VIEWACTIVITY` to see other sessions and `CANCELQUERY` to cancel them. A role cannot cancel a statement run by an admin.
+    - Local testing: a single insecure node is enough. `SELECT pg_sleep(600)` gives a long runner. Two `BEGIN` sessions updating the same row give a lock conflict.
+
+    ### Secrets
+
+    - `COCKROACH_PASSWORD`: the SQL password, read by the `password` input's default. An insecure local node ignores it.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:26257/defaultdb?sslmode=require` | Any node of the cluster |
+    | `db_user` | `root` | The role the queries connect as |
+    | `password` | `{{ secret('COCKROACH_PASSWORD') }}` | SQL password, ignored by an insecure node |
+    | `long_running_seconds` | `300` | Elapsed time at which a statement is flagged |
+    | `min_waiters` | `1` | Waiters on a held contended lock that flag a statement early |
+    | `min_recent_contention_events` | `0` | Recent blocker events that flag a statement. 0 turns this off |
+    | `excluded_applications` | `[]` | Application names never cancelled |
+    | `settle_duration` | `PT5S` | Wait after the cancel before the re-read |
+    | `auto_remediate` | `false` | Allow `CANCEL QUERY` |
+    | `dry_run` | `true` | Must be `false` before anything is cancelled |
+
+    ## Quick start
+
+    1. Add the `COCKROACH_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url` to one of your nodes and `db_user` to a role with `VIEWACTIVITY` and `CANCELQUERY`.
+    3. Run it once and read the categories. A `WAITING` row wants you to cancel the matching `BLOCKER`, not the waiter.
+    4. To cancel the worst offender, run with `auto_remediate: true` and `dry_run: false`, then resume the `Pause` with `approved: true` and your change record.
+    5. Enable the `every_5_minutes` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Cancel every blocker over a waiter threshold in a loop, rather than only the single worst offender.
+    - Add a `CANCEL SESSION` branch for a transaction that holds a lock while sitting idle, where there is no running statement to cancel.
+    - Store the first-seen time of a blocker in a KV key, so a transaction that blocks others for longer than a budget is paged rather than cancelled on sight.
+    - Record each cancelled `query_id`, user and query text to a table for an audit trail.
+    - Loop over several clusters by passing a list of JDBC URLs.
+
+    ## Links
+
+    - SHOW STATEMENTS and query cancellation: https://www.cockroachlabs.com/docs/v24.1/show-statements
+    - CANCEL QUERY: https://www.cockroachlabs.com/docs/v24.1/cancel-query
+    - crdb_internal.cluster_locks and contention: https://www.cockroachlabs.com/docs/v24.1/crdb-internal
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Observability & Performance
+    - Day 2 Operations
+  ee: false
+  demo: false
+
+
