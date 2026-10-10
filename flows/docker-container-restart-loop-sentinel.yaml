@@ -1,0 +1,515 @@
+id: docker-container-restart-loop-sentinel
+namespace: company.team
+
+description: |
+  Catch containers stuck in a restart loop on a plain Docker host. A container with
+  restart: always that dies on startup keeps showing as "Up 2 seconds" in docker ps, so a
+  naive health check reads it as running while the service is down and the daemon burns CPU
+  restarting it. This flow reads RestartCount, State and the restart policy per container
+  through the Docker Engine API, compares RestartCount with a KV baseline written by the
+  previous run. It then classifies each container as FLAPPING, CRASH_ON_START, OOM_KILLED,
+  RESTART_POLICY_MISSING or OK. It pulls the last log lines of every failing container into
+  the report so the alert says why it is dying. With auto_remediate on and dry_run off it
+  stops the flapping containers behind an approval gate, then inspects them again and fails
+  the run if one is still restarting.
+
+inputs:
+  - id: docker_host
+    type: STRING
+    displayName: Docker daemon
+    description: >-
+      Docker Engine endpoint to watch, for example tcp://build-01:2375. The reads use its HTTP
+      Engine API, so this flow needs a TCP endpoint or a socket proxy, not a bare Unix socket.
+    defaults: "tcp://docker-01:2375"
+
+  - id: container_name_filter
+    type: STRING
+    displayName: Container name pattern
+    description: Only containers whose name matches this regular expression are watched.
+    defaults: "^.*$"
+
+  - id: important_name_pattern
+    type: STRING
+    displayName: Important container pattern
+    description: >-
+      Containers that must come back by themselves after a host reboot. One of these running
+      with restart policy "no" is reported as RESTART_POLICY_MISSING.
+    defaults: "^(api|app|svc|web|worker)-.*$"
+
+  - id: protected_name_pattern
+    type: STRING
+    displayName: Never stop these
+    description: >-
+      Allowlist of containers this flow must never stop, whatever it finds. They are still
+      reported and alerted on.
+    defaults: "^(kestra.*|traefik.*|.*-(db|database|cache|proxy|gateway))$"
+
+  - id: flap_threshold
+    type: INT
+    displayName: Restart delta that counts as flapping
+    description: >-
+      Restarts since the previous run, not restarts ever. A container that restarted once last
+      month has a delta of zero.
+    defaults: 3
+
+  - id: crash_uptime_seconds
+    type: INT
+    displayName: Short uptime, in seconds
+    description: A current run shorter than this, with a non-zero exit code and at least one restart, is a crash on start.
+    defaults: 120
+
+  - id: log_tail_lines
+    type: INT
+    displayName: Log lines per failing container
+    defaults: 20
+
+  - id: baseline_key
+    type: STRING
+    displayName: KV key for the restart baseline
+    description: Use one key per Docker host, so two hosts never share a baseline. No TTL is set on it.
+    defaults: "docker_restart_baseline"
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Stop the flapping containers, after a human resumes the paused execution. Never touches the allowlist.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the containment is only reported. Must be false, together with auto_remediate, for anything to be stopped.
+    defaults: true
+
+variables:
+  api: "{{ inputs.docker_host | replace({'tcp://': 'http://'}) }}"
+
+tasks:
+  - id: list_containers
+    type: io.kestra.plugin.core.http.Request
+    description: Read-only. Every container on the host, running or not. This list carries no restart counter, which is the whole problem.
+    uri: "{{ render(vars.api) }}/containers/json?all=true"
+    method: GET
+
+  - id: watched
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Keep the containers matching the name filter.
+    values:
+      ids: >-
+        {{ ({'c': fromJson(outputs.list_containers.body), 're': inputs.container_name_filter} | toJson) | jq('
+           .re as $re | [.c[] | {id: .Id, name: (.Names[0] | ltrimstr("/"))} | select(.name | test($re))] | sort_by(.name)') | first | toJson }}
+
+  - id: inspect_each
+    type: io.kestra.plugin.core.flow.Loop
+    description: >-
+      One read-only inspect per watched container. RestartCount, the exact state, the exit code,
+      the OOM flag and the restart policy exist only here.
+    values: "{{ outputs.watched.values.ids }}"
+    concurrencyLimit: 4
+    outputs:
+      - id: state
+        type: STRING
+        value: >-
+          {{ outputs.inspect.body | jq('{id: .Id, name: (.Name | ltrimstr("/")), image: .Config.Image,
+             restarts: .RestartCount, status: .State.Status, exit_code: .State.ExitCode,
+             oom: .State.OOMKilled, error: (.State.Error // ""), started_at: .State.StartedAt,
+             finished_at: .State.FinishedAt, policy: .HostConfig.RestartPolicy.Name}') | first | toJson }}
+    tasks:
+      - id: inspect
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ render(vars.api) }}/containers/{{ fromJson(item.value).id }}/json"
+        method: GET
+
+  - id: window
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The baseline the previous run left behind, plus the timestamp a container must have started after to count as short-lived.
+    values:
+      previous: "{{ (kv(inputs.baseline_key, errorOnMissing=false) ?? {}) | toJson }}"
+      cutoff: "{{ now() | dateAdd(-1 * inputs.crash_uptime_seconds, 'SECONDS') | date('yyyyMMddHHmmss', timeZone='UTC') }}"
+      observed_at: "{{ now() | date('yyyy-MM-dd HH:mm:ss', timeZone='UTC') }}"
+
+  - id: assess
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      One row per container. The restart delta since the previous run is what separates a container
+      that restarted once last month from one flapping right now.
+    values:
+      rows: >-
+        {{ ({'rows': ((outputs.inspect_each.outputs ?? []) | jq('map(.outputs.state | fromjson)') | first),
+            'prev': fromJson(outputs.window.values.previous),
+            'cutoff': outputs.window.values.cutoff,
+            'flap': inputs.flap_threshold,
+            'important': inputs.important_name_pattern,
+            'protected': inputs.protected_name_pattern} | toJson) | jq('
+           . as $in
+           | ($in.prev.counts // {}) as $base
+           | ($in.prev.ids // {}) as $ids
+           | [ $in.rows[] as $r
+               | (if ($base[$r.name] == null or $ids[$r.name] != $r.id) then null else ($base[$r.name] | tostring | tonumber) end) as $b
+               | (if $b == null then null else ($r.restarts - $b) end) as $delta
+               | (($r.started_at | gsub("[^0-9]"; "") | .[0:14]) > $in.cutoff) as $young
+               | ($r.name | test($in.important)) as $imp
+               | ($r.name | test($in.protected)) as $prot
+               | (if ($r.oom and ($delta == null or $delta > 0 or $young)) then "OOM_KILLED"
+                  elif ($delta != null and $delta >= $in.flap) then "FLAPPING"
+                  elif ($r.restarts > 0 and $r.exit_code != 0
+                        and ($r.status == "restarting" or ($r.status == "running" and $young))) then "CRASH_ON_START"
+                  elif ($imp and ($r.policy == "no" or $r.policy == "")) then "RESTART_POLICY_MISSING"
+                  else "OK" end) as $v
+               | $r + {baseline: $b, delta: $delta, important: $imp, protected: $prot, verdict: $v,
+                       targeted: ((($v == "FLAPPING") or ($v == "CRASH_ON_START")) and ($prot | not))} ]
+           | sort_by(.verdict, .name)') | first | toJson }}
+
+  - id: triage
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      findings: "{{ fromJson(outputs.assess.values.rows) | jq('[.[] | select(.verdict != \"OK\")]') | first | toJson }}"
+      targets: "{{ fromJson(outputs.assess.values.rows) | jq('[.[] | select(.targeted)]') | first | toJson }}"
+      held_back: "{{ fromJson(outputs.assess.values.rows) | jq('[.[] | select(.protected and ((.verdict == \"FLAPPING\") or (.verdict == \"CRASH_ON_START\")))]') | first | toJson }}"
+      counts: "{{ fromJson(outputs.assess.values.rows) | jq('group_by(.verdict) | map(\"\\(.[0].verdict)=\\(length)\")') | first | jq('join(\", \")') | first }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Restart loop sentinel on {{ inputs.docker_host }}: {{ fromJson(outputs.assess.values.rows) | length }} containers watched,
+      {{ outputs.triage.values.counts }}. Restart deltas are measured against the baseline of
+      {{ fromJson(outputs.window.values.previous).observed_at ?? 'no previous run, so this run only records the baseline for the deltas' }}.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.triage.values.findings) | length > 0 }}"
+    then:
+      - id: fetch_logs
+        type: io.kestra.plugin.core.flow.Loop
+        description: The last lines each failing container printed before it died. A restart loop alert without them says nothing a human can act on.
+        values: "{{ outputs.triage.values.findings }}"
+        concurrencyLimit: 4
+        outputs:
+          - id: tail
+            type: STRING
+            value: >-
+              {{ ({'n': fromJson(item.value).name, 'v': (outputs.logs.body ?? '')} | toJson) | jq('{name: .n,
+                 tail: ([.v | match("20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^\\n]*"; "g") | .string] | join(" / "))}') | first | toJson }}
+        tasks:
+          - id: logs
+            type: io.kestra.plugin.core.http.Request
+            description: The Engine API multiplexes stdout and stderr, so the frame headers are stripped when the tail is assembled.
+            allowFailure: true
+            uri: "{{ render(vars.api) }}/containers/{{ fromJson(item.value).id }}/logs?stdout=true&stderr=true&timestamps=true&tail={{ inputs.log_tail_lines }}"
+            method: GET
+
+      - id: log_tails
+        type: io.kestra.plugin.core.output.OutputValues
+        description: The collected log tails, keyed by container name, so the report reads one map instead of a list.
+        values:
+          by_name: >-
+            {{ (outputs.fetch_logs.outputs ?? []) | jq('map(.outputs.tail | fromjson)
+               | map({(.name): .tail}) | add // {}') | first | toJson }}
+
+      - id: report
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: >-
+          {{ ({'f': fromJson(outputs.triage.values.findings),
+               't': fromJson(outputs.log_tails.values.by_name)} | toJson) | jq('
+             .t as $tails
+             | [ .f[] as $r
+                 | ($r.name + " [" + $r.verdict + "] image=" + $r.image + " restarts=" + ($r.restarts | tostring)
+                    + " baseline=" + (if $r.baseline == null then "none" else ($r.baseline | tostring) end)
+                    + " delta=" + (if $r.delta == null then "first observation" else ($r.delta | tostring) end)
+                    + " status=" + $r.status + " exit=" + ($r.exit_code | tostring) + " oom=" + ($r.oom | tostring)
+                    + " policy=" + $r.policy + " protected=" + ($r.protected | tostring)
+                    + (if ($r.error // "") == "" then "" else "\n  daemon error: " + $r.error end)
+                    + (if (($tails[$r.name]) // "") == "" then "\n  no log output captured"
+                       else "\n  last log lines: " + $tails[$r.name] end)) ]
+             | join("\n\n")') | first }}
+
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Docker restart loop sentinel on ' ~ inputs.docker_host ~ ': ' ~ (fromJson(outputs.triage.values.findings) | length) ~ ' of ' ~ (fromJson(outputs.assess.values.rows) | length) ~ ' watched containers need attention. ' ~ (fromJson(outputs.triage.values.findings) | jq('map("\(.name) \(.verdict) restarts \(.restarts) delta \(if .delta == null then "first observation" else .delta end) exit \(.exit_code)") | join("; ")') | first) ~ '. ' ~ (inputs.auto_remediate and not inputs.dry_run ? 'Stopping ' ~ (fromJson(outputs.triage.values.targets) | length) ~ ' of them once the approval gate is resumed.' : 'Nothing stopped (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: held_back_notice
+        type: io.kestra.plugin.core.log.Log
+        runIf: "{{ fromJson(outputs.triage.values.held_back) | length > 0 }}"
+        level: WARN
+        message: >-
+          In a restart loop but on the allowlist, so never stopped by this flow:
+          {{ fromJson(outputs.triage.values.held_back) | jq('map(.name) | join(", ")') | first }}.
+          Fix these by hand.
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and (fromJson(outputs.triage.values.targets) | length > 0) }}"
+        then:
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Stopping a container takes its service fully down. A restart loop is a code or config
+              bug that no restart fixes, so containment is a decision a human makes. Resume the
+              execution to apply it.
+
+          - id: contain
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              Remediation. One graceful stop per flapping container, one at a time. The container is
+              kept, not removed, so its restart history and its logs survive for whoever fixes it.
+            values: "{{ outputs.triage.values.targets }}"
+            concurrencyLimit: 1
+            outputs:
+              - id: settle
+                type: STRING
+                value: >-
+                  {{ {'name': fromJson(item.value).name, 'at': (now() | date('yyyyMMddHHmmss', timeZone='UTC'))} | toJson }}
+            tasks:
+              - id: stop
+                type: io.kestra.plugin.docker.cli.Stop
+                host: "{{ inputs.docker_host }}"
+                containerId: "{{ fromJson(item.value).id }}"
+                kill: false
+                delete: false
+
+          - id: verify
+            type: io.kestra.plugin.core.flow.Loop
+            description: Inspect every contained container again, from the daemon, not from the task that stopped it.
+            values: "{{ outputs.triage.values.targets }}"
+            concurrencyLimit: 4
+            outputs:
+              - id: after
+                type: STRING
+                value: >-
+                  {{ ({'n': fromJson(item.value).name, 'c': outputs.recheck.body} | toJson) | jq('
+                     {name: .n, restarts: (.c | fromjson | .RestartCount), status: (.c | fromjson | .State.Status),
+                      started: (.c | fromjson | .State.StartedAt | gsub("[^0-9]"; "") | .[0:14]),
+                      running: (.c | fromjson | .State.Running)}') | first | toJson }}
+            tasks:
+              - id: recheck
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ render(vars.api) }}/containers/{{ fromJson(item.value).id }}/json"
+                method: GET
+
+          - id: compare
+            type: io.kestra.plugin.core.output.OutputValues
+            description: >-
+              Settled means the container is no longer running, its status is "exited" and its last
+              start predates the stop, so nothing has launched it again since. The restart count is
+              reported alongside, never tested: a container that kept flapping while a human left the
+              approval gate paused has a higher count at the end even though the stop worked.
+            values:
+              r: >-
+                {{ ({'before': fromJson(outputs.triage.values.targets),
+                     'after': ((outputs.verify.outputs ?? []) | jq('map(.outputs.after | fromjson)
+                                  | map({(.name): .}) | add // {}') | first),
+                     'stops': ((outputs.contain.outputs ?? []) | jq('map(.outputs.settle | fromjson)
+                                  | map({(.name): .at}) | add // {}') | first)} | toJson) | jq('
+                   .after as $a
+                   | .stops as $s
+                   | [ .before[] as $b
+                       | ($a[$b.name] // {status: "gone", restarts: $b.restarts, started: "99999999999999", running: false}) as $x
+                       | ($s[$b.name] // "00000000000000") as $stop
+                       | ($x.started < $stop) as $not_restarted
+                       | {name: $b.name, before: $b.restarts, after: $x.restarts, status: $x.status,
+                          running: $x.running, stopped_at: $stop, started_at: $x.started,
+                          reason: (if $x.running then "still running"
+                                   elif $x.status == "restarting" then "still restarting"
+                                   elif ($not_restarted | not) then "started again after the stop"
+                                   elif $x.status != "exited" then ("unexpected status " + $x.status)
+                                   else "stopped" end),
+                          settled: (($x.running | not) and ($x.status == "exited") and $not_restarted)} ]') | first | toJson }}
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ fromJson(outputs.compare.values.r) | jq('[.[] | select(.settled | not)] | length') | first > 0 }}"
+            then:
+              - id: still_restarting
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  Containment did not hold. {{ fromJson(outputs.compare.values.r) | jq('[.[] | select(.settled | not) | "\(.name) \(.reason), status \(.status), RestartCount \(.before) to \(.after)"] | join("; ")') | first }}.
+                  Something outside Kestra is starting these containers again, so stop that first.
+            else:
+              - id: contained
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Contained and verified:
+                  {{ fromJson(outputs.compare.values.r) | jq('map("\(.name) \(.reason), status \(.status), RestartCount \(.before) to \(.after), nothing has started it since the stop") | join("; ")') | first }}.
+                  The container is kept, not removed. Fix the image or the configuration, then start it again.
+        else:
+          - id: no_change
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Reported only, nothing stopped (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}).
+              Would stop: {{ fromJson(outputs.triage.values.targets) | jq('if length == 0 then "nothing" else (map(.name) | join(", ")) end') | first }}.
+    else:
+      - id: all_stable
+        type: io.kestra.plugin.core.log.Log
+        message: "All {{ fromJson(outputs.assess.values.rows) | length }} watched containers on {{ inputs.docker_host }} are stable: no restart delta, no OOM kill, no missing restart policy."
+
+  - id: record_baseline
+    type: io.kestra.plugin.core.kv.Set
+    description: >-
+      The RestartCount of every watched container, so the next run computes a delta instead of
+      reading a lifetime total. No TTL, because an expired baseline key would throw instead of
+      reading as absent.
+    key: "{{ inputs.baseline_key }}"
+    kvType: JSON
+    value: >-
+      {{ ({'rows': fromJson(outputs.assess.values.rows), 'at': outputs.window.values.observed_at} | toJson) | jq('
+         {observed_at: .at,
+          counts: (.rows | map({(.name): .restarts}) | add // {}),
+          ids: (.rows | map({(.name): .id}) | add // {})}') | first | toJson }}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: An unreachable daemon or a containment that did not hold must never read as a healthy host.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Docker restart loop sentinel failed on ' ~ inputs.docker_host ~ ' (execution ' ~ execution.id ~ '). The restart state of that host is unknown. A container may still be restarting after containment. Check the execution logs.'} | toJson }}
+
+triggers:
+  - id: every_fifteen_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: >-
+      Shipped disabled and in safe mode. The interval is also the detection window, because the
+      restart delta is measured against the previous run.
+    cron: "*/15 * * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Docker Container Restart Loop Sentinel
+  shortDescription: Detect containers stuck in a restart loop on a Docker host from the RestartCount delta, classify why they are dying, pull their last log lines, then stop them behind an approval gate and verify they settled.
+  metaTitle: Catch Docker Container Restart Loops with Kestra
+  metaDescription: Track the RestartCount delta per container on a Docker host, classify flapping, crash on start, OOM kills and missing restart policies, then contain it.
+  description: |
+    A container with `restart: always` that dies on startup goes into a loop. Docker restarts it, it dies, Docker restarts it. `docker ps` keeps showing it as "Up 2 seconds", so a health check that looks at the current state sees a running container and reports fine. The service is down. The restart churn burns CPU and floods the daemon log. On a plain Docker host, which is where most small deployments live, nothing is watching.
+
+    The signal is not the current state. It is `RestartCount` climbing over time. This blueprint reads it per container, keeps a baseline in Kestra KV then reports the delta since the previous run.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    Three things make a restart loop hard to see from the outside. Each one shaped a task in this flow.
+
+    - `GET /containers/json` carries no restart counter. The list that `docker ps` prints cannot tell you a container has restarted 40 times, which is why every container is inspected individually.
+    - A lifetime `RestartCount` is not a symptom. A container that restarted once during a host reboot last month reads the same as one restarting every 30 seconds. Only the delta between two observations separates them, so the previous counts live in a KV key.
+    - `State.OOMKilled` stays true on a container that was killed for memory and then came back. Stopping it would hide a memory problem that only a memory limit fixes, so an OOM kill is classified apart from a crash loop and is never a containment target.
+
+    ## Safety
+
+    - Read-only by default. `dry_run` is `true` and `auto_remediate` is `false`, so a first run only reports and records the baseline.
+    - The one write to the Docker host is a graceful stop. It sits behind a `Pause` that a human resumes.
+    - `protected_name_pattern` is an allowlist of containers this flow never stops. They are still reported.
+    - `delete: false` on the stop, so the container, its logs and its restart history survive for whoever fixes it.
+    - Containment is verified against the daemon. If a container is still restarting, the run fails.
+
+    ## How it works
+
+    1. `list_containers` (`io.kestra.plugin.core.http.Request`) reads `GET /containers/json?all=true` from the Docker Engine API. `watched` keeps the names matching `container_name_filter`.
+    2. `inspect_each` (`io.kestra.plugin.core.flow.Loop`, 4 at a time, read-only) inspects each of them and keeps `RestartCount`, `State.Status`, `State.ExitCode`, `State.Error`, `State.OOMKilled`, `State.StartedAt`, `State.FinishedAt`, `HostConfig.RestartPolicy` and `Config.Image`.
+    3. `window` reads the baseline from the KV key and computes the short-uptime cutoff. `assess` classifies every container:
+       - `OOM_KILLED`: the last exit was a recent out-of-memory kill. The fix is memory, not restarts.
+       - `FLAPPING`: `RestartCount` grew by at least `flap_threshold` since the previous run.
+       - `CRASH_ON_START`: at least one restart, a non-zero exit code, plus a status of `restarting` or a status of `running` with a current run shorter than `crash_uptime_seconds`. A container that is simply stopped is not reported, however it exited.
+       - `RESTART_POLICY_MISSING`: the name matches `important_name_pattern` but the policy is `no`, so it will not come back after a host reboot.
+       - `OK`: nothing of the above.
+    4. `summary` logs the counts and the timestamp the deltas are measured from.
+    5. `route` (`io.kestra.plugin.core.flow.If`) only continues when something is wrong. `fetch_logs` reads the last `log_tail_lines` of each failing container and strips the Engine API stream framing. `report` prints every finding with its log tail. `alert` posts the summary to Slack. `held_back_notice` names the containers that are flapping but on the allowlist.
+    6. `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false. `approval` (`io.kestra.plugin.core.flow.Pause`) waits for a human. `contain` (`io.kestra.plugin.docker.cli.Stop`, one at a time, `kill: false`, `delete: false`) stops each target.
+    7. `verify` inspects the targets again. `compare` pairs the `RestartCount` before and after. `verify_result` fails the run if any target is still running, still restarting or was started again after the stop.
+    8. `record_baseline` (`io.kestra.plugin.core.kv.Set`) stores this run's counts for the next delta.
+    9. `errors` posts to Slack, so an unreachable daemon never reads as a healthy host.
+
+    ## What you get
+
+    - A restart loop caught from the counter delta, not from a current state that lies.
+    - Four separate causes, each with a different fix, instead of one "container unhealthy" alert.
+    - The failing container's own last log lines in the report and in the execution history.
+    - Containment that a human approves, that keeps the evidence then gets checked against the daemon afterwards.
+
+    ## Who it's for
+
+    - Teams running services with Docker or Compose on plain hosts and VMs, with no Kubernetes to restart-loop for them.
+    - Platform teams operating build hosts, edge nodes or self-hosted CI runners where a looping container quietly eats the box.
+    - Anyone who has found a container that had been restarting for a week because the dashboard said "running".
+
+    ## Why orchestrate this with Kestra
+
+    The delta needs state between runs, which is what a cron script never has. Kestra keeps the previous counts in KV. It gates the one destructive action behind a `Pause` and a pair of inputs. It re-reads the daemon after the change and fails the run when the change did not hold. Every observation stays in the execution history with its log tail. That history is also the answer to "how long has this been looping", which is the first question anyone asks.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against an isolated `docker:27-dind` daemon (Docker 27.5.1), with a local HTTP echo container standing in for the Slack webhook. Seven containers were put into deliberate states inside that daemon: two crash loopers (one exits 3, one exits 5), one repeatedly killed by a 20 MB memory limit, one crash looper named to match the allowlist, one healthy long runner, one running container with policy `no`, one plain stopped container. Every number below was cross-checked with `docker inspect` against that daemon.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | filter `^app-web$`, `flap_threshold: 1` | 1 watched, `OK=1`, `all_stable`, baseline recorded. The CLI agreed: `restarts=0 status=running` |
+    | 2 | same threshold, crash looper added to the filter | `CRASH_ON_START=1, OK=1`. `restarts=16`, first observation, `Would stop: app-api`. The log tail carried `FATAL: config key DATABASE_URL missing` |
+    | 3 | same inputs 80 seconds later | `FLAPPING=1, OK=1` on `restarts=18 baseline=16 delta=2` |
+    | 4 | all seven containers, `flap_threshold: 1`, second observation | `FLAPPING=3, OK=2, OOM_KILLED=1, RESTART_POLICY_MISSING=1`. Each before and after pair matched `docker inspect -f '{{.RestartCount}}'` |
+    | 5 | `auto_remediate: true`, `dry_run: true` | reported `Would stop: app-ghost`, changed nothing. `docker inspect` 70 seconds later: `restarts=17 status=restarting running=true` |
+    | 6 | `auto_remediate: true`, `dry_run: false` | paused, resumed through the API, stopped it. Re-inspect: `RestartCount 72 to 72, status exited`. The CLI agreed: `status=exited running=false` |
+    | 7 | the same inputs again, after containment | `OK=1`, `all_stable`. A container that is simply stopped is not reported as a crash looper |
+    | 8 | a flapping container matching `protected_name_pattern` | reported, held back by name, never stopped |
+    | 9 | an outside supervisor started the container again right after the stop | `verify_result` failed the run with "still running, status running, RestartCount 11 to 0" and the `errors` block alerted |
+    | 10 | unreachable daemon | the flow failed on the first read and the `errors` block alerted |
+
+    ## Prerequisites
+
+    - A Docker Engine endpoint this flow can read. The Engine API has no bulk inspect call, so the reads go over HTTP, which means a TCP endpoint or a read-only socket proxy rather than a bare Unix socket. Keep it off any untrusted network: an open Docker API is root on that host.
+    - The `io.kestra.plugin.docker` plugin, for the one write.
+    - Local testing: `docker run -d --privileged --name dind -e DOCKER_TLS_CERTDIR= docker:27-dind --tls=false --host=tcp://0.0.0.0:2375`, then create a loop inside it with `docker run -d --restart always busybox sh -c 'exit 3'`. Point `docker_host` at `tcp://dind:2375`.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: used by `alert` and by the `errors` block. In Kestra OSS, provide it as the base64-encoded environment variable `SECRET_SLACK_WEBHOOK_URL`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `docker_host` | `tcp://docker-01:2375` | Docker daemon to watch |
+    | `container_name_filter` | `^.*$` | Containers watched |
+    | `important_name_pattern` | `^(api\|app\|svc\|web\|worker)-.*$` | Must survive a host reboot |
+    | `protected_name_pattern` | `^(kestra.*\|traefik.*\|.*-(db\|database\|cache\|proxy\|gateway))$` | Never stopped |
+    | `flap_threshold` | `3` | Restart delta that counts as flapping |
+    | `crash_uptime_seconds` | `120` | A run shorter than this is short-lived |
+    | `log_tail_lines` | `20` | Log lines pulled per failing container |
+    | `baseline_key` | `docker_restart_baseline` | KV key holding the previous counts |
+    | `auto_remediate` | `false` | Allow the stop |
+    | `dry_run` | `true` | Must be `false` for the stop to run |
+
+    ## Quick start
+
+    1. Add the `SLACK_WEBHOOK_URL` secret.
+    2. Import the flow, set `docker_host` then run it with the defaults. The first run only records the baseline, because a delta needs two observations.
+    3. Run it again. Now the report carries a restart delta per container.
+    4. Tighten `container_name_filter` and `important_name_pattern` to the containers that matter. Put your databases and proxies in `protected_name_pattern`.
+    5. Enable the `every_fifteen_minutes` trigger. Leave it in safe mode until the reports look right, then decide whether containment should be automatic.
+
+    ## How to extend
+
+    - Watch several hosts by giving each one its own execution and its own `baseline_key`, through a parent flow and `io.kestra.plugin.core.flow.Subflow`.
+    - Open an incident instead of posting to Slack, with the log tail as the description.
+    - Add a per-container restart budget by keeping a rolling window of deltas in the same KV key.
+    - Replace the stop with a rollback to the previously running image tag, after the approval gate.
+    - Feed the OOM findings into a memory limit review, since those need a limit change rather than containment.
+
+    ## Links
+
+    - Docker plugin: https://kestra.io/plugins/plugin-docker
+    - Docker Engine API, inspect a container: https://docs.docker.com/reference/api/engine/version/v1.47/#tag/Container/operation/ContainerInspect
+    - Docker restart policies: https://docs.docker.com/engine/containers/start-containers-automatically/
+    - Kestra KV store: https://kestra.io/docs/concepts/kv-store
+  tags:
+    - Infrastructure
+  subTags:
+    - Docker
+    - Monitoring
+    - Incident Response
+  ee: false
+  demo: false
