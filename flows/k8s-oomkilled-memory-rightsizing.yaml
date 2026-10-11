@@ -1,0 +1,426 @@
+id: k8s-oomkilled-memory-rightsizing
+namespace: company.team
+description: |
+  Every 15 minutes, find containers that were OOMKilled since the last run,
+  recommend a higher memory limit for each Deployment or StatefulSet, ask a
+  human to approve the resizes in Kestra, then patch each workload and wait
+  for the rollout. Slack is told at every step.
+
+inputs:
+  - id: namespace
+    type: STRING
+    defaults: default
+    description: Kubernetes namespace to watch.
+
+  - id: lookback
+    type: DURATION
+    defaults: PT1H
+    description: How far back to look on the first run, before a checkpoint exists in the KV store.
+
+  - id: growth_factor
+    type: FLOAT
+    defaults: 1.5
+    description: Multiplier applied to the current memory limit to get the recommendation.
+
+  - id: max_memory_limit
+    type: STRING
+    defaults: 4Gi
+    description: Upper bound for any recommendation. Workloads already at this limit are flagged as a likely leak instead of resized.
+
+  - id: rollout_service_account
+    type: STRING
+    defaults: oom-watchdog
+    description: ServiceAccount in the watched namespace used by the pod that runs `kubectl rollout status`.
+
+  - id: kubectl_image
+    type: STRING
+    defaults: bitnami/kubectl:latest
+    description: Image with kubectl, used to wait for the rollout after a patch.
+
+tasks:
+  - id: last_check
+    type: io.kestra.plugin.core.kv.Get
+    description: Timestamp of the previous scan, so each OOM kill is reported once.
+    key: "oom_watchdog_last_check_{{ inputs.namespace }}"
+    errorOnMissing: false
+
+  - id: get_pods
+    type: io.kestra.plugin.kubernetes.kubectl.Get
+    description: List every pod in the namespace with its status (container states, restart counts, limits).
+    namespace: "{{ inputs.namespace }}"
+    resourceType: pods
+    fetchType: FETCH
+
+  - id: find_oom_kills
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Keep containers whose last termination was OOMKilled after the checkpoint,
+      group them by owning workload and compute the recommended memory limit.
+    containerImage: python:3.13-slim
+    inputFiles:
+      pods.json: "{{ outputs.get_pods | toJson }}"
+    env:
+      LAST_CHECK: "{{ outputs.last_check.value ?? '' }}"
+      LOOKBACK: "{{ inputs.lookback }}"
+      GROWTH_FACTOR: "{{ inputs.growth_factor }}"
+      MAX_MEMORY_LIMIT: "{{ inputs.max_memory_limit }}"
+    script: |
+      import json
+      import math
+      import os
+      import re
+      from datetime import datetime, timedelta, timezone
+
+      UNITS = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40,
+               "k": 10**3, "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12, "": 1}
+      QUANTITY = re.compile(r"^([0-9.]+)(Ki|Mi|Gi|Ti|k|K|M|G|T)?$")
+      DURATION = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$")
+      STEP_MIB = 64
+
+
+      def to_bytes(quantity):
+          match = QUANTITY.match(str(quantity or "").strip())
+          if not match:
+              return None
+          return int(float(match.group(1)) * UNITS[match.group(2) or ""])
+
+
+      def to_quantity(n_bytes):
+          # Round up to a multiple of 64Mi so limits stay readable.
+          mib = math.ceil(n_bytes / 2**20 / STEP_MIB) * STEP_MIB
+          return f"{mib // 1024}Gi" if mib % 1024 == 0 else f"{mib}Mi"
+
+
+      def parse_time(value):
+          return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+      def parse_duration(value):
+          # Kestra renders DURATION inputs as seconds (3600.0); ISO 8601 is accepted too.
+          match = DURATION.match(value)
+          if match is None:
+              return timedelta(seconds=float(value))
+          days, hours, minutes, seconds = (int(g or 0) for g in match.groups())
+          return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+
+
+      def owner(meta):
+          refs = meta.get("ownerReferences") or []
+          ref = next((r for r in refs if r.get("controller")), refs[0] if refs else None)
+          if ref is None:
+              return "Pod", meta["name"]
+          if ref["kind"] == "ReplicaSet":
+              # A Deployment's ReplicaSet is named <deployment>-<pod-template-hash>.
+              pod_hash = (meta.get("labels") or {}).get("pod-template-hash")
+              if pod_hash and ref["name"].endswith("-" + pod_hash):
+                  return "Deployment", ref["name"][: -len(pod_hash) - 1]
+          return ref["kind"], ref["name"]
+
+
+      with open("pods.json") as f:
+          pods = json.load(f)
+
+      now = datetime.now(timezone.utc)
+      since = parse_time(os.environ.get("LAST_CHECK")) or now - parse_duration(os.environ["LOOKBACK"])
+      growth = float(os.environ["GROWTH_FACTOR"])
+      max_limit_text = os.environ["MAX_MEMORY_LIMIT"]
+      max_limit = to_bytes(max_limit_text)
+
+      workloads = {}
+      for meta, status in zip(pods.get("metadataItems") or [], pods.get("statusItems") or []):
+          container_statuses = ((status or {}).get("status") or {}).get("containerStatuses") or []
+          for container in container_statuses:
+              terminated = ((container.get("lastState") or {}).get("terminated")
+                            or (container.get("state") or {}).get("terminated") or {})
+              finished = parse_time(terminated.get("finishedAt"))
+              if terminated.get("reason") != "OOMKilled" or finished is None or finished <= since:
+                  continue
+
+              kind, name = owner(meta)
+              entry = workloads.setdefault((kind, name, container["name"]), {
+                  "kind": kind,
+                  "resourceType": kind.lower(),
+                  "workload": name,
+                  "container": container["name"],
+                  "pods": [],
+                  "restarts": 0,
+                  "lastOomAt": "",
+                  "currentLimit": ((container.get("resources") or {}).get("limits") or {}).get("memory"),
+              })
+              entry["pods"].append(meta["name"])
+              entry["restarts"] += container.get("restartCount", 0)
+              entry["lastOomAt"] = max(entry["lastOomAt"], terminated["finishedAt"])
+
+      candidates = []
+      for entry in workloads.values():
+          current = to_bytes(entry["currentLimit"])
+          entry["recommendedLimit"] = None
+          if entry["kind"] not in ("Deployment", "StatefulSet"):
+              entry["action"] = "manual"
+              entry["note"] = f"{entry['kind']} workloads are not patched automatically."
+          elif current is None:
+              entry["action"] = "manual"
+              entry["note"] = ("No memory limit found in the pod status. Kubernetes 1.33+ reports it there; "
+                               "otherwise set the limit by hand.")
+          elif current >= max_limit:
+              entry["action"] = "investigate"
+              entry["note"] = (f"Already at the {max_limit_text} cap, so this is more likely a memory leak "
+                               "than an undersized limit.")
+          else:
+              entry["action"] = "resize"
+              entry["recommendedLimit"] = to_quantity(min(current * growth, max_limit))
+              entry["note"] = f"Recommended: raise the limit from {entry['currentLimit']} to {entry['recommendedLimit']}."
+          candidates.append(entry)
+
+      candidates.sort(key=lambda c: c["restarts"], reverse=True)
+      for c in candidates:
+          print(f"{c['kind']}/{c['workload']} container={c['container']} restarts={c['restarts']} "
+                f"limit={c['currentLimit']} action={c['action']}")
+      resizes = [c for c in candidates if c["action"] == "resize"]
+      print("::" + json.dumps({"outputs": {
+          "candidates": candidates,
+          "count": len(candidates),
+          "resizes": resizes,
+          "resizeCount": len(resizes),
+      }}) + "::")
+
+  - id: save_checkpoint
+    type: io.kestra.plugin.core.kv.Set
+    description: Move the checkpoint forward now, so a long approval wait does not cause the next run to report the same OOM kills again.
+    key: "oom_watchdog_last_check_{{ inputs.namespace }}"
+    value: "{{ execution.startDate }}"
+
+  - id: handle_oom_kills
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.find_oom_kills.vars.count > 0 }}"
+    then:
+      - id: notify_oom
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: One message per scan listing every affected workload and what the flow recommends.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":rotating_light: {{ outputs.find_oom_kills.vars.count }} OOMKilled container(s) in `{{ inputs.namespace }}`.{% for c in outputs.find_oom_kills.vars.candidates %}\n• {{ c.kind }} `{{ c.workload }}`, container `{{ c.container }}`: {{ c.restarts }} restarts, limit {{ c.currentLimit ?? 'none' }}. {{ c.note }}{% endfor %}{% if outputs.find_oom_kills.vars.resizeCount > 0 %}\nApprove or reject the resize: {{ kestra.url ?? 'http://localhost:8080/' }}ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}{% endif %}"
+          }
+
+      - id: resize_if_recommended
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.find_oom_kills.vars.resizeCount > 0 }}"
+        then:
+          - id: approve_resize
+            type: io.kestra.plugin.core.flow.Pause
+            description: One decision covers every resize recommended in this scan. If nobody answers within 24 hours, the default (reject) applies.
+            pauseDuration: PT24H
+            behavior: RESUME
+            onResume:
+              - id: decision
+                type: SELECT
+                values:
+                  - approve
+                  - reject
+                defaults: reject
+                description: Apply the recommended memory limits or keep the current ones.
+
+          - id: apply_if_approved
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.approve_resize.onResume.decision ?? 'reject') == 'approve' }}"
+            then:
+              - id: each_resize
+                type: io.kestra.plugin.core.flow.Loop
+                description: Patch one workload at a time and wait for its rollout before moving to the next.
+                values: "{{ outputs.find_oom_kills.vars.resizes }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: patch_memory_limit
+                    type: io.kestra.plugin.kubernetes.kubectl.Patch
+                    description: Strategic merge patch on the pod template, matched by container name.
+                    namespace: "{{ inputs.namespace }}"
+                    resourceType: "{{ fromJson(item.value).resourceType }}"
+                    resourceName: "{{ fromJson(item.value).workload }}"
+                    apiGroup: apps
+                    patch: |
+                      {
+                        "spec": {
+                          "template": {
+                            "spec": {
+                              "containers": [
+                                {
+                                  "name": "{{ fromJson(item.value).container }}",
+                                  "resources": {
+                                    "limits": {
+                                      "memory": "{{ fromJson(item.value).recommendedLimit }}"
+                                    }
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+
+                  - id: wait_for_rollout
+                    type: io.kestra.plugin.kubernetes.core.PodCreate
+                    description: Run `kubectl rollout status` inside the cluster so the flow only succeeds once the new pods are ready.
+                    namespace: "{{ inputs.namespace }}"
+                    waitRunning: PT10M
+                    spec:
+                      serviceAccountName: "{{ inputs.rollout_service_account }}"
+                      restartPolicy: Never
+                      containers:
+                        - name: rollout-status
+                          image: "{{ inputs.kubectl_image }}"
+                          command:
+                            - kubectl
+                            - rollout
+                            - status
+                            - "{{ fromJson(item.value).resourceType }}/{{ fromJson(item.value).workload }}"
+                            - "--namespace={{ inputs.namespace }}"
+                            - --timeout=5m
+
+                  - id: notify_resized
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    payload: |
+                      {
+                        "text": ":white_check_mark: {{ fromJson(item.value).kind }} `{{ fromJson(item.value).workload }}`: memory limit of `{{ fromJson(item.value).container }}` raised from {{ fromJson(item.value).currentLimit }} to {{ fromJson(item.value).recommendedLimit }}. Rollout complete."
+                      }
+            else:
+              - id: notify_kept
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "text": ":no_entry_sign: Resize in `{{ inputs.namespace }}` was rejected or timed out. Limits stay as they are:{% for c in outputs.find_oom_kills.vars.resizes %}\n• {{ c.kind }} `{{ c.workload }}` / `{{ c.container }}`: {{ c.currentLimit }}{% endfor %}"
+                  }
+    else:
+      - id: nothing_to_do
+        type: io.kestra.plugin.core.log.Log
+        message: "No new OOMKilled containers in {{ inputs.namespace }} since {{ outputs.last_check.value ?? ('the last ' ~ inputs.lookback) }}."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":x: OOM watchdog for `{{ inputs.namespace }}` failed (execution {{ execution.id }}). Check the patch and the rollout in Kestra."
+      }
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+pluginDefaults:
+  - type: io.kestra.plugin.kubernetes
+    values:
+      connection:
+        masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+        caCertData: "{{ secret('K8S_CA_CERT_DATA') }}"
+        oauthToken: "{{ secret('K8S_OAUTH_TOKEN') }}"
+
+extend:
+  title: Kubernetes OOMKilled Watchdog with Approval-Gated Memory Right-Sizing
+  shortDescription: Detect OOMKilled containers, recommend a higher memory limit, and patch the workload after a human approves it.
+  metaTitle: Kubernetes OOMKilled Watchdog and Memory Right-Sizing with Kestra
+  metaDescription: Detect OOMKilled Kubernetes containers, recommend a new memory limit, and patch the Deployment or StatefulSet after approval, with Slack updates.
+  description: |
+    Containers that are OOMKilled restart quietly, and the usual fix (raising the memory limit) waits until someone notices the CrashLoopBackOff. This flow finds every OOM kill in a namespace, works out which Deployment or StatefulSet owns it, recommends a new limit, and applies it only after a human approves. Each step is posted to Slack.
+
+    ## How it works
+    1. `every_15_minutes` (`io.kestra.plugin.core.trigger.Schedule`) runs the scan. `last_check` (`io.kestra.plugin.core.kv.Get`) reads the timestamp of the previous scan from the KV store, so each OOM kill is reported once.
+    2. `get_pods` (`io.kestra.plugin.kubernetes.kubectl.Get`) lists the pods in the namespace with their status.
+    3. `find_oom_kills` (`io.kestra.plugin.scripts.python.Script`) keeps containers whose last termination reason is `OOMKilled` after the checkpoint. It resolves the owner (a Deployment through its ReplicaSet, or a StatefulSet), reads the current limit from the container status, and recommends `current limit × growth_factor`, rounded up to 64Mi and capped at `max_memory_limit`.
+    4. `save_checkpoint` (`io.kestra.plugin.core.kv.Set`) moves the checkpoint forward before any approval wait.
+    5. `notify_oom` posts one Slack message listing every affected workload with its recommendation, and a link to the execution when a resize is recommended.
+    6. `approve_resize` (`io.kestra.plugin.core.flow.Pause`) waits up to 24 hours for `approve` or `reject`. One decision covers every resize recommended in that scan. No answer means reject, and `notify_kept` says so in Slack.
+    7. On approval, `each_resize` (`io.kestra.plugin.core.flow.Loop`) goes through the workloads one at a time: `patch_memory_limit` (`io.kestra.plugin.kubernetes.kubectl.Patch`) applies a strategic merge patch to the container's `resources.limits.memory`, and `wait_for_rollout` (`io.kestra.plugin.kubernetes.core.PodCreate`) runs `kubectl rollout status` inside the cluster until the new pods are ready.
+    8. Workloads that are not Deployments or StatefulSets (Jobs, DaemonSets, bare pods), or that already sit at `max_memory_limit`, are reported but never patched. Hitting the cap usually means a leak, not an undersized limit.
+
+    ## Prerequisites
+    - Kestra 2.0 or later, for the `Loop` task.
+    - Kubernetes 1.33 or later. The flow reads the current limit from `status.containerStatuses[].resources`, which is populated from 1.33 on. On older clusters, workloads are reported with action `manual`.
+    - A Kestra worker that can run Docker containers (for `find_oom_kills`).
+    - RBAC for the identity behind `K8S_OAUTH_TOKEN`, in the watched namespace: `get`/`list` on `pods`, `patch` on `deployments` and `statefulsets`, and `create`/`get`/`list`/`watch`/`delete` on `pods` plus `get` on `pods/log` (for `PodCreate`).
+    - A ServiceAccount (default `oom-watchdog`) in the watched namespace for the rollout check, with `get`/`list`/`watch` on `deployments`, `statefulsets`, `replicasets` and `pods`:
+
+      ```yaml
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: oom-watchdog
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: oom-watchdog-rollout-status
+      rules:
+        - apiGroups: ["apps"]
+          resources: ["deployments", "statefulsets", "replicasets"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "watch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: oom-watchdog-rollout-status
+      subjects:
+        - kind: ServiceAccount
+          name: oom-watchdog
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: oom-watchdog-rollout-status
+      ```
+
+    ### Secrets
+    - `K8S_MASTER_URL`: Kubernetes API server URL.
+    - `K8S_CA_CERT_DATA`: cluster CA certificate.
+    - `K8S_OAUTH_TOKEN`: token for the RBAC permissions above.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for notifications.
+
+    If Kestra runs inside the cluster or has a kubeconfig, you can remove `pluginDefaults` and the Kubernetes tasks use that configuration instead.
+
+    ### Inputs
+    - `namespace` (STRING, default `default`): namespace to watch.
+    - `lookback` (DURATION, default `PT1H`): window for the first run, before a checkpoint exists.
+    - `growth_factor` (FLOAT, default `1.5`): multiplier for the recommendation.
+    - `max_memory_limit` (STRING, default `4Gi`): cap for recommendations.
+    - `rollout_service_account` (STRING, default `oom-watchdog`): ServiceAccount for the rollout check.
+    - `kubectl_image` (STRING, default `bitnami/kubectl:latest`): image used for `kubectl rollout status`.
+
+    ### Outputs
+    - `outputs.find_oom_kills.vars.candidates`: one entry per affected workload and container, with `kind`, `workload`, `container`, `pods`, `restarts`, `currentLimit`, `recommendedLimit`, `action` (`resize`, `manual` or `investigate`) and `note`.
+    - `outputs.find_oom_kills.vars.count`: number of entries.
+    - `outputs.find_oom_kills.vars.resizes` and `resizeCount`: the entries with action `resize`, which are the ones patched after approval.
+
+    ## Quick start
+    1. Add the secrets above and apply the ServiceAccount manifest in the watched namespace.
+    2. Import the flow and run it once manually to see the current OOM kills.
+    3. Open the paused execution from the Slack link, click Resume and pick `approve`.
+    4. Leave the schedule on so new OOM kills are picked up every 15 minutes.
+
+    ## Common pitfalls
+    - Approval is all or nothing for a scan. To skip one workload, reject and change the others by hand, or extend the flow as described below.
+    - The first run reports OOM kills from the last `lookback` window. Later runs only report what happened since the previous run.
+    - `kubectl rollout status` fails if the new limit is still too small and the pods keep crashing. The flow then fails and `notify_failure` posts to Slack.
+    - If the workload is managed by GitOps (Argo CD, Flux), the patch will be reverted on the next sync. Change the limit in Git instead, or extend the flow to open a pull request.
+
+    ## How to extend
+    - Use peak memory from Prometheus (`container_memory_working_set_bytes`) instead of a fixed growth factor.
+    - Watch several namespaces by wrapping the scan in a `Loop`.
+    - Add a per-workload decision, or a limit override, as extra `onResume` inputs on `approve_resize`.
+    - Open a pull request against your GitOps repository instead of patching the cluster directly.
+
+    ## Links
+    - Kubernetes plugin: https://kestra.io/plugins/plugin-kubernetes
+    - Pause task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause
+    - Python Script task: https://kestra.io/plugins/plugin-script-python
+    - Slack plugin: https://kestra.io/plugins/plugin-slack
+    - Kubernetes container status resources: https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/
+  tags:
+    - Infrastructure
+  ee: false
+  demo: false
