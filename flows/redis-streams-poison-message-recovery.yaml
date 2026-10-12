@@ -1,0 +1,371 @@
+id: redis-streams-poison-message-recovery
+namespace: company.team
+description: |
+  Inspect a Redis Streams consumer group's Pending Entries List for messages that are both idle
+  and repeatedly delivered. An approved run moves each poison payload into a Redis hash keyed
+  by its original stream ID, then acknowledges the original message. The hash write is
+  idempotent, so a retry after a failed acknowledgement cannot create a second quarantine
+  record. Fresh work and messages below the attempt threshold remain pending for normal workers.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: recovery_request
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: redis-poison-recovery-change-me
+    description: "POST /api/v1/main/executions/webhook/company.team/redis-streams-poison-message-recovery/redis-poison-recovery-change-me after an operator inspects a consumer alert."
+  - id: disabled_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    disabled: true
+    description: Enable only after tuning the idle and attempt thresholds for the worker's maximum processing time.
+
+inputs:
+  - id: stream
+    type: STRING
+    defaults: orders
+    description: Stream whose pending entries are examined; use a dedicated group and keep the name free of whitespace.
+  - id: group
+    type: STRING
+    defaults: g1
+    description: Existing consumer group; the flow never creates or deletes a group or consumer.
+  - id: quarantine_hash
+    type: STRING
+    defaults: orders:g1:quarantine
+    description: Redis hash that durably stores one JSON record per original stream ID before XACK.
+  - id: rescue_consumer
+    type: STRING
+    defaults: poison-review
+    description: Consumer name used by XAUTOCLAIM JUSTID; no worker should process under this name.
+  - id: min_idle_ms
+    type: INT
+    defaults: 900000
+    description: Minimum pending idle time in milliseconds; set above the longest legitimate handler runtime.
+  - id: max_deliveries
+    type: INT
+    defaults: 5
+    description: Quarantine only entries with at least this many previous deliveries, so one retry is not treated as poison.
+  - id: batch_count
+    type: INT
+    defaults: 25
+    description: Maximum idle PEL rows to inspect and maximum entries to quarantine in one run; use start_id to page.
+  - id: start_id
+    type: STRING
+    defaults: "-"
+    description: XPENDING lower bound, or an exclusive bound such as (1700000000000-0 from the previous next_start output.
+  - id: host
+    type: STRING
+    defaults: redis-poison
+    description: Redis hostname visible from the RedisCLI task container.
+  - id: port
+    type: INT
+    defaults: 6379
+    description: Redis TCP port visible from the RedisCLI task container.
+  - id: database
+    type: INT
+    defaults: 0
+    description: Redis logical database containing the source stream and quarantine hash.
+  - id: network
+    type: STRING
+    defaults: redis-poison-net
+    description: Docker network shared by Redis and the RedisCLI task containers.
+  - id: apply
+    type: BOOL
+    defaults: false
+    description: Request quarantine; a human approval is still required, and dry_run must also be false.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Keep true while evaluating thresholds; false plus apply and approval permits the hash write and XACK.
+  - id: approval_timeout
+    type: STRING
+    defaults: PT2H
+    description: ISO-8601 duration after which an unanswered approval expires and the run fails without changing Redis.
+
+variables:
+  inspect_lua: |
+    local stream = KEYS[1]
+    local group = ARGV[1]
+    local idle = tonumber(ARGV[2])
+    local attempts = tonumber(ARGV[3])
+    local count = tonumber(ARGV[4])
+    local start = ARGV[5]
+    local summary = redis.call('XPENDING', stream, group)
+    local rows = redis.call('XPENDING', stream, group, 'IDLE', idle, start, '+', count)
+    local candidates = {}
+    local ids = {}
+    for _, row in ipairs(rows) do
+      ids[#ids + 1] = row[1]
+      if tonumber(row[4]) >= attempts then
+        candidates[#candidates + 1] = { id = row[1], owner = row[2], idle_ms = row[3], deliveries = row[4] }
+      end
+    end
+    local next_start = start
+    if #rows > 0 then next_start = '(' .. rows[#rows][1] end
+    return cjson.encode({ pending_total = summary[1], scanned = #rows, scanned_ids = ids,
+      poison_count = #candidates, candidates = candidates, next_start = next_start })
+
+  quarantine_lua: |
+    local function hex(value)
+      return (string.gsub(value, '.', function(c) return string.format('%02x', string.byte(c)) end))
+    end
+    local stream = KEYS[1]
+    local quarantine = KEYS[2]
+    local group = ARGV[1]
+    local rescue = ARGV[2]
+    local idle = tonumber(ARGV[3])
+    local attempts = tonumber(ARGV[4])
+    local approved_csv = ARGV[5]
+    if redis.call('TYPE', quarantine).ok ~= 'none' and redis.call('TYPE', quarantine).ok ~= 'hash' then
+      return redis.error_reply('quarantine key must be a hash')
+    end
+    local moved = {}
+    local existing = {}
+    local missing = {}
+    local skipped = {}
+    local approved = {}
+    for id in string.gmatch(approved_csv, '[^,]+') do approved[#approved + 1] = id end
+    for _, id in ipairs(approved) do
+      local rows = redis.call('XPENDING', stream, group, 'IDLE', idle, id, id, 1)
+      if #rows == 0 then
+        skipped[#skipped + 1] = id
+      else
+      local row = rows[1]
+      local id = row[1]
+      if tonumber(row[4]) >= attempts then
+        local payload = redis.call('XRANGE', stream, id, id, 'COUNT', 1)
+        if #payload == 0 then
+          missing[#missing + 1] = id
+        else
+          local prior = redis.call('HGET', quarantine, id)
+          if prior then
+            local ok, record = pcall(cjson.decode, prior)
+            if not ok or record.source_stream ~= stream or record.source_group ~= group or record.source_id ~= id then
+              return redis.error_reply('quarantine field exists with incompatible content for ' .. id)
+            end
+          end
+          local claimed = redis.call('XAUTOCLAIM', stream, group, rescue, idle, id, 'COUNT', 1, 'JUSTID')
+          if #claimed[2] ~= 1 or claimed[2][1] ~= id then
+            return redis.error_reply('XAUTOCLAIM did not return inspected id ' .. id)
+          end
+          if not prior then
+            local fields_hex = {}
+            for _, field in ipairs(payload[1][2]) do fields_hex[#fields_hex + 1] = hex(field) end
+            local record = cjson.encode({ source_stream = stream, source_group = group,
+              source_id = id, delivery_count = row[4], field_encoding = 'hex', fields_hex = fields_hex })
+            local wrote = redis.call('HSETNX', quarantine, id, record)
+            if wrote ~= 1 then return redis.error_reply('quarantine write not confirmed for ' .. id) end
+            moved[#moved + 1] = id
+          else
+            existing[#existing + 1] = id
+          end
+          local acked = redis.call('XACK', stream, group, id)
+          if acked ~= 1 then return redis.error_reply('XACK not confirmed for ' .. id) end
+        end
+      else
+        skipped[#skipped + 1] = id
+      end
+      end
+    end
+    local after = redis.call('XPENDING', stream, group)
+    return cjson.encode({ approved = #approved, new_quarantine = #moved,
+      newly_quarantined_ids = moved, recovered_existing = #existing, recovered_ids = existing,
+      missing_payload_count = #missing, missing_payload_ids = missing, skipped_ids = skipped,
+      pending_after = after[1],
+      quarantine_fields = redis.call('HLEN', quarantine) })
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Reject unsafe CLI arguments, a self-overwriting destination, and unbounded scans before Redis is contacted.
+    values:
+      valid: >-
+        {{ {'stream': inputs.stream, 'group': inputs.group, 'hash': inputs.quarantine_hash,
+             'consumer': inputs.rescue_consumer, 'start': inputs.start_id,
+             'idle': inputs.min_idle_ms, 'attempts': inputs.max_deliveries,
+             'count': inputs.batch_count, 'port': inputs.port, 'db': inputs.database} | toJson | jq('
+          (.stream | test("^[A-Za-z0-9:_-]+$")) and
+          (.group | test("^[A-Za-z0-9:_-]+$")) and
+          (.hash | test("^[A-Za-z0-9:_-]+$")) and
+          (.consumer | test("^[A-Za-z0-9:_-]+$")) and
+          (.hash != .stream) and
+          (.start == "-" or (.start | test("^[0-9]+-[0-9]+$")) or (.start | test("^[(][0-9]+-[0-9]+$"))) and
+          (.idle >= 0 and .attempts >= 2 and .count >= 1 and .count <= 100 and .port >= 1 and .port <= 65535 and .db >= 0)
+        ') | first }}
+
+  - id: reject_invalid_inputs
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs.validate_inputs.values.valid | trim) != 'true' }}"
+    then:
+      - id: fail_invalid_inputs
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Invalid Redis scope or bounds. Use simple stream/group/hash/consumer names, distinct source and hash, 1–100 rows, and at least 2 deliveries."
+
+  - id: inspect_pending
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: Read XPENDING with an idle filter and bounded count; do not change ownership or ACK anything.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    inputFiles:
+      inspect.lua: "{{ vars.inspect_lua }}"
+    commands:
+      - "--eval inspect.lua {{ inputs.stream }} , {{ inputs.group }} {{ inputs.min_idle_ms }} {{ inputs.max_deliveries }} {{ inputs.batch_count }} {{ inputs.start_id }}"
+    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+  - id: log_findings
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Redis stream {{ inputs.stream }} group {{ inputs.group }}: {{ fromJson(outputs.inspect_pending.vars.command_1).scanned }}
+      idle rows inspected, {{ fromJson(outputs.inspect_pending.vars.command_1).poison_count }} poison candidates.
+      Candidate IDs: {{ fromJson(outputs.inspect_pending.vars.command_1).candidates | jq('map(.id) | join(", ")') | first }}.
+      Quarantine destination: {{ inputs.quarantine_hash }}.
+      No entries change unless apply=true, dry_run=false and approval is granted.
+
+  - id: route_candidates
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.inspect_pending.vars.command_1).poison_count > 0 and inputs.apply and not inputs.dry_run }}"
+    then:
+      - id: approve_quarantine
+        type: io.kestra.plugin.core.flow.Pause
+        description: Approve moving only still-idle poison entries to the quarantine hash and then acknowledging them.
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        behavior: FAIL
+        onResume:
+          - id: approved
+            type: BOOL
+            description: Confirm the quarantine hash and source group before acknowledging poison entries.
+
+      - id: apply_approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_quarantine.onResume.approved }}"
+        then:
+          - id: quarantine_poison
+            type: io.kestra.plugin.redis.cli.RedisCLI
+            description: Re-read the bounded PEL, XAUTOCLAIM JUSTID, HSETNX the original-ID payload, then XACK only after the hash field exists.
+            host: "{{ inputs.host }}"
+            port: "{{ inputs.port }}"
+            database: "{{ inputs.database }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: "{{ inputs.network }}"
+            inputFiles:
+              quarantine.lua: "{{ vars.quarantine_lua }}"
+            commands:
+              - "--eval quarantine.lua {{ inputs.stream }} {{ inputs.quarantine_hash }} , {{ inputs.group }} {{ inputs.rescue_consumer }} {{ inputs.min_idle_ms }} {{ inputs.max_deliveries }} {{ fromJson(outputs.inspect_pending.vars.command_1).candidates | jq('map(.id) | join(\",\")') | first }}"
+            retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+          - id: verify_quarantine
+            type: io.kestra.plugin.core.flow.If
+            description: A deleted or trimmed payload cannot be copied, so leave its pending ID visible and fail loudly.
+            condition: "{{ fromJson(outputs.quarantine_poison.vars.command_1).missing_payload_count > 0 }}"
+            then:
+              - id: fail_missing_payload
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "One or more poison IDs have no stream payload. Inspect {{ inputs.stream }}/{{ inputs.group }} XPENDING and compare with {{ inputs.quarantine_hash }}; no missing ID was ACKed."
+
+          - id: notify_quarantine
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ fromJson(outputs.quarantine_poison.vars.command_1).new_quarantine > 0 }}"
+            then:
+              - id: notify_operator
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: >-
+                  Redis Streams poison recovery: {{ fromJson(outputs.quarantine_poison.vars.command_1).new_quarantine }}
+                  entries from {{ inputs.stream }}/{{ inputs.group }} were stored in {{ inputs.quarantine_hash }}
+                  by original ID, then XACKed. Review each hash field with HGET before redriving.
+                retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+errors:
+  - id: alert_recovery_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Redis Streams poison recovery {{ execution.id }} failed in input validation, Redis inspection,
+      approval, or quarantine verification. Open the execution to identify the failing task.
+      Compare XPENDING {{ inputs.stream }} {{ inputs.group }} with HGETALL {{ inputs.quarantine_hash }}
+      before retrying; a hash record may already exist even if its XACK was interrupted.
+
+outputs:
+  - id: inspection
+    type: JSON
+    value: "{{ fromJson(outputs.inspect_pending.vars.command_1 ?? '{}') }}"
+  - id: quarantine
+    type: JSON
+    value: "{{ fromJson(outputs.quarantine_poison.vars.command_1 ?? '{}') }}"
+
+extend:
+  title: Quarantine Redis Streams Poison Messages After Repeated Delivery
+  shortDescription: Inspect idle pending entries and, with approval, durably quarantine repeated failures before acknowledging them.
+  metaTitle: Redis Streams Poison Message Recovery with Kestra
+  metaDescription: Safely quarantine repeatedly delivered Redis Streams entries by original ID; XACK follows a durable, idempotent hash write.
+  description: |
+    A worker crash can leave a Redis Stream entry pending, while a poison payload can fail every
+    delivery. This flow handles the second case: entries already retried enough times. It checks
+    idle time and delivery count, then stores the original fields in a Redis hash before XACK.
+    It does not delete consumers or promise exactly-once business processing.
+
+    ## How it works
+    1. `validate_inputs` rejects unsafe CLI arguments and unbounded scans.
+    2. `inspect_pending` calls bounded `XPENDING IDLE`; `log_findings` records candidate IDs and counts.
+    3. `route_candidates` (`If`) requires `apply=true`, `dry_run=false`, and candidates. A `Pause` asks for approval.
+    4. `quarantine_poison` rechecks the live PEL, uses `XAUTOCLAIM JUSTID`, writes one hash field per original ID with `HSETNX`, then calls `XACK` only after the field exists.
+    5. `verify_quarantine` fails if a pending ID has no source payload. `notify_quarantine` sends one actionable Slack alert for newly stored entries.
+
+    ## Error handling
+    - RedisCLI retries connection failures with exponential backoff, and `errors` names the execution and cause.
+    - The Lua handoff is isolated from other clients. If a failure occurs after `HSETNX` but before `XACK`, the next run verifies the original-ID record and finishes the ACK without writing a second record.
+    - A missing payload is never ACKed by this flow. Inspect it manually because Redis may already have trimmed or deleted it.
+    - The batch is bounded to 100 inspected rows. Approval is bound to the inspected IDs; a late approval rechecks each ID and its thresholds before any write.
+
+    ## What this blueprint teaches about Kestra
+    Combine a read-only plan, `If` and `Pause` approval gate, and a RedisCLI Lua handoff that keeps message state recoverable across retries. A disabled Schedule can be enabled after tuning the thresholds; the Webhook allows on-call to request an immediate review.
+
+    ## Prerequisites
+    Redis 7 or later with a stream and consumer group; `redis-cli` Docker tasks must reach it. The Redis role needs `XPENDING`, `XRANGE`, `XAUTOCLAIM`, `HGET`, `HSETNX`, `HLEN`, and `XACK`. Configure the Slack webhook secret. For protected Redis, add `password: "{{ secret('REDIS_PASSWORD') }}"` to both RedisCLI tasks.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: operator alert destination; pass as a Kestra secret, never a flow input.
+    - `REDIS_PASSWORD` (optional): Redis password when enabling authentication on both CLI tasks.
+
+    ### Inputs
+    - `stream=orders`, `group=g1`: source stream and existing group.
+    - `quarantine_hash=orders:g1:quarantine`: hash where each source ID maps to JSON with hex-encoded original fields and delivery count.
+    - `rescue_consumer=poison-review`: owner used only while claiming a poison ID for quarantine.
+    - `min_idle_ms=900000`, `max_deliveries=5`: thresholds; tune above normal processing time and expected retries.
+    - `batch_count=25`, `start_id=-`: bounded page through idle PEL entries; pass the returned `next_start` for the next page.
+    - `host=redis-poison`, `port=6379`, `database=0`, `network=redis-poison-net`: connection and Docker network.
+    - `apply=false`, `dry_run=true`, `approval_timeout=PT2H`: three safeguards before XACK.
+
+    ### Outputs
+    - `inspection` (JSON): total pending, scanned rows, poison IDs, and next page bound.
+    - `quarantine` (JSON): newly stored IDs, recovered existing records, missing payload IDs, and pending count after. Empty on a read-only run.
+
+    ## Quick start
+    1. Start Redis 7 on a Docker network and create `orders` plus group `g1`; arrange for a worker to leave a repeatedly delivered entry pending.
+    2. Import the flow and set `SLACK_WEBHOOK_URL`. Run read-only first and inspect the candidate IDs.
+    3. Set `apply=true` and `dry_run=false`; approve the Pause. Confirm `HGET orders:g1:quarantine <id>` before manually redriving the payload. `fields_hex` preserves binary field names and values in alternating order; decode each hex string before replay.
+
+    ## Plugins used
+    - [Redis CLI](https://kestra.io/plugins/plugin-redis/redis-cli/io.kestra.plugin.redis.cli.rediscli)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+
+    ## Links
+    - [Redis XPENDING](https://redis.io/docs/latest/commands/xpending/)
+    - [Redis XAUTOCLAIM](https://redis.io/docs/latest/commands/xautoclaim/)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Redis
+    - Streaming & Messaging
+    - Day 2 Operations
+  ee: false
+  demo: false
