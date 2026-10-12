@@ -1,0 +1,561 @@
+id: expense-report-auditor
+namespace: company.team
+description: |
+  Audit every expense claim of a month: check it against policy, catch receipts
+  submitted twice (even months apart), let an LLM read each receipt image or PDF
+  and compare it with the claim, then route only the exceptions to finance.
+
+labels:
+  team: finance
+  use-case: expense-audit
+
+variables:
+  claude_model: claude-sonnet-5-5
+
+triggers:
+  - id: monthly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Audit the previous month on the 2nd. Shipped disabled; enable it once a dry run looks right for your bucket.
+    cron: "0 6 2 * *"
+    disabled: true
+
+inputs:
+  - id: bucket
+    type: STRING
+    displayName: Bucket
+    description: The S3-compatible bucket holding the monthly expense exports.
+    defaults: expenses
+  - id: prefix
+    type: STRING
+    displayName: Prefix
+    description: Folder under which each month lives as <prefix>/<YYYY-MM>/claims.csv and <prefix>/<YYYY-MM>/receipts/.
+    defaults: claims
+  - id: month
+    type: STRING
+    displayName: Month (YYYY-MM)
+    description: The month to audit. Empty means the month before the run.
+    required: false
+  - id: s3_endpoint
+    type: STRING
+    displayName: S3 endpoint
+    description: Use https://s3.<region>.amazonaws.com for AWS, or the URL of your S3-compatible store such as MinIO, SeaweedFS or Cloudflare R2.
+    defaults: https://s3.us-east-1.amazonaws.com
+  - id: region
+    type: STRING
+    displayName: Region
+    defaults: us-east-1
+  - id: policy
+    type: JSON
+    displayName: Expense policy
+    description: Daily limits per category, the amount above which a receipt is required, and the other rules applied to every claim.
+    defaults: |
+      {
+        "daily_limits": {"meals": 75, "lodging": 250, "travel": 150, "other": 100},
+        "receipt_required_above": 25,
+        "flag_weekends": true,
+        "max_age_days": 60,
+        "alcohol_reimbursable": false
+      }
+  - id: max_receipts
+    type: INT
+    displayName: Max receipts to read
+    description: The most receipts sent to the model in one run, which caps the cost. Claims beyond it are flagged for manual review.
+    defaults: 200
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Audit and report only. No review request, no decisions file, and receipt fingerprints are not saved.
+    defaults: true
+
+tasks:
+  - id: period
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The month to audit, from the input or the month before the run.
+    values:
+      month: "{{ inputs.month ?? ((trigger.date ?? execution.startDate) | dateAdd(-1, 'MONTHS') | date('yyyy-MM')) }}"
+
+  - id: fetch
+    type: io.kestra.plugin.aws.s3.Downloads
+    description: Download the month's claims.csv and every receipt.
+    endpointOverride: "{{ inputs.s3_endpoint }}"
+    forcePathStyle: true
+    compatibilityMode: true
+    region: "{{ inputs.region }}"
+    accessKeyId: "{{ secret('S3_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('S3_SECRET_KEY_ID') }}"
+    bucket: "{{ inputs.bucket }}"
+    prefix: "{{ inputs.prefix }}/{{ outputs.period.values.month }}/"
+    action: NONE
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 3
+
+  - id: rules
+    type: io.kestra.plugin.scripts.python.Script
+    description: Check every claim against the policy and against receipts already submitted in earlier months, and prepare the receipts for the model.
+    dependencies:
+      - kestra
+    inputFiles: "{{ outputs.fetch.outputFiles | toJson }}"
+    script: |
+      import base64, csv, hashlib, json, re
+      from datetime import date, timedelta
+      from pathlib import Path
+      from kestra import Kestra
+
+      month = {{ outputs.period.values.month | toJson }}
+      if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+          raise SystemExit(f"month must look like 2026-09, got {month!r}")
+      base = Path({{ inputs.prefix | toJson }}, month)
+      if not (base / "claims.csv").exists():
+          raise SystemExit(f"{base}/claims.csv was not found in the bucket")
+
+      policy = json.loads({{ inputs.policy | toJson | toJson }})
+      known = json.loads({{ (kv('expense-receipt-fingerprints-' ~ (inputs.bucket | slugify), errorOnMissing=false) ?? {}) | toJson | toJson }})
+      limits = {k.lower(): float(v) for k, v in policy["daily_limits"].items()}
+      today = date.today()
+
+      claims, batch, seen_in_batch, fingerprints = [], [], {}, {}
+      for row in csv.DictReader(open(base / "claims.csv", encoding="utf-8")):
+          flags = []
+          try:
+              amount, spent = float(row["amount"]), date.fromisoformat(row["date"])
+          except ValueError:
+              claims.append({**row, "flags": ["invalid amount or date"]})
+              continue
+          category = row["category"].strip().lower()
+          if category in limits and amount > limits[category]:
+              flags.append(f"over the {category} limit of {limits[category]:.0f}")
+          if policy.get("flag_weekends") and spent.weekday() >= 5:
+              flags.append("spent on a weekend")
+          if (today - spent).days > policy.get("max_age_days", 10**6):
+              flags.append(f"older than {policy['max_age_days']} days")
+          key = f"{base}/receipts/{row['receipt_file']}" if row["receipt_file"] else None
+          receipt = Path(key) if key else None
+          sent = False
+          if receipt and not receipt.exists():
+              flags.append(f"receipt file {row['receipt_file']} not found in the bucket")
+          elif not receipt:
+              if amount > policy.get("receipt_required_above", 0):
+                  flags.append("receipt missing")
+          else:
+              # Two fingerprints: the exact file, and what it describes, so a re-saved copy is caught too.
+              for fp in (hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                         "|".join([re.sub(r"\W", "", row["merchant"].lower()), f"{amount:.2f}", row["date"]])):
+                  earlier = known.get(fp)
+                  if earlier and earlier["month"] != month:
+                      flags.append(f"duplicate of {earlier['claim_id']} from {earlier['month']}")
+                  elif fp in seen_in_batch:
+                      flags.append(f"duplicate of {seen_in_batch[fp]} in this month")
+                  seen_in_batch.setdefault(fp, row["claim_id"])
+                  fingerprints[fp] = {"claim_id": row["claim_id"], "month": month}
+              if len(batch) < int({{ inputs.max_receipts }}):
+                  # Untrusted claim text travels as base64 so it is never evaluated as a template.
+                  details = {k: row[k] for k in ("claim_id", "date", "merchant", "category", "amount", "currency", "description")}
+                  # Only the S3 key travels: Kestra script tasks turn storage URIs in their code into local paths.
+                  batch.append({"claim_id": row["claim_id"], "key": key,
+                                "media": "PDF" if receipt.suffix.lower() == ".pdf" else "IMAGE",
+                                "claim_b64": base64.b64encode(json.dumps(details).encode()).decode()})
+                  sent = True
+              else:
+                  flags.append("receipt not read (max_receipts reached)")
+          claims.append({**row, "flags": sorted(set(flags)), "receipt_sent": sent})
+
+      # Keep 13 months of fingerprints, replacing this month's so a re-run never flags itself.
+      cutoff = (today.replace(day=1) - timedelta(days=396)).strftime("%Y-%m")
+      merged = {fp: v for fp, v in known.items() if v["month"] != month and v["month"] >= cutoff}
+      for fp, first_seen in fingerprints.items():
+          merged.setdefault(fp, first_seen)  # keep the original submission, not a later duplicate
+      Kestra.outputs({
+          "month": month,
+          "claim_count": len(claims),
+          "claims_b64": base64.b64encode(json.dumps(claims).encode()).decode(),
+          "receipt_batch": batch,
+          "fingerprints": merged,
+      })
+
+  - id: read_receipts
+    type: io.kestra.plugin.core.flow.Loop
+    description: Read four receipts at a time. A receipt the model cannot process is flagged for review instead of stopping the audit.
+    values: "{{ outputs.rules.vars.receipt_batch }}"
+    concurrencyLimit: 4
+    transmitFailed: false
+    tasks:
+      - id: by_format
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ fromJson(item.value).media == 'PDF' }}"
+        then:
+          - id: read_pdf
+            type: io.kestra.plugin.ai.completion.ChatCompletion
+            provider:
+              type: io.kestra.plugin.ai.provider.Anthropic
+              apiKey: "{{ secret('ANTHROPIC_API_KEY') }}"
+              modelName: "{{ vars.claude_model }}"
+            configuration:
+              maxToken: 2000
+            retry:
+              type: exponential
+              interval: PT10S
+              maxInterval: PT2M
+              maxAttempts: 3
+            messages:
+              - type: SYSTEM
+                content: |
+                  You audit expense receipts. Read the attached receipt and report what it actually shows, without trusting the claim.
+                  Respond with one JSON object and nothing else:
+                  {"readable": true, "total": 0.00, "date": "YYYY-MM-DD", "merchant": "...", "alcohol": false, "tampering_signs": []}
+                  - total: the final amount paid, as a number, or null if you cannot read it.
+                  - alcohol: true if any line is beer, wine, spirits, cocktails or another alcoholic drink.
+                  - tampering_signs: short phrases for anything suspicious about the receipt itself, such as line items that do not add up to the total, mismatched fonts, edited digits or a receipt that looks generated. Do not list differences from the claim; those are checked separately. Empty when it looks genuine.
+              - type: USER
+                contentBlocks:
+                  - type: TEXT
+                    text: "The claim, for context only: {{ fromJson(item.value).claim_b64 | base64decode }}"
+                  - type: PDF
+                    uri: "{{ outputs.fetch.outputFiles[fromJson(item.value).key] }}"
+        else:
+          - id: read_image
+            type: io.kestra.plugin.ai.completion.ChatCompletion
+            provider:
+              type: io.kestra.plugin.ai.provider.Anthropic
+              apiKey: "{{ secret('ANTHROPIC_API_KEY') }}"
+              modelName: "{{ vars.claude_model }}"
+            configuration:
+              maxToken: 2000
+            retry:
+              type: exponential
+              interval: PT10S
+              maxInterval: PT2M
+              maxAttempts: 3
+            messages:
+              - type: SYSTEM
+                content: |
+                  You audit expense receipts. Read the attached receipt and report what it actually shows, without trusting the claim.
+                  Respond with one JSON object and nothing else:
+                  {"readable": true, "total": 0.00, "date": "YYYY-MM-DD", "merchant": "...", "alcohol": false, "tampering_signs": []}
+                  - total: the final amount paid, as a number, or null if you cannot read it.
+                  - alcohol: true if any line is beer, wine, spirits, cocktails or another alcoholic drink.
+                  - tampering_signs: short phrases for anything suspicious about the receipt itself, such as line items that do not add up to the total, mismatched fonts, edited digits or a receipt that looks generated. Do not list differences from the claim; those are checked separately. Empty when it looks genuine.
+              - type: USER
+                contentBlocks:
+                  - type: TEXT
+                    text: "The claim, for context only: {{ fromJson(item.value).claim_b64 | base64decode }}"
+                  - type: IMAGE
+                    uri: "{{ outputs.fetch.outputFiles[fromJson(item.value).key] }}"
+    outputs:
+      - id: claim_id
+        type: STRING
+        value: "{{ fromJson(item.value).claim_id }}"
+      - id: result_b64
+        type: STRING
+        value: "{{ (outputs.read_pdf.textOutput ?? outputs.read_image.textOutput) | base64encode }}"
+
+  - id: assess
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compare what each receipt shows with the claim, merge it with the policy checks, and decide which claims are clean and which need a person.
+    dependencies:
+      - kestra
+    inputFiles:
+      ids.json: "{{ loopOutputs(outputs.read_receipts.outputs ?? [], 'claim_id') | toJson }}"
+      results.json: "{{ loopOutputs(outputs.read_receipts.outputs ?? [], 'result_b64') | toJson }}"
+    outputFiles:
+      - audit.csv
+      - summary.md
+    script: |
+      import base64, csv, json, re
+      from datetime import date
+      from difflib import SequenceMatcher
+      from kestra import Kestra
+
+      policy = json.loads({{ inputs.policy | toJson | toJson }})
+      claims = json.loads(base64.b64decode({{ outputs.rules.vars.claims_b64 | toJson }}))
+      readings = {}
+      for cid, encoded in zip(json.load(open("ids.json")), json.load(open("results.json"))):
+          if cid and encoded:
+              raw = re.sub(r"^```(?:json)?|```$", "", base64.b64decode(encoded).decode().strip(), flags=re.M).strip()
+              try:
+                  readings[cid] = json.loads(raw)
+              except ValueError:
+                  readings[cid] = {"readable": False}
+
+      def clean(text, limit=60):
+          # Claim text ends up in Slack and in the review form: keep it plain.
+          return re.sub(r"[{}%#|`]", "", str(text))[:limit]
+
+      rows, flagged = [], []
+      for c in claims:
+          flags, read = list(c["flags"]), readings.get(c["claim_id"])
+          if read is None and c.get("receipt_sent"):
+              flags.append("receipt could not be read")
+          elif read:
+              if not read.get("readable", True) or read.get("total") is None:
+                  flags.append("receipt unreadable")
+              else:
+                  claimed = float(c["amount"])
+                  if abs(float(read["total"]) - claimed) > max(0.5, claimed * 0.01):
+                      flags.append(f"claimed {claimed:.2f} but the receipt shows {float(read['total']):.2f}")
+                  try:
+                      if read.get("date") and abs((date.fromisoformat(read["date"]) - date.fromisoformat(c["date"])).days) > 1:
+                          flags.append(f"receipt dated {read['date']}")
+                  except ValueError:
+                      pass
+                  if read.get("merchant") and SequenceMatcher(None, read["merchant"].lower(), c["merchant"].lower()).ratio() < 0.4:
+                      flags.append(f"receipt is from {clean(read['merchant'])}")
+              if read.get("alcohol") and not policy.get("alcohol_reimbursable", False):
+                  flags.append("alcohol on the receipt")
+              flags += [f"possible tampering: {clean(s)}" for s in read.get("tampering_signs") or []]
+          status = "needs review" if flags else "auto-approved"
+          rows.append({"claim_id": c["claim_id"], "employee": c["employee"], "date": c["date"], "merchant": c["merchant"],
+                       "category": c["category"], "amount": c["amount"], "currency": c["currency"], "status": status,
+                       "flags": "; ".join(flags), "receipt_total": (read or {}).get("total", "")})
+          if flags:
+              flagged.append(f"{c['claim_id']} ({clean(c['employee'])}, {float(c['amount']):.2f} {clean(c['currency'])}): {clean('; '.join(flags), 160)}")
+
+      with open("audit.csv", "w", newline="") as f:
+          writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["claim_id"])
+          writer.writeheader(); writer.writerows(rows)
+      total = sum(float(r["amount"]) for r in rows)
+      held = sum(float(r["amount"]) for r in rows if r["status"] == "needs review")
+      month = {{ outputs.rules.vars.month | toJson }}
+      lines = [f"# Expense audit {month}", "", f"{len(rows)} claims, {total:,.2f} in total. "
+               f"{len(rows) - len(flagged)} auto-approved, {len(flagged)} need review ({held:,.2f} held).", "",
+               "| Claim | Employee | Amount | Status | Why |", "|---|---|---|---|---|"]
+      lines += [f"| {r['claim_id']} | {clean(r['employee'])} | {float(r['amount']):.2f} {clean(r['currency'])} | {r['status']} | {clean(r['flags'], 300) if r['flags'] else ''} |"
+                for r in sorted(rows, key=lambda r: (r["status"] == "auto-approved", r["claim_id"]))]
+      open("summary.md", "w").write("\n".join(lines) + "\n")
+      Kestra.outputs({
+          "claims": len(rows), "flagged": len(flagged), "auto_approved": len(rows) - len(flagged),
+          "total_amount": round(total, 2), "held_amount": round(held, 2),
+          "flagged_options": flagged,
+          "summary": f"🧾 *Expense audit {month}*: {len(rows)} claims ({total:,.2f}). {len(rows) - len(flagged)} auto-approved, {len(flagged)} need review ({held:,.2f} held).",
+      })
+
+  - id: post_summary
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Share the audit result.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "{{ outputs.assess.vars.summary }} Details: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 3
+
+  - id: review
+    type: io.kestra.plugin.core.flow.If
+    description: Ask finance about the flagged claims only, and only outside a dry run.
+    condition: "{{ not inputs.dry_run and outputs.assess.vars.flagged > 0 }}"
+    then:
+      - id: ask_reviewer
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "🔎 {{ outputs.assess.vars.flagged }} expense claim(s) for {{ outputs.rules.vars.month }} need a decision: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 3
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Pick the flagged claims to reject or to send back to the employee. Every flagged claim not picked is approved. Without a decision within seven days the execution is cancelled.
+        pauseDuration: P7D
+        behavior: CANCEL
+        onResume:
+          - id: reject_claims
+            type: MULTISELECT
+            displayName: Reject these claims
+            expression: "{{ outputs.assess.vars.flagged_options }}"
+            required: false
+          - id: ask_employee
+            type: MULTISELECT
+            displayName: Ask the employee for more information
+            expression: "{{ outputs.assess.vars.flagged_options }}"
+            required: false
+          - id: note
+            type: STRING
+            displayName: Note for the audit trail (optional)
+            required: false
+
+  - id: record
+    type: io.kestra.plugin.core.flow.If
+    description: Write the decisions and remember this month's receipts, so a receipt submitted again later is caught.
+    condition: "{{ not inputs.dry_run }}"
+    then:
+      - id: decisions
+        type: io.kestra.plugin.scripts.python.Script
+        description: Turn the audit and the reviewer's choices into one decision per claim.
+        dependencies:
+          - kestra
+        inputFiles:
+          audit.csv: "{{ outputs.assess.outputFiles['audit.csv'] }}"
+          choices.json: "{{ {'reject': outputs.approval.onResume.reject_claims ?? [], 'ask': outputs.approval.onResume.ask_employee ?? []} | toJson }}"
+        outputFiles:
+          - decisions.csv
+        script: |
+          import csv, json
+          from collections import Counter
+          from kestra import Kestra
+
+          choices = json.load(open("choices.json"))
+          ids = lambda options: {o.split(" ", 1)[0] for o in options}
+          reject, ask = ids(choices["reject"]), ids(choices["ask"])
+          rows = list(csv.DictReader(open("audit.csv")))
+          for r in rows:
+              if r["status"] == "auto-approved":
+                  r["decision"], r["decided_by"] = "approved", "policy checks"
+              else:
+                  r["decision"] = "rejected" if r["claim_id"] in reject else "needs information" if r["claim_id"] in ask else "approved"
+                  r["decided_by"] = {{ (outputs.approval.resumed.by ?? 'reviewer') | toJson }}
+              r["note"] = {{ (outputs.approval.onResume.note ?? '') | toJson }} if r["status"] != "auto-approved" else ""
+          with open("decisions.csv", "w", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+          counts = Counter(r["decision"] for r in rows)
+          Kestra.outputs({"decisions": dict(counts),
+                          "approved_amount": round(sum(float(r["amount"]) for r in rows if r["decision"] == "approved"), 2)})
+
+      - id: upload_decisions
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store decisions.csv next to the month's claims for payroll or the expense tool to pick up.
+        endpointOverride: "{{ inputs.s3_endpoint }}"
+        forcePathStyle: true
+        compatibilityMode: true
+        region: "{{ inputs.region }}"
+        accessKeyId: "{{ secret('S3_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('S3_SECRET_KEY_ID') }}"
+        bucket: "{{ inputs.bucket }}"
+        key: "{{ inputs.prefix }}/{{ outputs.rules.vars.month }}/audit/decisions.csv"
+        from: "{{ outputs.decisions.outputFiles['decisions.csv'] }}"
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 3
+
+      - id: remember_receipts
+        type: io.kestra.plugin.core.kv.Set
+        description: Keep 13 months of receipt fingerprints for duplicate detection.
+        key: "expense-receipt-fingerprints-{{ inputs.bucket | slugify }}"
+        kvType: JSON
+        value: "{{ outputs.rules.vars.fingerprints | toJson }}"
+
+      - id: post_decisions
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "✅ Expense decisions for {{ outputs.rules.vars.month }}: {{ outputs.decisions.vars.decisions | toJson }}, {{ outputs.decisions.vars.approved_amount }} approved. Saved to s3://{{ inputs.bucket }}/{{ inputs.prefix }}/{{ outputs.rules.vars.month }}/audit/decisions.csv"
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 3
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert with the failed task, the error and a link. Nothing is written before the decisions, so the run can simply be retried.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    messageText: |
+      ❌ *Expense audit FAILED* (flow {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}).
+      Failed task: {{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}. Error: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'see the execution logs' }}
+      {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: audit_file
+    type: STRING
+    displayName: Audit file
+    description: Internal storage URI of audit.csv, every claim with its flags and status.
+    value: "{{ outputs.assess.outputFiles['audit.csv'] ?? 'none' }}"
+  - id: flagged_claims
+    type: INT
+    displayName: Claims needing review
+    value: "{{ outputs.assess.vars.flagged ?? 0 }}"
+  - id: decisions_file
+    type: STRING
+    displayName: Decisions file
+    value: "{{ outputs.decisions.outputFiles['decisions.csv'] ?? 'none' }}"
+
+extend:
+  shortDescription: Audit 100% of a month's expense claims against policy, catch duplicate and mismatched receipts with AI, and send only the exceptions to finance.
+  title: Expense Report Auditor with Policy Checks, Duplicate Receipt Detection and AI Receipt Reading
+  metaTitle: Expense Report Auditor with AI Receipt Checks
+  description: |
+    Finance teams usually spot-check only 10 to 20 percent of expense reports, because reviewing one takes around 20 minutes. Duplicate receipts, inflated amounts and policy breaks slip through, and AI-generated fake receipts now make up most flagged expense fraud. This blueprint audits every claim of the month. It approves the clean ones on its own and sends only the exceptions to a person, with the reason for each. It's for finance and operations teams that reimburse employees from an expense tool or a spreadsheet export.
+
+    ## How it works
+    1. `period` picks the month to audit, from the `month` input or the month before the run. `fetch` (`io.kestra.plugin.aws.s3.Downloads`) downloads `<prefix>/<YYYY-MM>/claims.csv` and every receipt from any S3-compatible bucket.
+    2. `rules` (`io.kestra.plugin.scripts.python.Script`) checks every claim against `policy`:
+       - daily limits per category;
+       - a missing receipt above the threshold, or a receipt file that isn't in the bucket;
+       - weekend spending and late submissions;
+       - duplicates within the month.
+
+       It also fingerprints every receipt, both the exact file and its merchant, amount and date, and compares them with up to 13 months of earlier receipts kept in the KV store, so a receipt submitted again months later is caught.
+    3. `read_receipts` (`io.kestra.plugin.core.flow.Loop`, four at a time) sends each receipt, image or PDF, to `io.kestra.plugin.ai.completion.ChatCompletion` with the Anthropic provider as an image or PDF content block. The model reports what the receipt actually shows: the total, the date, the merchant, any alcohol, and signs of tampering or generation. A receipt it can't process is flagged instead of stopping the audit.
+    4. `assess` compares the receipt with the claim in code, with tolerances: amount, date and merchant. It merges this with the policy checks and writes `audit.csv` and `summary.md`. A claim is auto-approved only when nothing at all is flagged.
+    5. `post_summary` posts the result to Slack. Outside a dry run, when something is flagged, `ask_reviewer` posts a link and `approval` (`io.kestra.plugin.core.flow.Pause`) shows finance a form whose options are **this month's flagged claims, with their reasons**. Reviewers pick the claims to reject and those to send back to the employee, and every other flagged claim is approved. Without a decision within seven days, the execution is cancelled.
+    6. `decisions` writes one decision per claim with who decided, `upload_decisions` (`io.kestra.plugin.aws.s3.Upload`) stores it as `<prefix>/<YYYY-MM>/audit/decisions.csv`, and `remember_receipts` (`io.kestra.plugin.core.kv.Set`) saves the month's receipt fingerprints. `alert_failure` posts any failure to Slack.
+
+    No money moves: the output is a decisions file for your payroll or expense tool to pick up. Claim text and receipt contents travel as base64 between tasks, so nothing an employee types is ever evaluated as a Kestra expression.
+
+    ## Prerequisites
+    - An S3-compatible bucket (AWS S3, MinIO, SeaweedFS, Cloudflare R2 and others) with one folder per month: `<prefix>/<YYYY-MM>/claims.csv` with the columns `claim_id, employee, date, merchant, category, amount, currency, receipt_file, description`, and the receipts in `<prefix>/<YYYY-MM>/receipts/` as PNG, JPG or PDF. Most expense tools can export this.
+    - Docker on the worker for the Python script tasks.
+    - Secrets:
+      - `S3_ACCESS_KEY_ID` and `S3_SECRET_KEY_ID`: credentials that can read the month's folder and write `audit/decisions.csv`.
+      - `ANTHROPIC_API_KEY`: Anthropic API key for reading receipts.
+      - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the summary, the review request, the decisions and failure alerts.
+
+    ### Inputs
+    - `bucket` (STRING, default `expenses`) and `prefix` (STRING, default `claims`): where the monthly folders live.
+    - `month` (STRING, optional): `YYYY-MM`. Empty means the month before the run.
+    - `s3_endpoint` (STRING, default `https://s3.us-east-1.amazonaws.com`) and `region` (STRING, default `us-east-1`): use your own endpoint for MinIO, SeaweedFS or R2.
+    - `policy` (JSON): `daily_limits` per category, `receipt_required_above`, `flag_weekends`, `max_age_days` and `alcohol_reimbursable`.
+    - `max_receipts` (INT, default `200`): the most receipts read by the model in one run. Claims beyond it are flagged for manual review.
+    - `dry_run` (BOOL, default `true`): audit and report only. No review request, no decisions file, and no fingerprints saved.
+
+    ## Quick start
+    1. Add the four secrets and save the flow.
+    2. Run it with `month` set to a past month and `dry_run` left on. Read `summary.md` and `audit.csv` in the `assess` outputs, and adjust `policy`.
+    3. Run the previous month with `dry_run` set to `false` to seed the receipt fingerprints, then the current month, and decide the flagged claims in the form.
+    4. Enable the `monthly` trigger to audit each month on the 2nd.
+
+    ## Outputs
+    - `{{ outputs.audit_file }}` / `{{ outputs.assess.outputFiles['audit.csv'] }}`: every claim with what the receipt shows, its flags and status.
+    - `{{ outputs.assess.outputFiles['summary.md'] }}` and `{{ outputs.assess.vars.summary }}`: the human summary.
+    - `{{ outputs.flagged_claims }}` / `{{ outputs.assess.vars.flagged }}`, plus `held_amount` and `total_amount`.
+    - `{{ outputs.decisions_file }}` / `{{ outputs.decisions.outputFiles['decisions.csv'] }}` and `{{ outputs.decisions.vars.decisions }}`: the decision for every claim, also stored in the bucket.
+    - KV key `expense-receipt-fingerprints-<bucket>`: 13 months of receipt fingerprints.
+
+    ## Common pitfalls
+    - Duplicate detection across months only starts after the first non-dry run has saved fingerprints. Run the previous month once first.
+    - Policy limits apply per claim. Split meals such as a team dinner need a higher `meals` limit, or are reviewed as flagged.
+    - The model can misread poor photos. Any mismatch is flagged for a person, never rejected automatically.
+    - Set the `claude_model` variable to change the model. Reading one receipt is one short multimodal call.
+
+    ## How to extend
+    - Load `decisions.csv` into your payroll or ERP with a database or HTTP task after `upload_decisions`.
+    - Email employees whose claims need information, using the `decisions` output.
+    - Add per-employee or per-department limits to `policy` and the `rules` script.
+
+    ## Links
+    - AWS S3 plugin: https://kestra.io/plugins/plugin-aws
+    - AI ChatCompletion task: https://kestra.io/plugins/plugin-ai/completion/io.kestra.plugin.ai.completion.chatcompletion
+    - Loop task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop
+    - Pause task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause
+    - Claude vision: https://docs.anthropic.com/en/docs/build-with-claude/vision
+    - This blueprint has been created by [Biplab Bera](https://github.com/bishalbera)
+  tags:
+    - Business
+    - AI
+    - Data
+  subTags:
+    - Approval Gates
+    - Policy & Compliance
+  ee: false
+  demo: false
+  metaDescription: Audit every expense claim against policy, catch duplicate and mismatched receipts with AI, and route only the exceptions to finance for approval.
