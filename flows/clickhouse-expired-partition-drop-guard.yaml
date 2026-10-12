@@ -1,0 +1,297 @@
+id: clickhouse-expired-partition-drop-guard
+namespace: company.team
+
+inputs:
+  - id: clickhouse_url
+    type: STRING
+    defaults: jdbc:clickhouse://localhost:8123/default
+    description: ClickHouse JDBC URL for the server that holds the table. Example jdbc:clickhouse://clickhouse:8123/default.
+
+  - id: use_secret_auth
+    type: BOOL
+    defaults: true
+    description: Leave true in production so the connection reads CLICKHOUSE_USERNAME and CLICKHOUSE_PASSWORD from secrets. Set false only to pass credentials inline in a disposable test environment.
+
+  - id: clickhouse_username
+    type: STRING
+    defaults: default
+    description: Username used only when use_secret_auth is false. Ignored in production.
+
+  - id: clickhouse_password
+    type: STRING
+    defaults: ""
+    description: Password used only when use_secret_auth is false. Ignored in production.
+
+  - id: database
+    type: STRING
+    defaults: default
+    description: Database that holds the MergeTree table to guard.
+
+  - id: table
+    type: STRING
+    defaults: events
+    description: MergeTree table partitioned by a date or datetime expression, for example toYYYYMM(ts), toDate(ts) or toYYYYMMDD(ts).
+
+  - id: retention_days
+    type: INT
+    defaults: 90
+    description: Retention window in days. A partition is expired when the newest row in it is older than now minus this many days.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, report the expired partitions without dropping anything.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true and dry_run is false, drop the expired partitions behind an approval gate, then re-read system.parts.
+
+variables:
+  detect_sql: |
+    SELECT
+      partition AS partition,
+      partition_id AS partition_id,
+      toString(greatest(max(max_time), toDateTime(max(max_date)))) AS newest_ts,
+      sum(rows) AS rows_total,
+      sum(bytes_on_disk) AS bytes_total,
+      count() AS parts
+    FROM system.parts
+    WHERE database = '{{ inputs.database }}'
+      AND table = '{{ inputs.table }}'
+      AND active = 1
+    GROUP BY partition, partition_id
+    HAVING greatest(max(max_time), toDateTime(max(max_date))) < now() - INTERVAL {{ inputs.retention_days }} DAY
+       AND greatest(max(max_time), toDateTime(max(max_date))) > toDateTime('1970-01-02 00:00:00')
+    ORDER BY partition
+
+triggers:
+  - id: weekly_retention_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "0 2 * * 1"
+    description: Weekly retention sweep. Disabled by default and pinned to safe mode so it reports without dropping until an operator enables it.
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Read system.parts for the table, group by partition and keep partitions whose newest row is older than the retention window. The epoch guard skips partitions with no date, so a non temporal partition key is never selected.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_USERNAME') : inputs.clickhouse_username }}"
+    password: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_PASSWORD') : inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.detect_sql) }}"
+
+  - id: summarize
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Materialize the expired partition id list once so the logs, the Slack alert and the failure message all read the same value.
+    values:
+      partition_list: >-
+        {{ outputs.detect.rows | jq('map(.partition_id) | join(", ")') | first }}
+
+  - id: log_detect
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ClickHouse {{ inputs.database }}.{{ inputs.table }}: {{ outputs.detect.size }} expired partition(s) older than {{ inputs.retention_days }} day(s).
+      Partitions: {{ outputs.summarize.values.partition_list }}
+      Mode: dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}
+
+  - id: guard
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.detect.size > 0 }}"
+    then:
+      - id: findings_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert on every detection, in dry run and in remediate mode, so a human sees the retention breach even when nothing is dropped.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "ClickHouse expired partition guard: {{ outputs.detect.size }} partition(s) in {{ inputs.database }}.{{ inputs.table }} older than {{ inputs.retention_days }} day(s). Partitions {{ outputs.summarize.values.partition_list }}. dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}."}
+
+      - id: mode
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Hold the run until a human approves the drop. The destructive step never starts on its own.
+            pauseDuration: PT2H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to drop the listed partitions. Anything else leaves them in place.
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+            then:
+              - id: drop_expired_partitions
+                type: io.kestra.plugin.core.flow.Loop
+                description: Remediation loop. One ALTER TABLE DROP PARTITION per expired partition, concurrencyLimit 1 so the DDL runs in turn and parallel drops never race on the same table.
+                concurrencyLimit: 1
+                values: "{{ outputs.detect.rows | jq('map(.partition_id)') | first | toJson }}"
+                tasks:
+                  - id: drop_one
+                    type: io.kestra.plugin.jdbc.clickhouse.Query
+                    description: Drop one expired partition by its id. allowFailure so one blocked drop does not stop the pass and the re-read stays the real gate.
+                    allowFailure: true
+                    url: "{{ inputs.clickhouse_url }}"
+                    username: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_USERNAME') : inputs.clickhouse_username }}"
+                    password: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_PASSWORD') : inputs.clickhouse_password }}"
+                    fetchType: NONE
+                    sql: "ALTER TABLE {{ inputs.database }}.{{ inputs.table }} DROP PARTITION ID '{{ item.value }}'"
+
+                  - id: drop_log
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Issued DROP PARTITION ID '{{ item.value }}' on {{ inputs.database }}.{{ inputs.table }}."
+
+              - id: reverify
+                type: io.kestra.plugin.jdbc.clickhouse.Query
+                description: Re-read system.parts with the same window. Any row here means a drop did not land.
+                url: "{{ inputs.clickhouse_url }}"
+                username: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_USERNAME') : inputs.clickhouse_username }}"
+                password: "{{ inputs.use_secret_auth ? secret('CLICKHOUSE_PASSWORD') : inputs.clickhouse_password }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.detect_sql) }}"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.reverify.size > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      {{ outputs.reverify.size }} expired partition(s) still present after the drop pass in {{ inputs.database }}.{{ inputs.table }}: {{ outputs.reverify.rows | jq('map(.partition_id) | join(", ")') | first }}. The connecting user may lack ALTER privilege or a concurrent writer re-created the partition.
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Dropped and verified. {{ outputs.detect.size }} expired partition(s) before, {{ outputs.reverify.size }} after."
+            else:
+              - id: not_approved
+                type: io.kestra.plugin.core.log.Log
+                message: "Approval not granted, so nothing was dropped. {{ outputs.detect.size }} expired partition(s) still remain in {{ inputs.database }}.{{ inputs.table }}."
+        else:
+          - id: report_only
+            type: io.kestra.plugin.core.log.Log
+            message: "Report only (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}). {{ outputs.detect.size }} expired partition(s) would be dropped: {{ outputs.summarize.values.partition_list }}. No change made."
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "No expired partitions in {{ inputs.database }}.{{ inputs.table }} older than {{ inputs.retention_days }} day(s). Nothing to drop."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Post to Slack on any failure, including a connection error or expired partitions still present after a drop pass.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "ClickHouse expired partition guard FAILED for {{ inputs.database }}.{{ inputs.table }} (execution {{ execution.id }}). A connection error, an ALTER error or expired partitions still present after a drop pass. Check the run."}
+
+extend:
+  title: ClickHouse Expired Partition Drop Guard
+  shortDescription: Detect ClickHouse MergeTree partitions older than a retention window from system.parts, drop them behind a dry-run and approval gate, then re-read system.parts and fail if any expired partition remains.
+  metaTitle: ClickHouse Expired Partition Drop Guard with Kestra
+  metaDescription: Detect ClickHouse partitions past a retention window in system.parts, drop them behind a dry-run and approval gate, then re-read to confirm.
+  description: |
+    ClickHouse MergeTree tables keep old partitions on disk when no TTL is set or when a TTL exists but its DELETE was never materialized by a merge. Storage then grows past the retention policy while every query still pays to skip the dead parts. This guard finds those partitions and drops them under a gate, then proves the drop landed.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Safety
+
+    - Read-only by default. `dry_run` is true and `auto_remediate` is false, so a plain run reports and never drops.
+    - A drop happens only when `auto_remediate` is true and `dry_run` is false. It then waits for a human to resume the `Pause` with `approved` set true. An unanswered gate reads as not approved.
+    - Expiry is read from the newest row timestamp in `system.parts`, so a partition whose age cannot be read (a non temporal partition key) is skipped and never dropped.
+    - Each drop is isolated and the loop runs one statement at a time, so one blocked drop does not stop the others and parallel DDL never races on the same table.
+
+    ## How it works
+
+    1. `detect` (`io.kestra.plugin.jdbc.clickhouse.Query`) reads `system.parts` for the table, groups active parts by partition and keeps partitions whose newest row is older than `now() - retention_days`. It reads the newest row as `greatest(max(max_time), toDateTime(max(max_date)))`, correct for `toYYYYMM`, `toDate` and `toYYYYMMDD` partition keys. That same value must also be above the epoch floor, so a non temporal key is never selected.
+    2. `summarize` (`io.kestra.plugin.core.output.OutputValues`) records the expired partition id list once for the logs, the alert and the failure message.
+    3. `guard` (`io.kestra.plugin.core.flow.If`) branches on the expired count. With none found, `clean` logs and the run ends.
+    4. `findings_alert` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts the breach on every detection, in dry run and in remediate mode.
+    5. `mode` (`io.kestra.plugin.core.flow.If`) enters the remediation branch only when `auto_remediate` is true and `dry_run` is false. Otherwise `report_only` lists what would be dropped and stops.
+    6. `approval_gate` (`io.kestra.plugin.core.flow.Pause`) holds the run until a human resumes it with `approved`. `apply` runs the drop only when `approved` is true.
+    7. `drop_expired_partitions` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs `ALTER TABLE ... DROP PARTITION ID` once per expired partition.
+    8. `reverify` re-reads `system.parts` with the same window. `verify_result` then fails the run through `io.kestra.plugin.core.execution.Fail` if any expired partition is still present.
+    ## What you get
+
+    - A retention check that reads the real data age from `system.parts`, not the partition key format, so it works across date and datetime partition keys.
+    - A drop that is safe to leave scheduled. It reports until an operator turns on remediation and approves each run.
+    - A real verification step. The run passes only when the second read of `system.parts` shows zero expired partitions.
+    - Slack alerts on the findings and on any failure.
+
+    ## Who it's for
+
+    - Data platform engineers who run ClickHouse and need storage held to a retention policy without hand-written SQL.
+    - DBAs cleaning up tables that have no TTL or whose TTL was never materialized.
+    - Teams evaluating the ClickHouse plugin who want an example that reads a system table and runs gated DDL.
+
+    ## Why orchestrate this with Kestra
+
+    ClickHouse has no scheduler, no approval step and no way to prove a maintenance command took effect. Kestra adds the missing pieces. It schedules the sweep, gates the destructive statement behind dry-run and approval, re-reads `system.parts` to turn a hopeful drop into a verified one, applies the same connection settings to every task and posts a Slack alert the moment a step fails.
+
+    ## Tested end to end
+
+    Run on Kestra 2.0.5 against a ClickHouse 24.8 server with a `toYYYYMM(ts)` table seeded with three 2024 partitions and two recent ones.
+
+    - Detector can fail: a 3650 day window selected 0 partitions, a 90 day window selected 3 on the same table.
+    - Dry run at 90 days detected 3, alerted and left all 3 in place (confirmed with `clickhouse-client`).
+    - Remediate with approval dropped all 3 and the re-read reported 0 remaining (3 before, 0 after in `system.parts`).
+    - The approval gate held. A run resumed with `approved` false dropped nothing.
+    - A read-only user turned every drop into a no-op, the re-read found 3 still expired and the run failed and alerted.
+    - An unreachable host failed the detect step and fired the Slack alert.
+    ## Prerequisites
+
+    A ClickHouse server reachable over the JDBC HTTP interface and a user that can read `system.parts` and run `ALTER TABLE ... DROP PARTITION` on the target table.
+
+    ### Secrets
+
+    - `CLICKHOUSE_USERNAME`: ClickHouse user, read when `use_secret_auth` is true.
+    - `CLICKHOUSE_PASSWORD`: password for that user.
+    - `SLACK_WEBHOOK_URL`: used by `findings_alert` and the `errors` block.
+    - In Kestra OSS, provide each secret as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Name | Type | Default | Description |
+    | :--- | :--- | :--- | :--- |
+    | `clickhouse_url` | STRING | `jdbc:clickhouse://localhost:8123/default` | ClickHouse JDBC URL. |
+    | `use_secret_auth` | BOOL | `true` | Read credentials from secrets. Set false only for inline test credentials. |
+    | `database` | STRING | `default` | Database holding the table. |
+    | `table` | STRING | `events` | MergeTree table to guard. |
+    | `retention_days` | INT | `90` | A partition is expired when its newest row is older than this. |
+    | `dry_run` | BOOL | `true` | Report without dropping. |
+    | `auto_remediate` | BOOL | `false` | Drop behind the approval gate when dry_run is false. |
+
+    ## Quick start
+
+    1. Set `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD` and `SLACK_WEBHOOK_URL` as namespace secrets.
+    2. Import this flow.
+    3. Run it with `database` and `table` pointed at a partitioned MergeTree table. The default dry run reports the expired partitions.
+    4. To drop, run again with `dry_run` false and `auto_remediate` true, then resume the paused execution with `approved` true.
+
+    ## How to extend
+
+    - Loop over several tables from one flow by moving the detect and drop steps into a table loop.
+    - Replace `DROP PARTITION` with `MOVE PARTITION ... TO DISK` to tier old data to object storage instead of deleting it.
+    - Add a second window that only alerts, so near-expiry partitions are visible before they are dropped.
+    - Fail the run as soon as detection finds anything, for a read-only drift check with no remediation.
+
+    ## Links
+
+    - ClickHouse plugin: https://kestra.io/plugins/plugin-jdbc-clickhouse
+    - ALTER TABLE DROP PARTITION: https://clickhouse.com/docs/en/sql-reference/statements/alter/partition
+    - system.parts: https://clickhouse.com/docs/en/operations/system-tables/parts
+    - Schedule trigger: https://kestra.io/plugins/core/triggers/io.kestra.plugin.core.trigger.schedule
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false

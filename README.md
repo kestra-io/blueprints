@@ -62,6 +62,8 @@ Required & recommended fields
 - `tasks` (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
 - `extend` (required): use this metadata block to explain the Blueprint for the catalog UI.
   - `title`: concise human title (one line).
+  - `metaTitle`: SEO title for the browser tab.
+  - `shortDescription`: short summary used for UI preview cards.
   - `description`: long explanation, prerequisites, steps to run, expected outputs, warnings.
   - `metaDescription`: short summary (<= 160 chars) used for search/cards.
   - `tags`: categories to improve discoverability.
@@ -87,6 +89,8 @@ Example `extend` template to copy-paste:
 ```yaml
 extend:
   title: Short human-friendly title here
+  metaTitle: SEO title for search engines
+  shortDescription: Short summary used for UI preview cards
   description: |
     Short summary: what the Blueprint does.
 

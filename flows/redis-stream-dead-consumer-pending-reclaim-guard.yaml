@@ -1,0 +1,549 @@
+id: redis-stream-dead-consumer-pending-reclaim-guard
+namespace: company.team
+
+description: |
+  Find Redis Stream consumer groups where a crashed or scaled-down consumer left messages in its
+  Pending Entries List that it was delivered but never acknowledged. Those entries are never
+  reprocessed, the group lag never clears and the PEL blocks the stream from being trimmed. This
+  flow reads XINFO GROUPS and XINFO CONSUMERS, flags every consumer idle past a threshold that
+  still owns pending entries, reclaims the stuck entries onto a live consumer with XAUTOCLAIM so
+  the work is reprocessed rather than lost, then removes the dead consumer with XGROUP DELCONSUMER
+  behind a dry run and a Pause. It reads the group again and fails the run if a dead consumer still
+  exists or still owns pending. A consumer that is actively reading is spared even when it holds
+  pending entries, because that is normal in-flight work.
+
+inputs:
+  - id: stream
+    type: STRING
+    displayName: Stream key
+    defaults: orders
+
+  - id: group
+    type: STRING
+    displayName: Consumer group
+    defaults: g1
+
+  - id: idle_threshold_ms
+    type: INT
+    displayName: Consumer idle threshold (ms)
+    description: >-
+      A consumer whose idle time is at least this long and that still owns pending entries is
+      treated as dead. A consumer below it is active and is never touched, even when it holds pending.
+    defaults: 900000
+
+  - id: reclaim_min_idle_ms
+    type: INT
+    displayName: XAUTOCLAIM minimum entry idle (ms)
+    description: >-
+      Only pending entries idle at least this long are reclaimed. Set it above the longest time a
+      healthy consumer legitimately takes to process one message, so in-flight work is never stolen.
+    defaults: 900000
+  - id: reclaim_consumer
+    type: STRING
+    displayName: Consumer to reclaim onto
+    description: >-
+      The live consumer that stuck entries are moved to. Leave empty to auto pick the most recently
+      active consumer in the group that is not itself a reap target.
+    defaults: ""
+
+  - id: fallback_reclaim_consumer
+    type: STRING
+    displayName: Fallback reclaim consumer
+    description: >-
+      Used only when the group has no active consumer at all. XAUTOCLAIM creates it, so the stuck
+      entries land on a known name a worker can be pointed at rather than being lost.
+    defaults: reclaim-rescue
+
+  - id: scan_count
+    type: INT
+    displayName: XAUTOCLAIM COUNT per step
+    description: How many pending entries XAUTOCLAIM reclaims per cursor step.
+    defaults: 500
+
+  - id: max_iterations
+    type: INT
+    displayName: Maximum XAUTOCLAIM cursor steps
+    description: Ceiling on the reclaim loop so a very large PEL cannot run unbounded.
+    defaults: 1000
+
+  - id: host
+    type: STRING
+    displayName: Redis host
+    defaults: redis-stream
+
+  - id: port
+    type: INT
+    displayName: Redis port
+    defaults: 6379
+
+  - id: database
+    type: INT
+    displayName: Database index
+    defaults: 0
+
+  - id: network
+    type: STRING
+    displayName: Docker network for redis-cli
+    description: Leave empty unless Redis is only reachable on a named Docker network.
+    defaults: ""
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration to wait for an answer before the pause expires.
+    defaults: "PT2H"
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow the reclaim and the delete. Still needs dry_run false and an approval.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any entry is reclaimed or any consumer is deleted.
+    defaults: true
+
+variables:
+  detect_lua: |
+    local stream = KEYS[1]
+    local group = ARGV[1]
+    local function kv(flat)
+      local m = {}
+      for i = 1, #flat, 2 do m[flat[i]] = flat[i + 1] end
+      return m
+    end
+    local okg, groups = pcall(function() return redis.call('XINFO', 'GROUPS', stream) end)
+    if not okg then return cjson.encode({ stream_exists = false, group_found = false, groups = {}, consumers = {} }) end
+    local glist = {}
+    for _, g in ipairs(groups) do
+      local gm = kv(g)
+      glist[#glist + 1] = { name = gm.name, consumers = gm.consumers, pending = gm.pending, lag = gm.lag, last_delivered = gm['last-delivered-id'] }
+    end
+    local clist = {}
+    local okc, consumers = pcall(function() return redis.call('XINFO', 'CONSUMERS', stream, group) end)
+    if okc then
+      for _, c in ipairs(consumers) do
+        local cm = kv(c)
+        clist[#clist + 1] = { name = cm.name, pending = cm.pending, idle = cm.idle, inactive = cm.inactive }
+      end
+    end
+    return cjson.encode({ stream_exists = true, group = group, group_found = okc, xlen = redis.call('XLEN', stream), groups = glist, consumers = clist })
+
+  reclaim_lua: |
+    local stream = KEYS[1]
+    local group = ARGV[1]
+    local consumer = ARGV[2]
+    local minidle = tonumber(ARGV[3])
+    local count = tonumber(ARGV[4])
+    local maxiter = tonumber(ARGV[5])
+    local cursor = '0-0'
+    local claimed = 0
+    local iter = 0
+    repeat
+      iter = iter + 1
+      local res = redis.call('XAUTOCLAIM', stream, group, consumer, minidle, cursor, 'COUNT', count, 'JUSTID')
+      cursor = res[1]
+      claimed = claimed + #res[2]
+    until cursor == '0-0' or iter >= maxiter
+    return cjson.encode({ consumer = consumer, claimed = claimed, final_cursor = cursor, iterations = iter, completed = (cursor == '0-0') })
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: >-
+      Read-only. Run one Lua script through redis-cli --eval that calls XINFO GROUPS and
+      XINFO CONSUMERS and returns the per-consumer name, pending count and idle time as JSON.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    inputFiles:
+      detect.lua: "{{ vars.detect_lua }}"
+    commands:
+      - "--eval detect.lua {{ inputs.stream }} , {{ inputs.group }}"
+
+  - id: assess
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      Flag every consumer idle past the threshold that still owns pending entries, pick the live
+      consumer to reclaim onto and build the reap set, which never includes the reclaim target.
+    values:
+      items: >-
+        {{ {'d': fromJson(outputs.detect.vars.command_1), 'thr': inputs.idle_threshold_ms, 'reclaim': inputs.reclaim_consumer, 'fallback': inputs.fallback_reclaim_consumer, 'stream': inputs.stream, 'armed': (inputs.auto_remediate and not inputs.dry_run)} | jq('
+          .d as $d | .thr as $thr
+          | (if ($d.consumers | type) == "array" then $d.consumers else [] end) as $cons
+          | (if ($d.groups | type) == "array" then $d.groups else [] end) as $groups
+          | ($cons | map({(.name): .}) | add // {}) as $byname
+          | [ $cons[] | select(.idle >= $thr and .pending > 0) | .name ] as $dead
+          | ($cons | map(select(.idle < $thr)) | sort_by(.idle)) as $liveobjs
+          | [ $liveobjs[] | .name ] as $live
+          | (if .reclaim != "" then .reclaim elif ($live | length) > 0 then $live[0] else .fallback end) as $target
+          | [ $dead[] | select(. != $target) ] as $reapable
+          | ([ $reapable[] | ($byname[.].pending // 0) ] | add // 0) as $reap_pending
+          | ($groups[0] // {}) as $g0
+          | {stream: .stream, group: $d.group, stream_exists: $d.stream_exists, group_found: $d.group_found,
+             consumers: $cons, dead: $dead, reapable: $reapable, reclaim_target: $target, live: $live,
+             reap_pending: $reap_pending, group_lag: ($g0.lag // null), group_pending: ($g0.pending // null),
+             armed: .armed, findings: ($reapable | length),
+             slack: ("Redis stream " + .stream + " group " + ($d.group // "?") + ": "
+               + (if ($d.stream_exists | not) then "stream does not exist."
+                  elif ($d.group_found | not) then "consumer group not found on the stream."
+                  elif ($reapable | length) == 0 then "no dead consumer owns pending entries."
+                  else (($reapable | length) | tostring) + " dead consumer(s) hold " + ($reap_pending | tostring) + " pending entries: "
+                       + ([ $reapable[] | $byname[.] | "\(.name) idle \(.idle)ms pending \(.pending)" ] | join("; "))
+                       + ". Reclaim target " + $target + "." end)),
+             action: (if .armed and ($reapable | length) > 0 then "Asking for approval to reclaim onto " + $target + " and delete: " + ($reapable | join(", ")) + "."
+                      elif .armed then "Remediation is armed, but no dead consumer owns pending, so nothing will change."
+                      else "No change applied: this run is read-only." end)}
+          ') | first | toJson }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ fromJson(outputs.assess.values.items) | jq('"Stream \(.stream) group \(.group): \(.consumers | length) consumer(s), \(.dead | length) idle past the threshold with pending, \(.findings) to reclaim and delete. " + .slack') | first }}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: Alert on a dead consumer, a missing stream or a missing group. A clean group logs and stops.
+    condition: "{{ fromJson(outputs.assess.values.items) | jq('if (.findings > 0) or (.stream_exists | not) or (.group_found | not) then 1 else 0 end') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': (fromJson(outputs.assess.values.items) | jq('.slack') | first) ~ ' ' ~ (fromJson(outputs.assess.values.items) | jq('.action') | first)} | toJson }}
+
+      - id: planned
+        type: io.kestra.plugin.core.log.Log
+        description: What a remediation run would do, printed on every run including a dry one.
+        message: "{{ fromJson(outputs.assess.values.items) | jq('.action') | first }}"
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: The reclaim and delete run only when auto_remediate is true, dry_run is false and a dead consumer owns pending.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and (fromJson(outputs.assess.values.items) | jq('.reapable | length') | first > 0) }}"
+        then:
+          - id: hold
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Reclaiming moves entries to another consumer and deleting a consumer discards its
+              pending list, so a human answers first. With no answer, nothing changes.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Reclaim the stuck entries and delete the dead consumers?
+                defaults: false
+              - id: note
+                type: STRING
+                displayName: Decision note
+                defaults: ""
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.hold.onResume.approved ?? false }}"
+            then:
+              - id: reclaim
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: >-
+                  Reclaim the stuck pending entries onto the live consumer with XAUTOCLAIM, looped
+                  on the cursor to exhaustion. Only entries idle past reclaim_min_idle_ms move, so
+                  fresh in-flight entries are left where they are.
+                host: "{{ inputs.host }}"
+                port: "{{ inputs.port }}"
+                database: "{{ inputs.database }}"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.network }}"
+                inputFiles:
+                  reclaim.lua: "{{ vars.reclaim_lua }}"
+                commands:
+                  - "--eval reclaim.lua {{ inputs.stream }} , {{ inputs.group }} {{ fromJson(outputs.assess.values.items).reclaim_target }} {{ inputs.reclaim_min_idle_ms }} {{ inputs.scan_count }} {{ inputs.max_iterations }}"
+
+              - id: reread1
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: Read the consumers again so the delete only touches the ones whose pending is now zero.
+                host: "{{ inputs.host }}"
+                port: "{{ inputs.port }}"
+                database: "{{ inputs.database }}"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.network }}"
+                inputFiles:
+                  detect.lua: "{{ vars.detect_lua }}"
+                commands:
+                  - "--eval detect.lua {{ inputs.stream }} , {{ inputs.group }}"
+
+              - id: delete_plan
+                type: io.kestra.plugin.core.output.OutputValues
+                description: A reap target is deleted only if the reclaim moved its whole pending list. Any that still owns pending is left in place.
+                values:
+                  items: >-
+                    {{ {'r': fromJson(outputs.reread1.vars.command_1), 'reap': fromJson(outputs.assess.values.items).reapable} | jq('
+                      .reap as $reap
+                      | (if (.r.consumers | type) == "array" then .r.consumers else [] end) as $cons
+                      | ($cons | map({(.name): .}) | add // {}) as $byname
+                      | [ $reap[] | select(($byname[.] != null) and (($byname[.].pending // 0) == 0)) ] as $deletable
+                      | [ $reap[] | select(($byname[.] != null) and (($byname[.].pending // 0) > 0)) ] as $still_pending
+                      | {deletable: $deletable, still_pending: $still_pending,
+                         note: ("Safe to delete (pending now 0): " + (if ($deletable | length) == 0 then "none" else ($deletable | join(", ")) end)
+                                + ". Still owns pending, left in place: " + (if ($still_pending | length) == 0 then "none" else ($still_pending | join(", ")) end) + ".")}
+                      ') | first | toJson }}
+
+              - id: plan_log
+                type: io.kestra.plugin.core.log.Log
+                message: "{{ fromJson(outputs.delete_plan.values.items) | jq('.note') | first }}"
+
+              - id: delete_dead_consumers
+                type: io.kestra.plugin.core.flow.Loop
+                description: Delete each dead consumer whose pending is now zero, one XGROUP DELCONSUMER per task.
+                concurrencyLimit: 1
+                values: "{{ fromJson(outputs.delete_plan.values.items) | jq('.deletable') | first | toJson }}"
+                tasks:
+                  - id: delconsumer
+                    type: io.kestra.plugin.redis.cli.RedisCLI
+                    host: "{{ inputs.host }}"
+                    port: "{{ inputs.port }}"
+                    database: "{{ inputs.database }}"
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: "{{ inputs.network }}"
+                    commands:
+                      - "XGROUP DELCONSUMER {{ inputs.stream }} {{ inputs.group }} {{ item.value }}"
+                  - id: delconsumer_log
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Deleted consumer {{ item.value }}. XGROUP DELCONSUMER returned pending count {{ outputs.delconsumer.vars.command_1 }} (zero means the reclaim had already moved its entries)."
+
+              - id: reread2
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: Final read of the group, so the verify step can confirm no dead consumer is left.
+                host: "{{ inputs.host }}"
+                port: "{{ inputs.port }}"
+                database: "{{ inputs.database }}"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.network }}"
+                inputFiles:
+                  detect.lua: "{{ vars.detect_lua }}"
+                commands:
+                  - "--eval detect.lua {{ inputs.stream }} , {{ inputs.group }}"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                description: Fail the run if any dead consumer still exists, still owns pending or the reclaim did not finish.
+                condition: >-
+                  {{ {'r': fromJson(outputs.reread2.vars.command_1), 'reap': fromJson(outputs.assess.values.items).reapable, 'rc': fromJson(outputs.reclaim.vars.command_1)} | jq('.reap as $reap | (if (.r.consumers | type) == "array" then (.r.consumers | map(.name)) else [] end) as $names | ([ $reap[] | . as $n | select((([$n] - $names) | length) == 0) ] | length) as $survivors | (if .rc.completed then 0 else 1 end) as $incomplete | if ($survivors > 0) or ($incomplete > 0) then 1 else 0 end') | first > 0 }}
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      {{ {'r': fromJson(outputs.reread2.vars.command_1), 'reap': fromJson(outputs.assess.values.items).reapable, 'rc': fromJson(outputs.reclaim.vars.command_1)} | jq('.reap as $reap | (if (.r.consumers | type) == "array" then .r.consumers else [] end) as $cons | [ $cons[] | . as $c | select(($reap | map(select(. == $c.name)) | length) > 0) | "\(.name) pending \(.pending)" ] as $surv | "Remediation did not clear the dead consumers. Reclaim completed=\(.rc.completed) claimed=\(.rc.claimed). Dead consumers still present: " + (if ($surv | length) == 0 then "none, so the reclaim loop did not finish" else ($surv | join("; ")) end) + "."') | first }}
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      {{ {'a': fromJson(outputs.assess.values.items), 'r': fromJson(outputs.reread2.vars.command_1), 'rc': fromJson(outputs.reclaim.vars.command_1)} | jq('.a.reapable as $reap | .a.reclaim_target as $tgt | .rc.claimed as $cl | ([ .a.consumers[] | . as $c | select(($reap | map(select(. == $c.name)) | length) > 0) | "\($c.name) had pending \($c.pending)" ] | join("; ")) as $before | (if (.r.consumers | type) == "array" then .r.consumers else [] end) as $after | "Reclaimed " + ($cl | tostring) + " stuck entries onto " + $tgt + ", deleted dead consumer(s) " + ($reap | join(", ")) + ". Before: " + $before + ". After: " + (if ($after | length) == 0 then "no consumers" else ([ $after[] | "\(.name) pending \(.pending)" ] | join("; ")) end) + "."') | first }}
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval not granted{{ (outputs.hold.onResume.note ?? '') == '' ? '' : (', note: ' ~ outputs.hold.onResume.note) }}.
+                  Nothing was reclaimed and no consumer was deleted. The findings stay open.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every consumer that owns pending entries is active. No crashed or scaled-down consumer is holding a stuck pending list."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Redis stream dead consumer reclaim guard failed on ' ~ inputs.host ~ ' stream ' ~ inputs.stream ~ ' group ' ~ inputs.group ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "40 * * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Redis Stream Dead Consumer Pending Reclaim Guard
+  shortDescription: Find Redis Stream consumers idle past a threshold that still own pending entries, reclaim their stuck messages onto a live consumer with XAUTOCLAIM, then delete the dead consumer with XGROUP DELCONSUMER behind a Pause and re-read the group to prove it landed.
+  metaTitle: Redis Stream Dead Consumer Pending Reclaim Guard with Kestra
+  metaDescription: Reclaim stuck pending entries from dead Redis Stream consumers with XAUTOCLAIM, delete the consumer with XGROUP DELCONSUMER behind a Pause, then verify.
+  description: |
+    A Redis Stream consumer group tracks every message it delivers until a consumer acknowledges
+    it. When a consumer crashes or is scaled down, the entries it was handed stay in its Pending
+    Entries List forever. They are never reprocessed, the group lag never clears and the uncleared
+    PEL keeps the stream from being trimmed with `XADD MAXLEN` or `XTRIM`. Nothing fails loudly.
+    The queue just stops draining and memory climbs.
+
+    This blueprint reads `XINFO GROUPS` and `XINFO CONSUMERS`, flags every consumer that has been
+    idle past a threshold and still owns pending entries, reclaims those entries onto a live
+    consumer with `XAUTOCLAIM` so the work is reprocessed instead of lost, then removes the dead
+    consumer with `XGROUP DELCONSUMER`. It reads the group again and fails the run if a dead
+    consumer is still there or still owns pending.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Safety
+
+    - A consumer that is actively reading is never a target, even when it holds pending entries.
+      Pending on an active consumer is normal in-flight work, so the detector requires both idle
+      past `idle_threshold_ms` and a non-zero pending count.
+    - `XAUTOCLAIM` only moves entries idle at least `reclaim_min_idle_ms`. Set that above the
+      longest time a healthy consumer takes to process one message, so a slow but live message is
+      never stolen from under the worker holding it.
+    - A dead consumer is deleted only after a fresh read shows its pending list is empty. Deleting
+      a consumer discards whatever pending entries it still owns, so a consumer that still holds
+      pending after the reclaim is left in place and the run fails instead.
+    - The reclaim target is never a reap target, so the group always keeps at least one consumer.
+    - The reclaim and the delete need `auto_remediate` true, `dry_run` false and a human answering
+      the `Pause`. Three conditions, all of them, before anything changes.
+
+    ## How it works
+
+    1. `detect` (`io.kestra.plugin.redis.cli.RedisCLI`) runs one Lua script through
+       `redis-cli --eval`. The script calls `XINFO GROUPS` and `XINFO CONSUMERS` and returns the
+       name, pending count and idle time of every consumer as JSON. Read-only.
+    2. `assess` flags each consumer idle at least `idle_threshold_ms` that still owns pending,
+       picks the consumer to reclaim onto (the `reclaim_consumer` input, else the most recently
+       active consumer, else `fallback_reclaim_consumer`) then builds the reap set, which never
+       contains the reclaim target. `summary` logs it.
+    3. `route` (`io.kestra.plugin.core.flow.If`): a clean group logs and stops. A dead consumer, a
+       missing stream or a missing group sends `alert` to Slack and `planned` prints what a
+       remediation run would do.
+       - `remediate_gate` opens only with `auto_remediate` true, `dry_run` false and a dead
+         consumer that owns pending. `hold` (`io.kestra.plugin.core.flow.Pause`) waits for an answer.
+       - On approval, `reclaim` runs `XAUTOCLAIM` looped on its cursor to move the stuck entries
+         onto the reclaim target. `reread1` reads the consumers again. `delete_plan` keeps only the
+         reap targets whose pending is now zero. `delete_dead_consumers`
+         (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs one `XGROUP DELCONSUMER`
+         per consumer. `reread2` reads the group a final time and `verify_result` fails the run if
+         any reap target is still present or the reclaim loop did not finish.
+       - Without approval, `declined` records the decision and nothing changes.
+    4. `errors` posts to Slack when the flow fails.
+
+    ## What you get
+
+    - A per-consumer view of a stream group: who is active, who is idle and how many entries each
+      one is holding unacknowledged.
+    - The stuck work moved back onto a live consumer so it is reprocessed, not abandoned in a
+      crashed consumer's PEL.
+    - The dead consumer removed so the group stops reporting phantom pending, with a re-read that
+      fails the run when the change did not land.
+
+    ## Who it's for
+
+    - Teams running Redis Streams with a consumer group behind a worker pool that scales up and
+      down or restarts, which leaves behind consumers nobody cleans up.
+    - SREs who have watched a group's lag sit at a fixed non-zero number for days because a
+      consumer that no longer exists still owns the entries.
+    - Anyone evaluating the Redis plugin who wants an `XAUTOCLAIM` and `XGROUP` example that is
+      safe to point at a real group.
+
+    ## Why orchestrate this with Kestra
+
+    Reclaiming a PEL safely is a sequence, not one command. You read the group, decide which
+    consumers are genuinely dead, move their entries without stealing live work, delete only the
+    consumers that are now empty, then read the group again to confirm. Kestra keeps that sequence
+    in one place, puts the destructive half behind `auto_remediate`, `dry_run` and a `Pause`, runs
+    it on a schedule and records every decision on the execution.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against a Redis 7.4 container, with a local HTTP sink standing in for
+    Slack. The stream `orders` held a consumer group `g1` with a crashed consumer `dead1` holding
+    pending entries it never acknowledged, plus an active consumer `worker1` reading and holding
+    in-flight work. Every run was checked against `redis-cli` with `XINFO CONSUMERS`,
+    `XINFO GROUPS` and `XPENDING`, not only against the Kestra log.
+
+    | Run | Execution | Inputs | Result |
+    |---|---|---|---|
+    | Healthy | `10v19VY9ChoFNvZ4ENFJsS` | both consumers just read (idle under 5s), each holds pending | 0 findings. `dead1` pending 3 and `worker1` pending 1, both spared because neither is idle past the threshold. Route logs clean |
+    | Degraded, dry run | `7duhkjs2LDgrj6RVuv1YDA` | `idle_threshold_ms: 5000`, `dead1` idle 41625ms | Names `dead1` only (pending 3), reclaim target `worker1`. `worker1` idle 42ms pending 2, spared. Alert sent, nothing changed |
+    | Remediate, approved | `7WsnXsewX98QIKtxdRgL6p` | `auto_remediate: true`, `dry_run: false`, threshold 25000, resumed `approved: true` | `XAUTOCLAIM` moved 4 entries onto `worker1` (pending 2 to 5), `XGROUP DELCONSUMER` removed `dead1`, re-read confirmed `dead1` gone. `XPENDING` total 5 before and after, so nothing was lost |
+    | Declined | `6i0JCAf8uwZuSNFDxiULwf` | the same, resumed `approved: false` | Paused then declined. `dead1` still present with pending 3 |
+    | Failure | `2UQVKXnWDTqidTntBfMil5` | `reclaim_min_idle_ms: 999999999` so `XAUTOCLAIM` reclaims nothing | Reclaim claimed 0, `dead1` still owned pending, so it was not deleted. `verify_result` failed the run and the `errors` block posted to Slack. `dead1` kept its 3 entries |
+    | Fallback target | `6Otw1Ao9bWz6mL0LogKbBx` | no active consumer in the group | Both idle consumers reclaimed onto the created `reclaim-rescue`, then deleted. Entries preserved on `reclaim-rescue` |
+
+
+    ## Prerequisites
+
+    - A Redis 5 or later instance with at least one stream and consumer group, reachable from the
+      containers the `RedisCLI` tasks start. `XINFO`, `XAUTOCLAIM` and `XGROUP` must be allowed for
+      the user.
+    - A live consumer to reclaim onto. Leave `reclaim_consumer` empty to auto pick the most
+      recently active one.
+    - Local testing:
+      - `docker run -d --name redis-stream --network mynet redis:7-alpine`;
+      - seed a stuck PEL with `XADD`, `XGROUP CREATE`, then `XREADGROUP` as a consumer without
+        `XACK` and let it go idle;
+      - run the flow with `network: mynet`.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block. In Kestra OSS, provide it as the
+      base64-encoded environment variable `SECRET_SLACK_WEBHOOK_URL`.
+    - A password-protected instance also wants `REDIS_PASSWORD`. Add
+      `password: "{{ secret('REDIS_PASSWORD') }}"` to each `RedisCLI` task.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `stream`, `group` | `orders`, `g1` | The stream and consumer group to check |
+    | `idle_threshold_ms` | `900000` | Idle time past which a consumer with pending is dead |
+    | `reclaim_min_idle_ms` | `900000` | `XAUTOCLAIM` only moves entries idle at least this long |
+    | `reclaim_consumer` | empty | Consumer to reclaim onto, empty to auto pick |
+    | `fallback_reclaim_consumer` | `reclaim-rescue` | Used only when no consumer is active |
+    | `scan_count` | `500` | `XAUTOCLAIM COUNT` per cursor step |
+    | `max_iterations` | `1000` | Ceiling on the reclaim loop |
+    | `host`, `port`, `database` | `redis-stream`, `6379`, `0` | The instance to read |
+    | `network` | empty | Docker network for the `redis-cli` containers |
+    | `approval_timeout` | `PT2H` | How long the pause waits |
+    | `auto_remediate` | `false` | Allow the reclaim and the delete |
+    | `dry_run` | `true` | Must be `false` for a change to apply |
+    ## Quick start
+
+    1. Add the `SLACK_WEBHOOK_URL` secret.
+    2. Import the flow, set `stream` and `group` and run it with the defaults. It reports the
+       consumers and stops without changing anything.
+    3. Set `idle_threshold_ms` to how long a consumer may be idle before you treat it as gone and
+       `reclaim_min_idle_ms` above your longest message processing time.
+    4. To clean up, name a live `reclaim_consumer` or leave it empty, set `auto_remediate: true`
+       and `dry_run: false`, run it, then answer the pause.
+    5. Enable the `hourly` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Check several groups by wrapping the read in a `Loop` over a list of stream and group pairs.
+    - Trim the stream after a clean reclaim with `XADD MAXLEN` or `XTRIM`, now that the PEL no
+      longer pins old entries.
+    - Alert only when the reclaimed count or the group lag crosses a threshold, so a tiny PEL stays
+      quiet and a real backlog pages someone.
+    - Replace the `Pause` with a Slack approval. Drop it for a group you are sure about.
+    - Record the reclaimed count per run in Kestra KV to chart how often consumers are dying.
+
+    ## Links
+
+    - Redis consumer groups: https://redis.io/docs/latest/develop/data-types/streams/
+    - `XAUTOCLAIM`: https://redis.io/docs/latest/commands/xautoclaim/
+    - `XGROUP DELCONSUMER`: https://redis.io/docs/latest/commands/xgroup-delconsumer/
+    - Redis plugin: https://kestra.io/plugins/plugin-redis
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false

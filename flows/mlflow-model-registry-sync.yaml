@@ -1,0 +1,432 @@
+id: mlflow-model-registry-sync
+namespace: company.team
+description: |
+  Compare the MLflow model registry with the production serving registry table once a day and
+  alert Slack when deployed models lag behind the registered version, have no serving row at all,
+  or have been archived in MLflow. The verdict, gap count, and stale list are published as outputs.
+
+triggers:
+  - id: daily_registry_reconcile
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Reconcile MLflow registry state against the serving registry every day at 05:00 UTC (shipped disabled, enable it once the secrets exist).
+    cron: "0 5 * * *"
+    disabled: true
+
+inputs:
+  - id: env
+    type: STRING
+    displayName: Target environment
+    description: Environment key used to filter serving registry rows (for example production or staging).
+    defaults: "production"
+  - id: registry_gap_tolerance
+    type: INT
+    displayName: Registry gap tolerance
+    description: Number of lagging or missing models tolerated before the alert branch fires.
+    defaults: 0
+  - id: reconciliation_repo
+    type: STRING
+    displayName: Reconciliation repository (optional)
+    description: GitHub owner and repository that receives a follow up issue when drift is found. Leave empty to skip that call.
+    defaults: ""
+
+tasks:
+  # --- 1. collect MLflow registry state ---
+  - id: fetch_registered_models
+    type: io.kestra.plugin.core.http.Request
+    description: List every registered model in MLflow through the 2.0 REST search endpoint.
+    uri: "{{ secret('MLFLOW_TRACKING_URI') }}/api/2.0/mlflow/registered-models/search?max_results=1000"
+    method: GET
+    headers:
+      Accept: "application/json"
+      Authorization: "Bearer {{ secret('MLFLOW_TOKEN') }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+
+  - id: fetch_model_versions
+    type: io.kestra.plugin.core.http.Request
+    description: Pull every model version with its current stage so the comparison sees promotions and archivals.
+    uri: "{{ secret('MLFLOW_TRACKING_URI') }}/api/2.0/mlflow/model-versions/search?max_results=1000"
+    method: GET
+    headers:
+      Accept: "application/json"
+      Authorization: "Bearer {{ secret('MLFLOW_TOKEN') }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+
+  # --- 2. read what production actually serves ---
+  - id: query_deployed_models
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read name, version, and deployed_at for the chosen environment from the production serving registry table.
+    url: "{{ secret('POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        model_name AS name,
+        model_version AS version,
+        deployed_at::text AS deployed_at
+      FROM public.deployed_models
+      WHERE environment = '{{ inputs.env }}'
+      ORDER BY model_name;
+
+  # --- 3. reconcile registry against serving rows ---
+  - id: reconcile
+    type: io.kestra.plugin.scripts.python.Script
+    description: Classify every model as gap, missing, or stale and emit the verdict through the JSON outputs protocol.
+    inputFiles:
+      mlflow_models.json: "{{ outputs.fetch_registered_models.body }}"
+      mlflow_versions.json: "{{ outputs.fetch_model_versions.body }}"
+      deployed_rows.json: "{{ outputs.query_deployed_models.rows | json }}"
+      config.json: |
+        {"env": "{{ inputs.env }}", "tolerance": {{ inputs.registry_gap_tolerance }}}
+    script: |
+      import datetime
+      import json
+
+
+      def load_json(path):
+          try:
+              with open(path, "r", encoding="utf-8") as handle:
+                  raw = handle.read().strip()
+              if not raw:
+                  return None
+              return json.loads(raw)
+          except Exception:
+              return None
+
+
+      def as_int(value):
+          try:
+              return int(str(value).strip())
+          except (TypeError, ValueError):
+              return None
+
+
+      def clean(value):
+          return str(value).replace("\\", "/").replace('"', "'")
+
+
+      config = load_json("config.json") or {}
+      tolerance = as_int(config.get("tolerance"))
+      if tolerance is None or tolerance < 0:
+          tolerance = 0
+      env = clean(config.get("env") or "production")
+
+      models_doc = load_json("mlflow_models.json")
+      versions_doc = load_json("mlflow_versions.json")
+      deployed_rows = load_json("deployed_rows.json")
+
+      checked_at = (
+          datetime.datetime.now(datetime.timezone.utc)
+          .replace(microsecond=0)
+          .isoformat()
+          .replace("+00:00", "Z")
+      )
+
+      registered_names = set()
+      deployed_map = {}
+      without_target_stage = []
+      gaps = []
+      missing = []
+      stale = []
+      gaps_text = "none"
+      missing_text = "none"
+      stale_text = "none"
+      reason = "ok"
+
+      if not isinstance(models_doc, dict) or not isinstance(versions_doc, dict) or not isinstance(deployed_rows, list):
+          reason = "unreadable_input"
+          verdict = "UNKNOWN"
+          gap_count = 0
+          stale_models = []
+          stale_count = 0
+          needs_attention = True
+      else:
+          registered_entries = models_doc.get("registered_models")
+          if not isinstance(registered_entries, list):
+              registered_entries = []
+          for entry in registered_entries:
+              if isinstance(entry, dict) and entry.get("name"):
+                  registered_names.add(str(entry["name"]))
+
+          version_entries = versions_doc.get("model_versions")
+          if not isinstance(version_entries, list):
+              version_entries = []
+
+          by_model = {}
+          for entry in version_entries:
+              if not isinstance(entry, dict):
+                  continue
+              name = entry.get("name")
+              version = as_int(entry.get("version"))
+              if not name or version is None:
+                  continue
+              stage = str(entry.get("current_stage") or "None").strip()
+              by_model.setdefault(str(name), []).append((version, stage))
+
+          target = {}
+          for name, items in by_model.items():
+              production = [v for v, s in items if s.lower() == "production"]
+              staging = [v for v, s in items if s.lower() == "staging"]
+              if production:
+                  target[name] = max(production)
+              elif staging:
+                  target[name] = max(staging)
+
+          for name in sorted(registered_names):
+              if name in by_model and name not in target:
+                  without_target_stage.append(name)
+
+          for row in deployed_rows:
+              if not isinstance(row, dict):
+                  continue
+              name = row.get("name") or row.get("model_name")
+              version = as_int(row.get("version"))
+              if version is None:
+                  version = as_int(row.get("model_version"))
+              if not name or version is None:
+                  continue
+              deployed_map[str(name)] = version
+
+          for name in sorted(target):
+              registered_version = target[name]
+              if name not in deployed_map:
+                  missing.append({"name": name, "registered_version": registered_version})
+              elif deployed_map[name] < registered_version:
+                  gaps.append({
+                      "name": name,
+                      "deployed_version": deployed_map[name],
+                      "registered_version": registered_version,
+                  })
+
+          for name in sorted(deployed_map):
+              deployed_version = deployed_map[name]
+              items = by_model.get(name)
+              if not items:
+                  stale.append({"name": name, "version": deployed_version, "reason": "absent_from_mlflow"})
+                  continue
+              stage = None
+              for version, current_stage in items:
+                  if version == deployed_version:
+                      stage = current_stage
+                      break
+              if stage is None:
+                  stale.append({"name": name, "version": deployed_version, "reason": "version_not_registered"})
+              elif stage.lower() == "archived":
+                  stale.append({"name": name, "version": deployed_version, "reason": "archived"})
+
+          gap_count = len(gaps) + len(missing)
+          stale_models = [
+              "%s v%s (%s)" % (clean(s["name"]), s["version"], s["reason"]) for s in stale
+          ]
+          stale_count = len(stale)
+          needs_attention = gap_count > tolerance or stale_count > 0
+          verdict = "DRIFT" if needs_attention else "IN_SYNC"
+          gaps_text = "; ".join(
+              "%s (deployed v%s, registered v%s)"
+              % (clean(g["name"]), g["deployed_version"], g["registered_version"])
+              for g in gaps
+          ) or "none"
+          missing_text = "; ".join(
+              "%s (registered v%s, no serving row)" % (clean(m["name"]), m["registered_version"])
+              for m in missing
+          ) or "none"
+          stale_text = "; ".join(stale_models) or "none"
+
+      payload = {
+          "outputs": {
+              "verdict": verdict,
+              "gap_count": gap_count,
+              "stale_models": stale_models,
+              "stale_count": stale_count,
+              "missing_count": len(missing),
+              "gaps": gaps,
+              "missing": missing,
+              "stale": stale,
+              "gaps_text": gaps_text,
+              "missing_text": missing_text,
+              "stale_text": stale_text,
+              "needs_attention": bool(needs_attention),
+              "tolerance": tolerance,
+              "env": env,
+              "reason": reason,
+              "checked_at": checked_at,
+              "registry_model_count": len(registered_names),
+              "deployed_count": len(deployed_map),
+              "without_target_stage": sorted(without_target_stage),
+          }
+      }
+      print("::" + json.dumps(payload) + "::")
+      print(
+          "verdict=%s gap_count=%d missing=%d stale=%d reason=%s"
+          % (verdict, gap_count, len(missing), len(stale), reason)
+      )
+
+  # --- 4. alert branch ---
+  - id: drift_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Alert when the gap count is above the tolerance or any serving row is stale, otherwise record a green run.
+    condition: "{{ outputs.reconcile.vars.needs_attention }}"
+    then:
+      - id: slack_drift_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the gap, missing, and stale lists to the alert channel with the verdict and the execution link.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":rotating_light: MLflow registry drift for {{ outputs.reconcile.vars.env }} at {{ outputs.reconcile.vars.checked_at }}. gap_count {{ outputs.reconcile.vars.gap_count }}, missing {{ outputs.reconcile.vars.missing_count }}, stale {{ outputs.reconcile.vars.stale_count }}, verdict {{ outputs.reconcile.vars.verdict }}. Execution {{ execution.id }}.",
+            "blocks": [
+              {"type": "section", "text": {"type": "mrkdwn", "text": "*MLflow registry reconciliation* for `{{ outputs.reconcile.vars.env }}`\n*Verdict* `{{ outputs.reconcile.vars.verdict }}` at {{ outputs.reconcile.vars.checked_at }}\n*Tolerance* {{ outputs.reconcile.vars.tolerance }} gap(s) allowed\n*MLflow registered models* {{ outputs.reconcile.vars.registry_model_count }}, *serving rows* {{ outputs.reconcile.vars.deployed_count }}"}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": "*Gaps* (serving version behind the registered version)\n{{ outputs.reconcile.vars.gaps_text }}"}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": "*Missing* (registered in MLflow, no serving row)\n{{ outputs.reconcile.vars.missing_text }}"}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": "*Stale* (serving row archived or absent in MLflow)\n{{ outputs.reconcile.vars.stale_text }}"}}
+            ]
+          }
+
+      - id: open_reconciliation_issue
+        type: io.kestra.plugin.core.http.Request
+        description: Optional follow up that opens an issue in the reconciliation repository so a human owns the repair.
+        runIf: "{{ inputs.reconciliation_repo != '' }}"
+        allowFailure: true
+        uri: "https://api.github.com/repos/{{ inputs.reconciliation_repo }}/issues"
+        method: POST
+        contentType: "application/json"
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github.v3+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        body: |
+          {
+            "title": "MLflow registry reconciliation {{ outputs.reconcile.vars.env }} {{ outputs.reconcile.vars.checked_at }}",
+            "labels": ["mlops", "registry-sync"],
+            "body": "Verdict {{ outputs.reconcile.vars.verdict }} at {{ outputs.reconcile.vars.checked_at }}\n\nGaps: {{ outputs.reconcile.vars.gaps_text }}\nMissing: {{ outputs.reconcile.vars.missing_text }}\nStale: {{ outputs.reconcile.vars.stale_text }}\n\nExecution {{ execution.id }}"
+          }
+
+    else:
+      - id: log_in_sync
+        type: io.kestra.plugin.core.log.Log
+        description: Green path, record the in sync numbers so the execution history shows every check that ran.
+        message: "MLflow registry and the {{ inputs.env }} serving registry are in sync. gap_count {{ outputs.reconcile.vars.gap_count }}, stale {{ outputs.reconcile.vars.stale_count }}, checked_at {{ outputs.reconcile.vars.checked_at }}."
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert the channel when the reconciliation itself fails, so a broken check never looks like a clean one.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED {{ flow.id }} run {{ execution.id }}"}
+
+outputs:
+  - id: gap_count
+    type: INT
+    value: "{{ outputs.reconcile.vars.gap_count }}"
+  - id: stale_models
+    type: JSON
+    value: "{{ outputs.reconcile.vars.stale_models | toJson }}"
+  - id: verdict
+    type: STRING
+    value: "{{ outputs.reconcile.vars.verdict }}"
+  - id: checked_at
+    type: STRING
+    value: "{{ outputs.reconcile.vars.checked_at }}"
+
+extend:
+  title: Reconcile MLflow Registry Drift Against Deployed Serving Models
+  metaTitle: MLflow Model Registry Sync with the Production Serving Registry
+  shortDescription: Compare MLflow registered model versions with the production serving registry table, alert Slack on gaps, missing rows, and archived models, and publish a reconciliation verdict.
+  description: |
+    Model registries and serving tables drift apart quietly. A version gets promoted in MLflow but the deployment job fails, a model gets archived after a rewrite but the old version keeps serving, or a model is registered and never deployed at all. Nobody notices until a rollout references a version that production never ran. This flow reads both sides every day and tells you exactly where they disagree.
+
+    ## How it works
+
+    1. The `daily_registry_reconcile` trigger (`io.kestra.plugin.core.trigger.Schedule`, cron `0 5 * * *`, shipped `disabled: true`) starts the check once a day at 05:00 UTC.
+    2. `fetch_registered_models` (`io.kestra.plugin.core.http.Request`) calls `GET /api/2.0/mlflow/registered-models/search` on `MLFLOW_TRACKING_URI`, and `fetch_model_versions` calls `GET /api/2.0/mlflow/model-versions/search` for every version together with its `current_stage`, both authenticated with `MLFLOW_TOKEN` in an `Authorization: Bearer` header.
+    3. `query_deployed_models` (`io.kestra.plugin.jdbc.postgresql.Query` with `fetchType: FETCH`) reads `name`, `version`, and `deployed_at` from `public.deployed_models` for the `env` input, which is what production is actually serving.
+    4. `reconcile` (`io.kestra.plugin.scripts.python.Script`) picks a target version per model (the latest Production version if one exists, otherwise the latest Staging version) and compares it with the deployed row, then classifies the model as a gap (serving version behind the registered version), missing (registered with a target stage but no serving row), or stale (serving row archived in MLflow, unregistered, or absent from MLflow).
+    5. The script emits `verdict`, `gap_count`, `stale_models`, and `checked_at` through the JSON outputs protocol, plus per category text lists that the alert interpolates directly.
+    6. `drift_gate` (`io.kestra.plugin.core.flow.If`) branches on `needs_attention`, which is true when `gap_count` exceeds `registry_gap_tolerance` or any model is stale, so the alert path posts to Slack and optionally opens a GitHub issue while the clean path logs an in sync message.
+
+    ## What you get
+
+    - A daily verdict of `IN_SYNC`, `DRIFT`, or `UNKNOWN` with the exact count of models whose serving row lags or is missing.
+    - Three explicit lists in Slack: gaps, missing rows, and stale rows, each with the model name and the two versions involved.
+    - Stale detection that catches the quiet failure mode where a model keeps serving after MLflow archived or unregistered it.
+    - A tolerance input so a known backlog of one or two pending promotions does not page anyone.
+    - Flow outputs (`gap_count`, `stale_models`, `verdict`, `checked_at`) that a parent promotion pipeline can gate on.
+
+    ## Who it's for
+
+    - MLOps engineers who own the promotion path from a registered model to a live serving deployment.
+    - Platform teams that keep a serving registry table in Postgres and need a second opinion from MLflow.
+    - ML tech leads who want evidence that production runs the version the registry says is current.
+    - Auditors and release managers who need a dated record that deployed models were checked against the registry.
+
+    ## Why orchestrate this with Kestra
+
+    The comparison itself is a short script, but the reliability is the hard part. Two REST calls need retries, the database read needs credentials that must not live in the script, the branch between alerting and staying quiet must be visible in the execution history, and the failure of the check itself needs its own notification. Kestra gives all of that declaratively, a disabled schedule ships with the flow so you turn it on instead of wiring a cron box, and the outputs turn a daily report into something another flow can branch on. A one-off script scattered across a cron host gives none of that lineage.
+
+    ## Prerequisites
+
+    - A Kestra instance (`0.20.0`+ recommended) with the core, scripts, Slack, and JDBC PostgreSQL plugins available.
+    - An MLflow tracking server with the model registry enabled, reachable from the Kestra worker, without a trailing slash on its base URL.
+    - A PostgreSQL database holding `public.deployed_models` with the columns `model_name TEXT`, `model_version TEXT`, `environment TEXT`, and `deployed_at TIMESTAMPTZ`.
+    - A Slack incoming webhook for the drift alert and for the failure handler.
+    - Python available to the script task, or add a Docker task runner to `reconcile` if the worker has no interpreter.
+
+    ### Secrets
+
+    - `MLFLOW_TRACKING_URI`: base URL of the MLflow tracking server, for example `https://mlflow.example.com` with no trailing slash.
+    - `MLFLOW_TOKEN`: bearer token sent in the `Authorization` header of both registry calls; store a placeholder value if your tracking server does not enforce authentication.
+    - `POSTGRES_JDBC_URL`: JDBC URL of the production database, for example `jdbc:postgresql://db.example.com:5432/ml_platform`.
+    - `POSTGRES_USERNAME`: database user allowed to read `public.deployed_models`.
+    - `POSTGRES_PASSWORD`: password for that database user.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL used for the drift alert and the failure alert.
+    - `GITHUB_TOKEN`: only needed when `reconciliation_repo` is set, so the optional issue can be opened.
+
+    ## Quick start
+
+    1. Add the secrets above to the `company.team` namespace in Kestra.
+    2. Copy this blueprint into `flows/mlflow-model-registry-sync.yaml` and adjust the namespace if needed.
+    3. Confirm the SQL in `query_deployed_models` matches your serving table, then run the flow once manually and read the verdict from the outputs.
+    4. Turn the schedule on by flipping the trigger to the snippet below, or keep it disabled and call the flow from your deployment pipeline.
+    5. Set `registry_gap_tolerance` to the backlog you are willing to carry, and set `reconciliation_repo` only if you want the follow up issue.
+
+    ```yaml
+    triggers:
+      - id: daily_registry_reconcile
+        type: io.kestra.plugin.core.trigger.Schedule
+        cron: "0 5 * * *"
+        disabled: false
+    ```
+
+    Secrets go in Namespace, then Secrets, as `MLFLOW_TRACKING_URI`, `MLFLOW_TOKEN`, `POSTGRES_JDBC_URL`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `SLACK_WEBHOOK_URL`, never in this file.
+
+    ## How to extend
+
+    - Change the target stage rule in `reconcile` so Staging counts as a gap only for specific model name prefixes.
+    - Add a second SQL task that writes the verdict into a history table to build a trend of drift over time.
+    - Replace the Slack alert with an email or Discord task, or fan out one message per gap with a `Loop`.
+    - Fail the execution on `DRIFT` with `io.kestra.plugin.core.execution.Fail` if your release pipeline should stop instead of being notified.
+    - Compare against an environment column per stage by running the flow once per `env` input from a parent flow.
+
+    ## Links
+
+    - MLflow Model Registry documentation: https://mlflow.org/docs/latest/ml/model-registry
+    - MLflow REST API reference: https://mlflow.org/docs/latest/api_reference/rest-api.html
+    - Kestra PostgreSQL plugin documentation: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - AI
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
+  metaDescription: Compare MLflow model versions with the production serving registry in Kestra, flag gaps, missing rows, and archived models, and alert Slack with the verdict.
