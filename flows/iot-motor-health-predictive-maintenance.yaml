@@ -1,0 +1,672 @@
+id: iot-motor-health-predictive-maintenance
+namespace: company.team
+
+# Serialize this flow's Redis read/modify/write transactions, including manual runs.
+# Keep one writer per namespace/flow/device; this is not a cross-flow Redis lock.
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: telemetry
+    type: JSON
+    defaults: '{}'
+    description: Manual test payload following the contract below; MQTT payloads take precedence.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Suppress all Slack and MQTT writes; persist simulated health in a separate Redis key.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: Permit safe-mode requests only for fresh MQTT samples when dry_run is also false.
+  - id: health_profile
+    type: JSON
+    defaults: |
+      {
+        "motor_temp_c": {"direction": "high", "warning": 60, "critical": 80, "weight": 0.4},
+        "motor_current_a": {"direction": "high", "warning": 5, "critical": 8, "weight": 0.3},
+        "vibration_mm_s": {"direction": "high", "warning": 4.5, "critical": 7.1, "weight": 0.3}
+      }
+    description: Map of metric names to direction (high/low), warning, critical, and positive weight. Illustrative thresholds; calibrate per asset.
+  - id: detection_policy
+    type: JSON
+    defaults: |
+      {
+        "ema_alpha": 0.35,
+        "anomaly_score": 60,
+        "recovery_score": 80,
+        "min_anomaly_samples": 3,
+        "min_anomaly_seconds": 30,
+        "min_recovery_samples": 3,
+        "max_sample_gap_seconds": 120,
+        "max_sample_age_seconds": 300,
+        "max_future_skew_seconds": 10,
+        "alert_cooldown_seconds": 900,
+        "command_cooldown_seconds": 1800,
+        "command_ttl_seconds": 30
+      }
+    description: Detection, freshness, recovery and cooldown settings; exact ranges are documented below.
+  - id: state_ttl
+    type: DURATION
+    defaults: P7D
+    description: Redis retention after each accepted sample; expiry starts a new health history.
+
+# Trigger connection settings cannot depend on an execution-time input.
+# Change these flow variables (and input defaults) for unattended MQTT executions.
+variables:
+  device_topic_root: devices
+  mqtt_subscriber_client_id: kestra-motor-health
+  mqtt_version: V3
+  state_key_prefix: motor-health-v1
+
+tasks:
+  - id: validate_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate policy and telemetry; reject stale, retained, non-finite or incorrectly routed data before Redis access.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.12-slim
+    dependencies:
+      - kestra
+    inputFiles:
+      telemetry.json: "{{ (trigger.payload ?? inputs.telemetry) | toJson }}"
+      profile.json: "{{ inputs.health_profile | toJson }}"
+      policy.json: "{{ inputs.detection_policy | toJson }}"
+      context.json: >-
+        {{ {'topic': trigger.topic ?? '', 'retained': trigger.retain ?? false,
+            'topic_root': vars.device_topic_root, 'prefix': vars.state_key_prefix,
+            'namespace': flow.namespace, 'flow_id': flow.id, 'dry_run': inputs.dry_run,
+            'state_ttl': inputs.state_ttl} | toJson }}
+    script: |
+      import hashlib
+      import json
+      import math
+      import re
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      def load(name):
+          with open(name, encoding="utf-8") as f:
+              value = json.load(f)
+          # A JSON input can be supplied as JSON text by some clients.
+          return json.loads(value) if isinstance(value, str) else value
+
+      def number(value, name):
+          if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+              raise ValueError(f"{name} must be a finite number")
+          return float(value)
+
+      t, profile, p, c = [load(n) for n in ("telemetry.json", "profile.json", "policy.json", "context.json")]
+      if not isinstance(t, dict) or t.get("schema_version") != 1 or isinstance(t.get("schema_version"), bool):
+          raise ValueError("telemetry must be an object with schema_version=1")
+      device = t.get("device_id")
+      if not isinstance(device, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", device):
+          raise ValueError("device_id must contain 1..64 letters, digits, underscores or hyphens")
+      if t.get("operating_state") not in ("RUNNING", "IDLE"):
+          raise ValueError("operating_state must be RUNNING or IDLE")
+      if not isinstance(profile, dict) or not profile or len(profile) > 16:
+          raise ValueError("health_profile must contain 1..16 metrics")
+      if not isinstance(t.get("metrics"), dict):
+          raise ValueError("metrics must be an object")
+      for name, value in t["metrics"].items():
+          number(value, f"metrics.{name}")
+      for name, spec in profile.items():
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name) or not isinstance(spec, dict):
+              raise ValueError("invalid metric profile")
+          if set(spec) != {"direction", "warning", "critical", "weight"}:
+              raise ValueError(f"{name}: expected direction, warning, critical and weight")
+          w, k, weight = [number(spec.get(field), f"{name}.{field}") for field in ("warning", "critical", "weight")]
+          if spec.get("direction") not in ("high", "low") or weight <= 0:
+              raise ValueError(f"{name}: invalid direction or weight")
+          if (spec["direction"] == "high" and w >= k) or (spec["direction"] == "low" and w <= k):
+              raise ValueError(f"{name}: warning/critical order is invalid")
+          number(t["metrics"].get(name), f"metrics.{name}")
+      required = {
+          "ema_alpha", "anomaly_score", "recovery_score", "min_anomaly_samples",
+          "min_anomaly_seconds", "min_recovery_samples", "max_sample_gap_seconds",
+          "max_sample_age_seconds", "max_future_skew_seconds", "alert_cooldown_seconds",
+          "command_cooldown_seconds", "command_ttl_seconds"
+      }
+      if not isinstance(p, dict) or set(p) != required:
+          raise ValueError("detection_policy must supply exactly the documented fields")
+      for name in required:
+          number(p[name], f"detection_policy.{name}")
+      if not 0 < p["ema_alpha"] <= 1 or not 0 <= p["anomaly_score"] < p["recovery_score"] <= 100:
+          raise ValueError("invalid smoothing or score thresholds")
+      for name in ("min_anomaly_samples", "min_recovery_samples"):
+          if isinstance(p[name], bool) or not isinstance(p[name], int) or not 2 <= p[name] <= 1000:
+              raise ValueError(f"{name} must be an integer in 2..1000")
+      for name in required - {"ema_alpha", "anomaly_score", "recovery_score", "min_anomaly_samples", "min_recovery_samples", "max_future_skew_seconds"}:
+          if p[name] <= 0:
+              raise ValueError(f"{name} must be positive")
+      if not 0 <= p["max_future_skew_seconds"] <= 60 or not 0 < p["command_ttl_seconds"] <= 300:
+          raise ValueError("future skew must be 0..60s; command TTL must be >0..300s")
+      ttl = re.fullmatch(r"P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?", str(c["state_ttl"]))
+      if not ttl or not any(float(part or 0) > 0 for part in ttl.groups()):
+          raise ValueError("state_ttl must be a positive day/hour/minute/second ISO duration")
+      if not isinstance(t.get("timestamp"), str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", t["timestamp"]):
+          raise ValueError("timestamp must include UTC date/time/seconds and optional microseconds, ending in Z")
+      stamp = datetime.fromisoformat(t["timestamp"].replace("Z", "+00:00")).timestamp()
+      now = datetime.now(timezone.utc).timestamp()
+      if now - stamp > p["max_sample_age_seconds"] or stamp - now > p["max_future_skew_seconds"]:
+          raise ValueError("telemetry is stale or too far in the future")
+      if c["retained"]:
+          raise ValueError("retained telemetry is not accepted; publish with retain=false")
+      source = "mqtt" if c["topic"] else "manual"
+      if source == "mqtt" and c["topic"] != f"{c['topic_root']}/{device}/telemetry":
+          raise ValueError("topic device_id does not match the telemetry device_id")
+      mode = "dry-run" if c["dry_run"] else "live"
+      fingerprint = hashlib.sha256(json.dumps({"profile": profile, "policy": p}, sort_keys=True).encode()).hexdigest()
+      Kestra.outputs({
+          "telemetry": t, "profile": profile, "policy": p, "timestamp_epoch": stamp,
+          "profile_hash": fingerprint, "source": source,
+          "state_key": f"{c['prefix']}:{c['namespace']}:{c['flow_id']}:{mode}:{device}"
+      })
+
+  - id: load_previous_state
+    type: io.kestra.plugin.redis.string.Get
+    description: Load this asset's health history; a missing key is the normal first-sample case.
+    url: "{{ secret('REDIS_URI') }}"
+    key: "{{ outputs.validate_telemetry.vars.state_key }}"
+    serdeType: JSON
+    failedOnMissing: false
+    retry:
+      type: constant
+      interval: PT2S
+      maxAttempts: 3
+
+  - id: score_health
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compute weighted risk, smoothed health and trend; maintain anomaly/recovery streaks and effect cooldowns.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.12-slim
+    dependencies:
+      - kestra
+    inputFiles:
+      validated.json: "{{ outputs.validate_telemetry.vars | toJson }}"
+      previous.json: "{{ (outputs.load_previous_state.data ?? {}) | toJson }}"
+    script: |
+      import copy
+      import json
+      import math
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      with open("validated.json", encoding="utf-8") as f:
+          v = json.load(f)
+      with open("previous.json", encoding="utf-8") as f:
+          old = json.load(f)
+      t, profile, p = v["telemetry"], v["profile"], v["policy"]
+      stamp, now = v["timestamp_epoch"], datetime.now(timezone.utc).timestamp()
+      if now - stamp > p["max_sample_age_seconds"]:
+          raise ValueError("telemetry became stale while queued or loading Redis")
+      if not isinstance(old, dict):
+          raise ValueError("Redis state must be a JSON object")
+      if old:
+          required = {"schema_version", "device_id", "profile_hash", "last_timestamp", "ema_health",
+                      "status", "operating_state", "anomaly_count", "anomaly_since", "recovery_count", "last_alert_at",
+                      "last_command_at", "pending_alert"}
+          if not required <= set(old) or old["schema_version"] != 1 or old["device_id"] != t["device_id"]:
+              raise ValueError("Redis state is incompatible; inspect it before resetting")
+          for name in ("last_timestamp", "ema_health", "last_alert_at", "last_command_at"):
+              value = old[name]
+              if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                  raise ValueError(f"invalid Redis state: {name}")
+          for name in ("anomaly_count", "recovery_count"):
+              if isinstance(old[name], bool) or not isinstance(old[name], int) or old[name] < 0:
+                  raise ValueError(f"invalid Redis state: {name}")
+          if old["status"] not in ("HEALTHY", "PENDING", "CRITICAL", "IDLE") or old["operating_state"] not in ("RUNNING", "IDLE") or old["pending_alert"] not in (None, "INCIDENT", "RECOVERY") or not 0 <= old["ema_health"] <= 100:
+              raise ValueError("invalid Redis status or pending alert")
+          if old["anomaly_since"] is not None and (isinstance(old["anomaly_since"], bool) or not isinstance(old["anomaly_since"], (int, float)) or not math.isfinite(old["anomaly_since"])):
+              raise ValueError("invalid Redis anomaly_since")
+      if old and stamp <= old["last_timestamp"]:
+          Kestra.outputs({"accepted": False, "reason": "duplicate_or_out_of_order", "alert_due": False, "command_due": False})
+      else:
+          continuous = bool(old) and stamp - old["last_timestamp"] <= p["max_sample_gap_seconds"] and old["profile_hash"] == v["profile_hash"] and old["operating_state"] == t["operating_state"]
+          risks, critical_metrics = {}, []
+          for name, spec in profile.items():
+              x, w, k = t["metrics"][name], spec["warning"], spec["critical"]
+              if (spec["direction"] == "high" and x <= w) or (spec["direction"] == "low" and x >= w):
+                  risk = 0.0
+              elif (spec["direction"] == "high" and x >= k) or (spec["direction"] == "low" and x <= k):
+                  risk = 1.0
+              else:
+                  scale = max(abs(w), abs(k), 1.0)
+                  risk = (x / scale - w / scale) / (k / scale - w / scale)
+              risks[name] = risk
+              if risk >= 1:
+                  critical_metrics.append(name)
+          # Scale weights before summing to avoid overflow with extreme finite inputs.
+          max_weight = max(spec["weight"] for spec in profile.values())
+          weights = {name: spec["weight"] / max_weight for name, spec in profile.items()}
+          raw = 100 * (1 - sum(risks[name] * weights[name] for name in profile) / sum(weights.values()))
+          previous_ema = old["ema_health"] if continuous else raw
+          ema = p["ema_alpha"] * raw + (1 - p["ema_alpha"]) * previous_ema
+          running = t["operating_state"] == "RUNNING"
+          # A healthy raw sample breaks the streak even if EMA still remembers a spike.
+          anomalous = running and (bool(critical_metrics) or (raw <= p["anomaly_score"] and ema <= p["anomaly_score"]))
+          count = (old.get("anomaly_count", 0) if continuous else 0) + 1 if anomalous else 0
+          since = (old.get("anomaly_since") if continuous and old.get("anomaly_count", 0) else stamp) if anomalous else None
+          sustained = anomalous and count >= p["min_anomaly_samples"] and stamp - since >= p["min_anomaly_seconds"]
+          recovery_count = (old.get("recovery_count", 0) if continuous else 0) + 1 if running and not anomalous and ema >= p["recovery_score"] else 0
+          previous_status = old.get("status", "HEALTHY")
+          if previous_status == "CRITICAL":
+              status = "HEALTHY" if recovery_count >= p["min_recovery_samples"] else "CRITICAL"
+          else:
+              status = "CRITICAL" if sustained else ("PENDING" if anomalous else ("HEALTHY" if running else "IDLE"))
+          pending = old.get("pending_alert")
+          if status == "CRITICAL" and previous_status != "CRITICAL":
+              pending = "INCIDENT"
+          elif previous_status == "CRITICAL" and status == "HEALTHY":
+              pending = "RECOVERY"
+          last_alert, last_command = old.get("last_alert_at", 0), old.get("last_command_at", 0)
+          reminder = status == "CRITICAL" and anomalous and now - last_alert >= p["alert_cooldown_seconds"]
+          alert_due = pending is not None or reminder
+          event = pending or ("INCIDENT" if reminder else "NONE")
+          command_due = sustained and now - last_command >= p["command_cooldown_seconds"]
+          delta = ema - previous_ema
+          trend = "DEGRADING" if delta < -1 else ("RECOVERING" if delta > 1 else "STABLE")
+          state = {
+              "schema_version": 1, "device_id": t["device_id"], "profile_hash": v["profile_hash"],
+              "last_timestamp": stamp, "ema_health": ema, "status": status, "operating_state": t["operating_state"],
+              "anomaly_count": count, "anomaly_since": since, "recovery_count": recovery_count,
+              "last_alert_at": last_alert, "last_command_at": last_command, "pending_alert": pending
+          }
+          after_alert = copy.deepcopy(state)
+          if alert_due:
+              after_alert.update(last_alert_at=now, pending_alert=None)
+          message = (f"Motor health {event}: {t['device_id']} | state={status}, operating={t['operating_state']}, "
+                     f"health={ema:.1f}/100 (raw={raw:.1f}), trend={trend}, consecutive={count}, "
+                     f"duration={0 if since is None else stamp-since:.1f}s, "
+                     f"critical_metrics={','.join(critical_metrics) or 'none'}. "
+                     "Inspect the asset; safe-mode delivery is reported separately in the execution.")
+          Kestra.outputs({
+              "accepted": True, "device_id": t["device_id"], "status": status,
+              "health_score": round(ema, 2), "raw_health_score": round(raw, 2), "trend": trend,
+              "metric_risks": risks, "anomaly_count": count, "sustained_anomaly": sustained,
+              "critical_metrics": critical_metrics, "alert_due": alert_due, "alert_event": event,
+              "alert_message": message, "command_due": command_due, "state": state, "after_alert_state": after_alert
+          })
+
+  - id: process_accepted_sample
+    type: io.kestra.plugin.core.flow.If
+    description: Duplicates and older samples have no state changes, alerts or commands.
+    condition: "{{ outputs.score_health.vars.accepted }}"
+    then:
+      - id: persist_health_state
+        type: io.kestra.plugin.redis.string.Set
+        description: Commit counters and any pending alert before attempting external effects.
+        url: "{{ secret('REDIS_URI') }}"
+        key: "{{ outputs.validate_telemetry.vars.state_key }}"
+        serdeType: JSON
+        value: "{{ outputs.score_health.vars.state | toJson }}"
+        options:
+          expirationDuration: "{{ inputs.state_ttl }}"
+        retry:
+          type: constant
+          interval: PT2S
+          maxAttempts: 3
+
+      - id: notify_when_due
+        type: io.kestra.plugin.core.flow.If
+        description: Send incident/recovery notifications and rate-limited incident reminders.
+        condition: "{{ outputs.score_health.vars.alert_due }}"
+        then:
+          - id: choose_notification_mode
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.dry_run }}"
+            then:
+              - id: preview_alert
+                type: io.kestra.plugin.core.log.Log
+                message: "DRY RUN: {{ outputs.score_health.vars.alert_message }}"
+            else:
+              - id: slack_health_alert
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Notify the operator; a successful webhook response is not device acknowledgement.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: "{{ outputs.score_health.vars.alert_message }} Execution: {{ execution.id }}"
+          - id: persist_notification_receipt
+            type: io.kestra.plugin.redis.string.Set
+            description: Advance alert cooldown only after Slack accepted the message, or after a simulated alert.
+            url: "{{ secret('REDIS_URI') }}"
+            key: "{{ outputs.validate_telemetry.vars.state_key }}"
+            serdeType: JSON
+            value: "{{ outputs.score_health.vars.after_alert_state | toJson }}"
+            options:
+              expirationDuration: "{{ inputs.state_ttl }}"
+            retry:
+              type: constant
+              interval: PT2S
+              maxAttempts: 3
+
+      - id: consider_safe_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Remediation requires a sustained anomaly and an elapsed command cooldown.
+        condition: "{{ outputs.score_health.vars.command_due }}"
+        then:
+          - id: authorize_safe_mode
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.validate_telemetry.vars.source == 'mqtt' }}"
+            then:
+              - id: prepare_safe_mode
+                type: io.kestra.plugin.scripts.python.Script
+                description: Recheck freshness immediately before publication; attach expiry and a stable idempotency key.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: python:3.12-slim
+                dependencies:
+                  - kestra
+                inputFiles:
+                  validated.json: "{{ outputs.validate_telemetry.vars | toJson }}"
+                  state.json: "{{ outputs.score_health.vars.after_alert_state | toJson }}"
+                script: |
+                  import hashlib
+                  import json
+                  from datetime import datetime, timezone
+                  from kestra import Kestra
+
+                  with open("validated.json", encoding="utf-8") as f:
+                      v = json.load(f)
+                  with open("state.json", encoding="utf-8") as f:
+                      state = json.load(f)
+                  now = datetime.now(timezone.utc).timestamp()
+                  fresh = -v["policy"]["max_future_skew_seconds"] <= now - v["timestamp_epoch"] <= v["policy"]["max_sample_age_seconds"]
+                  identity = f"{v['state_key']}:{v['telemetry']['timestamp']}:safe_mode"
+                  command_id = hashlib.sha256(identity.encode()).hexdigest()
+                  # Expiry is bounded by both a short command TTL and the sample's freshness deadline.
+                  expires = min(now + v["policy"]["command_ttl_seconds"], v["timestamp_epoch"] + v["policy"]["max_sample_age_seconds"])
+                  command = {
+                      "schema_version": 1, "command_id": command_id, "device_id": v["telemetry"]["device_id"],
+                      "command": "safe_mode", "reason": "sustained_motor_health_anomaly",
+                      "telemetry_timestamp": v["telemetry"]["timestamp"],
+                      "issued_at": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
+                      "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z")
+                  }
+                  state["last_command_at"] = now
+                  Kestra.outputs({"fresh": fresh and expires > now, "command": command, "after_command_state": state})
+              - id: publish_only_fresh_command
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.prepare_safe_mode.vars.fresh }}"
+                then:
+                  - id: publish_safe_mode
+                    type: io.kestra.plugin.mqtt.Publish
+                    description: Request device-defined safe mode; never retain commands or restore normal operation automatically.
+                    server: "{{ secret('MQTT_SERVER') }}"
+                    username: "{{ secret('MQTT_USERNAME') }}"
+                    password: "{{ secret('MQTT_PASSWORD') }}"
+                    mqttVersion: "{{ vars.mqtt_version }}"
+                    clientId: "cmd-{{ execution.id }}"
+                    connectionTimeout: PT10S
+                    topic: "{{ vars.device_topic_root }}/{{ outputs.score_health.vars.device_id }}/commands"
+                    qos: 1
+                    retain: false
+                    serdeType: JSON
+                    from: "{{ outputs.prepare_safe_mode.vars.command | toJson }}"
+                  - id: persist_command_receipt
+                    type: io.kestra.plugin.redis.string.Set
+                    description: Record broker publication success; the asset must still validate and acknowledge the command.
+                    url: "{{ secret('REDIS_URI') }}"
+                    key: "{{ outputs.validate_telemetry.vars.state_key }}"
+                    serdeType: JSON
+                    value: "{{ outputs.prepare_safe_mode.vars.after_command_state | toJson }}"
+                    options:
+                      expirationDuration: "{{ inputs.state_ttl }}"
+                    retry:
+                      type: constant
+                      interval: PT2S
+                      maxAttempts: 3
+                else:
+                  - id: skip_expired_command
+                    type: io.kestra.plugin.core.log.Log
+                    level: WARN
+                    message: Telemetry expired before publication; safe-mode request suppressed.
+            else:
+              - id: preview_safe_mode
+                type: io.kestra.plugin.core.log.Log
+                message: "Safe mode eligible for {{ outputs.score_health.vars.device_id }}; publication suppressed by dry_run, auto_remediate or manual-source guard."
+
+      - id: log_health_result
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ outputs.score_health.vars.device_id }}: {{ outputs.score_health.vars.status }}, health={{ outputs.score_health.vars.health_score }}/100, trend={{ outputs.score_health.vars.trend }}; state={{ outputs.validate_telemetry.vars.state_key }}"
+    else:
+      - id: log_ignored_sample
+        type: io.kestra.plugin.core.log.Log
+        message: "Ignored telemetry: {{ outputs.score_health.vars.reason }}"
+
+errors:
+  - id: log_processing_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Motor health execution {{ execution.id }} failed. Inspect task errors; no automatic resume command is issued."
+  - id: notify_live_failure
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ not inputs.dry_run }}"
+    then:
+      - id: slack_processing_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "Motor health processing failed in {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}. Inspect Kestra task errors; a command may already have been published before a later failure."
+
+triggers:
+  - id: mqtt_telemetry
+    type: io.kestra.plugin.mqtt.RealtimeTrigger
+    description: One JSON sample per execution; queue executions while serializing Redis updates.
+    server: "{{ secret('MQTT_SERVER') }}"
+    username: "{{ secret('MQTT_USERNAME') }}"
+    password: "{{ secret('MQTT_PASSWORD') }}"
+    mqttVersion: "{{ vars.mqtt_version }}"
+    clientId: "{{ vars.mqtt_subscriber_client_id }}"
+    connectionTimeout: PT10S
+    topic: "{{ vars.device_topic_root }}/+/telemetry"
+    qos: 1
+    serdeType: JSON
+    allowConcurrent: true
+
+extend:
+  title: Detect Sustained IoT Motor Health Anomalies and Request Safe Mode
+  metaTitle: IoT Motor Health Monitoring and Safe-Mode Blueprint
+  shortDescription: Monitor motor health from MQTT telemetry, track sustained anomalies in Redis, alert Slack, and optionally request device-defined safe mode.
+  metaDescription: Score MQTT motor telemetry, persist trends in Redis, detect sustained anomalies, alert Slack, and optionally request safe mode with dry-run safeguards.
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Approval Gates
+  ee: false
+  demo: false
+  description: |
+    Use MQTT telemetry to monitor motors in robots, pumps, conveyors, fans and
+    automated guided vehicles (AGVs). Kestra validates a generic metric contract,
+    reads previous state from Redis, calculates weighted health and an exponential
+    moving average (EMA), tracks sustained anomalies and recovery, notifies Slack,
+    and optionally requests device-defined safe mode through MQTT.
+
+    This is an explainable condition-monitoring heuristic for predictive
+    maintenance triage, not a trained failure predictor or a certified safety
+    controller. Example thresholds are illustrative, not equipment ratings.
+    Keep independent hardware protection and calibrate thresholds for each asset.
+    Separate flows or namespaces are appropriate for different asset profiles.
+
+    ## Prerequisites
+    - A compatible Kestra installation with MQTT, Redis, Slack, Python Script
+      and Docker task-runner plugins. Validate against your installed versions.
+    - A Docker-compatible engine accessible to Kestra workers; Python tasks use
+      python:3.12-slim and install the kestra Python package. Image/package download
+      access is needed, or use a prebuilt internal image with that package.
+    - An MQTT 3.1.1 (default V3) or MQTT 5 broker accessible to the Kestra server
+      and workers; a Redis service reachable by workers. Use authenticated TLS
+      services in a deployed environment and configure the broker CA/trust store.
+    - A Slack incoming webhook for live notifications. Dry runs do not need Slack.
+    - Devices or an adapter must emit the contract below and independently enforce
+      command expiry, device identity, command deduplication and their own safe mode.
+
+    ## Secrets (names only; never commit values)
+    - MQTT_SERVER: broker URI, e.g. ssl://broker.example.com:8883; required by trigger
+      and publisher. tcp:// is suitable only for an isolated local test broker.
+    - MQTT_USERNAME: broker account used to read telemetry and publish commands.
+    - MQTT_PASSWORD: broker account password. For an anonymous local test broker,
+      define the username/password secrets as empty strings or remove both fields.
+    - REDIS_URI: Redis connection URI including required authentication/database,
+      e.g. rediss://user:password@redis.example.com:6379/0; required for persistence.
+    - SLACK_WEBHOOK_URL: Slack incoming webhook URL; required only for live alerts
+      and live execution-error notifications.
+    On Kestra OSS, expose base64-encoded values through SECRET_<NAME> environment
+    variables. Consult the secrets documentation for your deployment.
+
+    ## Telemetry contract (schema_version=1)
+    Publish UTF-8 JSON to devices/<device_id>/telemetry with retain=false:
+    ```json
+    {
+      "schema_version": 1,
+      "device_id": "pump-07",
+      "timestamp": "2026-10-09T12:00:00Z",
+      "operating_state": "RUNNING",
+      "metrics": {
+        "motor_temp_c": 74.0,
+        "motor_current_a": 7.3,
+        "vibration_mm_s": 6.2
+      }
+    }
+    ```
+    Replace the example timestamp with the current UTC time. Fields: device_id
+    contains 1..64 letters, digits, underscores or hyphens; timestamp is UTC ISO
+    8601 ending in Z and strictly increasing per device; operating_state is RUNNING
+    or IDLE; metrics supplies a finite JSON number for every configured profile
+    metric. Additional numeric metrics are ignored. Timestamps include date, time
+    and seconds, with at most 6 fractional digits. Synchronize device clocks. A duplicate
+    or older timestamp is ignored, including QoS 1 redelivery. Do not reset the
+    clock when restarting a device. An MQTT topic/device mismatch is rejected.
+    IDLE resets streaks and suppresses new anomalies/commands; it does not clear a
+    latched critical incident. Every configured metric is required even when idle.
+    Normalize source telemetry in an adapter: motor_temp means degrees C only
+    after mapping to motor_temp_c; normalized vibration is not vibration_mm_s.
+
+    ## Inputs
+    - telemetry (JSON, default {}): manual payload using the contract; without an
+      MQTT trigger, supply all required fields. Manual runs cannot publish commands.
+    - dry_run (BOOL, default true): no Slack or MQTT writes, including errors;
+      Redis is still read/written under a separate dry-run key. Simulated alerts
+      advance their own cooldown; simulated commands do not advance command cooldown.
+    - auto_remediate (BOOL, default false): opt into commands only with dry_run=false
+      and a fresh MQTT sample. Changing this alone never publishes a command.
+    - health_profile (JSON): default motor_temp_c high 60/80 weight 0.4,
+      motor_current_a high 5/8 weight 0.3, vibration_mm_s high 4.5/7.1 weight 0.3.
+      Supply 1..16 metrics. Each has exactly direction (high or low), warning,
+      critical (finite numbers) and weight (>0). For high, warning < critical;
+      for low, warning > critical. Metric names begin with a letter and have at
+      most 64 letters/digits/underscores. Weights are normalized automatically.
+      Add rpm for low-speed risk or battery_v for undervoltage with direction=low;
+      remove metrics absent from your sensors. Match units and operating envelope.
+    - detection_policy (JSON): supply all fields, with the following defaults:
+      ema_alpha=0.35 (>0..1); anomaly_score=60; recovery_score=80
+      (0 <= anomaly_score < recovery_score <= 100);
+      min_anomaly_samples=3 and min_recovery_samples=3 (integers 2..1000);
+      min_anomaly_seconds=30; max_sample_gap_seconds=120;
+      max_sample_age_seconds=300; max_future_skew_seconds=10 (0..60);
+      alert_cooldown_seconds=900; command_cooldown_seconds=1800;
+      command_ttl_seconds=30 (>0..300). Other durations must be positive seconds.
+      Samples must satisfy both the count and duration; more than the minimum
+      sample count may be needed at a higher reporting frequency.
+    - state_ttl (DURATION, default P7D): positive Redis retention duration, e.g.
+      P1D, P7D or PT12H (positive days/hours/minutes/seconds). Expiry loses
+      streaks/cooldowns and starts a new history. Choose
+      longer retention than cooldowns and typical device offline periods.
+    MQTT executions use flow input defaults. Change defaults in the YAML to set
+    unattended policy; manual overrides affect only that execution. Edit variables
+    device_topic_root (devices), mqtt_subscriber_client_id (kestra-motor-health),
+    mqtt_version (V3 or V5) and state_key_prefix (motor-health-v1) as needed. Each
+    deployed subscriber requires a unique, stable client ID on its broker.
+
+    ## How detection works
+    Each metric's risk is clamp((value-warning)/(critical-warning), 0, 1), valid
+    for both high and low profiles. Raw health is 100*(1-weighted mean risk).
+    EMA health is alpha*raw+(1-alpha)*previous EMA. A configured critical metric,
+    or both raw and EMA health <= anomaly_score, starts a RUNNING anomaly streak.
+    A healthy raw sample breaks the streak even while EMA remembers a past spike. CRITICAL requires
+    both the minimum consecutive sample count and elapsed event-time duration.
+    At 15-second intervals, 3 anomalous samples span 30 seconds. Gaps over the
+    limit, profile/policy changes and non-anomalous samples reset anomaly streaks.
+    Profile/policy or operating-state changes also reset the EMA and recovery streak, preserving the
+    critical latch and existing effect cooldowns. Redis expiry resets everything.
+    A latched incident recovers only after min_recovery_samples consecutive
+    RUNNING samples with no anomaly and EMA >= recovery_score. Trend describes
+    a per-sample EMA change above 1 point, not a time-to-failure estimate.
+
+    ## Tasks and effects
+    1. validate_telemetry checks the contract, policy, freshness and topic routing.
+    2. load_previous_state reads Redis; a missing key starts a new history.
+    3. score_health computes scores, streaks, status, pending alerts and cooldowns.
+    4. process_accepted_sample persists health and branches to Slack/safe-mode tasks.
+       Pending incident/recovery alerts survive delivery failures. Alert cooldown
+       advances only after a successful webhook response or simulated alert.
+       A subsequent fresh sample can retry a pending alert; no background retry
+       runs when the device stops transmitting.
+    5. consider_safe_mode requires a sustained current anomaly and command cooldown.
+       It checks opt-in, dry-run and MQTT source, then rechecks freshness, publishes
+       a non-retained command and records broker-publication time in Redis.
+    6. errors logs failures and sends a generic Slack failure message in live mode.
+       No recovery path issues a command to resume normal operation.
+    Redis reads/writes use bounded retries; Slack and MQTT publication intentionally
+    have no task retry, because network uncertainty can duplicate external effects.
+    Slack acceptance/broker publication is not proof of operator/device action.
+    A crash between external success and its Redis receipt can duplicate an effect
+    on a later sample. Devices must deduplicate command_id and reject expired
+    commands; Kestra cannot guarantee exactly-once control. Replaying the same
+    publication task has the same command_id; different samples have different IDs.
+
+    ## Safe-mode contract
+    Topic: devices/<device_id>/commands; JSON schema_version=1 with command=safe_mode,
+    command_id, device_id, reason, telemetry_timestamp, issued_at and expires_at.
+    The device defines safe mode (for example reduced load or controlled stop).
+    Expiry is the earlier of now+command_ttl_seconds and the telemetry freshness
+    deadline. Commands are never retained; a disconnected device must not act on
+    an old command when it reconnects. Authentication/topic ACLs and device-side
+    expiry/identity checks are required. Acknowledgement handling is outside this flow.
+
+    ## Quick start
+    1. Set secrets, install plugins, configure Docker access, and calibrate the profile.
+    2. Use a distinct subscriber client ID and a low-rate device telemetry topic.
+       Save the YAML in Kestra's flow editor or import it from the blueprint catalog;
+       extend is catalog metadata, so omit that block if your raw flow validator
+       rejects non-flow fields. Validate the executable flow on your installation.
+    3. Keep dry_run=true and auto_remediate=false. Publish healthy and anomalous
+       samples with current UTC timestamps, or supply a manual telemetry input.
+       Inspect score outputs and the dry-run Redis key. No live messages are sent.
+    4. Change the input default dry_run to false for unattended live Slack alerts,
+       keeping auto_remediate=false. Live state begins separately from simulation.
+    5. After testing device expiry/deduplication and safe-mode behavior, explicitly
+       change the auto_remediate default to true. Observe broker and device receipts.
+
+    ## Outputs and operational limits
+    - outputs.validate_telemetry.vars.state_key: Redis key scoped by namespace,
+      flow, mode and device; source is mqtt or manual.
+    - outputs.score_health.vars.accepted: false for duplicates/older samples.
+    - Accepted samples expose outputs.score_health.vars.health_score,
+      raw_health_score, status (HEALTHY/PENDING/CRITICAL/IDLE), trend, metric_risks,
+      anomaly_count, sustained_anomaly, critical_metrics, alert_due and command_due.
+      command_due describes eligibility, not actual publication.
+    - outputs.score_health.vars.state / after_alert_state: health state snapshots;
+      final stored state may also include a command receipt.
+    - outputs.prepare_safe_mode.vars.command: command intent, only when authorized;
+      outputs.publish_safe_mode.messagesCount: broker publication result if executed.
+    concurrency.limit=1 serializes this flow's state transactions; allowConcurrent
+    queues MQTT executions. Use one writer for each scoped key and low-rate samples.
+    Queue backlog can make samples stale. This flow does not detect missing telemetry
+    and it does not reorder old samples. For large fleets, partition by asset group
+    with distinct namespaces/flows and subscriber IDs; avoid overlapping key writers.
+    Broker connection/JSON deserialization errors can happen before an execution
+    exists and must be monitored separately from the flow errors handler.
+
+    ## References
+    - [Blueprint contribution rules](https://github.com/kestra-io/blueprints#blueprint-yaml-contribution-guidelines)
+    - [MQTT RealtimeTrigger](https://kestra.io/plugins/plugin-mqtt/io.kestra.plugin.mqtt.realtimetrigger)
+    - [MQTT Publish](https://kestra.io/plugins/plugin-mqtt/io.kestra.plugin.mqtt.publish)
+    - [Redis Get](https://kestra.io/plugins/plugin-redis/redis-string/io.kestra.plugin.redis.string.get)
+    - [Redis Set](https://kestra.io/plugins/plugin-redis/redis-string/io.kestra.plugin.redis.string.set)
+    - [Slack webhook](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [Concurrency](https://kestra.io/docs/workflow-components/concurrency)
+    - [Secrets](https://kestra.io/docs/concepts/secret)
