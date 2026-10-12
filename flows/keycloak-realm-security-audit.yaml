@@ -1,0 +1,695 @@
+id: keycloak-realm-security-audit
+namespace: company.team
+description: |
+  Audit a Keycloak realm through the Admin REST API: administrators without a
+  second factor, accounts nobody has used for N days, client secrets that were
+  never rotated, wildcard redirect URIs and the password grant. Reports only
+  what changed since the last run, and with on-call approval rotates client
+  secrets or disables stale accounts, re-checking each one first.
+
+triggers:
+  - id: realm_changed
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: |
+      Call this after a realm change, for example at the end of the Terraform or keycloak-config-cli job that manages the realm:
+      curl -X POST -H 'Content-Type: application/json' -d '{"realm": "acme"}' http://localhost:8080/api/v1/main/executions/webhook/company.team/keycloak-realm-security-audit/keycloak-audit-change-me
+      The body's realm overrides the realm input.
+    key: keycloak-audit-change-me
+  - id: daily_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Daily sweep, so drift made by hand in the admin console and accounts going stale are caught too. Disabled until the secrets are set.
+    cron: "40 6 * * *"
+    disabled: true
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: realm
+    type: STRING
+    defaults: acme
+    description: 'Realm to audit. A webhook call can name another realm with a JSON body such as {"realm": "staff"}.'
+  - id: client_id
+    type: STRING
+    defaults: kestra-auditor
+    description: Confidential client in the audited realm whose service account the flow uses. Its secret is the KEYCLOAK_CLIENT_SECRET secret.
+  - id: stale_user_days
+    type: INT
+    defaults: 90
+    description: An enabled account with no login, token refresh or active session for this many days is stale. Login events must be saved for at least this long.
+  - id: secret_max_age_days
+    type: INT
+    defaults: 180
+    description: Report confidential clients whose secret is older than this. Many policies ask for 90 to 365 days.
+  - id: admin_realm_roles
+    type: ARRAY
+    itemType: STRING
+    defaults: ["admin"]
+    description: Realm roles that make a user an administrator of your applications. Held directly, through a group or through a composite role.
+  - id: admin_client_roles
+    type: ARRAY
+    itemType: STRING
+    defaults: ["realm-admin", "manage-realm", "manage-users", "manage-clients", "manage-authorization"]
+    description: Roles of the realm-management client that let a user change the realm itself.
+  - id: accept_webauthn
+    type: BOOL
+    defaults: true
+    description: Count a WebAuthn security key or passkey as a second factor. Set to false if your policy requires OTP specifically.
+  - id: ignore_clients
+    type: ARRAY
+    itemType: STRING
+    defaults: ["account", "account-console", "admin-cli", "broker", "realm-management", "security-admin-console"]
+    description: Client IDs never reported. The defaults are Keycloak's built-in clients; add clients whose findings you have accepted.
+  - id: max_users
+    type: INT
+    defaults: 5000
+    description: Stop reading users after this many; the report says so if the realm has more. Each user costs two API calls for the role check.
+  - id: ask_again_hours
+    type: INT
+    defaults: 72
+    description: Ask on-call again about a declined or unanswered rotation or account after this many hours.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link.
+
+variables:
+  realm: "{{ trigger.body.realm ?? inputs.realm }}"
+  state_key: "keycloak-audit-{{ trigger.body.realm ?? inputs.realm }}"
+  # Shared by the script tasks. Tokens and client secrets stay inside the scripts: an HTTP task would
+  # keep the token response, and the response of a secret rotation, in the execution outputs.
+  kc_client: |
+    import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+    BASE = os.environ["KC_URL"].rstrip("/")
+    REALM = os.environ["KC_REALM"]
+    CLIENT_ID = os.environ["KC_CLIENT_ID"]
+    _token = None
+
+
+    def fail(message):
+        # A single stderr line becomes the cause quoted by the Slack alert.
+        print(message, file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+    def _send(method, url, data=None, headers=None):
+        """Return (status, parsed body). Connection errors and 5xx are retried three times."""
+        for attempt in range(3):
+            req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    raw = r.read()
+                    return r.status, (json.loads(raw) if raw else None)
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                if e.code < 500 or attempt == 2:
+                    try:
+                        return e.code, json.loads(raw)
+                    except ValueError:
+                        return e.code, raw.decode(errors="replace")[:200]
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt == 2:
+                    fail(f"Keycloak is unreachable at KEYCLOAK_URL: {getattr(e, 'reason', e)}")
+            time.sleep(2 ** attempt * 2)
+
+
+    def _login():
+        global _token
+        form = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": CLIENT_ID,
+                                       "client_secret": os.environ["KC_CLIENT_SECRET"]}).encode()
+        status, body = _send("POST", f"{BASE}/realms/{REALM}/protocol/openid-connect/token", form,
+                             {"Content-Type": "application/x-www-form-urlencoded"})
+        detail = body.get("error_description", "") if isinstance(body, dict) else ""
+        if status == 200:
+            _token = body["access_token"]
+        elif status == 404:
+            fail(f"Realm {REALM} does not exist on the Keycloak at KEYCLOAK_URL")
+        elif "service account" in detail:
+            fail(f"Client {CLIENT_ID} cannot use the client credentials grant ({detail}): turn on Service accounts roles for it")
+        elif status in (400, 401):
+            fail(f"Keycloak rejected client {CLIENT_ID} in realm {REALM} (HTTP {status}: {detail}): "
+                 "check the client_id input and the KEYCLOAK_CLIENT_SECRET secret")
+        else:
+            fail(f"Token request to realm {REALM} failed with HTTP {status}: {body}")
+
+
+    def api(method, path, body=None, allow=()):
+        """Call the Admin REST API; path is relative to /admin/realms/<realm>."""
+        if _token is None:
+            _login()
+        for _ in range(2):
+            data = json.dumps(body).encode() if body is not None else None
+            status, out = _send(method, f"{BASE}/admin/realms/{REALM}{path}", data,
+                                {"Authorization": f"Bearer {_token}", "Content-Type": "application/json"})
+            if status != 401:
+                break
+            _login()  # the token expired during a long audit
+        if 200 <= status < 300 or status in allow:
+            return status, out
+        if status == 403:
+            fail(f"The service account of {CLIENT_ID} may not {method} {path.split('?')[0]} (HTTP 403): give it the "
+                 "realm-management roles view-users, view-clients and view-events, plus manage-users and "
+                 "manage-clients for the approved actions")
+        fail(f"{method} {path.split('?')[0]} returned HTTP {status}: {out}")
+
+
+    def paged(path, limit, page=100):
+        sep = "&" if "?" in path else "?"
+        items, first = [], 0
+        while first < limit:
+            size = min(page, limit - first)
+            _, chunk = api("GET", f"{path}{sep}first={first}&max={size}")
+            items += chunk
+            if len(chunk) < size:
+                break
+            first += size
+        return items
+
+
+    def utc(seconds):
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(seconds))
+
+
+    def outputs(values):
+        print("::" + json.dumps({"outputs": values}) + "::")
+
+tasks:
+  - id: validate_realm
+    type: io.kestra.plugin.core.flow.If
+    description: The realm name ends up in API paths and in the state key, so a webhook body cannot smuggle a path into it.
+    condition: "{{ not (render(vars.realm) | toJson | jq('test(\"^[A-Za-z0-9._-]{1,255}$\")') | first) }}"
+    then:
+      - id: invalid_realm
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Realm name '{{ render(vars.realm) }}' is not valid: use letters, digits, dot, dash and underscore only"
+
+  - id: check_realm
+    type: io.kestra.plugin.core.http.Request
+    description: Public realm endpoint, no credentials needed. Tells "Keycloak is down" (retried, then fails) apart from "realm not found".
+    uri: "{{ secret('KEYCLOAK_URL') }}/realms/{{ render(vars.realm) }}"
+    method: GET
+    options:
+      allowFailed: true
+    retry:
+      type: exponential
+      interval: PT5S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: realm_reachable
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_realm.code != 200 }}"
+    then:
+      - id: realm_status
+        type: io.kestra.plugin.core.flow.Switch
+        value: "{{ outputs.check_realm.code }}"
+        cases:
+          "404":
+            - id: realm_not_found
+              type: io.kestra.plugin.core.execution.Fail
+              errorMessage: >-
+                Realm {{ render(vars.realm) }} does not exist on the Keycloak at KEYCLOAK_URL.
+                If every realm returns 404, KEYCLOAK_URL may need the /auth path (Keycloak 16 and older, or --http-relative-path)
+        defaults:
+          - id: realm_unavailable
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "Keycloak answered HTTP {{ outputs.check_realm.code }} for realm {{ render(vars.realm) }}; check that it is healthy and that KEYCLOAK_URL is its base URL"
+
+  - id: audit
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Reads users, role mappings, credentials, login events, sessions and clients, and compares the findings
+      with the previous run's (from the KV store). Read-only. Never outputs or logs a secret or a token.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      KC_URL: "{{ secret('KEYCLOAK_URL') }}"
+      KC_REALM: "{{ render(vars.realm) }}"
+      KC_CLIENT_ID: "{{ inputs.client_id }}"
+      KC_CLIENT_SECRET: "{{ secret('KEYCLOAK_CLIENT_SECRET') }}"
+    inputFiles:
+      kc.py: "{{ vars.kc_client }}"
+      previous.json: "{{ kv(render(vars.state_key), errorOnMissing=false) ?? {} | toJson }}"
+      params.json: >-
+        {{ {'stale_user_days': inputs.stale_user_days, 'secret_max_age_days': inputs.secret_max_age_days,
+            'admin_realm_roles': inputs.admin_realm_roles, 'admin_client_roles': inputs.admin_client_roles,
+            'accept_webauthn': inputs.accept_webauthn, 'ignore_clients': inputs.ignore_clients,
+            'max_users': inputs.max_users, 'ask_again_hours': inputs.ask_again_hours} | toJson }}
+    script: |
+      import json, time
+      from concurrent.futures import ThreadPoolExecutor
+      from kc import api, paged, utc, outputs, CLIENT_ID, REALM
+
+      p = json.load(open("params.json"))
+      for k in ("admin_realm_roles", "admin_client_roles", "ignore_clients"):
+          if isinstance(p[k], str):  # array defaults can arrive as a JSON string on webhook runs
+              p[k] = json.loads(p[k])
+      previous = json.load(open("previous.json")) or {}
+      now = time.time()
+      cutoff = now - p["stale_user_days"] * 86400
+      findings = []
+
+      def finding(key, check, severity, summary, fix, **extra):
+          findings.append(dict(key=key, check=check, severity=severity, summary=summary, fix=fix, **extra))
+
+      clients = api("GET", "/clients?max=10000")[1]
+      by_client_id = {c["clientId"]: c for c in clients}
+      realm_management = by_client_id["realm-management"]["id"]
+
+      # 1. Administrators without a second factor
+      users = paged("/users?briefRepresentation=false", p["max_users"])
+      if len(users) >= p["max_users"]:
+          finding("coverage/max-users", "coverage", "info", f"only the first {p['max_users']} users were audited",
+                  "raise max_users")
+      people = [u for u in users if u.get("enabled") and not u["username"].startswith("service-account-")]
+
+      def admin_roles(u):
+          realm = {r["name"] for r in api("GET", f"/users/{u['id']}/role-mappings/realm/composite")[1]}
+          client = {r["name"] for r in api("GET", f"/users/{u['id']}/role-mappings/clients/{realm_management}/composite")[1]}
+          return sorted(realm & set(p["admin_realm_roles"])) + sorted(client & set(p["admin_client_roles"]))
+
+      with ThreadPoolExecutor(8) as pool:
+          roles = dict(zip([u["id"] for u in people], pool.map(admin_roles, people)))
+      for u in people:
+          if not roles[u["id"]]:
+              continue
+          types = {c["type"] for c in api("GET", f"/users/{u['id']}/credentials")[1]}
+          if "otp" in types or (p["accept_webauthn"] and types & {"webauthn", "webauthn-passwordless"}):
+              continue
+          direct = api("GET", f"/users/{u['id']}/role-mappings")[1]
+          direct_names = {r["name"] for r in direct.get("realmMappings", [])}
+          direct_names |= {r["name"] for r in direct.get("clientMappings", {}).get("realm-management", {}).get("mappings", [])}
+          direct_roles = [r for r in roles[u["id"]] if r in direct_names]
+          held = ", ".join(direct_roles) if direct_roles else ", ".join(roles[u["id"]]) + " through a group or composite role"
+          pending = "CONFIGURE_TOTP" in u.get("requiredActions", [])
+          finding(f"admin-without-2fa/{u['username']}", "admin-without-2fa", "high",
+                  f"administrator {u['username']} has no second factor; holds {held}"
+                  + ("; OTP setup is pending until their next login" if pending else ""),
+                  "ask them to set up OTP now, and require OTP for administrators in the browser flow")
+
+      # 2. Stale accounts, from login events and sessions
+      _, events_config = api("GET", "/events/config")
+      window = p["stale_user_days"]
+      expiration = events_config.get("eventsExpiration") or 0
+      saved_types = set(events_config.get("enabledEventTypes") or ["LOGIN"])
+      if not events_config.get("eventsEnabled"):
+          finding("coverage/events-off", "coverage", "info", "login events are not saved, so stale accounts cannot be detected",
+                  f"Realm settings > Events > User events settings: turn on Save events, with an expiration of at least {window} days")
+      elif expiration and expiration < window * 86400:
+          finding("coverage/events-expire", "coverage", "info",
+                  f"login events expire after {expiration // 86400} days, less than stale_user_days ({window}); the stale account check is skipped",
+                  f"raise the event expiration to at least {window} days, or lower stale_user_days")
+      elif "LOGIN" not in saved_types:
+          finding("coverage/login-not-saved", "coverage", "info", "LOGIN events are not among the saved event types",
+                  "add LOGIN, CODE_TO_TOKEN and REFRESH_TOKEN to the saved event types")
+      elif not api("GET", f"/events?dateTo={time.strftime('%Y-%m-%d', time.gmtime(cutoff))}&max=1")[1]:
+          finding("coverage/history-short", "coverage", "info",
+                  f"the event history is shorter than {window} days (events were enabled recently); the stale account check is skipped until it covers the window",
+                  "nothing to do: the check starts on its own once the history is long enough")
+      else:
+          types = "".join(f"&type={t}" for t in ("LOGIN", "CODE_TO_TOKEN", "REFRESH_TOKEN", "IDENTITY_PROVIDER_LOGIN"))
+          last_seen = {}
+          for e in paged(f"/events?dateFrom={time.strftime('%Y-%m-%d', time.gmtime(cutoff))}{types}", 200000, page=1000):
+              if e.get("userId"):
+                  last_seen[e["userId"]] = max(last_seen.get(e["userId"], 0), e["time"])
+          for u in people:
+              if u["createdTimestamp"] / 1000 > cutoff or last_seen.get(u["id"], 0) / 1000 > cutoff:
+                  continue
+              if api("GET", f"/users/{u['id']}/sessions")[1]:
+                  continue  # signed in with a long session, no new login event needed
+              last = api("GET", f"/events?user={u['id']}{types}&max=1")[1]
+              seen = f"last sign-in {utc(last[0]['time'] / 1000)[:10]}" if last else "no sign-in in the event history"
+              finding(f"stale-user/{u['username']}", "stale-user", "medium",
+                      f"account {u['username']} has not signed in for {window}+ days ({seen}, created {utc(u['createdTimestamp'] / 1000)[:10]}, no active session)",
+                      "disable it if the person left or no longer needs access", action="disable",
+                      target={"id": u["id"], "username": u["username"], "cutoff_ms": int(cutoff * 1000)})
+
+      # 3. Clients: secret age, redirect URIs, password grant
+      for c in clients:
+          cid = c["clientId"]
+          attrs = c.get("attributes") or {}
+          if cid in p["ignore_clients"] or attrs.get("realm_client") == "true" or not c.get("enabled", True):
+              continue
+          uses_secret = (not c.get("publicClient") and not c.get("bearerOnly")
+                         and c.get("clientAuthenticatorType", "client-secret") in ("client-secret", "client-secret-jwt"))
+          if uses_secret:
+              created = attrs.get("client.secret.creation.time", "")
+              age_days = int((now - int(created)) // 86400) if created else None
+              if age_days is None or age_days > p["secret_max_age_days"]:
+                  own = cid == CLIENT_ID
+                  finding(f"stale-secret/{cid}", "stale-secret", "medium",
+                          f"client {cid}: secret " + (f"is {age_days} days old (set {utc(int(created))[:10]})" if created
+                                                       else "has no creation date, so it was never rotated by Keycloak"),
+                          "rotate it yourself and update KEYCLOAK_CLIENT_SECRET (the flow never rotates its own secret)" if own
+                          else "rotate it and install the new secret in the application", action=None if own else "rotate",
+                          target={"id": c["id"], "clientId": cid, "created": created})
+          if c.get("standardFlowEnabled", True) or c.get("implicitFlowEnabled"):
+              for uri in c.get("redirectUris") or []:
+                  scheme, _, rest = uri.partition("://")
+                  if uri in ("*", "/*", "+"):
+                      finding(f"redirect/{cid}/{uri}", "redirect-uri", "high",
+                              f"client {cid} accepts any redirect URI ({uri}): codes and tokens can be sent to any site",
+                              "list the exact callback URLs")
+                  elif uri.endswith("*") and rest and "/" not in rest:
+                      finding(f"redirect/{cid}/{uri}", "redirect-uri", "high",
+                              f"client {cid} redirect URI {uri} has a wildcard in the host part: it also matches {rest[:-1]}.attacker.example",
+                              "end the host with a slash before any wildcard, or list exact URLs")
+                  elif uri.endswith("*"):
+                      finding(f"redirect/{cid}/{uri}", "redirect-uri", "low",
+                              f"client {cid} redirect URI {uri} accepts any path on that host",
+                              "list the exact callback paths")
+                  elif scheme == "http" and not rest.startswith(("localhost", "127.0.0.1", "[::1]")):
+                      finding(f"redirect/{cid}/{uri}", "redirect-uri", "medium",
+                              f"client {cid} redirect URI {uri} uses plain HTTP: codes travel unencrypted",
+                              "use https")
+          if c.get("directAccessGrantsEnabled"):
+              finding(f"password-grant/{cid}", "password-grant", "medium",
+                      f"client {cid} allows the password grant (Direct access grants): the application sees user passwords, and OAuth 2.1 removes this grant",
+                      "turn off Direct access grants; use the authorization code flow with PKCE, or a service account")
+
+      # 4. Changes since the last run, and what to propose
+      old = previous.get("findings", {})
+      asked = previous.get("asked", {})
+      current = {f["key"]: f for f in findings}
+      new = [f for f in findings if f["key"] not in old]
+      resolved = [dict(key=k, **v) for k, v in old.items() if k not in current]
+      proposals = []
+      for f in findings:
+          if not f.get("action"):
+              continue
+          if f["key"] in old and now - asked.get(f["key"], 0) < p["ask_again_hours"] * 3600:
+              continue
+          label = (f"Rotate the secret of {f['target']['clientId']}" if f["action"] == "rotate"
+                   else f"Disable {f['target']['username']}")
+          proposals.append(dict(label=label, action=f["action"], key=f["key"], reason=f["summary"], **f["target"]))
+          asked[f["key"]] = now
+      state = {"audited_at": utc(now), "asked": {k: v for k, v in asked.items() if k in current},
+               "findings": {f["key"]: {"severity": f["severity"], "summary": f["summary"]} for f in findings}}
+      severity_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+      findings.sort(key=lambda f: severity_order[f["severity"]])
+      new.sort(key=lambda f: severity_order[f["severity"]])
+      counts = {s: sum(1 for f in findings if f["severity"] == s) for s in severity_order}
+      print(f"{REALM}: {len(users)} users, {len(clients)} clients, {len(findings)} findings {counts}, "
+            f"{len(new)} new, {len(resolved)} resolved, {len(proposals)} to propose")
+      outputs({"first_run": not previous, "counts": counts, "findings": findings, "new": new, "resolved": resolved,
+               "unchanged": len(findings) - len(new), "proposals": proposals,
+               "choices": [x["label"] for x in proposals], "state": state})
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Saved before anyone is asked, so a run queued behind this one does not report or propose the same things again.
+    key: "{{ render(vars.state_key) }}"
+    kvType: JSON
+    value: "{{ outputs.audit.vars.state | toJson }}"
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs.audit.vars.new | length) + (outputs.audit.vars.resolved | length) > 0 }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Keycloak realm {{ render(vars.realm) }}: {% if outputs.audit.vars.first_run %}first audit, {{ outputs.audit.vars.findings | length }} findings{% else %}{{ outputs.audit.vars.new | length }} new, {{ outputs.audit.vars.resolved | length }} resolved, {{ outputs.audit.vars.unchanged }} unchanged{% endif %} ({{ outputs.audit.vars.counts.high }} high, {{ outputs.audit.vars.counts.medium }} medium, {{ outputs.audit.vars.counts.low }} low)
+          {% for f in outputs.audit.vars.new %}- {% if not outputs.audit.vars.first_run %}NEW {% endif %}{{ f.severity | upper }}: {{ f.summary }}. Fix: {{ f.fix }}
+          {% endfor %}{% for f in outputs.audit.vars.resolved %}- RESOLVED: {{ f.summary }}
+          {% endfor %}
+
+  - id: propose
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.vars.proposals | length > 0 }}"
+    then:
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Keycloak realm {{ render(vars.realm) }}: approve or ignore within 4 hours (nothing happens otherwise): {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+          {% for x in outputs.audit.vars.proposals %}- {{ x.label }}: {{ x.reason }}
+          {% endfor %}{% if outputs.audit.vars.proposals | jq('map(select(.action == "rotate")) | length') | first > 0 %}A rotated secret stops working at once unless the realm has a secret-rotation client policy (then it keeps working for the policy's grace period). The new secret is never sent anywhere: the client's owner copies it from the admin console.{% endif %}
+
+      - id: wait_for_approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Each choice is one client or one account. No answer within 4 hours means nothing is changed.
+        pauseDuration: PT4H
+        behavior: RESUME
+        onResume:
+          - id: approve
+            type: MULTISELECT
+            description: Tick what to do. Each item is checked again just before it runs.
+            expression: "{{ outputs.audit.vars.choices }}"
+            required: false
+
+      - id: approved
+        type: io.kestra.plugin.core.output.OutputValues
+        description: The proposals that were ticked, as a JSON list.
+        values:
+          items: >-
+            {{ {'p': outputs.audit.vars.proposals, 'a': outputs.wait_for_approval.onResume.approve ?? []} | toJson
+            | jq('.a as $a | [.p[] | select(.label as $l | ($a | map(select(. == $l)) | length) > 0)]') | first | toJson }}
+
+      - id: rotate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ fromJson(outputs.approved.values.items) | jq('map(select(.action == \"rotate\")) | length') | first > 0 }}"
+        then:
+          - id: rotate_secrets
+            type: io.kestra.plugin.core.flow.Loop
+            description: One client at a time, each isolated so a failure does not stop the others.
+            values: "{{ fromJson(outputs.approved.values.items) | jq('map(select(.action == \"rotate\"))') | first | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {{ outputs.rotate_secret.vars.result ?? (fromJson(item.value).clientId ~ ': NOT rotated, see the execution logs') }}
+            tasks:
+              - id: rotate_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: rotate_secret
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Rotates only if the secret is still the one that was shown; the new value is discarded, never output.
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    env:
+                      KC_URL: "{{ secret('KEYCLOAK_URL') }}"
+                      KC_REALM: "{{ render(vars.realm) }}"
+                      KC_CLIENT_ID: "{{ inputs.client_id }}"
+                      KC_CLIENT_SECRET: "{{ secret('KEYCLOAK_CLIENT_SECRET') }}"
+                    inputFiles:
+                      kc.py: "{{ vars.kc_client }}"
+                      item.json: "{{ item.value }}"
+                    script: |
+                      import json, time
+                      from kc import api, utc, outputs, fail
+                      item = json.load(open("item.json"))
+                      name = item["clientId"]
+                      status, client = api("GET", f"/clients/{item['id']}", allow=(404,))
+                      if status == 404:
+                          outputs({"result": f"{name}: skipped, the client was deleted since the proposal"})
+                          raise SystemExit
+                      before = (client.get("attributes") or {}).get("client.secret.creation.time", "")
+                      if before != item["created"]:
+                          outputs({"result": f"{name}: skipped, its secret was already changed since the proposal"})
+                          raise SystemExit
+                      api("POST", f"/clients/{item['id']}/client-secret")  # the response holds the new secret: not kept
+                      attrs = api("GET", f"/clients/{item['id']}")[1].get("attributes") or {}
+                      after = attrs.get("client.secret.creation.time", "")
+                      if not after or after == before:
+                          fail(f"{name}: Keycloak accepted the rotation but the secret creation time did not change")
+                      grace = attrs.get("client.secret.rotated.expiration.time")
+                      outputs({"result": f"{name}: secret rotated at {utc(int(after))}; " + (
+                          f"the old secret keeps working until {utc(int(grace))}, install the new one before then" if grace else
+                          "the old secret stopped working now, the owner must install the new one from Clients > "
+                          f"{name} > Credentials")})
+
+      - id: disable
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ fromJson(outputs.approved.values.items) | jq('map(select(.action == \"disable\")) | length') | first > 0 }}"
+        then:
+          - id: disable_users
+            type: io.kestra.plugin.core.flow.Loop
+            values: "{{ fromJson(outputs.approved.values.items) | jq('map(select(.action == \"disable\"))') | first | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {{ outputs.disable_user.vars.result ?? (fromJson(item.value).username ~ ': NOT disabled, see the execution logs') }}
+            tasks:
+              - id: disable_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: disable_user
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Disables only if the account is still unused (no login since the cutoff, no session) and still enabled.
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    env:
+                      KC_URL: "{{ secret('KEYCLOAK_URL') }}"
+                      KC_REALM: "{{ render(vars.realm) }}"
+                      KC_CLIENT_ID: "{{ inputs.client_id }}"
+                      KC_CLIENT_SECRET: "{{ secret('KEYCLOAK_CLIENT_SECRET') }}"
+                    inputFiles:
+                      kc.py: "{{ vars.kc_client }}"
+                      item.json: "{{ item.value }}"
+                    script: |
+                      import json, time
+                      from kc import api, outputs, fail
+                      item = json.load(open("item.json"))
+                      name, uid = item["username"], item["id"]
+                      status, user = api("GET", f"/users/{uid}", allow=(404,))
+                      if status == 404:
+                          outputs({"result": f"{name}: skipped, the account was deleted since the proposal"})
+                          raise SystemExit
+                      if not user.get("enabled"):
+                          outputs({"result": f"{name}: skipped, already disabled"})
+                          raise SystemExit
+                      since = time.strftime("%Y-%m-%d", time.gmtime(item["cutoff_ms"] / 1000))
+                      types = "".join(f"&type={t}" for t in ("LOGIN", "CODE_TO_TOKEN", "REFRESH_TOKEN", "IDENTITY_PROVIDER_LOGIN"))
+                      events = api("GET", f"/events?user={uid}&dateFrom={since}{types}&max=50")[1]
+                      if any(e["time"] > item["cutoff_ms"] for e in events) or api("GET", f"/users/{uid}/sessions")[1]:
+                          outputs({"result": f"{name}: skipped, signed in since the proposal"})
+                          raise SystemExit
+                      user["enabled"] = False
+                      api("PUT", f"/users/{uid}", user)
+                      if api("GET", f"/users/{uid}")[1].get("enabled"):
+                          fail(f"{name}: Keycloak accepted the update but the account is still enabled")
+                      outputs({"result": f"{name}: disabled; re-enable it in Users > {name} if it is still needed"})
+
+      - id: notify_outcome
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {% if fromJson(outputs.approved.values.items) | length == 0 %}Keycloak realm {{ render(vars.realm) }}: nothing approved, nothing was changed.{% else %}Keycloak realm {{ render(vars.realm) }}, approved actions:
+          {% for r in outputs.rotate_secrets.outputs ?? [] %}- {{ r.outputs.result }}
+          {% endfor %}{% for r in outputs.disable_users.outputs ?? [] %}- {{ r.outputs.result }}
+          {% endfor %}{% endif %}
+
+      - id: any_failed
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ {'r': outputs.rotate_secrets.outputs ?? [], 'd': outputs.disable_users.outputs ?? []} | jq('[(.r[], .d[]) | .outputs.result | select(contains(\"NOT \"))] | length') | first > 0 }}"
+        then:
+          - id: partial
+            type: io.kestra.plugin.core.execution.Exit
+            state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Keycloak realm audit failed for realm {{ trigger.body.realm ?? inputs.realm }} in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      {% if outputs.approved is defined %}Approved actions may have run: check the execution.{% else %}Nothing was changed by this run.{% endif %} {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: findings
+    type: JSON
+    description: Every current finding with its check, severity, summary and fix, high severity first.
+    value: "{{ outputs.audit.vars.findings ?? [] }}"
+  - id: changes
+    type: JSON
+    description: Findings that are new or resolved since the previous run.
+    value: "{{ {'new': outputs.audit.vars.new ?? [], 'resolved': outputs.audit.vars.resolved ?? []} }}"
+
+extend:
+  title: Audit Keycloak Realm Security and Fix It with On-Call Approval
+  shortDescription: Find Keycloak administrators without a second factor, stale accounts, old client secrets, wildcard redirect URIs and the password grant, report what changed since the last run, and with approval rotate secrets or disable accounts.
+  metaTitle: Keycloak Realm Security Audit with Kestra
+  metaDescription: Audit a Keycloak realm for admins without OTP, stale users, old client secrets and wildcard redirect URIs; rotate or disable with approval.
+  description: |
+    A Keycloak realm drifts. Someone is made an administrator through a group and never sets up OTP. A contractor leaves and the account stays enabled. A service client keeps the secret it got two years ago. A redirect URI typed as `https://app.example.com*` also accepts `https://app.example.com.attacker.example`, which lets an attacker receive authorization codes. None of this shows up until an audit or an incident.
+
+    This blueprint reads the realm through the Admin REST API with a dedicated service account, reports each finding once (and again when it is resolved), and turns the two safe fixes into a one-click decision for on-call: rotate an old client secret, or disable an account nobody uses. It was tested on Keycloak 26.4.
+
+    ## How it works
+
+    1. `realm_changed` (`Webhook`, event-based) runs an audit right after a realm change, for example at the end of the Terraform or keycloak-config-cli job that manages the realm; `daily_audit` (`Schedule`) catches drift made by hand.
+    2. `validate_realm` (`If`) rejects realm names that are not plain identifiers, since a webhook body can choose the realm.
+    3. `check_realm` (HTTP, retried) calls the public realm endpoint; `realm_reachable` (`If` + `Switch`) tells "realm not found" from "Keycloak unhealthy".
+    4. `audit` (Python, standard library) logs in with the client credentials grant and checks:
+       - **Administrators without a second factor**: effective realm roles and `realm-management` roles, so roles held through groups and composite roles count; OTP or (optionally) WebAuthn credentials; a pending "Configure OTP" required action is mentioned.
+       - **Stale accounts**: no LOGIN, CODE_TO_TOKEN, REFRESH_TOKEN or identity provider login event for `stale_user_days`, account older than that, and no active session. The check refuses to run, and says why, when events are off, expire too early, or do not yet reach back far enough.
+       - **Old client secrets**: `client.secret.creation.time` older than `secret_max_age_days`, or missing (the secret was never rotated by Keycloak).
+       - **Redirect URIs**: `*`, a wildcard in the host part, a path wildcard, plain HTTP.
+       - **The password grant** (Direct access grants) on any client.
+       It compares the findings with the previous run's, kept in the KV store.
+    5. `save_state` stores the findings before anyone is asked, so a queued run never reports or asks twice.
+    6. `report` (`If`) sends new and resolved findings to Slack.
+    7. `propose` (`If`) asks on-call and waits (`Pause`, 4 hours) with one checkbox per client or account. The choices are built at run time from the findings.
+    8. `rotate_secrets` and `disable_users` (`Loop`, each item in a `Sequential` with `allowFailure`) re-check each item just before acting: a secret already changed or an account that signed in since the proposal is skipped.
+    9. `notify_outcome` reports each result; `any_failed` (`If`) ends the run `WARNING` if one item failed.
+
+    ## Error handling
+
+    - **Secrets never leave Keycloak.** The token exchange and the rotation run inside scripts that output only what is chosen: an HTTP task would keep the token response, and the rotation response with the new secret, in the execution outputs. The client list returned by Keycloak includes secrets; the flow keeps only names and dates. The client's owner copies the new secret from the admin console.
+    - **Rotation is honest about downtime.** Without a secret-rotation client policy the old secret stops working at once, and the report says so. With one (preview feature `client-secret-rotation`), it reports until when the old secret is still accepted.
+    - **Actions only touch what was shown.** A secret is rotated only if its creation time is still the one in the proposal; an account is disabled only if it has no new login event and no session since the cutoff, and is still enabled.
+    - **No false "stale" verdicts.** If login events are off, expire before `stale_user_days`, or were enabled too recently to cover the window, the stale account check is skipped and reported as an info finding, instead of flagging everyone.
+    - **The flow never locks itself out.** Its own client is reported but never proposed for rotation.
+    - **Each item is isolated.** A failed rotation (for example a missing `manage-clients` role) is reported as "NOT rotated", the other items still run, and the run ends `WARNING`.
+    - **Clear failures.** Unreachable Keycloak (retried), realm not found, rejected credentials and missing roles each fail with the exact fix in the Slack alert, which names the task.
+    - **No alert storms.** Each finding is reported when it appears and when it is resolved; declined or unanswered proposals are asked again only after `ask_again_hours`. Runs are queued (`concurrency`), and the state is saved before the approval, so a burst of webhook calls produces one report.
+
+    ## What this blueprint teaches about Kestra
+
+    - A `Pause` whose `MULTISELECT` choices come from an `expression` computed earlier in the run; Kestra rejects any answer that was not offered.
+    - The KV store as memory between runs, to report changes instead of the same list every day.
+    - Sharing helper code between script tasks with a flow variable and `inputFiles`, and keeping credentials out of task outputs.
+    - A `Loop` with per-item `Sequential` + `allowFailure` and a `??` fallback in the loop output for the failed items.
+
+    ## Prerequisites
+
+    - Keycloak 22 or later (tested on 26.4). In the audited realm, a confidential client (default `kestra-auditor`) with **Service accounts roles** on and these `realm-management` roles: `view-users`, `view-clients`, `view-events` for the audit, `manage-users` and `manage-clients` for the actions.
+    - Login events saved for at least `stale_user_days` (Realm settings > Events > User events settings).
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    - `KEYCLOAK_URL`: base URL, for example `https://sso.example.com` (add `/auth` for Keycloak 16 and older).
+    - `KEYCLOAK_CLIENT_SECRET`: secret of the auditor client.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `realm` (STRING, default `acme`): realm to audit; a webhook body `{"realm": "..."}` overrides it.
+    - `client_id` (STRING, default `kestra-auditor`): the auditor client.
+    - `stale_user_days` (INT, 90), `secret_max_age_days` (INT, 180).
+    - `admin_realm_roles` (ARRAY, `admin`), `admin_client_roles` (ARRAY, `realm-admin`, `manage-realm`, `manage-users`, `manage-clients`, `manage-authorization`): what makes a user an administrator.
+    - `accept_webauthn` (BOOL, true), `ignore_clients` (ARRAY, Keycloak's built-in clients), `max_users` (INT, 5000), `ask_again_hours` (INT, 72), `kestra_url` (STRING).
+
+    ### Outputs
+
+    - `findings` (JSON): every current finding with check, severity, summary and fix.
+    - `changes` (JSON): new and resolved findings. Both are empty when the run fails.
+
+    ## Quick start
+
+    1. Create the auditor client and give its service account the roles above. Turn on login events.
+    2. Add the secrets and run the flow. The first run reports every finding; on the test realm it found 12 (5 high, 6 medium, 1 low), for example "client legacy-portal redirect URI https://legacy.example.com* has a wildcard in the host part: it also matches legacy.example.com.attacker.example".
+    3. Tick what to fix in the approval form, or nothing. Later runs only report changes: "0 new, 4 resolved, 8 unchanged".
+    4. Call the webhook from the pipeline that changes the realm, and enable the daily schedule.
+
+    ## How to extend
+
+    - Push the new secret to Vault or AWS Secrets Manager from the rotation script, instead of leaving it only in Keycloak.
+    - Audit several realms: create the auditor client in each, and call the webhook with each realm name.
+    - Add checks the same way, for example identity providers that trust unverified e-mails, or a brute-force detection setting that is off.
+
+    ## Links
+
+    - [Keycloak Admin REST API](https://www.keycloak.org/docs-api/latest/rest-api/index.html)
+    - [Python plugin](https://kestra.io/plugins/plugin-script-python)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - System
+  subTags:
+    - Policy & Compliance
+    - Approval Gates
+  ee: false
+  demo: false
