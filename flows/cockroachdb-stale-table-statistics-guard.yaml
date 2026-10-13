@@ -1,0 +1,548 @@
+id: cockroachdb-stale-table-statistics-guard
+namespace: company.team
+
+description: |
+  Find CockroachDB tables whose optimizer statistics are old, missing or badly out of step with the
+  rows actually in the table. It also catches automatic collection being switched off. Then it collects
+  fresh statistics per table, re-enables automatic collection, reads the catalog again and fails the
+  run if a target's newest statistic did not move.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: Any CockroachDB node over the Postgres wire protocol. The SQL port is 26257 by default. The database in this URL is the one the run audits.
+    defaults: "jdbc:postgresql://localhost:26257/defaultdb?sslmode=require"
+
+  - id: db_user
+    type: STRING
+    displayName: SQL user
+    description: The role the queries connect as. It needs SELECT on the audited tables and the privilege to run CREATE STATISTICS on them.
+    defaults: "root"
+
+  - id: password
+    type: STRING
+    displayName: SQL password
+    description: Read from the COCKROACH_PASSWORD secret by default. An insecure local cluster ignores it.
+    defaults: "{{ secret('COCKROACH_PASSWORD') }}"
+
+  - id: include_schemas
+    type: STRING
+    displayName: Schemas to audit
+    description: Comma separated schema names. Empty means every user schema in the connected database.
+    defaults: ""
+
+  - id: max_statistics_age_hours
+    type: INT
+    displayName: Maximum statistics age (hours)
+    description: A table whose newest statistic is older than this is flagged. A table with no statistics at all is always flagged.
+    defaults: 24
+
+  - id: measure_live_rows
+    type: BOOL
+    displayName: Count live rows on fresh tables
+    description: >-
+      Age alone cannot catch statistics that are recent and wrong. With this on, the run counts the
+      rows in tables the age check considered fine and compares the count with the row count stored
+      in the statistic. It is a full primary index scan per table, so it is off by default and capped.
+    defaults: false
+
+  - id: max_tables_measured
+    type: INT
+    displayName: Maximum tables counted per run
+    description: Ceiling on how many tables get a live row count, oldest statistics first.
+    defaults: 20
+
+  - id: row_drift_factor
+    type: FLOAT
+    displayName: Row count drift factor
+    description: Flag a table when the live count and the stored count differ by at least this many times, in either direction.
+    defaults: 10.0
+
+  - id: min_drift_rows
+    type: INT
+    displayName: Minimum rows for a drift finding
+    description: Ignore drift on small tables. Compared against the larger of the live count and the stored count, never against the stored count alone.
+    defaults: 1000
+
+  - id: max_tables_collected
+    type: INT
+    displayName: Maximum tables collected per run
+    description: Per run ceiling on CREATE STATISTICS. Whatever is left over is reported and picked up by the next run, so one pass never samples a whole cluster at once.
+    defaults: 10
+
+  - id: enforce_automatic_collection
+    type: BOOL
+    displayName: Re-enable automatic collection
+    description: Set sql.stats.automatic_collection.enabled back to true when it is off. Without it, every table goes stale again after this run.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow CREATE STATISTICS and the cluster setting change. Collecting statistics reads data and rewrites estimates, it never changes rows or schema.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before anything is collected.
+    defaults: true
+
+variables:
+  scope_cte: |
+    scope AS (
+      SELECT ct.table_id,
+             ct.schema_name,
+             ct.name AS table_name,
+             format('%I.%I.%I', ct.database_name, ct.schema_name, ct.name) AS qualified_name
+        FROM crdb_internal.tables ct
+        JOIN information_schema.tables it
+          ON it.table_schema = ct.schema_name AND it.table_name = ct.name
+       WHERE ct.database_name = current_database()
+         AND ct.state = 'PUBLIC'
+         AND it.table_type = 'BASE TABLE'
+         AND ct.schema_name NOT IN ('crdb_internal', 'pg_catalog', 'pg_extension', 'information_schema')
+         AND (length(btrim('{{ inputs.include_schemas }}')) = 0
+              OR ct.schema_name = ANY (string_to_array(btrim('{{ inputs.include_schemas }}'), ',')))
+    )
+
+  stats_cte: |
+    st AS (
+      SELECT DISTINCT ON ("tableID")
+             "tableID" AS table_id,
+             "createdAt" AS newest_created_at,
+             "rowCount" AS stat_row_count
+        FROM system.table_statistics
+       ORDER BY "tableID", "createdAt" DESC
+    ), stc AS (
+      SELECT "tableID" AS table_id, count(*)::INT8 AS statistic_count
+        FROM system.table_statistics GROUP BY 1
+    )
+
+  settings_sql: |
+    WITH {{ render(vars.scope_cte) }}
+    SELECT current_database() AS database_name,
+           coalesce((SELECT value FROM crdb_internal.cluster_settings
+                      WHERE variable = 'sql.stats.automatic_collection.enabled'), 'unknown') AS auto_collection,
+           coalesce((SELECT value = 'true' FROM crdb_internal.cluster_settings
+                      WHERE variable = 'sql.stats.automatic_collection.enabled'), false) AS auto_collection_enabled,
+           coalesce((SELECT value FROM crdb_internal.cluster_settings
+                      WHERE variable = 'sql.stats.automatic_collection.min_stale_rows'), 'unknown') AS min_stale_rows,
+           coalesce((SELECT value FROM crdb_internal.cluster_settings
+                      WHERE variable = 'sql.stats.automatic_collection.fraction_stale_rows'), 'unknown') AS fraction_stale_rows,
+           (SELECT count(*) FROM scope)::INT8 AS tables_in_scope
+
+  inventory_sql: |
+    WITH {{ render(vars.scope_cte) }}, {{ render(vars.stats_cte) }}
+    SELECT s.table_id,
+           s.qualified_name,
+           quote_literal(s.qualified_name) AS name_literal
+      FROM scope s JOIN st ON st.table_id = s.table_id
+     WHERE {{ inputs.measure_live_rows }}
+       AND extract(EPOCH FROM (now() - st.newest_created_at))::INT8 <= {{ inputs.max_statistics_age_hours }} * 3600
+     ORDER BY st.newest_created_at ASC, s.qualified_name
+     LIMIT {{ inputs.max_tables_measured }}
+
+  live_counts_sql: |
+    SELECT '' AS qualified_name, (-1)::INT8 AS live_rows
+    {% for r in outputs.inventory.rows %}UNION ALL SELECT {{ r.name_literal }}, count(*)::INT8 FROM {{ r.qualified_name }}
+    {% endfor %}
+
+  audit_sql: |
+    WITH measured(qualified_name, live_rows) AS (
+      VALUES ('', (-1)::INT8){% for r in outputs.live_counts.rows %}, ('{{ r.qualified_name | replace({"'": "''"}) }}', {{ r.live_rows }}::INT8){% endfor %}
+
+    ), {{ render(vars.scope_cte) }}, {{ render(vars.stats_cte) }}, j AS (
+      SELECT s.table_id, s.schema_name, s.table_name, s.qualified_name,
+             coalesce(st.newest_created_at::STRING, '1970-01-01 00:00:00') AS newest_ts,
+             coalesce(extract(EPOCH FROM st.newest_created_at)::INT8, -1) AS newest_epoch,
+             coalesce(extract(EPOCH FROM (now() - st.newest_created_at))::INT8, -1) AS stats_age_seconds,
+             coalesce(st.stat_row_count, -1) AS stat_row_count,
+             coalesce(stc.statistic_count, 0) AS statistic_count,
+             coalesce(max(m.live_rows), -1) AS live_rows,
+             (st.table_id IS NULL) AS never_collected
+        FROM scope s
+        LEFT JOIN st ON st.table_id = s.table_id
+        LEFT JOIN stc ON stc.table_id = s.table_id
+        LEFT JOIN measured m ON m.qualified_name = s.qualified_name
+       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 11
+    ), f AS (
+      SELECT j.*,
+             CASE WHEN never_collected THEN 'NEVER_COLLECTED'
+                  WHEN stats_age_seconds > {{ inputs.max_statistics_age_hours }} * 3600 THEN 'STALE_AGE'
+                  ELSE 'ROW_COUNT_DRIFT' END AS verdict,
+             CASE WHEN live_rows >= 0 AND stat_row_count >= 0
+                  THEN round(greatest(live_rows, stat_row_count)::FLOAT8
+                             / greatest(least(live_rows, stat_row_count), 1)::FLOAT8, 2)
+                  ELSE 0::FLOAT8 END AS drift_factor
+        FROM j
+       WHERE never_collected
+          OR stats_age_seconds > {{ inputs.max_statistics_age_hours }} * 3600
+          OR (stat_row_count >= 0
+              AND live_rows >= 0
+              AND greatest(live_rows, stat_row_count) >= {{ inputs.min_drift_rows }}
+              AND greatest(live_rows, stat_row_count)::FLOAT8
+                  > greatest(least(live_rows, stat_row_count), 1)::FLOAT8 * {{ inputs.row_drift_factor }})
+    )
+    SELECT table_id, schema_name, table_name, qualified_name, verdict, newest_ts, newest_epoch,
+           stats_age_seconds, stat_row_count, live_rows, drift_factor, statistic_count,
+           'CREATE STATISTICS kestra_stats_refresh FROM ' || qualified_name AS collect_sql,
+           row_number() OVER (ORDER BY CASE verdict WHEN 'NEVER_COLLECTED' THEN 0
+                                                    WHEN 'ROW_COUNT_DRIFT' THEN 1
+                                                    ELSE 2 END,
+                                       drift_factor DESC, stats_age_seconds DESC, qualified_name)::INT8 AS collect_rank
+      FROM f
+     ORDER BY collect_rank
+     LIMIT 200
+
+  verify_sql: |
+    WITH targets(table_id, qualified_name, before_ts) AS (
+      VALUES (0::INT8, '', '1970-01-01 00:00:00'::TIMESTAMP){% for r in outputs.audit.rows %}{% if r.collect_rank <= inputs.max_tables_collected %}, ({{ r.table_id }}::INT8, '{{ r.qualified_name | replace({"'": "''"}) }}', '{{ r.newest_ts }}'::TIMESTAMP){% endif %}{% endfor %}
+
+    ), {{ render(vars.stats_cte) }}
+    SELECT count(*) FILTER (WHERE t.table_id <> 0)::INT8 AS targets_checked,
+           count(*) FILTER (WHERE t.table_id <> 0
+                              AND (st.newest_created_at IS NULL OR st.newest_created_at <= t.before_ts))::INT8 AS targets_not_advanced,
+           coalesce(string_agg(t.qualified_name || ' newest ' || coalesce(st.newest_created_at::STRING, 'none')
+                               || ' was ' || t.before_ts::STRING, '; ')
+                    FILTER (WHERE t.table_id <> 0
+                              AND (st.newest_created_at IS NULL OR st.newest_created_at <= t.before_ts)), '') AS laggards,
+           coalesce(string_agg(t.qualified_name || ' newest ' || coalesce(st.newest_created_at::STRING, 'none')
+                               || ' rows ' || coalesce(st.stat_row_count::STRING, 'none'), '; ')
+                    FILTER (WHERE t.table_id <> 0), '') AS target_state,
+           coalesce((SELECT value = 'true' FROM crdb_internal.cluster_settings
+                      WHERE variable = 'sql.stats.automatic_collection.enabled'), false) AS auto_collection_enabled
+      FROM targets t LEFT JOIN st ON st.table_id = t.table_id
+
+tasks:
+  - id: settings_before
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. The three automatic statistics settings plus the number of tables in scope. With
+      automatic collection off, every table in the database drifts, so this is read before the
+      per-table audit rather than after it.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.settings_sql) }}"
+
+  - id: inventory
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. The tables whose statistics are fresh by age and so need a live row count to tell
+      whether they are also correct. Returns nothing when measure_live_rows is off, oldest statistics
+      first, capped by max_tables_measured.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.inventory_sql) }}"
+
+  - id: live_counts
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One count per candidate table, built as a single UNION ALL from the inventory so a
+      cluster is read once rather than once per table. With no candidates it returns only its own
+      sentinel row.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.live_counts_sql) }}"
+
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per table that needs statistics, classified NEVER_COLLECTED, STALE_AGE or
+      ROW_COUNT_DRIFT, with the collection statement and the rank that the per run cap applies to.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      CockroachDB statistics on {{ outputs.settings_before.row.database_name }}:
+      {{ outputs.settings_before.row.tables_in_scope }} tables in scope,
+      automatic collection {{ outputs.settings_before.row.auto_collection }}
+      (min_stale_rows {{ outputs.settings_before.row.min_stale_rows }},
+      fraction_stale_rows {{ outputs.settings_before.row.fraction_stale_rows }}).
+      {{ outputs.inventory.size }} tables row counted, {{ outputs.audit.size }} need collection,
+      cap {{ inputs.max_tables_collected }} per run.
+      {% for r in outputs.audit.rows %}{{ r.verdict }} {{ r.qualified_name }}: newest statistic {{ r.newest_ts }} ({{ r.stats_age_seconds }}s old, {{ r.statistic_count }} stored), stored row count {{ r.stat_row_count }}, live rows {{ r.live_rows }}, drift {{ r.drift_factor }}x, rank {{ r.collect_rank }}{{ r.collect_rank <= inputs.max_tables_collected ? ' (in this pass)' : ' (next pass)' }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.size > 0 or not outputs.settings_before.row.auto_collection_enabled }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'CockroachDB ' ~ inputs.jdbc_url ~ ': ' ~ outputs.audit.size ~ ' table(s) need fresh optimizer statistics out of ' ~ outputs.settings_before.row.tables_in_scope ~ ' in scope, automatic collection is ' ~ outputs.settings_before.row.auto_collection ~ '. ' ~ (outputs.audit.rows | jq('if length == 0 then "No table flagged" else map("\(.verdict) \(.qualified_name) (newest \(.newest_ts), stored rows \(.stat_row_count), live rows \(.live_rows), drift \(.drift_factor)x)") | join("; ") end') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Collecting now, up to ' ~ inputs.max_tables_collected ~ ' table(s) this pass.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          Collecting statistics is not a destructive change. It reads a sample of the table and
+          rewrites the optimizer's estimates, so no row, schema or query is touched and the worst
+          case is the scan load while it samples. That is why there is no approval Pause here, unlike
+          the guards in this family that drop or cancel something. The gate is still auto_remediate
+          plus dry_run. The per run cap keeps one pass small.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: setting_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.enforce_automatic_collection and not outputs.settings_before.row.auto_collection_enabled }}"
+            then:
+              - id: enable_automatic_collection
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: >-
+                  Without this the tables collected below go stale again on the next bulk write. A role
+                  without MODIFYCLUSTERSETTING has this statement rejected, which must not stop the
+                  collection, so the failure is allowed here and the re-read below is what decides the run.
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.password }}"
+                fetchType: NONE
+                sql: "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = true"
+
+          - id: collect_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.audit.size > 0 }}"
+            then:
+              - id: remediate_collect
+                type: io.kestra.plugin.core.flow.Loop
+                description: One CREATE STATISTICS at a time. Two collections running together contend for the same sampling budget and write the same system table, so the iterations are serialised.
+                concurrencyLimit: 1
+                values: "{{ outputs.audit.rows | jq('map(select(.collect_rank <= ' ~ inputs.max_tables_collected ~ ') | .collect_sql)') | first | toJson }}"
+                tasks:
+                  - id: collect_one
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: A rejected statement leaves the loop running so the re-read below is what decides the run.
+                    allowFailure: true
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ inputs.db_user }}"
+                    password: "{{ inputs.password }}"
+                    fetchType: NONE
+                    sql: "{{ item.value }}"
+
+          - id: verify
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Read-only. Reads the newest statistic for every table this pass targeted and compares it with the timestamp the audit saw.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ inputs.db_user }}"
+            password: "{{ inputs.password }}"
+            fetchType: FETCH_ONE
+            sql: "{{ render(vars.verify_sql) }}"
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.verify.row.targets_not_advanced > 0 or (inputs.enforce_automatic_collection and not outputs.verify.row.auto_collection_enabled) }}"
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  The re-read after remediation did not come back clean.
+                  {{ outputs.verify.row.targets_not_advanced }} of {{ outputs.verify.row.targets_checked }}
+                  targeted tables still carry the statistic the audit read{{ outputs.verify.row.laggards == '' ? '' : ': ' ~ outputs.verify.row.laggards }}.
+                  Automatic collection is
+                  {{ outputs.verify.row.auto_collection_enabled ? 'enabled' : 'still disabled, so every table drifts again' }}.
+                  A statistic that did not move means the CREATE STATISTICS was rejected, the table was dropped
+                  between the audit and the collection or a job cancelled the sampling, so read the collect_one
+                  logs. A setting that did not change means the role is missing MODIFYCLUSTERSETTING.
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Collected statistics on {{ outputs.verify.row.targets_checked }} of {{ outputs.audit.size }} flagged tables,
+                  cap {{ inputs.max_tables_collected }} per run.
+                  Now: {{ outputs.verify.row.target_state }}.
+                  Automatic collection {{ outputs.settings_before.row.auto_collection }} before,
+                  {{ outputs.verify.row.auto_collection_enabled ? 'true' : 'false' }} after.
+                  {{ outputs.audit.size > inputs.max_tables_collected ? (outputs.audit.size - inputs.max_tables_collected) ~ ' table(s) left for the next run.' : 'Nothing left over.' }}
+        else:
+          - id: no_change
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Reporting only (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}).
+              Would run: {{ outputs.audit.rows | jq('map(select(.collect_rank <= ' ~ inputs.max_tables_collected ~ ') | .collect_sql) | if length == 0 then "nothing" else join("; ") end') | first }}.
+              {{ (inputs.enforce_automatic_collection and not outputs.settings_before.row.auto_collection_enabled) ? 'Would also run SET CLUSTER SETTING sql.stats.automatic_collection.enabled = true.' : 'Automatic collection is already on.' }}
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every one of the {{ outputs.settings_before.row.tables_in_scope }} tables in {{ outputs.settings_before.row.database_name }} has a statistic newer than {{ inputs.max_statistics_age_hours }}h. Automatic collection is on."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'CockroachDB stale table statistics guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Stale statistics are invisible in every error log, so a guard that cannot run is worth reading. Check the logs.'} | toJson }}
+
+triggers:
+  - id: every_6_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled. Always runs in safe mode.
+    cron: "0 */6 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: CockroachDB Stale Table Statistics Guard
+  shortDescription: Find CockroachDB tables whose optimizer statistics are old, missing or badly wrong about the row count, catch automatic collection being off, then collect fresh statistics per table and verify the newest statistic moved.
+  metaTitle: CockroachDB Stale Table Statistics Guard with Kestra
+  metaDescription: Audit stale, missing or wrong CockroachDB table statistics, alert Slack, collect fresh statistics per table within a cap and verify they landed.
+  description: |
+    CockroachDB's cost based optimizer picks a plan from the statistics it holds about each table. After a bulk ingest, a restore or with automatic collection switched off, those statistics describe a table that no longer exists. The optimizer thinks a table holds a thousand rows when it holds ten million, so it picks a full scan or the wrong join order. Query latency jumps. Nothing errors. No schema changed. The plan is simply built on a number that stopped being true.
+
+    This is one of the few database faults with no signal of its own. There is no failed statement, no lock, no alert. The slow query looks like a slow query. The only place the cause is visible is the catalog, in the age of the newest statistic and the row count stored in it.
+
+    This blueprint reads `system.table_statistics` for every table in the connected database and flags three things: a table with no statistics at all, a table whose newest statistic is older than a threshold and a table whose stored row count is out by more than a factor from the rows actually there. It reads the automatic collection settings as well, because a cluster with `sql.stats.automatic_collection.enabled` set to false makes every table stale in turn. Then it collects fresh statistics per table within a per run cap, re-enables automatic collection, reads the catalog again and fails the run if a target's newest statistic did not move.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    - The row count stored in a statistic is the one number you cannot use to decide whether a table is worth collecting. A table that grew from 500 rows to 2 million carries a stored count of 500, so any size filter built on the stored count skips exactly the tables that are worst wrong. The size floor here is applied to the larger of the stored count and the measured count, never to the stored count alone.
+    - Age alone is a proxy. A statistic collected ten minutes before a bulk load is fresh and wrong. One collected two days ago on a table nobody writes to is old and correct. So the run has two detectors. The cheap one is age, which needs only the catalog. The exact one counts the rows in tables the age check already considered fine, which is the only set where a count can tell you something new.
+    - There is no `crdb_internal` view for the statistics catalog. `system.table_statistics` is the source, keyed by `tableID`, with camel case column names that have to be quoted. `SHOW STATISTICS FOR TABLE` is the readable form of the same rows for one table.
+    - `crdb_internal.tables` is cluster wide but it lists views alongside tables and carries no type column. `CREATE STATISTICS` on a view fails with `is not a table`. `information_schema.tables` has the type but only for the connected database, so the scope query joins the two and keeps `BASE TABLE` rows. That is also why a run audits one database, the one in the JDBC URL.
+    - Automatic collection has its own floor. `sql.stats.automatic_collection.min_stale_rows` defaults to 500 rows and `fraction_stale_rows` to 0.2, so even with automatic collection on, a large table needs a fifth of its rows to change before the refresher looks at it. Both are reported every run next to the enabled flag.
+
+    ## Safety
+
+    - Collecting statistics is not a destructive change. `CREATE STATISTICS` reads a sample of the table and writes a new row to the statistics catalog. No row, no schema, no index and no query is modified. The old statistics are simply superseded. The cost is the sampling scan.
+    - That is why this flow has no approval `Pause`, which is a deliberate difference from the guards in this family that drop a partition, cancel a query or lower a replica count. Asking a human to approve a statistics refresh would train people to click through a prompt that never has a wrong answer. The gate that matters here is cost, not consent, so the controls are the per run cap, the serialised loop and the opt-in row counting.
+    - Nothing is collected unless `auto_remediate` is true and `dry_run` is false. In reporting mode the run prints the exact statements it would have issued.
+    - `max_tables_collected` bounds one pass, so a cluster with 400 stale tables is worked through over successive runs rather than sampled all at once. The leftover count is logged and alerted.
+    - The collection loop runs with `concurrencyLimit: 1`, so two samplings never contend.
+    - The only statements the flow ever writes are `CREATE STATISTICS kestra_stats_refresh FROM <table>` against names read from the catalog and `SET CLUSTER SETTING sql.stats.automatic_collection.enabled = true`. It never deletes a statistic, never changes a different setting and never touches user data.
+    - The row counting path is off by default because it is a full primary index scan per table.
+
+    ## How it works
+
+    1. `settings_before` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) reads `sql.stats.automatic_collection.enabled`, `min_stale_rows` and `fraction_stale_rows` from `crdb_internal.cluster_settings`, plus the number of tables in scope.
+    2. `inventory` lists the tables whose newest statistic is inside the age threshold, oldest first, capped by `max_tables_measured`. It returns nothing at all when `measure_live_rows` is false.
+    3. `live_counts` runs one `UNION ALL` of `count(*)` over those candidates, so the cluster answers one query rather than one per table.
+    4. `audit` classifies every table in scope and returns only the ones that need collecting.
+
+       | Verdict | Meaning | Detector |
+       |---|---|---|
+       | `NEVER_COLLECTED` | No statistic exists, so the optimizer is working from defaults | Catalog |
+       | `STALE_AGE` | The newest statistic is older than `max_statistics_age_hours` | Catalog |
+       | `ROW_COUNT_DRIFT` | The statistic is recent but its row count is out by more than `row_drift_factor` | Live count |
+
+    5. `summary` logs every flagged table with its newest statistic, its stored row count, the live count and whether the cap covers it this pass.
+    6. `route` (`io.kestra.plugin.core.flow.If`):
+       - **clean:** logs that every table has a current statistic and automatic collection is on.
+       - **findings:** `alert` posts the verdicts and the numbers to Slack.
+         - `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false. There is no approval step, because nothing destructive happens here.
+         - `enable_automatic_collection` sets `sql.stats.automatic_collection.enabled` back to true when it is off and `enforce_automatic_collection` allows it.
+         - `remediate_collect` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs one `CREATE STATISTICS` per table, up to the cap.
+         - `verify` re-reads the newest statistic for every targeted table and compares it with the timestamp the audit saw. `verify_result` fails the run when any target did not advance or when automatic collection is still off.
+    7. `errors` alerts Slack when the audit itself cannot run.
+
+    ## What you get
+
+    - The tables whose plans are being chosen from numbers that are no longer true, split by why: never collected, too old or recent but wrong.
+    - The automatic collection settings beside the per table findings, so a cluster where collection was switched off months ago reads as one cause rather than fifty symptoms.
+    - Fresh statistics collected within a cap you set, so a large cluster is worked through over several runs instead of being sampled in one.
+    - A before and after timestamp per table from the catalog, so a green run is a measurement rather than an assumption.
+
+    ## Who it's for
+
+    - Teams running CockroachDB who have watched a query get slower with no deploy, no schema change and no error to point at.
+    - Anyone who has just finished a bulk ingest, a restore or a backfill, which is when the stored row counts are furthest from the truth.
+    - Platform engineers who need to know whether automatic collection is actually on across every cluster they run.
+
+    ## Why orchestrate this with Kestra
+
+    Stale statistics are a state that gets worse quietly, so the useful thing is a schedule rather than an alert. Kestra runs the audit every six hours, keeps each run with its numbers, posts the findings to Slack and holds the collection behind `auto_remediate` and `dry_run`. The per run cap means the schedule spreads a big backlog across passes instead of hammering the cluster once. The re-read makes the run report success only after the catalog says the statistics actually moved.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against a CockroachDB v24.1 single node cluster reached with the PostgreSQL plugin, with a local HTTP sink standing in for Slack. The degraded states were built the way they happen in production: collect a baseline, switch automatic collection off, then bulk load so the stored row count is left behind. Two tables were left current to prove the audit does not flag what is fine. Every result was read back with `SHOW STATISTICS FOR TABLE` rather than from the Kestra log.
+
+    | Run | Cluster state | Result |
+    |---|---|---|
+    | 1 | 3 tables, all with current statistics, automatic collection on | Clean. 0 findings |
+    | 2 | collection off, `orders` bulk loaded to 200,500 rows behind a statistic 3 days old saying 500 | 1 finding, `STALE_AGE` on `shop.public.orders`, collection reported false. The 2 current tables not flagged. Alert sent, no change |
+    | 3 | same, `auto_remediate: true`, `dry_run: true` | Same finding, both statements printed, newest statistic and the setting unchanged in the SQL client |
+    | 4 | same, `auto_remediate: true`, `dry_run: false` | `CREATE STATISTICS` ran, stored row count 500 to 200,500, setting back to true. `EXPLAIN` estimate for the scan went from 500 to 200,500 |
+    | 5 | 2 stale tables, `max_tables_collected: 1` | Oldest collected, the other reported as left for the next pass, which the next run picked up |
+    | 6 | `events` bulk loaded to 205,000 rows behind a statistic 30 seconds old saying 5,000, `measure_live_rows: true` | `ROW_COUNT_DRIFT` at 41x on a table the age check passed. The other 2 counted and not flagged |
+    | 7 | same, remediated | Stored row count 5,000 to 205,000, verified in the catalog |
+    | 8 | a new table with no statistics at all | `NEVER_COLLECTED`, collected at 1,000 rows, verified |
+    | 9 | collection off, run as a role without `MODIFYCLUSTERSETTING` | `SET CLUSTER SETTING` rejected, the collection still ran, the re-read FAILED the run on the setting |
+    | 10 | run as a role with `statement_timeout` at 250ms | `CREATE STATISTICS` cancelled, the re-read found the statistic the audit saw and FAILED the run |
+    | 11 | unreachable host | `errors` alert sent |
+    ## Prerequisites
+
+    - A CockroachDB cluster reachable over the Postgres wire protocol, which is what the PostgreSQL plugin speaks to it. There is no separate CockroachDB plugin.
+    - The audited database is the one named in `jdbc_url`.
+    - The audit role needs `SELECT` on the tables in scope, which is also all `CREATE STATISTICS` asks for. Reading `system.table_statistics` needs more than that. A plain role is refused outright, so grant the `VIEWSYSTEMTABLE` system privilege or use a member of `admin`. Re-enabling the setting needs `MODIFYCLUSTERSETTING`. A role without it has that one statement rejected while the collection still runs.
+    - `measure_live_rows` scans the primary index of each candidate table, so leave it off on a cluster where that scan is not affordable. Narrow it with `include_schemas` and `max_tables_measured`.
+
+    ### Secrets
+
+    - `COCKROACH_PASSWORD`: the SQL password, read by the `password` input's default. An insecure local node ignores it.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:26257/defaultdb?sslmode=require` | Any node plus the database to audit |
+    | `db_user` | `root` | The role the queries connect as |
+    | `password` | `{{ secret('COCKROACH_PASSWORD') }}` | SQL password |
+    | `include_schemas` | empty | Comma separated schemas, empty means every user schema |
+    | `max_statistics_age_hours` | `24` | Age at which a statistic counts as stale |
+    | `measure_live_rows` | `false` | Count rows on tables the age check passed |
+    | `max_tables_measured` | `20` | Ceiling on tables counted per run |
+    | `row_drift_factor` | `10.0` | Factor between stored and live counts that counts as drift |
+    | `min_drift_rows` | `1000` | Size floor for a drift finding |
+    | `max_tables_collected` | `10` | Per run ceiling on `CREATE STATISTICS` |
+    | `enforce_automatic_collection` | `true` | Re-enable automatic collection when it is off |
+    | `auto_remediate` | `false` | Allow the collection and the setting change |
+    | `dry_run` | `true` | Must be `false` before anything is collected |
+
+    ## Quick start
+
+    1. Add the `COCKROACH_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url` to a node, with the database you want audited in the path.
+    3. Run it once as it ships. Read the automatic collection line first, since a cluster with collection off needs that fixed before any per table finding means much.
+    4. Run it with `measure_live_rows: true` on a quiet cluster to see which fresh looking statistics are actually wrong.
+    5. Collect with `auto_remediate: true` and `dry_run: false`. Raise `max_tables_collected` only as far as the sampling load allows.
+    6. Enable the `every_6_hours` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Loop over several databases or clusters by passing a list of JDBC URLs, since one run audits the database in its own URL.
+    - Collect per column with `CREATE STATISTICS ... ON (col) FROM table` for the columns a slow plan actually filters on, which samples far less than a whole table.
+    - Record each run's drift factors in a KV key and alert on a table whose statistics go stale repeatedly, which usually means the automatic refresher's row floor is too high for it.
+    - Compare `EXPLAIN` estimated row counts before and after the collection and attach the pair to the Slack message, which is the plan level proof that the refresh changed a decision.
+    - Add a branch that raises `sql.stats.automatic_collection.fraction_stale_rows` for a specific table with `ALTER TABLE ... SET (sql_stats_automatic_collection_fraction_stale_rows = ...)` instead of collecting it by hand every pass.
+
+    ## Links
+
+    - Table statistics and CREATE STATISTICS: https://www.cockroachlabs.com/docs/v24.1/create-statistics
+    - Cost based optimizer and statistics: https://www.cockroachlabs.com/docs/v24.1/cost-based-optimizer
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Performance
+    - Day 2 Operations
+  ee: false
+  demo: false
