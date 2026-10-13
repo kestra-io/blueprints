@@ -1,0 +1,554 @@
+id: mongodb-unbounded-array-growth-trim-guard
+namespace: company.team
+
+description: |
+  Find the MongoDB documents whose embedded array has grown without a bound and is marching
+  toward the hard 16MB BSON document limit. An `events`, `history` or `audit` array that every
+  write `$push`es to never stops growing on its own. The day a document crosses 16MB, every
+  further write to that document fails, so the breakage arrives with no warning and only for
+  the hottest records. This flow measures array lengths and document sizes, reports the
+  documents over a length threshold, optionally copies the entries it is about to discard into
+  an archive collection, trims each array to its newest entries behind a safe mode gate and an
+  approval, then reads the collection again and fails the run if any targeted document is still
+  oversized.
+
+inputs:
+  - id: connection_uri
+    type: STRING
+    displayName: MongoDB connection string
+    description: >-
+      Leave empty in production so the flow reads the MONGODB_URI secret. Set it to a plain
+      connection string only for a local test run.
+    defaults: ""
+
+  - id: database
+    type: STRING
+    displayName: Database
+    defaults: appdata
+
+  - id: collection
+    type: STRING
+    displayName: Collection
+    defaults: activity
+
+  - id: array_field
+    type: STRING
+    displayName: Embedded array field
+    description: >-
+      The array every write appends to, for example events. Documents where this field is not an
+      array are never counted and never touched.
+    defaults: events
+
+  - id: length_threshold
+    type: INT
+    displayName: Array length that counts as oversized
+    description: >-
+      A document whose array holds more than this many entries is reported. This is the same
+      predicate the trim uses, so a document at or below the threshold is never written to.
+    defaults: 5000
+
+  - id: keep_n
+    type: INT
+    displayName: Entries to keep when trimming
+    description: >-
+      The trim keeps the newest keep_n entries and drops the rest. Must be at least 1 and no
+      larger than length_threshold, otherwise the trim could not clear the detection and the
+      flow fails fast instead of writing.
+    defaults: 1000
+
+  - id: scan_limit
+    type: INT
+    displayName: Documents sampled per report
+    description: >-
+      Ceiling on the sample listed in the log and on each re-check sample. The counts are
+      exact and server-side, so the cap only bounds how many documents are named.
+    defaults: 25
+
+  - id: archive_overflow
+    type: BOOL
+    displayName: Archive the overflow before trimming
+    description: >-
+      Copy every entry the trim would discard into archive_collection first, one document per
+      entry, then fail the run before trimming if the archive is short. Leave this false only
+      when the oldest entries are genuinely disposable.
+    defaults: false
+
+  - id: archive_collection
+    type: STRING
+    displayName: Archive collection
+    description: Where archived entries land when archive_overflow is true. Lives in the same database.
+    defaults: activity_overflow_archive
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration to wait for an answer before the pause expires.
+    defaults: "PT2H"
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow the trim. Still needs dry_run false and an approval.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any array is trimmed.
+    defaults: true
+
+variables:
+  size_pipeline: >-
+    {{ {'f': inputs.array_field, 't': inputs.length_threshold, 'k': inputs.keep_n, 'l': inputs.scan_limit} | jq('[{"$match":{(.f):{"$type":"array"},(.f+"."+(.t|tostring)):{"$exists":true}}},{"$facet":{"sample":[{"$project":{"array_length":{"$size":("$"+.f)},"document_bytes":{"$bsonSize":"$$ROOT"}}},{"$sort":{"array_length":-1}},{"$limit":.l}],"targets":[{"$project":{"_id":1}}],"totals":[{"$group":{"_id":"all","documents":{"$sum":1},"overflow_entries":{"$sum":{"$subtract":[{"$size":("$"+.f)},.k]}},"largest_bytes":{"$max":{"$bsonSize":"$$ROOT"}}}}]}},{"$project":{"sample":1,"target_ids":{"$map":{"input":"$targets","as":"x","in":"$$x._id"}},"documents":{"$ifNull":[{"$arrayElemAt":["$totals.documents",0]},0]},"overflow_entries":{"$ifNull":[{"$arrayElemAt":["$totals.overflow_entries",0]},0]},"largest_bytes":{"$ifNull":[{"$arrayElemAt":["$totals.largest_bytes",0]},0]}}},{"$set":{"ceiling_pct":{"$round":[{"$multiply":[{"$divide":["$largest_bytes",16777216]},100]},2]}}}]') | first | toJson }}
+
+  target_check: >-
+    {{ {'ids': outputs.detect.rows[0].target_ids, 'f': inputs.array_field, 't': inputs.length_threshold} | jq('[{"$match":{"_id":{"$in":.ids}}},{"$facet":{"sample":[{"$project":{"array_length":{"$size":("$"+.f)}}},{"$sort":{"array_length":-1}},{"$limit":5}],"totals":[{"$group":{"_id":"all","oversized":{"$sum":{"$cond":[{"$gt":[{"$size":("$"+.f)},.t]},1,0]}},"largest":{"$max":{"$size":("$"+.f)}}}}]}},{"$project":{"sample":1,"oversized":{"$ifNull":[{"$arrayElemAt":["$totals.oversized",0]},0]},"largest":{"$ifNull":[{"$arrayElemAt":["$totals.largest",0]},0]}}}]') | first | toJson }}
+
+tasks:
+  - id: check_inputs
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      A keep_n of 0 would empty the array and a keep_n above the threshold could never clear the
+      detection, so both are refused before a single read.
+    condition: "{{ inputs.keep_n < 1 or inputs.keep_n > inputs.length_threshold }}"
+    then:
+      - id: bad_inputs
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          keep_n is {{ inputs.keep_n }} and length_threshold is {{ inputs.length_threshold }}.
+          keep_n must be at least 1 and no larger than length_threshold. Nothing was read and
+          nothing was written.
+
+  - id: detect
+    type: io.kestra.plugin.mongodb.Aggregate
+    description: >-
+      Read-only. Counts the documents whose array holds more entries than the threshold, sums
+      the entries a trim would discard, reports the largest document in bytes against the 16MB
+      BSON limit, names the worst scan_limit documents and records the id of every document it
+      matched, which the re-check measures. The match uses array index existence, so the server
+      answers it without reading every entry.
+    connection:
+      uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+    database: "{{ inputs.database }}"
+    collection: "{{ inputs.collection }}"
+    pipeline: "{{ render(vars.size_pipeline) }}"
+    store: FETCH
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    description: Log the counts. Task outputs are not in the execution JSON, so the numbers the gates use are written here.
+    message: >-
+      Checked {{ inputs.database }}.{{ inputs.collection }} field {{ inputs.array_field }} for arrays
+      longer than {{ inputs.length_threshold }} entries. Oversized documents:
+      {{ outputs.detect.rows[0].documents ?? 0 }}. Entries a trim to {{ inputs.keep_n }} would discard:
+      {{ outputs.detect.rows[0].overflow_entries ?? 0 }}. Largest document:
+      {{ outputs.detect.rows[0].largest_bytes ?? 0 }} bytes, which is
+      {{ outputs.detect.rows[0].ceiling_pct ?? 0 }} percent of the 16777216 byte BSON limit.
+      Worst documents: {{ outputs.detect.rows[0].sample ?? 'none' }}.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: Oversized documents mean alert and consider remediation. A collection with none just logs and stops.
+    condition: "{{ (outputs.detect.rows[0].documents ?? 0) > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': ('MongoDB array growth guard on ' ~ inputs.database ~ '.' ~ inputs.collection ~ ': ' ~ (outputs.detect.rows[0].documents ?? 0) ~ ' document(s) with more than ' ~ inputs.length_threshold ~ ' entries in ' ~ inputs.array_field ~ '. Largest document ' ~ (outputs.detect.rows[0].largest_bytes ?? 0) ~ ' bytes, ' ~ (outputs.detect.rows[0].ceiling_pct ?? 0) ~ ' percent of the 16MB BSON limit. Execution ' ~ execution.id ~ '.')} | toJson }}
+
+      - id: planned
+        type: io.kestra.plugin.core.log.Log
+        description: What a remediation run would do, printed on every run including a dry one.
+        message: >-
+          A trim would keep the newest {{ inputs.keep_n }} entries in each of
+          {{ outputs.detect.rows[0].documents ?? 0 }} document(s) and discard
+          {{ outputs.detect.rows[0].overflow_entries ?? 0 }} entry(s).
+          archive_overflow={{ inputs.archive_overflow }} dry_run={{ inputs.dry_run }}
+          auto_remediate={{ inputs.auto_remediate }}. A write runs only when auto_remediate is true
+          and dry_run is false and a reviewer approves the pause.
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: The trim opens only when auto_remediate is true and dry_run is false.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: hold
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              A trim discards entries, so a human answers first. With no answer nothing is
+              written and the findings stay open.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Trim the oversized arrays?
+                defaults: false
+              - id: note
+                type: STRING
+                displayName: Decision note
+                defaults: ""
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.hold.onResume.approved ?? false }}"
+            then:
+              - id: archive_branch
+                type: io.kestra.plugin.core.flow.If
+                description: With archive_overflow true the discarded entries are copied out and counted before anything is trimmed.
+                condition: "{{ inputs.archive_overflow }}"
+                then:
+                  - id: archive
+                    type: io.kestra.plugin.mongodb.Aggregate
+                    description: >-
+                      Copy the entries the trim is about to discard into the archive collection,
+                      one document per entry, keyed by source document, execution id and array
+                      index so a repeat of the same run overwrites instead of duplicating. The
+                      merge echoes every written document, so the results go to internal storage
+                      and the worker result stays small.
+                    connection:
+                      uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+                    database: "{{ inputs.database }}"
+                    collection: "{{ inputs.collection }}"
+                    pipeline: >-
+                      {{ {'f': inputs.array_field, 't': inputs.length_threshold, 'k': inputs.keep_n, 'src': inputs.collection, 'db': inputs.database, 'arch': inputs.archive_collection, 'run': execution.id} | jq('[{"$match":{(.f):{"$type":"array"},(.f+"."+(.t|tostring)):{"$exists":true}}},{"$project":{"_id":0,"source_id":"$_id","discard":{"$slice":[("$"+.f),{"$subtract":[{"$size":("$"+.f)},.k]}]}}},{"$unwind":{"path":"$discard","includeArrayIndex":"entry_index"}},{"$project":{"_id":{"source_id":"$source_id","run":.run,"entry_index":"$entry_index"},"source_collection":.src,"array_field":.f,"archived_at":"$$NOW","entry":"$discard"}},{"$merge":{"into":{"db":.db,"coll":.arch}}}]') | first | toJson }}
+                    store: STORE
+
+                  - id: archive_check
+                    type: io.kestra.plugin.mongodb.Aggregate
+                    description: Read-only. Count the entries this execution actually archived.
+                    connection:
+                      uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+                    database: "{{ inputs.database }}"
+                    collection: "{{ inputs.archive_collection }}"
+                    pipeline: >-
+                      {{ {'run': execution.id} | jq('[{"$match":{"_id.run":.run}},{"$facet":{"c":[{"$count":"n"}]}},{"$project":{"archived":{"$ifNull":[{"$arrayElemAt":["$c.n",0]},0]}}}]') | first | toJson }}
+                    store: FETCH
+
+                  - id: archive_gate
+                    type: io.kestra.plugin.core.flow.If
+                    description: Refuse to trim when the archive holds fewer entries than the detection says will be discarded.
+                    condition: "{{ (outputs.archive_check.rows[0].archived ?? 0) < (outputs.detect.rows[0].overflow_entries ?? 0) }}"
+                    then:
+                      - id: archive_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          Archive is short. {{ outputs.detect.rows[0].overflow_entries ?? 0 }} entry(s) are
+                          due to be discarded but {{ inputs.database }}.{{ inputs.archive_collection }} holds
+                          only {{ outputs.archive_check.rows[0].archived ?? 0 }} for execution
+                          {{ execution.id }}. Nothing was trimmed, so no entry was lost.
+                    else:
+                      - id: archived_ok
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          Archived {{ outputs.archive_check.rows[0].archived ?? 0 }} entry(s) into
+                          {{ inputs.database }}.{{ inputs.archive_collection }} for execution {{ execution.id }},
+                          covering the {{ outputs.detect.rows[0].overflow_entries ?? 0 }} entry(s) the trim
+                          will discard.
+                else:
+                  - id: archive_skipped
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      archive_overflow is false, so the oldest
+                      {{ outputs.detect.rows[0].overflow_entries ?? 0 }} entry(s) are discarded for good
+                      by the trim. Set archive_overflow to true to copy them out first.
+
+              - id: trim
+                type: io.kestra.plugin.mongodb.Update
+                description: >-
+                  One UPDATE_MANY that keeps the newest keep_n entries in every oversized array.
+                  The filter is the detection predicate, so a document at or below the threshold is
+                  never written to. The push of an empty $each with a negative $slice is the
+                  server-side trim MongoDB documents for capped arrays.
+                connection:
+                  uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+                database: "{{ inputs.database }}"
+                collection: "{{ inputs.collection }}"
+                operation: UPDATE_MANY
+                filter:
+                  "{{ inputs.array_field }}":
+                    $type: array
+                  "{{ inputs.array_field }}.{{ inputs.length_threshold }}":
+                    $exists: true
+                document: >-
+                  {{ {'f': inputs.array_field, 'k': inputs.keep_n} | jq('{"$push":{(.f):{"$each":[],"$slice":(0-.k)}}}') | first | toJson }}
+
+              - id: log_trim
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Trim matched {{ outputs.trim.matchedCount }} document(s) and modified
+                  {{ outputs.trim.modifiedCount }}. Acknowledged: {{ outputs.trim.wasAcknowledged }}.
+
+              - id: reverify
+                type: io.kestra.plugin.mongodb.Aggregate
+                description: >-
+                  Read-only. Measures the exact documents the detection matched, by id, so a
+                  document that a concurrent writer created after the detection ran cannot make
+                  this look like a failed trim.
+                connection:
+                  uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+                database: "{{ inputs.database }}"
+                collection: "{{ inputs.collection }}"
+                pipeline: "{{ render(vars.target_check) }}"
+                store: FETCH
+
+              - id: log_reverify
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Re-check after the trim found {{ outputs.reverify.rows[0].oversized ?? 0 }} of the
+                  {{ outputs.detect.rows[0].documents ?? 0 }} matched document(s) still holding more than
+                  {{ inputs.length_threshold }} entries. Largest of them is now
+                  {{ outputs.reverify.rows[0].largest ?? 0 }} entries.
+
+              - id: verify_gate
+                type: io.kestra.plugin.core.flow.If
+                description: Fail the run if any targeted document is still oversized after the trim.
+                condition: "{{ (outputs.reverify.rows[0].oversized ?? 0) > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      The trim ran but the re-check still finds {{ outputs.reverify.rows[0].oversized ?? 0 }}
+                      of the {{ outputs.detect.rows[0].documents ?? 0 }} matched document(s) in
+                      {{ inputs.database }}.{{ inputs.collection }} with more than
+                      {{ inputs.length_threshold }} entries in {{ inputs.array_field }}. A writer is
+                      appending to those documents faster than the trim bounds them. Or the write did not
+                      apply. They are still heading for the 16MB BSON limit.
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Trimmed {{ outputs.trim.modifiedCount }} document(s) in
+                      {{ inputs.database }}.{{ inputs.collection }} to the newest {{ inputs.keep_n }}
+                      entries. The re-check measures the same {{ outputs.detect.rows[0].documents ?? 0 }} matched
+                      document(s) and finds {{ outputs.reverify.rows[0].oversized ?? 0 }} still oversized, so
+                      the growth is bounded again.
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval not granted{{ (outputs.hold.onResume.note ?? '') == '' ? '' : (', note: ' ~ outputs.hold.onResume.note) }}.
+                  No array was trimmed. The oversized documents stay as they are.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No oversized arrays. {{ inputs.database }}.{{ inputs.collection }} holds 0 documents with more
+          than {{ inputs.length_threshold }} entries in {{ inputs.array_field }}, so nothing is heading for
+          the 16MB BSON limit at this threshold.
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': ('MongoDB array growth guard failed on ' ~ inputs.database ~ '.' ~ inputs.collection ~ ' (execution ' ~ execution.id ~ '). Check the logs.')} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: >-
+      Shipped disabled. Its inputs force safe mode, so even an enabled schedule only ever
+      measures and reports and never trims on its own.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: MongoDB Unbounded Array Growth Trim Guard
+  shortDescription: Detect MongoDB documents whose embedded array is growing toward the 16MB BSON limit, archive the overflow, trim each array to its newest entries behind an approval and re-measure to prove it.
+  metaTitle: MongoDB Unbounded Array Growth Trim Guard with Kestra
+  metaDescription: Detect MongoDB arrays growing toward the 16MB BSON limit, archive the overflow, trim to the newest entries behind an approval, then re-measure.
+  description: |
+    A MongoDB document cannot exceed 16MB. An embedded array that every write `$push`es to, the
+    `events` list on a device, the `history` on an order, the `audit` trail on an account, has
+    nothing stopping it. It grows for months, then one document crosses the limit and from that
+    moment every write to it fails with `BSONObjectTooLarge`. The failure is per document, so it
+    hits the busiest records first while the rest of the collection looks fine, which is why it
+    is usually found in production rather than in review.
+
+    This blueprint measures the thing that actually matters: how many entries each array holds
+    and how close the whole document is to the ceiling. It reports the documents over a length
+    threshold, can copy the entries it is about to discard into an archive collection, trims each
+    oversized array to its newest entries with one server-side `$push` carrying `$each: []` and a
+    negative `$slice`, then measures again and fails the run if anything is still oversized.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Safety
+
+    - Read-only by default. The first run with the defaults only measures and reports. A trim
+      needs `auto_remediate` true, `dry_run` false, then a human answering the `Pause`.
+    - The trim filter is the detection predicate, not the keep boundary. A document at or below
+      `length_threshold` is never written to, so a short array cannot be clipped by a run that was
+      aimed at a long one.
+    - `keep_n` is refused before the first read when it is below 1, which would empty the array,
+      or above `length_threshold`, which could never clear the detection.
+    - With `archive_overflow` true the discarded entries are written out and counted first.
+      The run then fails before the trim if the archive holds fewer entries than the detection
+      says will be dropped. No entry is dropped without its copy already stored.
+    - The re-measurement is the proof, not the modified count. If any targeted document is still
+      oversized, the run fails rather than reporting success.
+    - Trimming discards the oldest entries permanently when `archive_overflow` is false. The flow
+      says so in its own log before it writes.
+
+    ## How it works
+
+    1. `check_inputs` (`io.kestra.plugin.core.flow.If`) fails the run on a `keep_n` that is below
+       1 or above `length_threshold`, before any connection is made.
+    2. `detect` (`io.kestra.plugin.mongodb.Aggregate`) matches documents where the array field is
+       an array and the array index at `length_threshold` exists, which is how MongoDB answers
+       "longer than N" without walking every entry. One `$facet` then returns the exact document
+       count, the exact number of entries a trim would discard, the largest document in bytes with
+       its percentage of the 16777216 byte limit and the worst `scan_limit` documents by length.
+    3. `report` (`io.kestra.plugin.core.log.Log`) logs those numbers, because task outputs are not
+       in the execution JSON.
+    4. `route` (`io.kestra.plugin.core.flow.If`): zero oversized documents logs `clean` and stops.
+       One or more sends `alert` to Slack and prints `planned`, which states what a remediation run
+       would do on every run including a dry one.
+    5. `remediate_gate` (`io.kestra.plugin.core.flow.If`) opens only with `auto_remediate` true and
+       `dry_run` false. `hold` (`io.kestra.plugin.core.flow.Pause`) waits for an answer.
+    6. On approval and with `archive_overflow` true, `archive` (`io.kestra.plugin.mongodb.Aggregate`)
+       slices the entries about to be discarded, `$unwind`s them and `$merge`s one document per
+       entry into `archive_collection`, keyed by source document, execution id and array index.
+       `archive_check` counts what landed and `archive_gate` fails the run if it is short.
+    7. `trim` (`io.kestra.plugin.mongodb.Update`, `UPDATE_MANY`) applies
+       `$push: { <field>: { $each: [], $slice: -keep_n } }`, the server-side way to keep the newest
+       `keep_n` entries, to every document matching the detection predicate.
+    8. `reverify` runs the same measurement and `verify_gate` fails the run with
+       `io.kestra.plugin.core.execution.Fail` if any document is still over the threshold. Without
+       approval `declined` records the decision and nothing changes.
+    9. `errors` posts to Slack when any task fails, for example when MongoDB is unreachable.
+
+    ## What you get
+
+    - The exact number of documents whose array is over the threshold, the entries a trim would
+      drop and the largest document in bytes against the 16MB ceiling, so the headroom is a
+      number rather than a guess.
+    - A Slack alert while the documents are still writable, instead of a `BSONObjectTooLarge`
+      incident on the busiest records.
+    - A gated, approved, server-side trim that keeps the newest entries and touches only the
+      documents that were reported.
+    - An optional archive of every discarded entry, with the trim refused if the archive is short.
+    - A re-measurement that fails the run when the collection is still unbounded, so a writer
+      pushing faster than the trim is caught rather than hidden.
+
+    ## Who it's for
+
+    - Teams with an append-only array inside a document: event lists, status history, audit trails.
+    - SREs who would rather bound growth on a schedule than debug `BSONObjectTooLarge` at 3am.
+    - Anyone migrating an embedded array to its own collection who needs the live documents kept
+      under the limit while that work lands.
+
+    ## Why orchestrate this with Kestra
+
+    MongoDB has no server-side cap on array length. `$slice` on a push bounds it, but only if every
+    writer remembers to use it. It also does nothing about the documents that already grew. This
+    flow is the outside check. The schedule decides when growth is measured, the counts are logged,
+    the write sits behind `auto_remediate`, `dry_run` and a `Pause` with the decision recorded on
+    the execution, the archive step is proved before anything is discarded and the re-measurement
+    turns the trim into a checked outcome. The Slack alert and the error path are the same ones the
+    rest of your flows use.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against a MongoDB 7.0 container, on the final file. The collection held
+    three documents: `device-hot` with 10050 entries in `events`, `device-quiet` with 5 entries
+    plus `device-noarray` with no `events` field at all. Every before and after length was read back
+    with `mongosh`, not only from the Kestra log.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | Bad config | `keep_n: 6000`, `length_threshold: 5000` | `check_inputs` failed the run before any read, `errors` alerted |
+    | Clean | `length_threshold: 20000` | 0 oversized, `clean` logged, no alert, SUCCESS. `mongosh` 10050 / 5 |
+    | Detect and dry run | `length_threshold: 5000`, other defaults | 1 oversized, 9050 entries over, largest 1426096 bytes which is 8.5 percent of the limit, Slack alert, nothing written. `mongosh` still 10050 / 5 |
+    | Armed but dry | `auto_remediate: true`, `dry_run: true` | Still no write. `mongosh` still 10050 / 5 |
+    | Declined | `auto_remediate: true`, `dry_run: false`, resumed `approved: false` | Paused, then `declined`. `mongosh` still 10050 / 5 |
+    | Remediate | the same, resumed `approved: true` | Matched 1, modified 1, re-check 0 oversized, SUCCESS. `mongosh` 1000 / 5, the document 1426096 bytes to 140946 |
+    | Archive then trim | the same plus `archive_overflow: true` | 9050 entries archived and counted before the trim, then matched 1, re-check 0. `mongosh` archive 9050, collection 1000 / 5 |
+    | Still unbounded | remediate with a writer inserting oversized documents through the run | Trim matched 48, re-check still found 1 oversized, `verify_gate` failed the run, `errors` alerted |
+    | Unreachable | `connection_uri` pointed at a dead host | `detect` failed, `errors` posted to Slack, execution FAILED |
+
+    The trim kept the newest entries, not an arbitrary 1000: `mongosh` read back sequence numbers
+    9050 to 10049 out of the original 0 to 10049. The archive held the other side exactly, sequence
+    0 to 9049, one document per entry. `device-quiet` stayed at 5 entries and `device-noarray` was
+    never matched in any run, which is the precision that matters: a trim aimed at one document
+    must not clip the others.
+
+    ### Does the detector actually fail on growth
+
+    The clean run and the detect run isolate it. Nothing changed on the collection between them
+    except the threshold: 20000 returned 0 oversized, 5000 returned exactly 1, the same
+    `device-hot`, on the same three documents. `mongosh` confirmed both counts directly. The
+    still-unbounded run proved the gate the other way: with a writer inserting oversized documents
+    through the run, the trim landed on 48 documents yet the re-check still found 1, so the run
+    failed instead of reporting a clean collection.
+
+    ## Prerequisites
+
+    - A reachable MongoDB instance and a user that can read the collection and update it. The
+      archive option also needs write access to the archive collection.
+    - A document shape with an embedded array that grows by append. MongoDB 4.4 or later, because
+      the report uses `$bsonSize`.
+    - Local testing: `docker run -d --name mdb --network mynet mongo:7.0`, seed one document with a
+      long array and one with a short one, then run with `connection_uri: mongodb://mdb:27017`.
+
+    ### Secrets
+
+    - `MONGODB_URI`: the MongoDB connection string. Read when `connection_uri` is left empty,
+      which is how the flow should run in production. In Kestra OSS, provide it as the
+      base64-encoded environment variable `SECRET_MONGODB_URI`.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block. Provide it as
+      `SECRET_SLACK_WEBHOOK_URL`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `connection_uri` | empty | Plain connection string for a local test. Empty reads `MONGODB_URI` |
+    | `database`, `collection` | `appdata`, `activity` | The collection to guard |
+    | `array_field` | `events` | The embedded array that grows by append |
+    | `length_threshold` | `5000` | More entries than this counts as oversized. Also the trim filter |
+    | `keep_n` | `1000` | Entries kept when trimming, the newest ones |
+    | `scan_limit` | `25` | How many documents the report names. Counts stay exact |
+    | `archive_overflow` | `false` | Copy discarded entries out first, then verify before trimming |
+    | `archive_collection` | `activity_overflow_archive` | Where archived entries land |
+    | `approval_timeout` | `PT2H` | How long the pause waits for an answer |
+    | `auto_remediate` | `false` | Allow the trim |
+    | `dry_run` | `true` | Must be `false` for a trim to apply |
+
+    ## Quick start
+
+    1. Add the `MONGODB_URI` and `SLACK_WEBHOOK_URL` secrets.
+    2. Set `database`, `collection` and `array_field`, then run the flow. It reports the oversized
+       count and the headroom. It writes nothing.
+    3. Pick `keep_n` from that report, set `archive_overflow` to true if the old entries matter,
+       set `auto_remediate: true` and `dry_run: false`, run again, then answer the pause.
+    4. Enable the `daily` schedule, which always runs in safe mode.
+
+    ## How to extend
+
+    - Alert on the headroom rather than the length: fail the run when `ceiling_pct` crosses a
+      number, so one threshold covers arrays of very different entry sizes.
+    - Guard several collections by wrapping the tasks in a `io.kestra.plugin.core.flow.Loop` over a
+      list, with `concurrencyLimit: 1` on the part that writes.
+    - Put a TTL index on `archived_at` in the archive collection so the archive itself stays bounded.
+    - Once the documents are bounded, make the writers push with `$slice` themselves, so this flow
+       becomes the check rather than the cleanup.
+    - Replace the `Pause` with a Slack approval. Or drop it for a collection you are sure about.
+
+    ## Links
+
+    - MongoDB plugin: https://kestra.io/plugins/plugin-mongodb
+    - BSON document size limit: https://www.mongodb.com/docs/manual/reference/limits/
+    - `$push` with `$slice`: https://www.mongodb.com/docs/manual/reference/operator/update/slice/
+    - `$bsonSize`: https://www.mongodb.com/docs/manual/reference/operator/aggregation/bsonSize/
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false
