@@ -1,0 +1,737 @@
+id: minio-bucket-replication-audit
+namespace: company.team
+description: |
+  Audit bucket replication between two MinIO deployments, a source and a target.
+  For each bucket it checks that a replication rule exists and is enabled, that the
+  target answers, and how many objects are failed or pending, with the last failure.
+  It also spot-checks source objects on the target by key, size and ETag, and lists
+  the keys that are missing or different. Slack gets one message when the set of
+  problems changes, not on every run. With on-call approval the flow starts a resync
+  for the affected buckets, waits until it finishes and checks the buckets again.
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: minio-replication-audit-change-me
+    description: Call this from monitoring when a replication alert fires, for example `curl -X POST http://localhost:8080/api/v1/executions/webhook/company.team/minio-bucket-replication-audit/minio-replication-audit-change-me`.
+
+  - id: hourly_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly backstop for the webhook, so drift is found even when no alert fires. Enable it once the source and target secrets are set.
+    cron: "23 * * * *"
+    disabled: true
+
+inputs:
+  - id: buckets
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - orders
+    description: Buckets on the source to audit. Each one must exist on both deployments and have versioning enabled. Add a bucket here when a new one starts replicating.
+
+  - id: sample_size
+    type: INT
+    defaults: 200
+    description: Source objects to spot-check per bucket. Buckets with this many objects or fewer are checked completely. Use 0 to check every object, which is slow on large buckets.
+
+  - id: backlog_warn_objects
+    type: INT
+    defaults: 100
+    description: Warn when more objects than this are pending replication. Pending objects are normal during a burst of writes; a backlog that keeps growing means the target is slower than the source.
+
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of the Kestra UI. The approval message links to the execution page, where the resync choice is made.
+
+variables:
+  audit_py: |
+    import json
+    import re
+    import sys
+
+
+    def read_lines(path):
+        records = []
+        with open(path) as handle:
+            for line in handle:
+                if line.strip():
+                    records.append(json.loads(line))
+        return records
+
+
+    def read_listing(path):
+        # `mc ls --recursive --json`: one object per line, folders included
+        files = {}
+        for entry in read_lines(path):
+            if entry.get("type") == "file":
+                files[entry["key"]] = {"size": int(entry.get("size", 0)), "etag": entry.get("etag", "")}
+        return files
+
+
+    def choose_keys(keys, sample_size):
+        # Every key for a small bucket or sample_size 0. Otherwise evenly spaced keys: the same
+        # bucket gives the same sample on every run, and the sample covers the whole key range.
+        keys = sorted(keys)
+        if sample_size == 0 or len(keys) <= sample_size:
+            return keys, "all"
+        step = len(keys) / sample_size
+        return sorted({keys[int(i * step)] for i in range(sample_size)}), "sample"
+
+
+    def spot_check(source, target, sample_size):
+        chosen, mode = choose_keys(source.keys(), sample_size)
+        missing, mismatched = [], []
+        for key in chosen:
+            remote = target.get(key)
+            if remote is None:
+                missing.append(key)
+            elif remote["size"] != source[key]["size"] or remote["etag"] != source[key]["etag"]:
+                mismatched.append({"key": key, "source": source[key], "target": remote})
+        return {
+            "source_objects": len(source),
+            "target_objects": len(target),
+            "mode": mode,
+            "checked": len(chosen),
+            "missing_count": len(missing),
+            "mismatched_count": len(mismatched),
+            "missing": missing[:20],
+            "mismatched": mismatched[:20],
+        }
+
+
+    def replication_rule(path):
+        # `mc replicate ls --json`: one object with "rule" per rule, or an error object
+        records = read_lines(path)
+        rules = [record["rule"] for record in records if "rule" in record]
+        if rules:
+            enabled = any(rule.get("Status") == "Enabled" for rule in rules)
+            return ("enabled" if enabled else "disabled"), rules[0]["Destination"]["Bucket"]
+        text = json.dumps(records)
+        if "replication configuration not set" in text or "ReplicationConfigurationNotFoundError" in text:
+            return "missing", ""
+        raise RuntimeError(text[:300] or "mc printed nothing for the replication rule")
+
+
+    def replication_health(source, backlog_path, status_path, backlog_warn):
+        # `mc replicate status --json` for the target links; `mc replicate backlog --full --json`
+        # for every object version that is not replicated yet, with its FAILED or PENDING state.
+        status = read_lines(status_path)[0]
+        if status.get("status") != "success":
+            raise RuntimeError(json.dumps(status)[:300])
+        targets = status["remoteTargets"]
+        pending, failed = [], []
+        for record in read_lines(backlog_path):
+            if record.get("rStatus") == "FAILED":
+                failed.append(record)
+            elif record.get("rStatus") == "PENDING":
+                pending.append(record)
+
+        def size_of(record):
+            return source.get(record["object"], {}).get("size", 0)
+
+        last = max(failed, key=lambda record: record["replTimestamp"], default=None)
+        return {
+            "target_online": bool(targets) and all(target.get("isOnline") for target in targets),
+            "failed_objects": len(failed),
+            "failed_bytes": sum(size_of(record) for record in failed),
+            "pending_objects": len(pending),
+            "pending_bytes": sum(size_of(record) for record in pending),
+            "backlog_over": len(pending) > backlog_warn,
+            "last_failure": "%s at %s" % (last["object"], last["replTimestamp"]) if last else None,
+        }
+
+
+    def report(bucket, sample_size, backlog_warn):
+        source = read_listing("source.jsonl")
+        result = {"bucket": bucket}
+        with open("target.status") as handle:
+            target_ok = handle.read().strip() == "ok"
+        if target_ok:
+            result.update(spot_check(source, read_listing("target.jsonl"), sample_size))
+        else:
+            # the target did not list the bucket: the spot check cannot run, the replication state still can
+            with open("target.err") as handle:
+                text = re.sub(r'(Get|Put|Head) "[^"]*"', r'\1 <url>', handle.read().strip())
+                result["target_error"] = text[:300] or "the listing failed"
+            result.update({"source_objects": len(source), "target_objects": 0, "mode": "skipped", "checked": 0,
+                           "missing_count": 0, "mismatched_count": 0, "missing": [], "mismatched": []})
+        try:
+            rule, arn = replication_rule("rules.json")
+            health = {"target_online": None, "failed_objects": 0, "failed_bytes": 0, "pending_objects": 0,
+                      "pending_bytes": 0, "backlog_over": False, "last_failure": None}
+            if rule != "missing":
+                health = replication_health(source, "backlog.json", "status.json", backlog_warn)
+            health["rule"] = rule
+            health["arn"] = arn
+            result["replication"] = health
+        except RuntimeError as error:
+            result["error"] = "replication check failed: %s" % error
+        return result
+
+
+    if __name__ == "__main__":
+        mode, bucket = sys.argv[1], sys.argv[2]
+        if mode == "report":
+            result = report(bucket, int(sys.argv[3]), int(sys.argv[4]))
+        else:
+            result = {"bucket": bucket}
+            result.update(spot_check(read_listing("source.jsonl"), read_listing("target.jsonl"), int(sys.argv[3])))
+        with open("result.json", "w") as handle:
+            json.dump(result, handle)
+        print(json.dumps({key: result.get(key) for key in ("bucket", "checked", "missing_count", "mismatched_count", "error")}))
+  decide_py: |
+    import hashlib
+    import json
+
+
+    def problems(bucket):
+        # Short, stable strings. The signature is built from them: a run with the same
+        # problems as the stored ones does not alert again.
+        name = bucket["bucket"]
+        if "error" in bucket:
+            return ["%s:error" % name]
+        rep = bucket["replication"]
+        parts = []
+        if rep["rule"] != "enabled":
+            parts.append("%s:rule=%s" % (name, rep["rule"]))
+        if rep["target_online"] is False or bucket.get("target_error"):
+            parts.append("%s:target=offline" % name)
+        if rep["failed_objects"] > 0:
+            parts.append("%s:failed=%d" % (name, rep["failed_objects"]))
+        if rep["backlog_over"]:
+            parts.append("%s:backlog=over" % name)
+        if bucket["missing_count"] > 0:
+            parts.append("%s:missing=%d" % (name, bucket["missing_count"]))
+        if bucket["mismatched_count"] > 0:
+            parts.append("%s:mismatched=%d" % (name, bucket["mismatched_count"]))
+        return parts
+
+
+    def describe(bucket):
+        name = bucket["bucket"]
+        if "error" in bucket:
+            return ["- %s: the audit did not finish: %s. The execution logs name the failed task." % (name, bucket["error"])]
+        rep = bucket["replication"]
+        lines = []
+        if rep["rule"] == "missing":
+            lines.append("- %s: no replication rule. Add one with `mc replicate add`, or stop auditing this bucket." % name)
+        elif rep["rule"] == "disabled":
+            lines.append("- %s: the replication rule is disabled. Enable it with `mc replicate update` first; a resync cannot run while it is off." % name)
+        if rep["target_online"] is False or bucket.get("target_error"):
+            lines.append("- %s: the target is offline or does not list this bucket (%s). Restore it, or create the bucket on the target; replication retries when it is back." % (name, bucket.get("target_error") or "the target reports offline"))
+        if rep["failed_objects"] > 0:
+            lines.append("- %s: %d object(s) failed to replicate (%d bytes). Last failure: %s. Failed objects do not retry by themselves once the target is back; a resync sends them again." % (name, rep["failed_objects"], rep["failed_bytes"], rep["last_failure"] or "unknown"))
+        if rep["backlog_over"]:
+            lines.append("- %s: %d object(s) pending (%d bytes), above the warning level." % (name, rep["pending_objects"], rep["pending_bytes"]))
+        if bucket["missing_count"] > 0 or bucket["mismatched_count"] > 0:
+            lines.append("- %s: of %d checked object(s) (%s of %d source objects), %d missing and %d mismatched on the target." % (name, bucket["checked"], bucket["mode"], bucket["source_objects"], bucket["missing_count"], bucket["mismatched_count"]))
+            if bucket["mismatched_count"] > 0:
+                lines.append("    a resync does not replace a newer version written on the target; the mismatched keys need a look by hand")
+            for key in bucket["missing"][:5]:
+                lines.append("    missing: %s" % key)
+            for item in bucket["mismatched"][:5]:
+                lines.append("    mismatched: %s (source %s, target %s)" % (item["key"], item["source"], item["target"]))
+        return lines
+
+
+    def resync_candidate(bucket):
+        # A resync sends objects again: the missing and mismatched ones, and the FAILED ones, which
+        # do not retry by themselves once the target is back. It needs an enabled rule and a reachable target.
+        if "error" in bucket or bucket.get("target_error") or bucket["replication"]["rule"] != "enabled" or bucket["replication"]["target_online"] is not True:
+            return False
+        return bucket["missing_count"] > 0 or bucket["mismatched_count"] > 0 or bucket["replication"]["failed_objects"] > 0
+
+
+    buckets = []
+    for iteration in json.load(open("findings.json")):
+        name = iteration["item"]["value"]
+        outputs = iteration.get("outputs") or {}
+        if outputs.get("result"):
+            buckets.append(json.loads(outputs["result"]))
+        else:
+            buckets.append({"bucket": name, "error": "the audit task for this bucket failed"})
+
+    parts = sorted(part for bucket in buckets for part in problems(bucket))
+    signature = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+    previous = json.load(open("state.json")) or {}
+    has_issues = len(parts) > 0
+    changed = signature != previous.get("signature")
+    alert = changed and (has_issues or previous.get("has_issues", False))
+    resync = [bucket["bucket"] for bucket in buckets if resync_candidate(bucket)]
+    ask_resync = alert and len(resync) > 0
+
+    if has_issues:
+        affected = len([bucket for bucket in buckets if problems(bucket)])
+        lines = ["MinIO replication audit: %d problem(s) in %d of %d bucket(s). Changed since the last run:" % (len(parts), affected, len(buckets))]
+    else:
+        lines = ["MinIO replication audit: all %d bucket(s) are healthy again." % len(buckets)]
+    for bucket in buckets:
+        lines.extend(describe(bucket))
+    if ask_resync:
+        lines.append("Resync is possible for: %s. Pick an action on the execution page within 2 hours. Without an answer nothing is changed." % ", ".join(resync))
+
+    with open("decision.json", "w") as handle:
+        json.dump({
+            "alert": alert,
+            "ask_resync": ask_resync,
+            "resync_buckets": resync if ask_resync else [],
+            "message": "\n".join(lines),
+            "state": {"signature": signature, "has_issues": has_issues, "problems": parts},
+            "buckets": buckets,
+        }, handle)
+    print(json.dumps({"alert": alert, "ask_resync": ask_resync, "problems": parts}))
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.flow.If
+    description: Stop before any call to MinIO when the inputs cannot describe an audit.
+    condition: '{{ (inputs.buckets | length) == 0 or inputs.sample_size < 0 or inputs.backlog_warn_objects < 0 }}'
+    then:
+      - id: invalid_inputs
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Nothing to audit: set at least one bucket, and use sample_size 0 (every object) or a positive number, with backlog_warn_objects 0 or more."
+
+  - id: validate_bucket_names
+    type: io.kestra.plugin.core.flow.If
+    description: MinIO bucket names are 3 to 63 lowercase letters, digits, dots and hyphens. A typo here would otherwise show up as a confusing NoSuchBucket error.
+    condition: '{{ inputs.buckets | jq(''[.[] | select(test("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$") | not)] | length'') | first > 0 }}'
+    then:
+      - id: invalid_bucket_name
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "A bucket name in the buckets input is not valid. Use 3 to 63 lowercase letters, digits, dots and hyphens."
+
+  - id: check_source
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Fail early when the source deployment is unreachable or the credentials are rejected.
+    containerImage: minio/mc:latest
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    env:
+      SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+      SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+      SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+    commands:
+      - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+      - mc ls source > /dev/null
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: audit_buckets
+    type: io.kestra.plugin.core.flow.Loop
+    description: One iteration per bucket. Each bucket runs as a Sequential with allowFailure, so one broken bucket does not stop the audit of the others.
+    values: "{{ inputs.buckets | toJson }}"
+    allowFailure: true
+    outputs:
+      - id: result
+        type: STRING
+        value: "{% if outputs.report is defined %}{{ read(outputs.report.outputFiles['result.json']) }}{% endif %}"
+    tasks:
+      - id: audit_one_bucket
+        type: io.kestra.plugin.core.flow.Sequential
+        allowFailure: true
+        tasks:
+          - id: replication_rules
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: The replication configuration of the bucket. A bucket without one gets an error answer, which the report reads as "no rule", so this task does not fail there.
+            containerImage: minio/mc:latest
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+            env:
+              BUCKET: "{{ item.value }}"
+              SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+              SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+              SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+            commands:
+              - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+              - mc replicate ls --json "source/$BUCKET" > rules.json || true
+            outputFiles:
+              - rules.json
+
+          - id: replication_status
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Link state and counters from the source's point of view. The target's isOnline flag is read here.
+            containerImage: minio/mc:latest
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+            env:
+              BUCKET: "{{ item.value }}"
+              SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+              SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+              SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+            commands:
+              - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+              - mc replicate status --json "source/$BUCKET" > status.json || true
+            outputFiles:
+              - status.json
+
+          - id: replication_backlog
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Every object version that is not replicated yet, as FAILED or PENDING, with the time of its last attempt. Only the bucket's own versions are listed.
+            containerImage: minio/mc:latest
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+            env:
+              BUCKET: "{{ item.value }}"
+              SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+              SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+              SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+            commands:
+              - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+              - mc replicate backlog --full --json "source/$BUCKET" < /dev/null > backlog.json || true
+            outputFiles:
+              - backlog.json
+
+          - id: list_objects
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Current objects on both sides, one JSON line each, with size and ETag. A target that is down or does not have the bucket does not fail the task. The report records why and still shows the replication state.
+            containerImage: minio/mc:latest
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+            env:
+              BUCKET: "{{ item.value }}"
+              SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+              SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+              SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+              TARGET_ENDPOINT: "{{ secret('MINIO_TARGET_ENDPOINT') }}"
+              TARGET_ACCESS_KEY: "{{ secret('MINIO_TARGET_ACCESS_KEY') }}"
+              TARGET_SECRET_KEY: "{{ secret('MINIO_TARGET_SECRET_KEY') }}"
+            commands:
+              - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+              - mc ls --recursive --json "source/$BUCKET" > source.jsonl
+              - touch target.jsonl target.err
+              - (mc alias set target "$TARGET_ENDPOINT" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" > /dev/null 2> target.err && mc ls --recursive --json "target/$BUCKET" > target.jsonl 2>> target.err && echo ok > target.status) || echo unreachable > target.status
+            outputFiles:
+              - source.jsonl
+              - target.jsonl
+              - target.err
+              - target.status
+
+          - id: report
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Spot check (every object for small buckets, evenly spaced keys otherwise) and replication health, combined into one result per bucket.
+            containerImage: python:3.12-slim
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+            env:
+              BUCKET: "{{ item.value }}"
+              SAMPLE_SIZE: "{{ inputs.sample_size }}"
+              BACKLOG_WARN: "{{ inputs.backlog_warn_objects }}"
+            inputFiles:
+              audit.py: "{{ vars.audit_py }}"
+              source.jsonl: "{{ outputs.list_objects.outputFiles['source.jsonl'] }}"
+              target.jsonl: "{{ outputs.list_objects.outputFiles['target.jsonl'] }}"
+              target.err: "{{ outputs.list_objects.outputFiles['target.err'] }}"
+              target.status: "{{ outputs.list_objects.outputFiles['target.status'] }}"
+              rules.json: "{{ outputs.replication_rules.outputFiles['rules.json'] }}"
+              status.json: "{{ outputs.replication_status.outputFiles['status.json'] }}"
+              backlog.json: "{{ outputs.replication_backlog.outputFiles['backlog.json'] }}"
+            commands:
+              - python3 -I audit.py report "$BUCKET" "$SAMPLE_SIZE" "$BACKLOG_WARN" > /dev/null
+            outputFiles:
+              - result.json
+
+  - id: decide
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Compare the problems with the stored state. It alerts only when the set of problems changed, and asks for a resync only for buckets that are missing objects while their rule is enabled.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    inputFiles:
+      decide.py: "{{ vars.decide_py }}"
+      findings.json: "{{ outputs.audit_buckets.outputs | toJson }}"
+      state.json: "{{ kv('minio-replication-audit-state', errorOnMissing=false) | toJson }}"
+    commands:
+      - python3 -I decide.py > /dev/null
+    outputFiles:
+      - decision.json
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Store the signature of this run. It is written before any Slack message or approval, so a late run does not repeat an alert that was already sent.
+    key: minio-replication-audit-state
+    kvType: JSON
+    value: "{{ fromJson(read(outputs.decide.outputFiles['decision.json'])).state | toJson }}"
+
+  - id: if_alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(read(outputs.decide.outputFiles['decision.json'])).alert }}"
+    then:
+      - id: notify_change
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: One message per change in the problems. Repeats of the same problems are silent.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "{{ fromJson(read(outputs.decide.outputFiles['decision.json'])).message }}"
+
+  - id: if_resync_offered
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(read(outputs.decide.outputFiles['decision.json'])).ask_resync }}"
+    then:
+      - id: ask_resync
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Points to this execution, where the Pause shows the resync choice.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "Resync is waiting for an answer for {{ fromJson(read(outputs.decide.outputFiles['decision.json'])).resync_buckets | join(', ') }}. Choose Start resync or Decline here within 2 hours: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+      - id: wait_for_decision
+        type: io.kestra.plugin.core.flow.Pause
+        description: No answer within 2 hours resumes the run with no decision, and nothing is changed.
+        pauseDuration: PT2H
+        behavior: RESUME
+        onResume:
+          - id: decision
+            type: SELECT
+            values:
+              - Start resync
+              - Decline
+            required: false
+
+      - id: if_start_resync
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.decision ?? '') == 'Start resync' }}"
+        then:
+          - id: resync_buckets
+            type: io.kestra.plugin.core.flow.Loop
+            description: One resync per bucket, each isolated. Before starting, the rule is checked again, because the approval can come hours after the audit.
+            values: "{{ fromJson(read(outputs.decide.outputFiles['decision.json'])).resync_buckets | toJson }}"
+            allowFailure: true
+            outputs:
+              - id: result
+                type: STRING
+                value: "{% if outputs.recheck_compare is defined %}{{ read(outputs.recheck_compare.outputFiles['result.json']) }}{% endif %}"
+            tasks:
+              - id: resync_one_bucket
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: recheck_rule
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    description: Stops this bucket if its rule was disabled or removed since the audit. Also takes the rule's ARN for the resync.
+                    containerImage: minio/mc:latest
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
+                    env:
+                      BUCKET: "{{ item.value }}"
+                      SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+                      SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+                      SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+                    commands:
+                      - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+                      - mc replicate ls --json "source/$BUCKET" > rules.json
+                      - grep -q '"Status":"Enabled"' rules.json || { echo "The replication rule of $BUCKET is no longer enabled, so no resync was started." >&2; exit 1; }
+                      - echo "::{\"outputs\":{\"arn\":\"$(grep -o 'arn:minio:replication::[^\"]*' rules.json | head -1)\"}}::"
+                    outputFiles:
+                      - rules.json
+
+                  - id: start_resync
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    description: Starts the resync for the target ARN. The copies run in the background, so the next task waits for them.
+                    containerImage: minio/mc:latest
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
+                    env:
+                      BUCKET: "{{ item.value }}"
+                      ARN: "{{ outputs.recheck_rule.vars.arn }}"
+                      SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+                      SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+                      SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+                    commands:
+                      - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+                      - mc replicate resync start "source/$BUCKET" --remote-bucket "$ARN"
+
+                  - id: wait_resync
+                    type: io.kestra.plugin.core.flow.LoopUntil
+                    description: Checks every 5 seconds until the resync reports Completed or Failed and no object is still pending. The loop shows PAUSED between checks. It gives up after 15 minutes, which fails this bucket.
+                    condition: "{{ (['Completed', 'Failed'] contains outputs.poll_resync.vars.resync) and outputs.poll_resync.vars.pending == '0' }}"
+                    checkFrequency:
+                      interval: PT5S
+                      maxDuration: PT15M
+                    failOnMaxReached: true
+                    tasks:
+                      - id: poll_resync
+                        type: io.kestra.plugin.scripts.shell.Commands
+                        containerImage: minio/mc:latest
+                        taskRunner:
+                          type: io.kestra.plugin.scripts.runner.docker.Docker
+                          networkMode: host
+                        env:
+                          BUCKET: "{{ item.value }}"
+                          ARN: "{{ outputs.recheck_rule.vars.arn }}"
+                          SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+                          SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+                          SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+                        commands:
+                          - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+                          - mc replicate resync status --json "source/$BUCKET" --remote-bucket "$ARN" > resync.json || true
+                          - mc replicate backlog --full --json "source/$BUCKET" < /dev/null > backlog.json || true
+                          - STATE=$(grep -o '"resyncStatus":"[^"]*"' resync.json | head -1 | cut -d'"' -f4)
+                          - PENDING=$(grep -c '"rStatus":"PENDING"' backlog.json || true)
+                          - echo "::{\"outputs\":{\"resync\":\"${STATE:-unknown}\",\"pending\":\"${PENDING:-0}\"}}::"
+
+                  - id: recheck
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    description: After the resync, the same spot check again. Objects that are still missing stay in the Slack report.
+                    containerImage: minio/mc:latest
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
+                    env:
+                      BUCKET: "{{ item.value }}"
+                      SOURCE_ENDPOINT: "{{ secret('MINIO_SOURCE_ENDPOINT') }}"
+                      SOURCE_ACCESS_KEY: "{{ secret('MINIO_SOURCE_ACCESS_KEY') }}"
+                      SOURCE_SECRET_KEY: "{{ secret('MINIO_SOURCE_SECRET_KEY') }}"
+                      TARGET_ENDPOINT: "{{ secret('MINIO_TARGET_ENDPOINT') }}"
+                      TARGET_ACCESS_KEY: "{{ secret('MINIO_TARGET_ACCESS_KEY') }}"
+                      TARGET_SECRET_KEY: "{{ secret('MINIO_TARGET_SECRET_KEY') }}"
+                    commands:
+                      - mc alias set source "$SOURCE_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" > /dev/null
+                      - mc alias set target "$TARGET_ENDPOINT" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" > /dev/null
+                      - mc ls --recursive --json "source/$BUCKET" > source.jsonl
+                      - mc ls --recursive --json "target/$BUCKET" > target.jsonl
+                    outputFiles:
+                      - source.jsonl
+                      - target.jsonl
+
+                  - id: recheck_compare
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    containerImage: python:3.12-slim
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
+                    env:
+                      BUCKET: "{{ item.value }}"
+                      SAMPLE_SIZE: "{{ inputs.sample_size }}"
+                    inputFiles:
+                      audit.py: "{{ vars.audit_py }}"
+                      source.jsonl: "{{ outputs.recheck.outputFiles['source.jsonl'] }}"
+                      target.jsonl: "{{ outputs.recheck.outputFiles['target.jsonl'] }}"
+                    commands:
+                      - python3 -I audit.py spot "$BUCKET" "$SAMPLE_SIZE" > /dev/null
+                    outputFiles:
+                      - result.json
+
+          - id: report_resync
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: What is still missing after the resync. A bucket that is still short points to a delete marker on the target or to a failed copy, and needs a look by hand.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "{% if outputs.resync_buckets.outputs is defined %}{% for it in outputs.resync_buckets.outputs %}{% if it.outputs.result is defined %}{{ fromJson(it.outputs.result).bucket }}: after the resync, {{ fromJson(it.outputs.result).missing_count }} missing and {{ fromJson(it.outputs.result).mismatched_count }} mismatched of {{ fromJson(it.outputs.result).checked }} checked. {% if (fromJson(it.outputs.result).missing_count + fromJson(it.outputs.result).mismatched_count) == 0 %}Fixed.{% else %}Still short. Missing keys: a delete marker on the target hides them (check with mc ls --versions). Mismatched keys: the target has a newer version written directly, and a resync does not replace it; decide which copy is right, then copy the source version over it or remove the newer one.{% endif %}\n{% else %}{{ it.item.value }}: no resync was done. The rule check, the resync or the recheck stopped it; see the execution logs.\n{% endif %}{% endfor %}{% if (outputs.resync_buckets.outputs | length) < (fromJson(read(outputs.decide.outputFiles['decision.json'])).resync_buckets | length) %}Buckets without a result above: no resync was done for them; the rule check, the resync or the recheck stopped them. See the execution logs.\n{% endif %}{% else %}Every bucket: no resync was done; the rule check, the resync or the recheck stopped them. See the execution logs.{% endif %}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      MinIO replication audit failed in task {{ errorLogs() | jq('[.[] | select(.taskId != null)] | last | .taskId') | first }} (execution {{ execution.id }}).
+      Cause: {{ ((errorLogs() | jq('[.[] | select(.level == "ERROR" and (.message | startswith("Command failed") | not))] | first | .message') | first) ?? 'see the execution logs') | split(' \[\[') | first }}
+      For a connection or credential error, check the endpoints and secrets, the replication rule (`mc replicate ls`) and the target's health. Nothing was changed by the failed run unless a resync had already started.
+
+outputs:
+  - id: buckets
+    type: JSON
+    value: "{% if outputs.decide is defined %}{{ read(outputs.decide.outputFiles['decision.json']) }}{% else %}{}{% endif %}"
+
+extend:
+  title: Catch MinIO Replication Drift Before Objects Go Missing on the Target
+  shortDescription: Audits bucket replication between two MinIO deployments, spot-checks objects on the target, alerts once per change and offers a resync with approval.
+  metaTitle: MinIO Bucket Replication Audit with Kestra and mc
+  metaDescription: Check MinIO bucket replication health and spot-check objects on the target. Alerts once per change to Slack and runs a resync only after approval.
+  description: |
+    Bucket replication in MinIO fails quietly. A target that is down, a rule that was disabled during a deployment, or objects removed on the target leave the source looking healthy while the copy is incomplete. Nothing in the source tells you the target is short. This blueprint compares the two deployments directly, bucket by bucket.
+
+    It runs locally against any two MinIO deployments with versioning and bucket replication. Each run reads the replication rule and the replication status with `mc`, lists the objects on both sides, and compares them by key, size and ETag. Slack receives a message only when the set of problems changes. When objects are missing on the target and the rule is enabled, the run pauses and asks on-call whether to start a resync. It waits for the resync to finish and checks the buckets again.
+
+    ## How it works
+    1. `validate_inputs` and `validate_bucket_names` (`If`) fail before any call when the inputs are empty, negative or not valid bucket names.
+    2. `check_source` and `check_target` (`Commands`, `minio/mc`) check that both deployments answer, with retries.
+    3. `audit_buckets` (`Loop`) runs one `Sequential` per bucket, each with `allowFailure`:
+       - `replication_rules`, `replication_status`, `replication_backlog` read the rule, the link state and every unreplicated object version with its last attempt.
+       - `list_objects` lists the current objects on both sides.
+       - `report` (`Commands`, Python standard library) spot-checks the objects and merges everything into one result per bucket.
+    4. `decide` compares the problems with the state in the KV store and decides whether to alert and whether to offer a resync.
+    5. `save_state` (`kv.Set`) stores the signature of the run.
+    6. `notify_change` (`SlackIncomingWebhook`) sends one message per change.
+    7. `if_resync_offered` shows a Slack link and a `Pause` with a `SELECT` (Start resync or Decline). The pause is 2 hours and the default is no change.
+    8. `resync_buckets` (`Loop`) rechecks the rule, starts `mc replicate resync start` for the ARN, waits with `LoopUntil` until the resync is `Completed` or `Failed` and nothing is pending, then runs the spot check again.
+
+    ## What you get
+    - One Slack message per change, naming each bucket, the failed and pending counts, the last failure, and the missing keys.
+    - Flow outputs: `buckets` (JSON), with one entry per bucket and the decision.
+
+    ## Error handling
+    - Unreachable source or target: `check_source` and `check_target` retry, then the `errors` block posts the failed task name and the cause.
+    - One broken bucket (missing bucket, no permission) does not stop the others. Its `Sequential` is isolated with `allowFailure`, and the report shows it as an error.
+    - A bucket without a replication rule is a finding, not a failure.
+    - Approval comes late: the rule is checked again before the resync starts. If the check refuses it, the run ends as WARNING and the Slack report says no resync was done.
+    - A resync that never completes fails its bucket after 15 minutes instead of hanging.
+    - Nothing changes without an answer: the pause resumes with no decision.
+    - The state is written before any message, so a retried run does not alert twice for the same problems.
+
+    ## What this blueprint teaches about Kestra
+    - `Loop` with `Sequential` and `allowFailure` to isolate per-item failures.
+    - `LoopUntil` with `checkFrequency` and `failOnMaxReached` for a wait with a deadline.
+    - `Pause` with `onResume` inputs, `behavior: RESUME`, and reading the answer with `??`.
+    - KV store as state for "alert once per change", with `kv()` and `kv.Set`.
+    - `Commands` with the Docker task runner, `networkMode: host`, and `outputFiles` passed between tasks.
+    - `If` and `Fail` for validation before any side effect.
+
+    ## Prerequisites
+    - Two MinIO deployments with versioning enabled on every bucket, and a bucket replication rule from source to target.
+    - Docker on the Kestra worker, so the `minio/mc` and `python` task images can run. The worker needs network access to both deployments.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `MINIO_SOURCE_ENDPOINT`: URL of the source deployment, for example `http://minio-src.internal:9000`.
+    - `MINIO_SOURCE_ACCESS_KEY` and `MINIO_SOURCE_SECRET_KEY`: credentials with list, read and replication-admin rights on the source.
+    - `MINIO_TARGET_ENDPOINT`: URL of the target deployment.
+    - `MINIO_TARGET_ACCESS_KEY` and `MINIO_TARGET_SECRET_KEY`: credentials with list rights on the target.
+    - `SLACK_WEBHOOK_URL`: the incoming webhook for alerts and approval requests.
+
+    ### Inputs
+    - `buckets` (ARRAY of STRING, default `["orders"]`): buckets to audit.
+    - `sample_size` (INT, default 200): objects to spot-check per bucket; 0 checks every object.
+    - `backlog_warn_objects` (INT, default 100): pending objects above which the backlog is reported.
+    - `kestra_url` (STRING, default `http://localhost:8080`): base URL for the approval link.
+
+    ### Outputs
+    - `buckets` (JSON): the decision and the per-bucket results of the run. Empty when the run failed before the decision.
+
+    ## Quick start
+    1. Create the secrets above in Kestra.
+    2. Create a versioned bucket on both deployments, and add a replication rule from the source to the target with `mc replicate add`.
+    3. Run the flow with the defaults. The first run is silent when the buckets are healthy. Call the webhook to run it on demand, or enable the schedule.
+
+    ## How to read the result
+    - `missing` means the key is on the source and not on the target. `mismatched` means the key is on both, with a different size or ETag.
+    - `failed` counts object versions that replication could not copy; `pending` counts those still waiting. The last failure gives the object and the time.
+    - On a versioned target, a plain delete leaves a delete marker, and a resync does not bring the object back. Remove the marker on the target first (`mc rm --version-id`). The report shows objects that are still missing after the resync.
+    - Spot checks on large buckets sample evenly spaced keys. Use `sample_size` 0 for a full comparison.
+
+    ## How to extend
+    - Another MinIO deployment or S3 endpoint: change the secret values; the `mc` task runner talks to any S3 API.
+    - More buckets: add them to `buckets`, or read the list from a file with a `Commands` task.
+    - Alerting: replace `SlackIncomingWebhook` with `io.kestra.plugin.notifications.*` for PagerDuty or email.
+
+    ## Links
+    - [MinIO mc replicate](https://min.io/docs/minio/linux/reference/minio-mc/mc-replicate.html)
+    - [Kestra Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra LoopUntil](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
