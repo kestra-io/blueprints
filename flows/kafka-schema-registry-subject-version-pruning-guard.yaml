@@ -1,0 +1,475 @@
+id: kafka-schema-registry-subject-version-pruning-guard
+namespace: company.team
+
+description: |
+  Prune the version history of a Confluent Schema Registry subject down to the newest `keep_n`
+  versions, oldest first, behind an approval gate, then re-read the subject and fail the run if it is
+  still over the target. A subject under active schema evolution gains a version on every change and
+  the registry never prunes them, so a subject that has evolved weekly for two years carries more than
+  a hundred versions. Nothing breaks, it just gets expensive to live with: the `_schemas` storage topic
+  grows, a version listing becomes unreadable and nobody can say which old version still matters.
+  The delete is a SOFT delete, so the version leaves the active list while its global schema id stays
+  resolvable and a consumer still holding that id can keep deserialising old messages. The newest
+  version is never a target, because that is the one producers register against.
+
+inputs:
+  - id: schema_registry_url
+    type: STRING
+    displayName: Schema Registry URL
+    description: Base URL of the Confluent Schema Registry, with no trailing slash.
+    defaults: http://localhost:8081
+
+  - id: bootstrap_servers
+    type: STRING
+    displayName: Kafka bootstrap servers
+    description: Comma separated broker list, used to read the live topic set that scopes the prune.
+    defaults: localhost:9092
+
+  - id: keep_n
+    type: INT
+    displayName: Active versions to keep per subject
+    description: A subject with more active versions than this is pruned down to it, oldest first. Must be at least 1, because the newest version is the one producers register against. The flow refuses the run rather than deleting it.
+    defaults: 20
+
+  - id: subjects
+    type: ARRAY
+    itemType: STRING
+    displayName: Subjects to prune
+    description: Leave empty to cover every registered subject backing a live topic under the TopicNameStrategy. Name subjects here to cover those instead.
+    defaults: []
+
+  - id: exempt_subjects
+    type: ARRAY
+    itemType: STRING
+    displayName: Subjects never pruned
+    description: Subjects whose full version history is kept whatever its length, for example one under audit. Never read, never changed.
+    defaults: []
+
+  - id: permanent_delete
+    type: BOOL
+    displayName: Hard delete instead of soft delete
+    description: Leave false. True frees the global schema ids as well, so a consumer holding a pruned id can no longer deserialise and the data is unrecoverable. It also needs a second confirmation on the approval step.
+    defaults: false
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for any version to be deleted.
+    defaults: true
+
+variables:
+  audit_key: "sr_versions_{{ inputs.schema_registry_url | slugify }}"
+  prune_key: "sr_pruned_{{ inputs.schema_registry_url | slugify }}"
+  verify_key: "sr_prune_verify_{{ inputs.schema_registry_url | slugify }}"
+
+tasks:
+  - id: list_subjects
+    type: io.kestra.plugin.core.http.Request
+    description: Read-only. Every subject the registry serves right now.
+    method: GET
+    uri: "{{ inputs.schema_registry_url }}/subjects"
+
+  - id: list_topics
+    type: io.kestra.plugin.kafka.TopicList
+    description: Read-only AdminClient call. The live topic set is what scopes the prune, so a subject whose topic is gone keeps its whole history and is never read or written here.
+    properties:
+      bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+
+  - id: scope
+    type: io.kestra.plugin.core.output.OutputValues
+    description: In scope are the registered subjects backing a live topic (or the named list) minus the exempt ones. Internal topics are dropped.
+    values:
+      subject_list: >-
+        {{ {'reg': fromJson(outputs.list_subjects.body), 'topics': outputs.list_topics.topics, 'sel': inputs.subjects, 'ex': inputs.exempt_subjects} | jq('.reg as $reg | .sel as $sel | .ex as $ex | ([ .topics[] | select(startswith("_") | not) ]) as $pt | (($pt | map(. + "-value")) + ($pt | map(. + "-key"))) as $exp | (if ($sel | length) > 0 then ($reg - ($reg - $sel)) else ($reg - ($reg - $exp)) end) as $base | (($base - $ex) | sort)') | first | toJson }}
+
+  - id: in_scope
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.scope.values.subject_list) | length > 0 }}"
+    then:
+      - id: reset_audit
+        type: io.kestra.plugin.core.kv.Set
+        description: The audit accumulator is rebuilt from scratch every run. No ttl, so the read back inside the run can never hit an expired key.
+        key: "{{ render(vars.audit_key) }}"
+        kvType: JSON
+        value: "{}"
+
+      - id: audit
+        type: io.kestra.plugin.core.flow.Loop
+        description: Read the active version list of every in scope subject. One at a time, because each iteration folds its row into a single accumulator.
+        concurrencyLimit: 1
+        values: "{{ outputs.scope.values.subject_list }}"
+        tasks:
+          - id: read_versions
+            type: io.kestra.plugin.core.http.Request
+            description: Read-only. The active versions of this subject. A 404 means every version was already deleted, which is read as zero active versions.
+            method: GET
+            uri: "{{ inputs.schema_registry_url }}/subjects/{{ item.value }}/versions"
+            options:
+              allowFailed: true
+
+          - id: row_merge
+            type: io.kestra.plugin.core.output.OutputValues
+            description: Observed facts only. The keep_n comparison happens once, in assess.
+            values:
+              merged: >-
+                {{ {'cur': (kv(render(vars.audit_key), errorOnMissing=false) ?? '{}'), 'subject': item.value, 'code': outputs.read_versions.code, 'body': outputs.read_versions.body} | jq('(.cur | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $c | (if .code == 200 then (.body | fromjson | sort) else [] end) as $vs | {subject: .subject, active: ($vs | length), versions: $vs} as $row | $c + {(.subject): $row}') | first | toJson }}
+
+          - id: row_save
+            type: io.kestra.plugin.core.kv.Set
+            key: "{{ render(vars.audit_key) }}"
+            kvType: JSON
+            value: "{{ outputs.row_merge.values.merged }}"
+
+      - id: assess
+        type: io.kestra.plugin.core.output.OutputValues
+        description: A version is a prune target when fewer than keep_n versions sit above it. That rule keeps the newest keep_n whatever the numbering gaps are. It marks a subject unsafe when keep_n is zero, because the newest version would then be a target.
+        values:
+          result: >-
+            {{ {'rows': (kv(render(vars.audit_key), errorOnMissing=false) ?? '{}'), 'keep': inputs.keep_n} | jq('(.rows | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $r | .keep as $k | [ $r[] | .versions as $vs | {subject: .subject, active: .active, latest: ($vs | max), prune: [ $vs[] | . as $v | select(([ $vs[] | select(. >= $v) ] | length) > $k) ]} | . + {keep_after: (.active - (.prune | length)), unsafe: ((.latest != null) and (([.latest] - .prune) | length) == 0)} ] as $all | ([ $all[] | select((.prune | length) > 0) ] | sort_by(.subject)) as $over | {audited: ($r | length), count: ($over | length), total_targets: ([ $over[] | .prune[] ] | length), subjects: ($over | map(.subject)), targets: [ $over[] | .subject as $s | .prune[] | {subject: $s, version: .} ], unsafe: [ $over[] | select(.unsafe) | .subject ], detail: $over, summary: ([ $over[] | .subject + " [" + (.active | tostring) + " active, prune " + (.prune | map(tostring) | join(",")) + ", keeping newest " + (.keep_after | tostring) + " up to v" + (.latest | tostring) + "]" ] | join("; "))}') | first | toJson }}
+
+      - id: route
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ fromJson(outputs.assess.values.result).count > 0 }}"
+        then:
+          - id: log_findings
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Version history scan on {{ inputs.schema_registry_url }}: {{ fromJson(outputs.assess.values.result).audited }} subjects audited, {{ fromJson(outputs.assess.values.result).count }} over the keep_n of {{ inputs.keep_n }}, {{ fromJson(outputs.assess.values.result).total_targets }} versions would be pruned oldest first. {{ fromJson(outputs.assess.values.result).summary }}. permanent_delete={{ inputs.permanent_delete }} auto_remediate={{ inputs.auto_remediate }} dry_run={{ inputs.dry_run }}.
+
+          - id: alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: >-
+              {{ {'text': 'Schema Registry ' ~ inputs.schema_registry_url ~ ': ' ~ (fromJson(outputs.assess.values.result).count) ~ ' of ' ~ (fromJson(outputs.assess.values.result).audited) ~ ' audited subjects carry more than ' ~ inputs.keep_n ~ ' active versions, ' ~ (fromJson(outputs.assess.values.result).total_targets) ~ ' versions over target. ' ~ (fromJson(outputs.assess.values.result).summary) ~ '. permanent_delete=' ~ inputs.permanent_delete ~ ' auto_remediate=' ~ inputs.auto_remediate ~ ' dry_run=' ~ inputs.dry_run ~ '.'} | toJson }}
+
+          - id: safety_gate
+            type: io.kestra.plugin.core.flow.If
+            description: The newest version of a subject is never deletable. If the computed target set reaches it, the run stops here instead of pruning anything.
+            condition: "{{ fromJson(outputs.assess.values.result).unsafe | length > 0 }}"
+            then:
+              - id: refuse_latest
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  keep_n is {{ inputs.keep_n }}, so the newest version of {{ fromJson(outputs.assess.values.result).unsafe | jq('join(", ")') | first }} would be deleted. That is the version producers register against, so nothing was pruned. Set keep_n to 1 or more.
+            else:
+              - id: remediate_gate
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ inputs.auto_remediate and not inputs.dry_run and fromJson(outputs.assess.values.result).total_targets > 0 }}"
+                then:
+                  - id: approve
+                    type: io.kestra.plugin.core.flow.Pause
+                    description: >-
+                      Resume with approved=true to prune the versions listed by log_findings. With permanent_delete true you must also pass confirm_permanent=true, because a hard delete is unrecoverable. Resume without them or kill the execution to cancel.
+                    onResume:
+                      - id: approved
+                        type: BOOL
+                        displayName: Approve pruning the oldest versions down to keep_n
+                        required: false
+                      - id: confirm_permanent
+                        type: BOOL
+                        displayName: Confirm a hard delete, which frees the schema ids and cannot be undone
+                        required: false
+
+                  - id: do_prune
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ (outputs.approve.onResume.approved ?? false) and ((not inputs.permanent_delete) or (outputs.approve.onResume.confirm_permanent ?? false)) }}"
+                    then:
+                      - id: reset_pruned
+                        type: io.kestra.plugin.core.kv.Set
+                        key: "{{ render(vars.prune_key) }}"
+                        kvType: JSON
+                        value: "{}"
+
+                      - id: remediate_prune
+                        type: io.kestra.plugin.core.flow.Loop
+                        description: Remediation. Delete one version at a time, oldest first, recording the global schema id it carried before the delete so the verify step can prove the id survived.
+                        concurrencyLimit: 1
+                        values: "{{ fromJson(outputs.assess.values.result).targets | toJson }}"
+                        tasks:
+                          - id: read_version_id
+                            type: io.kestra.plugin.core.http.Request
+                            description: Read-only. It runs before the delete. The global schema id behind this version is what a consumer holds in a message header, so it is captured here to be checked afterwards.
+                            method: GET
+                            uri: "{{ inputs.schema_registry_url }}/subjects/{{ fromJson(item.value).subject }}/versions/{{ fromJson(item.value).version }}"
+                            options:
+                              allowFailed: true
+
+                          - id: soft_delete
+                            type: io.kestra.plugin.core.http.Request
+                            description: The prune. A plain DELETE on a version is a soft delete, so the version leaves the active list and its schema id stays resolvable. allowFailed lets a rejected delete fall through to the re-read, which is the authority.
+                            method: DELETE
+                            uri: "{{ inputs.schema_registry_url }}/subjects/{{ fromJson(item.value).subject }}/versions/{{ fromJson(item.value).version }}"
+                            options:
+                              allowFailed: true
+
+                          - id: hard_gate
+                            type: io.kestra.plugin.core.flow.If
+                            condition: "{{ inputs.permanent_delete }}"
+                            then:
+                              - id: hard_delete
+                                type: io.kestra.plugin.core.http.Request
+                                description: Only when permanent_delete and confirm_permanent are both set. This frees the schema id, so a consumer holding it can no longer resolve the schema.
+                                method: DELETE
+                                uri: "{{ inputs.schema_registry_url }}/subjects/{{ fromJson(item.value).subject }}/versions/{{ fromJson(item.value).version }}?permanent=true"
+                                options:
+                                  allowFailed: true
+
+                          - id: resolve_id
+                            type: io.kestra.plugin.core.http.Request
+                            description: Read-only. Ask the registry for the schema by the global id this version carried. A 200 after a soft delete is the proof the prune did not break an old consumer.
+                            method: GET
+                            uri: "{{ inputs.schema_registry_url }}/schemas/ids/{{ fromJson(outputs.read_version_id.body).id ?? 0 }}"
+                            options:
+                              allowFailed: true
+
+                          - id: pruned_merge
+                            type: io.kestra.plugin.core.output.OutputValues
+                            values:
+                              merged: >-
+                                {{ {'cur': (kv(render(vars.prune_key), errorOnMissing=false) ?? '{}'), 'subject': fromJson(item.value).subject, 'version': fromJson(item.value).version, 'rcode': outputs.read_version_id.code, 'rbody': outputs.read_version_id.body, 'dcode': outputs.soft_delete.code, 'icode': outputs.resolve_id.code} | jq('(.cur | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $c | (.subject + "@v" + (.version | tostring)) as $k | {key: $k, subject: .subject, version: .version, read_code: .rcode, schema_id: (if .rcode == 200 then (.rbody | fromjson | .id) else null end), delete_code: .dcode, resolve_code: .icode} as $row | $c + {($k): $row}') | first | toJson }}
+
+                          - id: pruned_save
+                            type: io.kestra.plugin.core.kv.Set
+                            key: "{{ render(vars.prune_key) }}"
+                            kvType: JSON
+                            value: "{{ outputs.pruned_merge.values.merged }}"
+
+                      - id: reset_verify
+                        type: io.kestra.plugin.core.kv.Set
+                        key: "{{ render(vars.verify_key) }}"
+                        kvType: JSON
+                        value: "{}"
+
+                      - id: verify
+                        type: io.kestra.plugin.core.flow.Loop
+                        description: Read the active version list again, straight from the registry, for every subject that was pruned.
+                        concurrencyLimit: 1
+                        values: "{{ fromJson(outputs.assess.values.result).subjects | toJson }}"
+                        tasks:
+                          - id: recheck_versions
+                            type: io.kestra.plugin.core.http.Request
+                            method: GET
+                            uri: "{{ inputs.schema_registry_url }}/subjects/{{ item.value }}/versions"
+                            options:
+                              allowFailed: true
+
+                          - id: recheck_merge
+                            type: io.kestra.plugin.core.output.OutputValues
+                            values:
+                              merged: >-
+                                {{ {'cur': (kv(render(vars.verify_key), errorOnMissing=false) ?? '{}'), 'subject': item.value, 'code': outputs.recheck_versions.code, 'body': outputs.recheck_versions.body} | jq('(.cur | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $c | (if .code == 200 then (.body | fromjson | sort) else [] end) as $vs | {subject: .subject, active: ($vs | length), latest: ($vs | max)} as $row | $c + {(.subject): $row}') | first | toJson }}
+
+                          - id: recheck_save
+                            type: io.kestra.plugin.core.kv.Set
+                            key: "{{ render(vars.verify_key) }}"
+                            kvType: JSON
+                            value: "{{ outputs.recheck_merge.values.merged }}"
+
+                      - id: verify_assess
+                        type: io.kestra.plugin.core.output.OutputValues
+                        description: >-
+                          Two independent failures are counted. A subject still over keep_n means the prune did not land. A pruned version whose schema id stopped resolving means a soft delete behaved like a hard delete, which would break a consumer. That is only expected when permanent_delete was asked for.
+                        values:
+                          result: >-
+                            {{ {'rows': (kv(render(vars.verify_key), errorOnMissing=false) ?? '{}'), 'pruned': (kv(render(vars.prune_key), errorOnMissing=false) ?? '{}'), 'keep': inputs.keep_n, 'perm': inputs.permanent_delete} | jq('(.rows | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $r | (.pruned | if type=="string" then (if .=="" then {} else fromjson end) else . end) as $p | .keep as $k | .perm as $perm | ([ $r[] | select(.active > $k) ] | sort_by(.subject)) as $still | ([ $p[] | select(.read_code == 200 and .resolve_code != 200) ] | sort_by(.key)) as $lost | {checked: ($r | length), pruned_count: ($p | length), still_over: ($still | length), lost: (if $perm then 0 else ($lost | length) end), freed: (if $perm then ($lost | length) else 0 end), bad: (($still | length) + (if $perm then 0 else ($lost | length) end)), still_summary: ([ $still[] | .subject + " [" + (.active | tostring) + " active, target " + ($k | tostring) + "]" ] | join("; ")), lost_summary: ([ $lost[] | .key + " [schema id " + (.schema_id | tostring) + " answers " + (.resolve_code | tostring) + "]" ] | join("; ")), ok_summary: ([ $r[] | .subject + " [" + (.active | tostring) + " active, newest v" + (.latest | tostring) + "]" ] | join("; "))}') | first | toJson }}
+
+                      - id: verify_result
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ fromJson(outputs.verify_assess.values.result).bad > 0 }}"
+                        then:
+                          - id: prune_failed
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: >-
+                              Prune ran, but the re-read does not agree. {{ fromJson(outputs.verify_assess.values.result).still_over }} subjects are still over keep_n of {{ inputs.keep_n }} ({{ fromJson(outputs.verify_assess.values.result).still_summary }}). {{ fromJson(outputs.verify_assess.values.result).lost }} pruned versions lost their global schema id ({{ fromJson(outputs.verify_assess.values.result).lost_summary }}), which a soft delete must never do. Check whether the subject is read only, whether a producer registered a new version during the pause or whether something else hard deleted the schema.
+                        else:
+                          - id: pruned_ok
+                            type: io.kestra.plugin.core.log.Log
+                            message: >-
+                              Pruned {{ fromJson(outputs.verify_assess.values.result).pruned_count }} versions across {{ fromJson(outputs.verify_assess.values.result).checked }} subjects. Now {{ fromJson(outputs.verify_assess.values.result).ok_summary }}. Schema ids freed by a hard delete: {{ fromJson(outputs.verify_assess.values.result).freed }}. Every soft deleted version still resolves by its global schema id, so a consumer holding an old id can still deserialise.
+                    else:
+                      - id: not_approved
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          Nothing was deleted. Either the resume carried no approval or permanent_delete was set without confirm_permanent. approved={{ outputs.approve.onResume.approved ?? false }} permanent_delete={{ inputs.permanent_delete }} confirm_permanent={{ outputs.approve.onResume.confirm_permanent ?? false }}.
+                else:
+                  - id: report_only
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Reported only. {{ fromJson(outputs.assess.values.result).total_targets }} versions are over the keep_n of {{ inputs.keep_n }} and nothing was deleted, because auto_remediate={{ inputs.auto_remediate }} and dry_run={{ inputs.dry_run }}. Set auto_remediate true and dry_run false to be offered the approval step.
+        else:
+          - id: all_within
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Every one of the {{ fromJson(outputs.assess.values.result).audited }} audited subjects on {{ inputs.schema_registry_url }} holds {{ inputs.keep_n }} or fewer active versions. No version history to prune.
+    else:
+      - id: no_subjects
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No subject on {{ inputs.schema_registry_url }} is in scope. Either the registry has no subjects, none of them backs a live Kafka topic under the TopicNameStrategy or every candidate is exempt. Nothing read, nothing changed.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {'text': 'Kafka schema registry subject version pruning guard failed on ' ~ inputs.schema_registry_url ~ ' (execution ' ~ execution.id ~ '). No version was deleted unless a log line says pruned. Check the logs.'} | toJson }}
+
+triggers:
+  - id: weekly_scan
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "0 4 * * 1"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+      permanent_delete: false
+
+extend:
+  title: Kafka Schema Registry Subject Version Pruning Guard
+  shortDescription: Prune a Schema Registry subject's version history down to the newest keep_n with soft deletes behind an approval gate, then re-read the subject and prove every pruned schema id still resolves.
+  metaTitle: Kafka Schema Registry Subject Version Pruning Guard with Kestra
+  metaDescription: Soft delete the oldest Schema Registry subject versions down to a keep_n target behind an approval gate, then re-read and fail if the subject is still over.
+  description: |
+    A Confluent Schema Registry subject gains a version every time its schema changes. The registry never removes one. A subject that has evolved weekly for two years carries more than a hundred active versions. Nothing in the registry will ever thin that list.
+
+    Nothing breaks, which is why it goes unnoticed. The cost is operational. The `_schemas` storage topic is compacted but never pruned, so it keeps every version of every subject forever and a new registry replica replays all of it on startup. `GET /subjects/<subject>/versions` turns into a wall of numbers that no one can read. And once the list is long enough, nobody can say which old versions still matter, so nobody dares touch any of them.
+
+    This blueprint prunes the history down to the newest `keep_n` versions per subject, oldest first, with a SOFT delete. A soft delete removes the version from the active list but leaves the global schema id resolvable through `GET /schemas/ids/<id>`, so a consumer that is still reading old messages whose headers carry that id keeps working. The newest version is never a target. After the prune the flow re-reads the subject. It also re-resolves every schema id it just soft deleted, so the run fails both when the subject is still over target and when a soft delete turned out to behave like a hard delete.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Safety
+
+    - Read-only by default. With the shipped inputs it lists subjects, lists versions, reports and alerts. It changes nothing.
+    - A delete needs three things at once: `auto_remediate` true, `dry_run` false and a human resuming the `Pause` with `approved=true`. An unanswered resume reads as not approved.
+    - The delete is a soft delete. The version leaves the active list, the schema stays retrievable by its global id, so a consumer holding that id can still deserialise an old message.
+    - `permanent_delete` offers the hard delete, which does free the ids and is unrecoverable. It is off by default and needs a second field on the same approval, `confirm_permanent=true`, so one careless resume cannot trigger it.
+    - The newest version of a subject is never deletable. The registry itself will happily soft delete it. When it is the only one left the whole subject disappears from `GET /subjects`, so this flow applies the rule instead. If `keep_n` is 0 the run fails with the subject names rather than pruning anything.
+    - Only subjects backing a live Kafka topic are in scope, read from the broker on every run, so a subject whose topic is gone keeps its whole history.
+    - `exempt_subjects` are never read and never changed.
+    - `keep_n` is an operator judgement, not an analysis. The registry cannot tell you whether a version from last year is still referenced by messages sitting in a topic with long retention. Pick `keep_n` from your longest topic retention and your slowest consumer, keep the soft delete and leave `permanent_delete` off.
+
+    ## How it works
+
+    1. `list_subjects` (`io.kestra.plugin.core.http.Request`) reads `GET /subjects`.
+    2. `list_topics` (`io.kestra.plugin.kafka.TopicList`, read-only) returns the live topics on the cluster.
+    3. `scope` keeps the registered subjects that back a live topic under the TopicNameStrategy (`<topic>-value`, `<topic>-key`) or the explicit `subjects` list, minus `exempt_subjects`. Internal topics are dropped.
+    4. `in_scope` (`io.kestra.plugin.core.flow.If`) stops with `no_subjects` when nothing is in scope.
+    5. `audit` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) reads `GET /subjects/<subject>/versions` per subject and folds the active version list into a KV accumulator.
+    6. `assess` marks a version as a target when fewer than `keep_n` versions sit above it. That keeps the newest `keep_n` whatever gaps the numbering has. With `keep_n` 0 it marks the subject unsafe, because the newest version would be a target.
+    7. `route` branches on whether any subject is over target.
+       - When none are, `all_within` logs that there is no history to prune. No alert.
+       - When some are, `log_findings` logs the per subject split and `alert` posts it to Slack.
+    8. `safety_gate` fails the run through `refuse_latest` if the target set reaches a newest version. Nothing is deleted.
+    9. `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false. Otherwise `report_only` logs what would have been pruned.
+       - `approve` (`io.kestra.plugin.core.flow.Pause`) waits for a resume carrying `approved`, plus `confirm_permanent` when `permanent_delete` is set.
+       - `remediate_prune` (`Loop`, `concurrencyLimit: 1`) walks the targets oldest first. Per version it reads the version to capture its global schema id, soft deletes it, hard deletes it only when both permanent flags are set, then re-resolves that schema id and records the answer.
+       - `verify` re-reads the active versions of every pruned subject.
+       - `verify_assess` counts two independent failures. One is a subject still over `keep_n`. The other is a soft deleted version whose schema id stopped resolving.
+       - `verify_result` fails the run through `prune_failed` on either, otherwise `pruned_ok` logs the new counts.
+    10. `errors` posts to Slack on any failure, for example an unreachable registry, a refused prune or a lost schema id.
+
+    ## What you get
+
+    - A per subject view of how deep the version history actually is, scoped to the subjects that still back a live topic.
+    - A prune that keeps the newest `keep_n` and walks the rest oldest first, with the newest version protected by a rule the registry does not enforce itself.
+    - A soft delete by default, with the hard delete behind its own input and its own confirmation.
+    - Proof the prune was safe: every soft deleted schema id is re-resolved by global id after the delete. The run fails if one of them stopped answering.
+    - Proof the prune landed: a re-read of each subject that fails the run if it is still over target.
+
+    ## Who it's for
+
+    - Platform teams running a shared registry where a few long lived subjects carry years of versions.
+    - Teams whose registry replicas are slow to start because the `_schemas` topic replay has grown.
+    - On-call engineers who want a reviewed way to thin a subject's history instead of hand running `DELETE /subjects/<s>/versions/<v>` against production.
+    - Anyone who wants a worked example of the Kafka plugin paired with the registry REST API behind an approval gate.
+
+    ## Why orchestrate this with Kestra
+
+    A loop of `curl` calls can delete versions. It cannot scope itself to the subjects that still back a live topic, refuse to touch the newest version, hold the delete for a second person or prove afterwards that the schema ids it removed from the active list are still resolvable. Kestra adds the schedule that watches the registry, the approval that turns a bulk delete into a reviewed change, the re-read that proves the result and a run history that says exactly which versions went and when.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against Apache Kafka 3.9.1 (KRaft, single node) with Confluent Schema Registry 7.9.0 and a local HTTP sink standing in for Slack. Topics `orders`, `payments` and `invoices` were live. `orders-value` was set to `NONE` compatibility and loaded with 8 versions (global schema ids 1 to 8). `payments-value` held 2 versions and is the precision control. Every result was confirmed by reading `GET /subjects/<s>/versions` and `GET /schemas/ids/<id>` directly, before and after each run.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | `keep_n: 20`, defaults | 2 subjects audited, 0 over target. Nothing deleted, no alert |
+    | 2 | `keep_n: 3` | `orders-value` reported at 8 active with versions 1 to 5 as targets, `payments-value` not flagged at 2. `dry_run` true so nothing deleted, `GET /subjects/orders-value/versions` still `[1,2,3,4,5,6,7,8]` |
+    | 3 | `keep_n: 3`, `auto_remediate: true`, `dry_run: true` | Same report, no `Pause`, registry unchanged |
+    | 4 | `keep_n: 0`, `auto_remediate: true`, `dry_run: false` | `refuse_latest` failed the run naming `orders-value` and `payments-value`, nothing deleted, `errors` alert sent. The refusal lands before the `Pause`, so an approver is never offered it |
+    | 5 | `keep_n: 3`, `auto_remediate: true`, `dry_run: false`, resumed with no answer | Paused, resumed empty, `not_approved` logged, registry unchanged |
+    | 6 | `keep_n: 3`, `auto_remediate: true`, `dry_run: false`, `approved=true` | Versions 1 to 5 soft deleted oldest first. Active list went `[1,2,3,4,5,6,7,8]` to `[6,7,8]`, `payments-value` still `[1,2]`, `latest` still v8. Schema ids 1 to 5 all answered 200 on `GET /schemas/ids/<id>` after the delete |
+    | 7 | `keep_n: 1`, approved, subject put in `READONLY` mode during the `Pause` | Registry rejected the deletes, the re-read still showed 3 active against a target of 1, `prune_failed` failed the run and `errors` alerted |
+    | 8 | `subjects: ["invoices-value"]`, `keep_n: 2`, `permanent_delete: true`, resumed with `approved=true` only | `not_approved`. The hard delete is unreachable without `confirm_permanent`, `invoices-value` still `[1,2,3,4]` |
+    | 9 | same plus `confirm_permanent=true` | Versions 1 and 2 hard deleted. Active went `[1,2,3,4]` to `[3,4]` and `?deleted=true` also returned `[3,4]`. Schema ids 13 and 14 answered 404, ids 15 and 16 still 200. The run reported 2 ids freed and did not fail, because the hard delete was asked for |
+    | 10 | `keep_n: 3`, the same inputs as run 2 | 3 subjects audited, 0 over target. The detector went from 1 over with 5 targets to 0 over on identical inputs |
+    | 11 | topic `invoices` deleted on the broker, `keep_n: 1` | Only 2 subjects audited. `invoices-value` was left out of scope entirely even though it still held 2 active versions, so its history was never read or touched |
+    | 12 | registry URL unreachable | `list_subjects` failed, run failed, `errors` alert sent |
+    | 13 | every candidate in `exempt_subjects` | `no_subjects` logged, nothing read, nothing changed |
+
+    The soft delete semantics were measured rather than assumed. After a soft delete of a version, `GET /schemas/ids/<id>` returns 200 with the schema and the version still appears under `?deleted=true`. After a hard delete of the same version the id answers 404 `Schema <id> not found`, `?deleted=true` does not bring it back and the version is gone from the history too. That difference is the whole reason the default here is a soft delete.
+
+    One more measurement worth stating, because it is why the newest version rule lives in this flow and not in the registry. Schema Registry 7.9.0 soft deletes the newest version of a subject on request without complaint. When that was the last active version the subject itself stopped answering `GET /subjects/<s>/versions` and dropped out of `GET /subjects`. The registry offers no protection here at all.
+
+    ## Prerequisites
+
+    - A Kafka cluster plus a Confluent Schema Registry reachable from the Kestra worker. The registry keeps its state in a Kafka topic, so it cannot run without a broker. This is why the blueprint is not a demo.
+    - A registry user allowed to read subjects and versions and, for remediation, delete versions. A broker principal allowed to list topics.
+    - Subjects named with the default `TopicNameStrategy`. A different strategy needs the `subjects` input filled in explicitly.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block. In Kestra OSS, provide it as the base64 encoded environment variable `SECRET_SLACK_WEBHOOK_URL`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `schema_registry_url` | `http://localhost:8081` | Registry base URL, no trailing slash |
+    | `bootstrap_servers` | `localhost:9092` | Brokers, read the live topic set that scopes the prune |
+    | `keep_n` | `20` | Active versions kept per subject. Must be 1 or more |
+    | `subjects` | `[]` | Empty means every subject backing a live topic |
+    | `exempt_subjects` | `[]` | Subjects whose history is kept whatever its length |
+    | `permanent_delete` | `false` | Hard delete, which frees the schema ids and is unrecoverable |
+    | `auto_remediate` | `false` | Allow the delete |
+    | `dry_run` | `true` | Must be `false` for a delete to apply |
+
+    ## Quick start
+
+    1. Add the `SLACK_WEBHOOK_URL` secret.
+    2. Import the flow and set `schema_registry_url` plus `bootstrap_servers`.
+    3. Run it with the defaults and read how deep each subject's history is.
+    4. Pick `keep_n` from your longest topic retention and your slowest consumer, then run again with `dry_run` true to see the exact version numbers that would go.
+    5. Run it with `auto_remediate: true` and `dry_run: false`, then resume the paused execution with `approved=true`.
+    6. Enable the `weekly_scan` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Export each targeted version's schema to object storage before the delete, so a wrongly pruned version can be re-registered.
+    - Set a different `keep_n` per subject group by running the flow once per group with the `subjects` input filled in.
+    - Replace the fixed `keep_n` with an age rule by reading the version metadata and keeping anything newer than a cutoff.
+    - Cross check against consumer lag before pruning, so a subject with a consumer group far behind is held back.
+    - Raise the Slack message to a channel with a link to the paused execution, so approval happens from chat.
+
+    ## Links
+
+    - Schema Registry API: https://docs.confluent.io/platform/current/schema-registry/develop/api.html
+    - Schema deletion guidelines, soft versus permanent: https://docs.confluent.io/platform/current/schema-registry/schema-deletion-guidelines.html
+    - Kafka plugin: https://kestra.io/plugins/plugin-kafka
+    - Pause task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
