@@ -1,0 +1,590 @@
+id: mqtt-stale-retained-message-purge-guard
+namespace: company.team
+description: |
+  Audit the retained messages an MQTT broker replays to every new subscriber,
+  flag the ones that are stale or fail a payload validity check, then clear
+  each one with a zero byte retained publish behind a dry run and an approval
+  pause. A fresh subscriber re-reads the broker afterwards and the run fails
+  if a cleared topic is still being replayed.
+
+inputs:
+  - id: mqtt_server
+    type: STRING
+    defaults: "{{ secret('MQTT_SERVER') }}"
+    description: Broker URI, for example tcp://broker.internal:1883 or ssl://broker.internal:8883.
+
+  - id: topic_filter
+    type: STRING
+    defaults: config/+
+    description: >-
+      Subscription filter that scopes the whole audit. Everything outside it is invisible to this
+      flow and can never be cleared. A bare wildcard is refused so one run cannot sweep a broker.
+
+  - id: timestamp_field
+    type: STRING
+    defaults: updated_at
+    description: >-
+      Payload field holding an ISO 8601 UTC timestamp. MQTT puts no timestamp on a retained
+      message, so this field is the only age signal the flow has.
+
+  - id: required_payload_fields
+    type: ARRAY
+    itemType: STRING
+    defaults: ["schema_version", "updated_at"]
+    description: Fields every retained payload on this filter must carry. A missing one is a validity failure.
+
+  - id: max_age_days
+    type: INT
+    defaults: 30
+    description: A retained payload whose timestamp field is older than this many days counts as stale.
+
+  - id: listen_duration
+    type: DURATION
+    defaults: PT10S
+    description: How long each read waits. The broker sends retained messages immediately on subscribe.
+
+  - id: max_messages
+    type: INT
+    defaults: 200
+    description: Ceiling on messages collected per read, so a busy filter cannot produce an unbounded batch.
+
+  - id: max_clear_per_run
+    type: INT
+    defaults: 5
+    description: Ceiling on topics cleared in one run. Anything over it waits for the next run and is reported.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Report what would be cleared and change nothing.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: Allow the zero byte retained publish. Still needs dry_run false plus pause approval.
+
+tasks:
+  - id: guard_topic_scope
+    type: io.kestra.plugin.core.flow.If
+    description: Refuse a filter that covers the whole broker, so the audit always has a bounded scope.
+    condition: "{{ inputs.topic_filter == '#' or inputs.topic_filter == '+' or inputs.topic_filter == '/#' }}"
+    then:
+      - id: refuse_broker_wide_filter
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          topic_filter {{ inputs.topic_filter }} covers every topic on the broker. Scope the audit
+          to a prefix such as config/+ before running it.
+
+  - id: read_retained
+    type: io.kestra.plugin.mqtt.Subscribe
+    description: >-
+      Connect with a client id that has never been seen before, so the broker replays its stored
+      retained message for every topic matching the filter. Each record carries the MQTT retain flag.
+    server: "{{ inputs.mqtt_server }}"
+    clientId: "kestra-retained-guard-detect-{{ execution.id }}"
+    topic: "{{ inputs.topic_filter }}"
+    serdeType: STRING
+    qos: 1
+    maxDuration: "{{ inputs.listen_duration }}"
+    maxRecords: "{{ inputs.max_messages }}"
+
+  - id: retained_to_json
+    type: io.kestra.plugin.serdes.json.IonToJson
+    description: Convert the collected messages to newline delimited JSON for the audit step.
+    from: "{{ outputs.read_retained.uri }}"
+    newLine: true
+
+  - id: audit_retained
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Keep only records whose MQTT retain flag is true, then score each payload for validity and
+      age. Live traffic that arrived during the read window is dropped here.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      retained.jsonl: "{{ outputs.retained_to_json.uri }}"
+    env:
+      TS_FIELD: "{{ inputs.timestamp_field }}"
+      REQUIRED_FIELDS: "{{ inputs.required_payload_fields }}"
+      MAX_AGE_DAYS: "{{ inputs.max_age_days }}"
+      MAX_CLEAR: "{{ inputs.max_clear_per_run }}"
+    script: |
+      import json, os
+      from datetime import datetime, timedelta, timezone
+
+      ts_field = os.environ["TS_FIELD"]
+      required = json.loads(os.environ["REQUIRED_FIELDS"])
+      max_age_days = int(os.environ["MAX_AGE_DAYS"])
+      max_clear = int(os.environ["MAX_CLEAR"])
+
+      now = datetime.now(timezone.utc)
+      cutoff = now - timedelta(days=max_age_days)
+
+      def parse_stamp(text):
+          cleaned = text.strip().replace("Z", "+00:00")
+          moment = datetime.fromisoformat(cleaned)
+          if moment.tzinfo is None:
+              moment = moment.replace(tzinfo=timezone.utc)
+          return moment
+
+      records = []
+      with open("retained.jsonl") as handle:
+          for line in handle:
+              line = line.strip()
+              if line:
+                  records.append(json.loads(line))
+
+      retained = [r for r in records if r.get("retain") is True]
+      live = len(records) - len(retained)
+      findings = []
+
+      for record in retained:
+          topic = record.get("topic") or ""
+          raw = record.get("payload")
+          raw = "" if raw is None else str(raw)
+          reasons = []
+          age_days = None
+          doc = None
+          if raw:
+              try:
+                  doc = json.loads(raw)
+              except ValueError:
+                  doc = None
+          if not isinstance(doc, dict):
+              reasons.append("payload is not a JSON object")
+          else:
+              for field in required:
+                  if field not in doc:
+                      reasons.append("missing required field " + str(field))
+              stamp = doc.get(ts_field)
+              if isinstance(stamp, str) and stamp.strip():
+                  try:
+                      moment = parse_stamp(stamp)
+                      age_days = round((now - moment).total_seconds() / 86400.0, 2)
+                      if moment < cutoff:
+                          reasons.append("stale since " + stamp.strip())
+                  except ValueError:
+                      reasons.append("unparsable " + ts_field)
+          if reasons:
+              findings.append({
+                  "topic": topic,
+                  "bytes": len(raw.encode("utf-8")),
+                  "age_days": age_days,
+                  "reasons": reasons,
+              })
+
+      findings.sort(key=lambda item: item["topic"])
+      clear = findings[:max_clear]
+      deferred = findings[max_clear:]
+
+      print("retained messages replayed on connect: %d" % len(retained))
+      print("non retained records dropped: %d" % live)
+      print("cutoff for stale: %s" % cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
+      for item in findings:
+          print("FINDING %s bytes=%d age_days=%s reasons=%s"
+                % (item["topic"], item["bytes"], item["age_days"], "; ".join(item["reasons"])))
+      for item in retained:
+          print("SEEN %s" % item.get("topic"))
+
+      parts = ["%s (%s)" % (item["topic"], ", ".join(item["reasons"])) for item in clear]
+      summary = " | ".join(parts).replace('"', "'") or "none"
+
+      print("::" + json.dumps({"outputs": {
+          "retained_total": str(len(retained)),
+          "live_dropped": str(live),
+          "finding_count": str(len(findings)),
+          "clear_count": str(len(clear)),
+          "deferred_count": str(len(deferred)),
+          "clear_topics": json.dumps([item["topic"] for item in clear]),
+          "summary": summary,
+          "cutoff": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+      }}) + "::")
+
+  - id: log_audit
+    type: io.kestra.plugin.core.log.Log
+    description: Put the audit result in the execution log so every run is readable without opening a task output.
+    message: >-
+      filter {{ inputs.topic_filter }}: {{ outputs.audit_retained.vars.retained_total }} retained,
+      {{ outputs.audit_retained.vars.finding_count }} flagged,
+      {{ outputs.audit_retained.vars.clear_count }} eligible to clear this run,
+      {{ outputs.audit_retained.vars.deferred_count }} deferred,
+      {{ outputs.audit_retained.vars.live_dropped }} non retained records dropped. Stale cutoff
+      {{ outputs.audit_retained.vars.cutoff }}. Targets: {{ outputs.audit_retained.vars.summary }}
+
+  - id: report_clean
+    type: io.kestra.plugin.core.flow.If
+    description: Nothing to do when every retained message on the filter is valid and fresh.
+    condition: "{{ (outputs.audit_retained.vars.finding_count | number) == 0 }}"
+    then:
+      - id: log_clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          All {{ outputs.audit_retained.vars.retained_total }} retained messages on
+          {{ inputs.topic_filter }} carry the required fields and are newer than
+          {{ outputs.audit_retained.vars.cutoff }}. Nothing cleared.
+
+  - id: alert_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Tell the channel what the broker is still handing out, whatever the run is allowed to change.
+    condition: "{{ (outputs.audit_retained.vars.finding_count | number) > 0 }}"
+    then:
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "MQTT retained message audit on {{ inputs.topic_filter }}: {{ outputs.audit_retained.vars.finding_count }} of {{ outputs.audit_retained.vars.retained_total }} retained messages are stale or invalid. Every client that reconnects still receives them. Eligible to clear now: {{ outputs.audit_retained.vars.clear_count }}. Deferred by the per run ceiling: {{ outputs.audit_retained.vars.deferred_count }}. Targets: {{ outputs.audit_retained.vars.summary }}. dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }} execution {{ execution.id }}."
+          }
+
+  - id: report_pending
+    type: io.kestra.plugin.core.flow.If
+    description: Read only outcome. Name the exact publishes the flow would make and stop.
+    condition: "{{ (outputs.audit_retained.vars.finding_count | number) > 0 and (inputs.dry_run or not inputs.auto_remediate) }}"
+    then:
+      - id: log_pending
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}, so nothing was
+          published. To clear these topics the flow would publish a zero byte payload with
+          retain true to each of {{ outputs.audit_retained.vars.clear_topics }}. Re-run with
+          auto_remediate true and dry_run false, then approve the pause.
+
+  - id: remediate_gate
+    type: io.kestra.plugin.core.flow.If
+    description: The only branch that writes. Needs findings, auto_remediate true, dry_run false and an approval.
+    condition: "{{ (outputs.audit_retained.vars.finding_count | number) > 0 and inputs.auto_remediate and not inputs.dry_run }}"
+    then:
+      - id: hold_for_approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          Clearing a retained message is irreversible. The stored value is gone and a device that
+          reconnects receives nothing on that topic until someone publishes a fresh one.
+        onResume:
+          - id: approved
+            type: BOOL
+            required: false
+            description: Set true to publish the zero byte retained message to each listed topic.
+
+      - id: apply_gate
+        type: io.kestra.plugin.core.flow.If
+        description: An unanswered resume leaves approved null, which must not read as approval.
+        condition: "{{ outputs.hold_for_approval.onResume.approved ?? false }}"
+        then:
+          - id: remediate_clear_retained
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One zero byte retained publish per flagged topic. Sequential, because two publishes
+              racing on the same topic leave the broker holding whichever landed last.
+            values: "{{ outputs.audit_retained.vars.clear_topics }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: publish_zero_byte_retained
+                type: io.kestra.plugin.mqtt.Publish
+                description: >-
+                  An empty payload published with retain true is the MQTT protocol's delete for a
+                  retained message. The broker drops its stored value and sends nothing further.
+                server: "{{ inputs.mqtt_server }}"
+                clientId: "kestra-retained-guard-clear-{{ execution.id }}"
+                topic: "{{ item.value }}"
+                serdeType: STRING
+                qos: 1
+                retain: true
+                from: ""
+
+          - id: verify_retained
+            type: io.kestra.plugin.mqtt.Subscribe
+            description: >-
+              A second client id the broker has never seen. What it receives on connect is the
+              broker's retained state after the clear, read from the broker rather than inferred.
+            server: "{{ inputs.mqtt_server }}"
+            clientId: "kestra-retained-guard-verify-{{ execution.id }}"
+            topic: "{{ inputs.topic_filter }}"
+            serdeType: STRING
+            qos: 1
+            maxDuration: "{{ inputs.listen_duration }}"
+            maxRecords: "{{ inputs.max_messages }}"
+
+          - id: verify_to_json
+            type: io.kestra.plugin.serdes.json.IonToJson
+            from: "{{ outputs.verify_retained.uri }}"
+            newLine: true
+
+          - id: verify_audit
+            type: io.kestra.plugin.scripts.python.Script
+            description: Compare the cleared topics against what the broker now replays. List what survived.
+            containerImage: python:3.12-slim
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            inputFiles:
+              retained.jsonl: "{{ outputs.verify_to_json.uri }}"
+              targets.json: "{{ outputs.audit_retained.vars.clear_topics }}"
+            script: |
+              import json
+
+              targets = set(json.load(open("targets.json")))
+              records = []
+              with open("retained.jsonl") as handle:
+                  for line in handle:
+                      line = line.strip()
+                      if line:
+                          records.append(json.loads(line))
+
+              still = sorted({r.get("topic") for r in records if r.get("retain") is True})
+              survivors = sorted(targets.intersection(still))
+              untouched = sorted(set(still) - targets)
+
+              print("targeted: %s" % sorted(targets))
+              print("still replayed by the broker: %s" % still)
+              print("survivors (clear did not land): %s" % survivors)
+              print("retained messages left untouched: %s" % untouched)
+
+              print("::" + json.dumps({"outputs": {
+                  "survivor_count": str(len(survivors)),
+                  "survivors": json.dumps(survivors),
+                  "remaining_total": str(len(still)),
+                  "untouched": json.dumps(untouched),
+              }}) + "::")
+
+          - id: log_verify
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Re-read {{ inputs.topic_filter }} with a new client: {{ outputs.verify_audit.vars.remaining_total }}
+              retained messages left, {{ outputs.verify_audit.vars.survivor_count }} of the targeted topics
+              still replayed ({{ outputs.verify_audit.vars.survivors }}). Untouched:
+              {{ outputs.verify_audit.vars.untouched }}
+
+          - id: fail_if_still_retained
+            type: io.kestra.plugin.core.flow.If
+            description: A clear that did not land must fail the run, not pass as success.
+            condition: "{{ (outputs.verify_audit.vars.survivor_count | number) > 0 }}"
+            then:
+              - id: fail_clear_did_not_land
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  The broker still replays {{ outputs.verify_audit.vars.survivors }} after the zero byte
+                  retained publish. Every client that reconnects keeps getting the old value. Check broker
+                  ACLs on the publish client and whether a producer re-published the topic during the pause.
+
+          - id: notify_cleared
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "MQTT retained state cleared on {{ inputs.topic_filter }}: {{ outputs.audit_retained.vars.clear_count }} topics purged and confirmed gone by a fresh subscriber. {{ outputs.verify_audit.vars.remaining_total }} retained messages remain on the filter. Devices on the cleared topics now receive nothing there until a fresh config is published. Execution {{ execution.id }}."
+              }
+
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Approval was not granted, so nothing was published. The broker still replays
+              {{ outputs.audit_retained.vars.clear_topics }} to every client that reconnects.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "mqtt-stale-retained-message-purge-guard FAILED on {{ inputs.topic_filter }} (execution {{ execution.id }}). Retained state on the broker may be unchanged or only partly cleared, so treat the last known good values as unverified until the next audit run."
+      }
+
+triggers:
+  - id: weekly_retained_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "0 6 * * 1"
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Purge a stale MQTT retained message that re-breaks every reconnecting client
+  demo: false
+  ee: false
+  shortDescription: Audit the retained messages an MQTT broker replays on connect, then clear the stale or invalid ones with a zero byte retained publish behind a dry run and an approval pause, with a fresh subscriber confirming the clear.
+  metaTitle: Clear stale MQTT retained messages with Kestra
+  metaDescription: Detect stale or invalid MQTT retained messages, clear them with a zero byte retained publish behind an approval, then confirm with a new subscriber.
+  tags:
+    - Infrastructure
+    - System
+  subTags:
+    - Streaming & Messaging
+    - Day 2 Operations
+    - Approval Gates
+  description: |-
+    A retained message is the broker's stored last known value for a topic, handed to every client
+    the moment it subscribes. That is what you want on a config or command topic. It is also what
+    hurts when the stored value is wrong. A bad config push, a firmware rollback, a decommissioned
+    topic still handing out an old command: the value sits on the broker and re-breaks every device
+    that reconnects, forever, with no error anywhere. The broker is doing exactly what it was told.
+
+    MQTT has one way to delete a retained message. Publish an empty payload to the same topic with
+    the retain flag set. The broker then drops its stored value. This blueprint finds the retained
+    messages worth deleting, then makes that publish behind a dry run and an approval, then proves
+    the broker stopped replaying them.
+
+    ## Findings
+
+    Measured on Mosquitto 2.0.22 while building this blueprint.
+
+    - `io.kestra.plugin.mqtt.Publish` with `serdeType: STRING`, `from: ""` and `retain: true` is the
+      combination that clears a retained message. `serdeType: BYTES` with the same empty value fails
+      at deserialization instead of publishing, so it cannot be used for the clear.
+    - Every record `io.kestra.plugin.mqtt.Subscribe` writes carries the MQTT `retain` flag, so the
+      audit can separate the broker's stored state from traffic that happened to arrive during the
+      read window. A message published without the retain flag before the run is not stored at all
+      and a later subscriber never sees it.
+    - MQTT puts no timestamp on a retained message. The protocol gives you the payload and nothing
+      else, so age has to come from the payload itself. This flow reads an ISO 8601 UTC field named
+      by `timestamp_field` and says so in the log, rather than implying the broker reported an age.
+    - A retained publish that a broker ACL denies does not come back as an error. The publish task
+      succeeds, the stored value stays. Nothing in the flow notices. Re-reading the broker with
+      a fresh client is the only check that catches it, which is why that step can fail the run.
+
+    ## Safety
+
+    - Clearing a retained message is irreversible. The stored value is gone. A client that
+      subscribes afterwards gets nothing on that topic until a fresh publish arrives. For a config
+      topic that can mean a device sitting unconfigured, so the purge sits behind `dry_run`,
+      `auto_remediate` plus a `Pause`. The Slack message says plainly what the devices lose.
+    - `topic_filter` bounds the entire run. A topic outside it is never read and never cleared, plus
+      a bare `#` or `+` filter is refused before the first connection.
+    - `max_clear_per_run` caps how many topics one run may purge. The rest are reported and wait.
+    - The flow never publishes a value. The only payload it ever sends is empty.
+
+    ## How it works
+
+    1. `guard_topic_scope` refuses a broker wide filter, so the audit always has a bounded scope.
+    2. `read_retained` (`io.kestra.plugin.mqtt.Subscribe`) connects with a client id built from the
+       execution id, which the broker has never seen. On subscribe the broker immediately replays
+       its retained message for every matching topic, with the retain flag set on each one.
+    3. `retained_to_json` converts the collected batch to newline delimited JSON.
+    4. `audit_retained` keeps only records whose retain flag is true, so live traffic from the read
+       window is dropped. For each retained payload it parses the JSON, checks every field in
+       `required_payload_fields` is present and compares `timestamp_field` against
+       `max_age_days`. A payload that is not a JSON object at all is flagged too, which is the
+       common shape of a poison retained message.
+    5. `report_clean` logs the all clear when nothing is flagged. `alert_findings` posts the flagged
+       topics to Slack either way, because the broker is handing them out right now.
+    6. `report_pending` is the read only outcome: it names the exact publishes the flow would make.
+    7. `remediate_gate` runs only when there are findings, `auto_remediate` is true and `dry_run` is
+       false. It pauses for approval. An unanswered resume leaves `approved` null, which the
+       gate reads as a refusal.
+    8. `remediate_clear_retained` loops the flagged topics with `concurrencyLimit: 1` and publishes a
+       zero byte payload with `retain: true` to each.
+    9. `verify_retained` connects with a second unused client id and reads the broker again.
+       `verify_audit` lists which targeted topics are still replayed. Then
+       `fail_if_still_retained` fails the run if any of them is. Only after that gate does
+       `notify_cleared` report success.
+
+    ## What you get
+
+    - A weekly read only audit of what your broker hands to every reconnecting client.
+    - A purge path that is explicit about being irreversible and cannot run by accident.
+    - A re-read from the broker as the proof, so a clear that silently did not land fails the run.
+    - Precision: a fresh valid retained message on a neighbouring topic is never touched.
+    - A Slack trail of what was flagged, what was purged and what devices lose as a result.
+
+    ## Who it's for
+
+    - IoT and fleet platform teams whose devices read config from retained MQTT topics.
+    - Anyone who has pushed a bad retained config and watched it re-break devices on reconnect.
+    - Platform engineers decommissioning topics and finding the broker still serving them.
+    - On call engineers debugging a device that misbehaves immediately after every restart.
+
+    ## Why orchestrate this with Kestra
+
+    Clearing retained state by hand is a one line `mosquitto_pub -r -n`, which is exactly the
+    problem: it is fast, irreversible and leaves no record. Kestra turns it into a reviewed path.
+    The audit runs on a schedule in read only mode, the purge needs two inputs plus a human
+    approval, the re-read is a task that can fail the run. The whole sequence is one execution
+    with logs and Slack messages attached. The same flow handles detection, the decision and the
+    proof, which a broker CLI cannot.
+
+    ## Tested end to end
+
+    Run against Mosquitto 2.0.22 on Kestra 2.0.5, with `mosquitto_sub` confirming broker state
+    before and after every run rather than trusting the Kestra log.
+
+    - Seeded five topics under `config/+`: a stale retained config, a fresh valid retained config, a
+      retained payload missing both required fields, a retained payload that is not JSON at all, plus
+      one message published without the retain flag.
+    - The detector saw 4 retained messages and 0 of the non retained one, then flagged exactly 3. The
+      fresh valid one was not flagged.
+    - With only the fresh valid message left, the same detector reported 0 findings, so it is not
+      simply reporting everything it reads.
+    - A non retained message published while the read window was open was collected by the
+      subscription then dropped by the retain flag check, which is the live traffic case.
+    - `dry_run: true` named the targets and changed nothing. `mosquitto_sub` showed every retained
+      message still there afterwards.
+    - `max_clear_per_run: 1` against 3 findings reported 1 eligible plus 2 deferred.
+    - With `auto_remediate: true`, `dry_run: false` and the pause approved, all 3 targets were
+      cleared and the re-read found 1 retained message left, the fresh one. `mosquitto_sub` agreed.
+    - The strongest check: a brand new subscriber received the stale value on connect before the run
+      then received nothing on that topic after it, which is the device symptom and its cure.
+    - Declining the pause published nothing. An unanswered resume behaved as a refusal.
+    - A broker ACL that denies the publishing client made the clear a silent no op. The publish task
+      still succeeded, so `fail_if_still_retained` failing the run is the only thing that caught it.
+    - A bare `#` filter was refused before the first connection.
+    - A broker made unreachable sent the run through the `errors` block to Slack.
+
+    ## Prerequisites
+
+    - An MQTT broker reachable from Kestra, speaking MQTT 3.1.1 or 5.
+    - A broker account allowed to subscribe to `topic_filter` and publish to the topics under it.
+    - Payloads on the audited topics that are JSON objects carrying a timestamp field.
+
+    ### Secrets
+
+    - `MQTT_SERVER`: broker URI, for example `tcp://broker.internal:1883` or `ssl://broker.internal:8883`.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the findings, purge and failure messages.
+
+    ### Inputs
+
+    - `mqtt_server`: broker URI. Defaults to the `MQTT_SERVER` secret.
+    - `topic_filter`: subscription filter that scopes the audit. Default `config/+`.
+    - `timestamp_field`: payload field holding an ISO 8601 UTC timestamp. Default `updated_at`.
+    - `required_payload_fields`: fields every retained payload must carry.
+    - `max_age_days`: age at which a retained payload counts as stale. Default 30.
+    - `listen_duration`: how long each read waits. Default `PT10S`.
+    - `max_messages`: ceiling on messages collected per read. Default 200.
+    - `max_clear_per_run`: ceiling on topics purged in one run. Default 5.
+    - `dry_run`: report only. Default true.
+    - `auto_remediate`: allow the purge. Default false.
+
+    ## Quick start
+
+    1. Add the `MQTT_SERVER` and `SLACK_WEBHOOK_URL` secrets.
+    2. Run it as is. Defaults are read only, so the first run only tells you what your broker is
+       handing out on `config/+`.
+    3. Read the audit log line. It gives the retained count, the flagged count, the stale cutoff and
+       the exact topics.
+    4. Confirm independently with `mosquitto_sub -h <broker> -t 'config/+' -v -W 3`, which prints the
+       same retained messages the flow read.
+    5. To purge, run with `auto_remediate: true` and `dry_run: false`, read the pause, then resume
+       with `approved: true`.
+    6. Re-run `mosquitto_sub`. The cleared topics print nothing and the healthy ones still print.
+
+    ## How to extend
+
+    - Point `topic_filter` at `command/+` or `state/+` to audit other retained namespaces, one
+      filter per flow so each keeps its own ceiling and schedule.
+    - For payloads with no timestamp convention, keep a first seen snapshot of each topic's value in
+      Kestra KV and derive age from when the value last changed. That measures how long the broker
+      has served this value, not when the device produced it, so state which one a dashboard shows.
+    - Republish a known good config after a clear, so devices are not left unconfigured.
+    - Add a validity rule for a minimum `schema_version` to catch payloads that are fresh but written
+      by a retired producer.
+    - Enable the schedule once the read only output looks right. Keep it in safe mode.
+
+    ## Links
+
+    - [MQTT 5 specification, retained messages](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901104)
+    - [Kestra MQTT plugin](https://kestra.io/plugins/plugin-mqtt)
+    - [Publish task](https://kestra.io/plugins/plugin-mqtt/io.kestra.plugin.mqtt.publish)
+    - [Subscribe task](https://kestra.io/plugins/plugin-mqtt/io.kestra.plugin.mqtt.subscribe)
+    - [Mosquitto broker](https://mosquitto.org/)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
