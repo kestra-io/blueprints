@@ -1,0 +1,644 @@
+id: timescaledb-chunk-time-interval-tuning-guard
+namespace: company.team
+
+description: |
+  Find TimescaleDB hypertables whose chunks no longer match the ingest rate, then correct the
+  chunk_time_interval. A hypertable's interval is chosen once at create time against a guess about
+  how much data will arrive. Too large and every chunk is enormous, so queries and compression chew
+  memory while a single chunk drop removes far more than intended. Too small and the table becomes
+  thousands of tiny chunks, so planning time climbs because the planner considers every chunk and the
+  catalog bloats. This blueprint measures real bytes per unit of time from recent closed chunks,
+  reports every hypertable outside the target size band, computes a corrected interval, then behind a
+  dry run and an approval Pause calls set_chunk_time_interval, re-reads
+  timescaledb_information.dimensions and fails the run if the setting did not change.
+  set_chunk_time_interval applies to chunks created in the future only. It does not re-chunk data
+  that is already stored.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: TimescaleDB speaks the PostgreSQL wire protocol, so this is a plain PostgreSQL JDBC URL.
+    defaults: "jdbc:postgresql://localhost:5432/metrics"
+
+  - id: db_user
+    type: STRING
+    displayName: Database user
+    defaults: postgres
+
+  - id: db_password
+    type: STRING
+    displayName: Database password
+    description: Defaults to the TIMESCALE_PASSWORD secret. Override per run only for local testing.
+    defaults: "{{ secret('TIMESCALE_PASSWORD') }}"
+
+  - id: schemas
+    type: STRING
+    displayName: Schemas to scan
+    description: Comma separated list of schemas holding the hypertables.
+    defaults: "public"
+
+  - id: target_chunk_bytes
+    type: INT
+    displayName: Target chunk size in bytes
+    description: >-
+      The size each new chunk should aim at, including indexes and toast. TimescaleDB guidance is
+      that the working set of a chunk fits comfortably in memory, about a quarter of the RAM on the
+      instance. The default is 256 MiB.
+    defaults: 268435456
+
+  - id: band_low_factor
+    type: FLOAT
+    displayName: Lower band factor
+    description: A hypertable is reported TOO_SMALL when its average sampled chunk is below the target times this factor.
+    defaults: 0.25
+
+  - id: band_high_factor
+    type: FLOAT
+    displayName: Upper band factor
+    description: A hypertable is reported TOO_LARGE when its average sampled chunk is above the target times this factor.
+    defaults: 4.0
+
+  - id: min_sample_chunks
+    type: INT
+    displayName: Minimum closed chunks needed to judge
+    description: >-
+      A hypertable with fewer closed chunks than this is reported SKIPPED rather than resized, so a
+      table that only started filling is never tuned off one sample.
+    defaults: 3
+
+  - id: max_sample_chunks
+    type: INT
+    displayName: Chunks sampled per hypertable
+    description: The most recent closed chunks used to measure bytes per unit of time. Older chunks are ignored so an old ingest rate does not skew the result.
+    defaults: 10
+
+  - id: min_new_interval
+    type: STRING
+    displayName: Smallest interval the flow will set
+    description: Floor on the computed interval, so a very dense table is never pushed into minute sized chunks.
+    defaults: "1 hour"
+
+  - id: max_new_interval
+    type: STRING
+    displayName: Largest interval the flow will set
+    description: Ceiling on the computed interval, so a very sparse table is never pushed into chunks nobody can drop at a useful granularity.
+    defaults: "30 days"
+
+  - id: min_change_factor
+    type: FLOAT
+    displayName: Minimum change factor
+    description: >-
+      The computed interval must differ from the current one by at least this ratio in either
+      direction before it is proposed. It stops the flow churning the setting for a small correction.
+    defaults: 1.5
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before set_chunk_time_interval is called.
+    defaults: true
+
+variables:
+  scan_cte: |
+    WITH params AS (
+      SELECT {{ inputs.target_chunk_bytes }}::numeric AS target_bytes,
+             {{ inputs.band_low_factor }}::numeric AS low_f,
+             {{ inputs.band_high_factor }}::numeric AS high_f,
+             {{ inputs.min_sample_chunks }}::int AS min_chunks,
+             {{ inputs.max_sample_chunks }}::int AS max_chunks,
+             extract(epoch FROM '{{ inputs.min_new_interval }}'::interval)::numeric AS min_secs,
+             extract(epoch FROM '{{ inputs.max_new_interval }}'::interval)::numeric AS max_secs,
+             {{ inputs.min_change_factor }}::numeric AS min_change
+    ), ht AS (
+      SELECT h.hypertable_schema AS sch, h.hypertable_name AS tbl,
+             format('%I.%I', h.hypertable_schema, h.hypertable_name) AS fqn,
+             d.column_name AS time_col, d.time_interval AS cur_iv,
+             extract(epoch FROM d.time_interval)::numeric AS cur_secs
+        FROM timescaledb_information.hypertables h
+        JOIN timescaledb_information.dimensions d
+          ON d.hypertable_schema = h.hypertable_schema
+         AND d.hypertable_name = h.hypertable_name
+         AND d.dimension_number = 1
+       WHERE h.hypertable_schema = ANY (string_to_array('{{ inputs.schemas }}', ','))
+         AND d.column_type::text = 'timestamp with time zone'
+         AND d.time_interval IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM timescaledb_information.continuous_aggregates ca
+            WHERE ca.materialization_hypertable_schema = h.hypertable_schema
+              AND ca.materialization_hypertable_name = h.hypertable_name)
+    ), csize AS (
+      SELECT t.sch, t.tbl, cd.chunk_schema, cd.chunk_name, cd.total_bytes
+        FROM ht t
+        CROSS JOIN LATERAL chunks_detailed_size(format('%I.%I', t.sch, t.tbl)::regclass) cd
+    ), cinfo AS (
+      SELECT t.sch, t.tbl, ic.chunk_schema, ic.chunk_name, ic.is_compressed,
+             extract(epoch FROM (ic.range_end - ic.range_start))::numeric AS span_secs,
+             row_number() OVER (PARTITION BY t.sch, t.tbl ORDER BY ic.range_start DESC) AS rn
+        FROM ht t
+        JOIN timescaledb_information.chunks ic
+          ON ic.hypertable_schema = t.sch AND ic.hypertable_name = t.tbl
+       WHERE ic.range_end <= now()
+    ), sample AS (
+      SELECT ci.sch, ci.tbl, ci.span_secs, ci.is_compressed, cs.total_bytes
+        FROM cinfo ci
+        JOIN csize cs ON cs.sch = ci.sch AND cs.tbl = ci.tbl
+                     AND cs.chunk_schema = ci.chunk_schema AND cs.chunk_name = ci.chunk_name
+       WHERE ci.rn <= (SELECT max_chunks FROM params)
+    ), agg AS (
+      SELECT sch, tbl, count(*) AS sampled,
+             sum(total_bytes)::numeric AS sum_bytes, sum(span_secs) AS sum_span,
+             avg(total_bytes)::numeric AS avg_bytes,
+             min(total_bytes)::numeric AS min_bytes, max(total_bytes)::numeric AS max_bytes,
+             count(*) FILTER (WHERE is_compressed) AS compressed_sampled
+        FROM sample GROUP BY 1, 2
+    ), joined AS (
+      SELECT t.*, a.sampled, a.sum_bytes, a.sum_span, a.avg_bytes, a.min_bytes, a.max_bytes,
+             a.compressed_sampled,
+             (SELECT count(*) FROM timescaledb_information.chunks x
+               WHERE x.hypertable_schema = t.sch AND x.hypertable_name = t.tbl) AS total_chunks,
+             CASE WHEN a.sum_span > 0 THEN a.sum_bytes / a.sum_span END AS bytes_per_sec
+        FROM ht t LEFT JOIN agg a ON a.sch = t.sch AND a.tbl = t.tbl
+    ), raw AS (
+      SELECT j.*, p.target_bytes, p.min_chunks, p.min_change,
+             p.target_bytes * p.low_f AS band_low,
+             p.target_bytes * p.high_f AS band_high,
+             p.min_secs, p.max_secs,
+             CASE WHEN j.bytes_per_sec > 0 THEN p.target_bytes / j.bytes_per_sec END AS raw_secs
+        FROM joined j CROSS JOIN params p
+    ), calc AS (
+      SELECT r.*,
+             least(greatest(
+               CASE WHEN r.raw_secs >= 7200 THEN round(r.raw_secs / 3600) * 3600
+                    WHEN r.raw_secs >= 120 THEN round(r.raw_secs / 60) * 60
+                    ELSE round(r.raw_secs) END, r.min_secs), r.max_secs) AS prop_secs
+        FROM raw r
+    ), fin AS (
+      SELECT c.*,
+             CASE
+               WHEN c.sampled IS NULL OR c.sampled < c.min_chunks THEN 'SKIPPED'
+               WHEN c.avg_bytes < c.band_low THEN 'TOO_SMALL'
+               WHEN c.avg_bytes > c.band_high THEN 'TOO_LARGE'
+               ELSE 'OK'
+             END AS status
+        FROM calc c
+    ), act AS (
+      SELECT f.*,
+             CASE WHEN f.status IN ('TOO_SMALL', 'TOO_LARGE')
+                   AND f.prop_secs IS NOT NULL
+                   AND f.prop_secs <> f.cur_secs
+                   AND greatest(f.prop_secs, f.cur_secs)
+                       / nullif(least(f.prop_secs, f.cur_secs), 0) >= f.min_change
+                  THEN 'SET_INTERVAL' ELSE 'NONE' END AS action
+        FROM fin f
+    )
+
+  audit_sql: |
+    {{ vars.scan_cte }}
+    SELECT fqn AS hypertable, status, action, time_col,
+           justify_interval(cur_iv)::text AS current_interval,
+           CASE WHEN prop_secs IS NULL THEN NULL
+                ELSE justify_interval(make_interval(secs => prop_secs::double precision))::text END AS proposed_interval,
+           coalesce(sampled, 0) AS chunks_sampled, total_chunks, compressed_sampled,
+           pg_size_pretty(avg_bytes::bigint) AS avg_chunk_size,
+           pg_size_pretty(min_bytes::bigint) AS smallest_sampled,
+           pg_size_pretty(max_bytes::bigint) AS largest_sampled,
+           pg_size_pretty(band_low::bigint) AS band_low,
+           pg_size_pretty(band_high::bigint) AS band_high,
+           CASE WHEN bytes_per_sec IS NULL THEN NULL
+                ELSE pg_size_pretty((bytes_per_sec * 86400)::bigint) END AS bytes_per_day,
+           CASE status
+             WHEN 'TOO_SMALL' THEN format('Average sampled chunk %s is below the %s floor of the target band. %s chunks exist, so the planner considers all of them on every query and the catalog carries a row set per chunk. At the measured %s per day a %s interval holds about the target %s',
+                    pg_size_pretty(avg_bytes::bigint), pg_size_pretty(band_low::bigint), total_chunks,
+                    pg_size_pretty((bytes_per_sec * 86400)::bigint),
+                    justify_interval(make_interval(secs => prop_secs::double precision))::text,
+                    pg_size_pretty(target_bytes::bigint))
+             WHEN 'TOO_LARGE' THEN format('Average sampled chunk %s is above the %s ceiling of the target band, so each chunk index and working set is larger than memory should hold and one chunk drop removes %s of range. At the measured %s per day a %s interval holds about the target %s',
+                    pg_size_pretty(avg_bytes::bigint), pg_size_pretty(band_high::bigint),
+                    justify_interval(cur_iv)::text,
+                    pg_size_pretty((bytes_per_sec * 86400)::bigint),
+                    justify_interval(make_interval(secs => prop_secs::double precision))::text,
+                    pg_size_pretty(target_bytes::bigint))
+             WHEN 'SKIPPED' THEN format('Only %s closed chunks, fewer than the %s needed to measure an ingest rate. Reported, never resized', coalesce(sampled, 0), min_chunks)
+             ELSE format('Average sampled chunk %s sits inside the band %s to %s', pg_size_pretty(avg_bytes::bigint), pg_size_pretty(band_low::bigint), pg_size_pretty(band_high::bigint))
+           END AS reason
+      FROM act
+     ORDER BY (status IN ('TOO_SMALL', 'TOO_LARGE')) DESC, hypertable
+
+  plan_sql: |
+    {{ vars.scan_cte }}
+    SELECT fqn AS hypertable, quote_literal(fqn) AS fqn_literal,
+           prop_secs::bigint AS new_interval_seconds,
+           justify_interval(cur_iv)::text AS current_interval,
+           justify_interval(make_interval(secs => prop_secs::double precision))::text AS new_interval,
+           status,
+           format('SELECT set_chunk_time_interval(%L, INTERVAL %L)', fqn, prop_secs::bigint || ' seconds') AS sql
+      FROM act
+     WHERE action = 'SET_INTERVAL'
+     ORDER BY hypertable
+
+  recheck_sql: |
+    WITH planned(fqn, want_secs) AS (
+      VALUES {{ outputs.plan.rows | jq('map("(" + .fqn_literal + "::text," + (.new_interval_seconds|tostring) + "::bigint)") | join(",")') | first }}
+    ), seen AS (
+      SELECT p.fqn, p.want_secs,
+             extract(epoch FROM d.time_interval)::bigint AS have_secs,
+             (extract(epoch FROM d.time_interval)::bigint = p.want_secs) IS TRUE AS applied
+        FROM planned p
+        LEFT JOIN timescaledb_information.dimensions d
+          ON format('%I.%I', d.hypertable_schema, d.hypertable_name) = p.fqn
+         AND d.dimension_number = 1
+    )
+    SELECT count(*) FILTER (WHERE NOT applied) AS still_wrong,
+           count(*) FILTER (WHERE applied) AS now_set,
+           coalesce(string_agg(CASE WHEN NOT applied THEN
+             fqn || ' (wanted ' || want_secs || 's, catalog reports ' || coalesce(have_secs::text, 'none') || 's)'
+           END, ', '), 'none') AS still_wrong_list,
+           coalesce(string_agg(CASE WHEN applied THEN fqn || ' (' || have_secs || 's)' END, ', '), 'none') AS now_set_list
+      FROM seen
+
+  newchunk_sql: |
+    WITH planned(fqn) AS (
+      VALUES {{ outputs.plan.rows | jq('map("(" + .fqn_literal + "::text)") | join(",")') | first }}
+    )
+    SELECT p.fqn AS hypertable,
+           count(c.chunk_name) AS chunks_created_this_run,
+           coalesce(string_agg(DISTINCT extract(epoch FROM (c.range_end - c.range_start))::bigint::text, ', '),
+                    'none yet') AS new_chunk_spans_seconds
+      FROM planned p
+      LEFT JOIN timescaledb_information.chunks c
+        ON format('%I.%I', c.hypertable_schema, c.hypertable_name) = p.fqn
+       AND c.chunk_creation_time >= '{{ execution.startDate }}'::timestamptz
+     GROUP BY 1
+     ORDER BY 1
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Samples the most recent closed chunks of every hypertable, measures bytes per unit
+      of time from their real sizes and classifies each hypertable as TOO_SMALL, TOO_LARGE, OK or
+      SKIPPED. Non hypertables are not in the catalog views it reads, so they can never appear.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.db_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per set_chunk_time_interval call the remediation would make, with the
+      current interval beside the computed one. Nothing here runs unless auto_remediate is true,
+      dry_run is false and the Pause is approved.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.db_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.plan_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      TimescaleDB chunk interval audit on {{ inputs.jdbc_url }}:
+      {{ outputs.audit.size }} hypertables scanned,
+      {{ outputs.audit.rows | jq('map(select(.status == "TOO_SMALL" or .status == "TOO_LARGE")) | length') | first }} outside the target band.
+      {% for r in outputs.audit.rows %}{{ r.status }} {{ r.hypertable }} (interval {{ r.current_interval }}, {{ r.chunks_sampled }} of {{ r.total_chunks }} chunks sampled, average {{ r.avg_chunk_size }}): {{ r.reason }}. {% endfor %}
+      Plan: {{ outputs.plan.size }} set_chunk_time_interval calls
+      ({{ outputs.plan.rows | jq('if length == 0 then "none" else map("\(.hypertable) \(.current_interval) to \(.new_interval)") | join(", ") end') | first }}).
+      Reminder: a new interval applies to chunks created later. Chunks already on disk keep their own range.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.rows | jq('map(select(.status == \"TOO_SMALL\" or .status == \"TOO_LARGE\")) | length') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'TimescaleDB ' ~ inputs.jdbc_url ~ ': ' ~ (outputs.audit.rows | jq('map(select(.status == "TOO_SMALL" or .status == "TOO_LARGE")) | length') | first) ~ ' hypertables have a chunk_time_interval that no longer matches their ingest rate. ' ~ (outputs.audit.rows | jq('map(select(.status == "TOO_SMALL" or .status == "TOO_LARGE") | "\(.status) \(.hypertable) interval \(.current_interval), average chunk \(.avg_chunk_size), proposed \(.proposed_interval)") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Asking for approval to set the new intervals, which apply to future chunks only.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.plan.size > 0 }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Hold the run until a human approves the new intervals. Chunk sizing drives query
+              planning, compression and the granularity at which data can be dropped, so read the
+              proposed interval beside the current one in the plan before approving.
+            pauseDuration: PT2H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                required: false
+                description: Set true to call set_chunk_time_interval on the listed hypertables. Anything else leaves every interval as it is.
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+            then:
+              - id: remediate_intervals
+                type: io.kestra.plugin.core.flow.Loop
+                description: >-
+                  One set_chunk_time_interval call per iteration, sequentially, so two iterations
+                  never write the hypertable catalog at the same time.
+                concurrencyLimit: 1
+                values: "{{ outputs.plan.rows | jq('map(.sql)') | first | toJson }}"
+                tasks:
+                  - id: set_interval
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    allowFailure: true
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ inputs.db_user }}"
+                    password: "{{ inputs.db_password }}"
+                    fetchType: NONE
+                    sql: "{{ item.value }}"
+
+              - id: recheck
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: >-
+                  Reads timescaledb_information.dimensions again for exactly the hypertables the plan
+                  targeted and compares the stored interval with the one that was asked for.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.db_password }}"
+                fetchType: FETCH_ONE
+                sql: "{{ render(vars.recheck_sql) }}"
+
+              - id: new_chunks
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: >-
+                  Read-only. Reports any chunk created during this run and the span it covers, which
+                  is the only direct evidence that a new interval is in force. Zero is the normal
+                  answer on a quiet table.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.db_password }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.newchunk_sql) }}"
+
+              - id: reaudit
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: >-
+                  Full re-scan for the log. Chunks already on disk keep their old range, so a resized
+                  hypertable is expected to stay outside the band here until new chunks replace the
+                  sample.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.db_user }}"
+                password: "{{ inputs.db_password }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.audit_sql) }}"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.recheck.row.still_wrong > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      set_chunk_time_interval did not land on
+                      {{ outputs.recheck.row.still_wrong }} of the targeted hypertables
+                      ({{ outputs.recheck.row.still_wrong_list }}).
+                      timescaledb_information.dimensions still reports the old interval. Check the
+                      remediate_intervals sub-execution logs and confirm the connecting role owns
+                      the hypertables.
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      set_chunk_time_interval landed on {{ outputs.recheck.row.now_set }} hypertables
+                      ({{ outputs.recheck.row.now_set_list }}), read back from
+                      timescaledb_information.dimensions.
+                      This proves the SETTING changed. It does not mean the stored data was
+                      re-chunked, because set_chunk_time_interval applies to chunks created from now
+                      on and leaves every existing chunk at its original range.
+                      Chunks created during this run:
+                      {% for r in outputs.new_chunks.rows %}{{ r.hypertable }} {{ r.chunks_created_this_run }} (spans {{ r.new_chunk_spans_seconds }} seconds){% endfor %}.
+                      Current band status, still measured from the old chunks:
+                      {{ outputs.reaudit.rows | jq('map("\(.status) \(.hypertable) \(.current_interval)") | join(", ")') | first }}.
+                      To move the data itself, copy each table through a new hypertable or let
+                      retention age the old chunks out.
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval was not granted, so no interval was changed.
+                  {{ outputs.plan.size }} set_chunk_time_interval calls are still pending:
+                  {{ outputs.plan.rows | jq('map("\(.hypertable) \(.current_interval) to \(.new_interval)") | join(", ")') | first }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          Every hypertable with enough closed chunks to judge has an average chunk size inside the
+          target band, so no chunk_time_interval needs correcting.
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'TimescaleDB chunk time interval tuning guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "35 5 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: TimescaleDB Chunk Time Interval Tuning Guard
+  shortDescription: Measure real per chunk bytes in TimescaleDB, find hypertables whose chunk_time_interval no longer matches the ingest rate, then set a corrected interval behind an approval and verify it landed.
+  metaTitle: TimescaleDB Chunk Time Interval Tuning Guard with Kestra
+  metaDescription: Find TimescaleDB hypertables with mis-sized chunks, compute a corrected chunk_time_interval, set it behind an approval and verify the catalog.
+  description: |
+    A hypertable's `chunk_time_interval` is chosen once, at create time, against a guess about how much data will arrive. Ingest rates change over a table's life and almost nobody revisits the setting. Get it wrong in one direction and each chunk is enormous, so queries and compression chew memory while a single chunk drop removes far more range than intended. Get it wrong the other way and the table turns into thousands of tiny chunks, so planning time climbs because the planner considers every chunk and the catalog carries a row set for each one.
+
+    This blueprint measures the real size of recent closed chunks with `chunks_detailed_size`, divides by the time span those chunks cover to get bytes per unit of time. It reports every hypertable whose average chunk falls outside a target size band. It computes the interval that would hold about the target bytes, then behind a dry run and an approval `Pause` calls `set_chunk_time_interval`, re-reads `timescaledb_information.dimensions` and fails the run if the stored interval did not change.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## What this fixes and what it cannot fix
+
+    `set_chunk_time_interval` changes the interval used for chunks created from that point on. It does not re-chunk data that is already stored. TimescaleDB offers no command that does.
+
+    So the verification step in this flow proves one thing precisely: the setting landed, read back from `timescaledb_information.dimensions`. It does not prove the table was repaired, because the existing chunks keep their original ranges and their original sizes. The re-audit after a change is expected to still report the hypertable outside the band, because it is still measuring those old chunks. That is correct behaviour, not a failure.
+
+    The flow also reads any chunk created during the run and reports the span it covers, which is the one piece of direct evidence that the new interval is in force. On a quiet table the honest answer is zero new chunks.
+
+    One detail to expect when the first new chunk does arrive: it is usually shorter than the new interval. TimescaleDB aligns chunk windows to the interval, then clips a new chunk where it meets a chunk that already exists, so the first one fills the gap and the second is full width. Measured on the fixture below, 25200 seconds then 154800 seconds against a new interval of 154800.
+
+    To move the stored data as well, copy the table through a fresh hypertable created with the new interval. You can also let a retention policy age the old chunks out while new ones arrive at the corrected size. Neither is done here, because both move data and belong behind their own review.
+
+    ## Findings
+
+    | Status | What the measurement shows | Why it matters |
+    |---|---|---|
+    | `TOO_SMALL` | Average sampled chunk is below the target times the lower band factor | Every query plan considers all chunks, so planning time grows with the chunk count. The catalog also carries a row set per chunk |
+    | `TOO_LARGE` | Average sampled chunk is above the target times the upper band factor | Chunk indexes and working sets no longer fit comfortably in memory. Dropping one chunk also removes far more range than intended |
+    | `OK` | Average sampled chunk sits inside the band | The interval still matches the ingest rate |
+    | `SKIPPED` | Fewer closed chunks than `min_sample_chunks` | There is not enough history to measure an ingest rate, so the table is reported and never resized |
+
+    The sample is the most recent closed chunks only, so an ingest rate from a year ago cannot drive today's proposal. A chunk whose window has not closed yet is excluded, because a half filled chunk understates the real size. Compressed chunks are counted at their compressed size through `chunks_detailed_size`, which is what the instance actually holds. The count of compressed chunks in the sample is reported beside the verdict.
+
+    TimescaleDB guidance is that the indexes and working set of a chunk fit comfortably in memory, roughly a quarter of the RAM on the instance. That is what `target_chunk_bytes` represents. The default of 256 MiB suits a machine with about 8 GiB of memory for 25 percent headroom. Set it from your own instance rather than taking the default.
+
+    ## Safety
+
+    - Read-only unless `auto_remediate` is true and `dry_run` is false. The audit and the plan are two `SELECT` queries.
+    - The write also needs a human to approve the `Pause`. An unanswered resume reads as declined, because the gate is `approved ?? false`.
+    - The plan prints every statement before anything runs, so the change is reviewable from a dry run log.
+    - `min_new_interval` and `max_new_interval` clamp the computed value, so no measurement can push a table to minute sized chunks or to a range nobody can drop usefully.
+    - `min_change_factor` stops the flow rewriting the setting for a small correction.
+    - No data is moved, copied or deleted. The only write is one catalog setting per hypertable.
+    - Tables that are not hypertables cannot appear, because the scan reads `timescaledb_information.hypertables`. Continuous aggregate materialization hypertables are excluded as well, since their sizing follows the aggregate definition.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) joins `timescaledb_information.hypertables`, the first time dimension from `timescaledb_information.dimensions`, the closed chunks from `timescaledb_information.chunks` and their real sizes from `chunks_detailed_size`. It takes the most recent `max_sample_chunks` closed chunks per hypertable, divides total bytes by total span, then classifies each table `TOO_SMALL`, `TOO_LARGE`, `OK` or `SKIPPED`.
+    2. `plan` returns one `set_chunk_time_interval` call per hypertable that needs correcting, with the current interval beside the computed one.
+    3. `summary` logs every hypertable, its chunk count, its average chunk size, the verdict and the plan.
+    4. `route` (`io.kestra.plugin.core.flow.If`):
+       - **inside the band:** logs it.
+       - **outside the band:** `alert` posts the findings to Slack.
+         - `remediate_gate` opens only when `auto_remediate` is true and `dry_run` is false.
+         - `approval_gate` (`io.kestra.plugin.core.flow.Pause`) waits for a human.
+         - `remediate_intervals` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs one `set_chunk_time_interval` per iteration.
+         - `recheck` reads `timescaledb_information.dimensions` again and counts how many targeted hypertables still report the old interval.
+         - `new_chunks` reports any chunk created during the run and its span.
+         - `reaudit` re-scans everything for the log.
+         - `verify_result` fails the run through `io.kestra.plugin.core.execution.Fail` when the stored interval did not change. Otherwise it logs what landed, plus the plain statement that existing chunks were not re-chunked.
+    5. `errors` alerts Slack when the database cannot be reached or a step fails.
+
+    ## What you get
+
+    - A verdict per hypertable built from measured bytes, not from a rule of thumb about the interval.
+    - The corrected interval computed from the observed bytes per day, clamped by a floor and a ceiling you set.
+    - The chunk count, the average, the smallest and the largest sampled chunk, so a table with uneven chunks is visible rather than averaged away.
+    - A write that one human approves, applied one statement at a time.
+    - A verification that reads the catalog back and fails the run if the setting did not change, with an honest statement of what that does and does not prove.
+    - Hypertables inside the band and tables that are not hypertables left untouched.
+
+    ## Who it's for
+
+    - Teams running TimescaleDB where the hypertables were created years ago and the traffic has moved since.
+    - Platform teams who inherited hypertables from several services, each with a different interval chosen by a different person.
+    - Anyone whose query planning time grew without the data growing. Also for anyone who found that dropping one chunk removed a quarter of the history.
+
+    ## Why orchestrate this with Kestra
+
+    Chunk sizing drifts quietly. Nothing errors, nothing alerts, the numbers stay correct, the queries just get slower and the chunk drops get blunter. A cron script could read the catalog, but the useful version of this needs the measurement, a computed proposal, a human who sees both intervals before agreeing, then a read back that fails loudly if the write did not take. Kestra gives it the schedule, the `dry_run` and `auto_remediate` gates, the approval `Pause` and the Slack alert in one flow, with the whole decision visible in the run log afterwards.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against TimescaleDB 2.30.2 on PostgreSQL 16, with a local HTTP sink standing in for Slack. Runs used `target_chunk_bytes: 1048576` so the fixtures stay small, with the shipped band factors 0.25 and 4.0, giving a band of 256 KiB to 4 MiB.
+
+    Four hypertables and one plain table were seeded, measured with `chunks_detailed_size` before any run:
+
+    | Table | Interval before | Closed chunks | Average chunk | Expected verdict |
+    |---|---|---|---|---|
+    | `public.sensor_fine` | 1 hour | 239 | 24 kB | `TOO_SMALL` |
+    | `public.sensor_coarse` | 60 days | 4 | 6202 kB | `TOO_LARGE` |
+    | `public.sensor_ok` | 1 day | 6 | 1191 kB | `OK`, untouched |
+    | `tuned.metrics_new` | 1 day | 2 | 24 kB | `SKIPPED`, too few chunks to judge |
+    | `public.plain_counts` | not a hypertable | n/a | n/a | never appears |
+
+    | Run | Execution | Inputs | Result |
+    |---|---|---|---|
+    | 1 | `4yL4VNrY8XJlNDkAI2E4zp` | defaults plus the small target | 3 hypertables scanned, 2 outside the band. Plan: `sensor_coarse` 60 days to 9 days 22:00:00, `sensor_fine` 1 hour to 1 day 19:00:00. Alert sent. `psql` confirmed all three intervals unchanged afterwards |
+    | 2 | `54ymNa654xf3yayJC7aLoN` | `auto_remediate: true`, `dry_run: false`, resumed with no answer | Paused, then took the declined branch. `psql`: every interval unchanged. An unanswered resume does not read as approval |
+    | 3 | `3GLc49t4sEOzTJzHVu2Iqx` | `auto_remediate: true`, `dry_run: false`, approved | 2 calls ran. `recheck` read `dimensions` back as 154800s and 856800s, 0 still wrong. `psql`: `sensor_fine` 1 hour to 1 day 19:00:00, `sensor_coarse` 60 days to 9 days 22:00:00, `sensor_ok` still 1 day. `new_chunks` honestly reported 0 chunks created during the run. The re-audit still reported both tables outside the band, measured from the old chunks, which is the documented behaviour |
+    | 4 | `14UM9wC7ks2itAO6Vpjf3s` | `schemas: tuned` | 2 scanned, 0 outside the band. `metrics_good` `OK` at 1191 kB, `metrics_new` `SKIPPED` on 2 closed chunks even though its chunks are 24 kB. Clean branch, no alert, no plan |
+    | 5 | `3tzdardMQkte79WTQTB702` | `auto_remediate: true`, `dry_run: false`, straight after run 3 | Both tables still report outside the band, the plan is empty because the computed interval now equals the stored one, so the remediation gate never opened. The flow does not churn the setting |
+    | 6 | `1XgLtEcpS3ZTaJuLUEwUT4` | as a role that is not the hypertable owner, after resetting `sensor_fine` to 1 hour | `set_chunk_time_interval` was refused with "must be owner of hypertable". `recheck` reported 1 still wrong, `wanted 154800s, catalog reports 3600s`, `verify_result` failed the run and the `errors` block posted to Slack. `psql`: still 3600s |
+    | 7 | `2oUhBzTrv6n7XamodS5Iz6` | unreachable host | `audit` failed on the connection, `errors` posted to Slack, run `FAILED` |
+
+    Proof the new interval takes effect, from `psql` after run 3. A row was inserted past the newest chunk boundary on `sensor_fine`, where every existing chunk spans 3600 seconds:
+
+    | Chunk | Range | Span |
+    |---|---|---|
+    | `_hyper_1_239_chunk` | `2026-10-14 00:00` to `01:00` | 3600s, an old chunk |
+    | `_hyper_1_251_chunk` | `2026-10-14 01:00` to `08:00` | 25200s, the first new chunk, clipped where it meets the old one |
+    | `_hyper_1_252_chunk` | `2026-10-14 08:00` to `2026-10-16 03:00` | 154800s, the full new interval |
+
+    So new chunks really are cut at the new interval. The first one after a change is shorter, because its aligned window overlaps the last chunk that already exists and TimescaleDB clips it to the gap. `sensor_coarse` behaved the same way, with its first new chunk at 475200s inside an 856800s window.
+
+    Runs 4 then 1 are the before and after of the detector itself: zero findings on well sized hypertables, then exactly the two mis-sized ones on the degraded schema, with the well sized table and the plain table left out. That is the proof the check can fail.
+
+    ## Prerequisites
+
+    - TimescaleDB 2.x. The flow reads `timescaledb_information.hypertables`, `.dimensions`, `.chunks` and `chunks_detailed_size`. It calls `set_chunk_time_interval` to make the change.
+    - Hypertables whose first dimension is `timestamp with time zone`, the common case. A hypertable partitioned on a plain timestamp, a date or an integer is not scanned, because its interval is a bigint in a unit only the application knows.
+    - The audit needs a role that can read those views. `set_chunk_time_interval` needs the owner of the hypertable.
+    - Local testing:
+      - `docker run -d --name ts -p 5432:5432 -e POSTGRES_PASSWORD=ts -e POSTGRES_DB=metrics timescale/timescaledb:latest-pg16`;
+      - create a hypertable with `chunk_time_interval => INTERVAL '1 hour'`, insert a few days of sparse rows, then run with a small `target_chunk_bytes`.
+
+    ### Secrets
+
+    - `TIMESCALE_PASSWORD`: the database password, read by the `db_password` input default.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/metrics` | TimescaleDB database |
+    | `db_user` | `postgres` | Database user |
+    | `db_password` | `secret('TIMESCALE_PASSWORD')` | Database password |
+    | `schemas` | `public` | Comma separated schemas to scan |
+    | `target_chunk_bytes` | `268435456` | Size each new chunk should aim at, 256 MiB |
+    | `band_low_factor` | `0.25` | Below target times this factor is `TOO_SMALL` |
+    | `band_high_factor` | `4.0` | Above target times this factor is `TOO_LARGE` |
+    | `min_sample_chunks` | `3` | Fewer closed chunks than this is `SKIPPED` |
+    | `max_sample_chunks` | `10` | Most recent closed chunks used to measure |
+    | `min_new_interval` | `1 hour` | Floor on the computed interval |
+    | `max_new_interval` | `30 days` | Ceiling on the computed interval |
+    | `min_change_factor` | `1.5` | Minimum ratio between old and new before proposing |
+    | `auto_remediate` | `false` | Allow the plan to run |
+    | `dry_run` | `true` | Must be `false` for anything to run |
+
+    ## Quick start
+
+    1. Add the `TIMESCALE_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow, set `jdbc_url` and `schemas`.
+    3. Set `target_chunk_bytes` to about a quarter of the instance memory divided by the number of hypertables you query together.
+    4. Run with the defaults and read the plan in the `summary` log.
+    5. Agree the proposed intervals with the table owners, then run with `auto_remediate: true` and `dry_run: false` and approve the `Pause`.
+    6. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Add the copy through a new hypertable as a second, separately approved flow, so stored data moves to the new sizing as well.
+    - Weight the sample by row count instead of bytes when a table's rows vary a lot in width.
+    - Record each run's measured bytes per day into a table and chart how the ingest rate moves, which turns one proposal into a trend.
+    - Scan several databases from one run by looping over a list of JDBC URLs.
+    - Raise `min_sample_chunks` on a fleet where tables are created often, so a new table is never tuned early.
+
+    ## Links
+
+    - set_chunk_time_interval: https://docs.tigerdata.com/api/latest/hypertable/set_chunk_time_interval/
+    - Chunk sizing guidance: https://docs.tigerdata.com/use-timescale/latest/hypertables/about-hypertables/
+    - chunks_detailed_size: https://docs.tigerdata.com/api/latest/hypertable/chunks_detailed_size/
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Day 2 Operations
+    - Performance
+  ee: false
+  demo: false
