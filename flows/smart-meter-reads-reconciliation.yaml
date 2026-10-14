@@ -1,0 +1,373 @@
+id: smart-meter-reads-reconciliation
+namespace: company.team
+description: |
+  Reconcile the kWh billed by the utility against what the AMI meter actually read the moment an
+  import lands, so a bad estimate or a silent meter problem surfaces the same day instead of at
+  month end. A webhook fired by the AMI importer starts the run and a disabled daily schedule
+  stands ready as the backstop until an operator switches it on. The flow writes the read and
+  billing fixtures, sums the hourly reads, compares them with the billed kWh, and flags a delta
+  beyond the tolerance input together with missing hourly slots and backward register jumps. Any
+  breach opens a GitHub issue with the gap table and pings Slack, while verdict, billed kWh,
+  metered kWh and delta percent ship as typed outputs.
+
+triggers:
+  - id: ami_import_completed
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: The AMI import job POSTs here once the interval reads and the billing estimate have landed, so reconciliation starts before anyone reads the statement.
+    key: "{{ secret('AMI_IMPORT_WEBHOOK_KEY') }}"
+  - id: daily_backstop
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Disabled 06:00 UTC net that re-runs the reconciliation every morning, shipped off until an operator enables it after a missed webhook.
+    cron: "0 6 * * *"
+    disabled: true
+
+inputs:
+  - id: tolerance_pct
+    type: FLOAT
+    defaults: 2.0
+    description: Largest absolute percent difference between metered and billed kWh that still counts as reconciled, 2.0 matches the usual utility rounding allowance.
+  - id: expected_hours
+    type: INT
+    defaults: 12
+    description: How many consecutive hourly slots the import should contain, used to spot missing reads inside the interval window.
+  - id: github_repository
+    type: STRING
+    defaults: acme-corp/utility-ops
+    description: Repository that receives the discrepancy issue whenever the delta crosses the tolerance or a gap is detected.
+
+tasks:
+  # --- 1. shared workspace ---
+  - id: reconciliation_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the read fixture, the billing fixture and the reconciler all read the same files for the whole run.
+    tasks:
+      - id: write_meter_fixtures
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Write meter-reads.csv with twelve hourly reads from one meter whose register rolls backward at 07:00, and billing-estimate.json with the billed kWh for the same window.
+        commands:
+          - |
+            set -u
+            cat > meter-reads.csv <<'READS_EOF'
+            meter_id,timestamp,read_kwh,register_kwh
+            AMI-0001,2026-10-13T00:00:00Z,0.82,48219.44
+            AMI-0001,2026-10-13T01:00:00Z,0.79,48220.26
+            AMI-0001,2026-10-13T02:00:00Z,0.85,48221.05
+            AMI-0001,2026-10-13T03:00:00Z,0.91,48221.90
+            AMI-0001,2026-10-13T04:00:00Z,0.88,48222.81
+            AMI-0001,2026-10-13T05:00:00Z,0.84,48223.69
+            AMI-0001,2026-10-13T06:00:00Z,0.80,48224.53
+            AMI-0001,2026-10-13T07:00:00Z,0.77,48210.00
+            AMI-0001,2026-10-13T08:00:00Z,0.83,48210.77
+            AMI-0001,2026-10-13T09:00:00Z,0.86,48211.60
+            AMI-0001,2026-10-13T10:00:00Z,0.90,48212.46
+            AMI-0001,2026-10-13T11:00:00Z,0.87,48213.36
+            READS_EOF
+            cat > billing-estimate.json <<'BILL_EOF'
+            {
+              "statement_id": "STMT-2026-10-13-0042",
+              "account_id": "ACC-55120",
+              "meter_id": "AMI-0001",
+              "period_start": "2026-10-13T00:00:00Z",
+              "period_end": "2026-10-13T12:00:00Z",
+              "tariff": "RESIDENTIAL_TOU",
+              "billed_kwh": 9.95
+            }
+            BILL_EOF
+            echo "meter read rows: $(($(wc -l < meter-reads.csv) - 1))"
+            echo "billed kWh source: billing-estimate.json"
+
+      # --- 2. reconcile reads against the bill ---
+      - id: reconcile_reads
+        type: io.kestra.plugin.scripts.python.Script
+        description: Sum the hourly reads, compare them with the billed kWh, detect missing hourly slots and backward register jumps, and emit the verdict as one repo-standard outputs payload line.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          TOLERANCE_PCT: "{{ inputs.tolerance_pct }}"
+          EXPECTED_HOURS: "{{ inputs.expected_hours }}"
+        script: |
+          import csv
+          import json
+          import os
+          from datetime import datetime, timedelta
+
+          READS_FILE = "meter-reads.csv"
+          BILL_FILE = "billing-estimate.json"
+          DEFAULT_TOLERANCE_PCT = 2.0
+          DEFAULT_EXPECTED_HOURS = 12
+          TS_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+          BILLING_KEYS = ("billed_kwh", "billedKwh", "estimated_kwh", "consumption_kwh", "kwh")
+
+
+          def first_of(record, *keys):
+              for key in keys:
+                  value = record.get(key)
+                  if value is not None and str(value).strip():
+                      return value
+              return None
+
+
+          def as_float(value):
+              try:
+                  return float(str(value).replace(",", "").strip())
+              except (TypeError, ValueError):
+                  return None
+
+
+          def as_positive_int(value, default):
+              try:
+                  parsed = int(float(str(value).strip()))
+              except (TypeError, ValueError):
+                  return default
+              return parsed if parsed > 0 else default
+
+
+          def parse_moment(value):
+              text = (value or "").strip()
+              for fmt in TS_FORMATS:
+                  try:
+                      return datetime.strptime(text, fmt)
+                  except (TypeError, ValueError):
+                      continue
+              return None
+
+
+          def stamp(moment):
+              return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          def read_meter_rows(path):
+              if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                  return []
+              try:
+                  with open(path, "r", encoding="utf-8") as handle:
+                      text = handle.read().strip()
+                  if not text:
+                      return []
+                  rows = []
+                  for record in csv.DictReader(text.splitlines()):
+                      if not isinstance(record, dict):
+                          continue
+                      moment = parse_moment(first_of(record, "timestamp", "interval_start", "ts"))
+                      kwh = as_float(first_of(record, "read_kwh", "kwh"))
+                      register = as_float(first_of(record, "register_kwh", "register"))
+                      meter = str(first_of(record, "meter_id", "meter") or "").strip() or "UNKNOWN"
+                      if moment is None or kwh is None:
+                          continue
+                      rows.append({"meter": meter, "moment": moment, "kwh": kwh, "register": register})
+                  return rows
+              except (OSError, csv.Error, TypeError, AttributeError):
+                  return []
+
+
+          def read_billed(path):
+              if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                  return None, None
+              try:
+                  with open(path, "r", encoding="utf-8") as handle:
+                      document = json.load(handle)
+              except (OSError, ValueError):
+                  return None, None
+              if not isinstance(document, dict):
+                  return None, None
+              meter = str(first_of(document, "meter_id", "meter") or "").strip() or None
+              for key in BILLING_KEYS:
+                  value = as_float(document.get(key))
+                  if value is not None:
+                      return value, meter
+              return None, meter
+
+
+          def env_float(name, default):
+              try:
+                  value = float(os.environ.get(name, ""))
+              except (TypeError, ValueError):
+                  return default
+              return value if value > 0.0 else default
+
+
+          tolerance_pct = env_float("TOLERANCE_PCT", DEFAULT_TOLERANCE_PCT)
+          expected_hours = as_positive_int(os.environ.get("EXPECTED_HOURS"), DEFAULT_EXPECTED_HOURS)
+
+          rows = read_meter_rows(READS_FILE)
+          billed, billed_meter = read_billed(BILL_FILE)
+          rows.sort(key=lambda item: (item["moment"], item["meter"]))
+
+          gaps = []
+          if rows:
+              meter = rows[0]["meter"] if rows[0]["meter"] != "UNKNOWN" else (billed_meter or "UNKNOWN")
+              present = {item["moment"] for item in rows}
+              start = rows[0]["moment"]
+              for offset in range(expected_hours):
+                  slot = start + timedelta(hours=offset)
+                  if slot not in present:
+                      gaps.append({"kind": "missing_hour", "meter": meter, "hour": stamp(slot),
+                                   "detail": "expected hourly slot has no read in meter-reads.csv"})
+              previous = None
+              for item in rows:
+                  if (previous is not None and item["register"] is not None
+                          and previous["register"] is not None and item["meter"] == previous["meter"]
+                          and item["register"] < previous["register"]):
+                      gaps.append({"kind": "backward_jump", "meter": item["meter"], "hour": stamp(item["moment"]),
+                                   "detail": "register fell from %.2f to %.2f" % (previous["register"], item["register"])})
+                  previous = item
+
+          metered_kwh = float(round(sum(item["kwh"] for item in rows), 2))
+          billed_kwh = float(billed) if billed is not None and billed > 0.0 else 0.0
+          if not rows or billed is None or billed <= 0.0:
+              verdict = "NO_DATA"
+              delta_pct = 0.0
+          else:
+              delta_pct = float(round((metered_kwh - billed_kwh) / billed_kwh * 100.0, 2))
+              verdict = "MISMATCH" if (gaps or abs(delta_pct) > tolerance_pct) else "OK"
+
+          print("::" + json.dumps({"outputs": {"verdict": verdict, "billed_kwh": billed_kwh, "metered_kwh": metered_kwh, "delta_pct": delta_pct, "gaps": gaps}}) + "::")
+
+      # --- 3. gap trail ---
+      - id: log_gap_report
+        type: io.kestra.plugin.core.flow.Loop
+        description: Walk the gap list so every missing hour and backward register jump leaves a plain text line in exceptions.txt beside the escalation.
+        values: "{{ outputs.reconcile_reads.vars.gaps }}"
+        tasks:
+          - id: append_gap_line
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Append this gap as one pipe-delimited exceptions.txt line carrying kind, meter, hour and detail.
+            commands:
+              - |
+                printf '%s | %s | %s | %s\n' "{{ each.kind }}" "{{ each.meter }}" "{{ each.hour }}" "{{ each.detail }}" >> exceptions.txt
+                echo "appended {{ each.kind }} at {{ each.hour }} to exceptions.txt"
+
+  # --- 4. escalation gate ---
+  - id: discrepancy_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Escalate whenever the absolute delta percent crosses the tolerance input or any gap was detected, and log a clean reconciliation otherwise.
+    condition: "{{ (outputs.reconcile_reads.vars.delta_pct | number) > (inputs.tolerance_pct | number) or (outputs.reconcile_reads.vars.delta_pct | number) < (0 - (inputs.tolerance_pct | number)) or (outputs.reconcile_reads.vars.gaps | length) > 0 }}"
+    then:
+      - id: open_discrepancy_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: Open a labeled issue holding the gap table and the three kWh numbers, so metering owns a durable backlog record.
+        oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "Smart meter reconciliation {{ outputs.reconcile_reads.vars.verdict }} - delta {{ outputs.reconcile_reads.vars.delta_pct }}% over {{ inputs.tolerance_pct }}%"
+        body: |
+          ## Meter reads against billed kWh
+
+          | Kind | Meter | Hour | Detail |
+          | --- | --- | --- | --- |
+          {% for gap in outputs.reconcile_reads.vars.gaps %}| {{ gap.kind }} | {{ gap.meter }} | {{ gap.hour }} | {{ gap.detail }} |
+          {% endfor %}
+
+          Billed **{{ outputs.reconcile_reads.vars.billed_kwh }} kWh**, metered **{{ outputs.reconcile_reads.vars.metered_kwh }} kWh**, delta **{{ outputs.reconcile_reads.vars.delta_pct }}%** against a {{ inputs.tolerance_pct }}% tolerance, {{ outputs.reconcile_reads.vars.gaps | length }} gap(s) also written to `exceptions.txt`.
+
+          Execution `{{ execution.id }}`.
+
+          Pull the affected interval reads again from the AMI export, then re-run. Raise `tolerance_pct` only for a known rounding allowance the utility already confirmed, because a gap is never explained by tolerance.
+        labels:
+          - smart-meter
+          - reconciliation
+
+      - id: alert_metering_ops
+        type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+        description: Tell the metering ops channel the verdict, the billed and metered kWh, the delta percent and where the issue was filed.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Smart meter reconciliation {{ outputs.reconcile_reads.vars.verdict }} - billed {{ outputs.reconcile_reads.vars.billed_kwh }} kWh vs metered {{ outputs.reconcile_reads.vars.metered_kwh }} kWh, delta {{ outputs.reconcile_reads.vars.delta_pct }}% against {{ inputs.tolerance_pct }}% tolerance, {{ outputs.reconcile_reads.vars.gaps | length }} gap(s) in exceptions.txt. Issue opened in {{ inputs.github_repository }}. Execution {{ execution.id }}."
+          }
+    else:
+      - id: log_reconciled
+        type: io.kestra.plugin.core.log.Log
+        description: Record the clean close so execution history proves the reads and the bill agreed within tolerance.
+        message: "Smart meter reconciliation clean - billed {{ outputs.reconcile_reads.vars.billed_kwh }} kWh, metered {{ outputs.reconcile_reads.vars.metered_kwh }} kWh, delta {{ outputs.reconcile_reads.vars.delta_pct }}% inside the {{ inputs.tolerance_pct }}% tolerance, no gaps to escalate."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    value: "{{ outputs.reconcile_reads.vars.verdict }}"
+  - id: billed_kwh
+    type: FLOAT
+    value: "{{ outputs.reconcile_reads.vars.billed_kwh }}"
+  - id: metered_kwh
+    type: FLOAT
+    value: "{{ outputs.reconcile_reads.vars.metered_kwh }}"
+  - id: delta_pct
+    type: FLOAT
+    value: "{{ outputs.reconcile_reads.vars.delta_pct }}"
+
+extend:
+  title: Reconcile Smart Meter Reads Against the Billing Estimate After Each AMI Import
+  metaTitle: Smart Meter Reads Reconciliation with GitHub and Slack
+  shortDescription: Sums hourly AMI reads against billed kWh, flags tolerance breaches, missing hours and backward register jumps, then escalates through GitHub and Slack.
+  metaDescription: Reconcile AMI meter reads against billed kWh in Kestra, flag tolerance breaches, missing hours and backward register jumps, then escalate via GitHub and Slack.
+  description: |
+    ## How it works
+
+    1. `ami_import_completed` (`io.kestra.plugin.core.trigger.Webhook`, keyed with the `AMI_IMPORT_WEBHOOK_KEY` secret) starts reconciliation the moment the AMI importer finishes loading the interval reads and the billing estimate. `daily_backstop` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 6 * * *`) is the morning net and ships `disabled: true` until an operator turns it on after a webhook that never fired.
+    2. `reconciliation_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) keeps every file in one directory for the whole run. `write_meter_fixtures` (`io.kestra.plugin.scripts.shell.Commands`) writes `meter-reads.csv` with twelve hourly reads from a single meter, the register deliberately rolling backward at 07:00, and `billing-estimate.json` with the billed kWh for the same window.
+    3. `reconcile_reads` (`io.kestra.plugin.scripts.python.Script`, stdlib only) sums `read_kwh` into `metered_kwh`, reads `billed_kwh`, computes `delta_pct`, walks the expected hourly slots for `missing_hour` entries and the register column for `backward_jump` entries, then prints one `::{"outputs": ...}::` line carrying `verdict`, `billed_kwh`, `metered_kwh`, `delta_pct` and `gaps`.
+    4. `log_gap_report` (`io.kestra.plugin.core.flow.Loop`) walks the gap list and `append_gap_line` (`io.kestra.plugin.scripts.shell.Commands`) appends one pipe-delimited line per gap to `exceptions.txt`. `discrepancy_gate` (`io.kestra.plugin.core.flow.If`) escalates when the absolute delta crosses `tolerance_pct` or any gap exists, filing `open_discrepancy_issue` (`io.kestra.plugin.github.issues.Create`) with the gap table and posting `alert_metering_ops` (`io.kestra.plugin.notifications.slack.SlackIncomingWebhook`), while a clean run records `log_reconciled`. The flow level `errors` handler reports a broken run with its execution id, because a failure and a clean import look identical in the logs.
+
+    ## What you get
+
+    - `verdict` (STRING) - `OK` when the delta sits inside tolerance and no gap exists, `MISMATCH` when either check fails, `NO_DATA` when the reads or the bill could not be read.
+    - `billed_kwh` (FLOAT), `metered_kwh` (FLOAT) and `delta_pct` (FLOAT) - the three numbers the gate weighed, ready for a billing dashboard.
+    - One `exceptions.txt` line per gap, a GitHub issue with the gap table and a Slack message whenever the gate opens.
+
+    ## Who it's for
+
+    - Metering and billing ops teams who eyeball an AMI export against a utility estimate before the statement goes out.
+    - Energy engineers who want a missing hour or a rolled back register to raise an issue the same morning it happens.
+    - Anyone who has found a month of drifted reads only when the customer disputed the bill.
+
+    ## Why orchestrate this with Kestra
+
+    A reconciliation script in cron tells nobody when it breaks, and an AMI import that lands half written looks exactly like one that landed clean. Kestra gives the importer a webhook to call, a disabled morning backstop, a shared workspace for the fixtures, a loop that leaves a paper trail per gap, and a gate that turns any breach into a GitHub issue plus a Slack ping. The verdict and the three numbers are typed outputs, so a billing dashboard reads them without scraping logs, and the `errors` handler keeps a broken run visible.
+
+    ## Prerequisites
+
+    - A Kestra worker with python available to the process runner.
+    - An AMI export shaped like `meter-reads.csv` (columns `meter_id`, `timestamp`, `read_kwh`, `register_kwh`) and a billing estimate shaped like `billing-estimate.json` carrying a `billed_kwh` number, or the shipped fixtures while you trial the flow.
+    - A GitHub token able to open issues in the repository named by `github_repository`, plus a Slack incoming webhook for the breach and failure alerts.
+
+    ### Secrets
+
+    - `AMI_IMPORT_WEBHOOK_KEY`: key segment guarding the webhook URL, so only the AMI importer can start a run.
+    - `GITHUB_TOKEN`: token used by `open_discrepancy_issue` to file the gap table.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL for the breach alert and for failure alerts.
+
+    ## Quick start
+
+    1. Add the three secrets to your namespace and import the flow.
+    2. Run once with the default inputs and confirm `verdict` reads `MISMATCH`, `billed_kwh` reads 9.95, `metered_kwh` reads 10.12, `delta_pct` reads 1.71 and `gaps` holds the backward jump at 07:00.
+    3. Point `github_repository` at a repository where issues are welcome, then re-run with `tolerance_pct` at 5.0 and watch the gate stay open on the gap alone.
+    4. Trigger `ami_import_completed` at `/api/v1/{tenant}/executions/webhook/{namespace}/smart-meter-reads-reconciliation/{AMI_IMPORT_WEBHOOK_KEY}`, or set `disabled: false` on `daily_backstop` once the importer is wired.
+
+    ## How to extend
+
+    - Replace the fixture heredocs with an `io.kestra.plugin.core.http.Request` or an `io.kestra.plugin.jdbc.postgresql.Query` task that reads the AMI export from its real source, keeping the same reconciler contract.
+    - Loop `gaps` with `io.kestra.plugin.core.flow.ForEach` to open one issue per missing hour when the metering team triages by feeder.
+
+    ## Links
+
+    - [Kestra flow triggers](https://kestra.io/docs/concepts/triggers)
+    - [Kestra GitHub plugin](https://kestra.io/plugins/plugin-github)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Kestra script tasks](https://kestra.io/plugins/core/tasks/scripts)
+  tags:
+    - Data
+    - Business
+  subTags:
+    - metering
+    - reconciliation
+    - energy
+    - alerts
+  ee: false
+  demo: false
