@@ -1,0 +1,503 @@
+id: cockroachdb-unused-index-drop-guard
+namespace: company.team
+
+description: |
+  Find CockroachDB secondary indexes that no query has ever read, then drop them one at a time behind
+  a dry run, a human approval and a re-read of the index list. The run refuses to drop anything at all
+  unless the index usage counters have been accumulating for longer than a window you set, because
+  those counters reset when a node restarts.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: Any CockroachDB node over the Postgres wire protocol. The SQL port is 26257 by default. The database in this URL is the one the run audits.
+    defaults: "jdbc:postgresql://localhost:26257/defaultdb?sslmode=require"
+
+  - id: db_user
+    type: STRING
+    displayName: SQL user
+    description: The role the queries connect as. It needs to read the index catalog and the node list, plus the privilege to drop an index on the audited tables.
+    defaults: "root"
+
+  - id: password
+    type: STRING
+    displayName: SQL password
+    description: Read from the COCKROACH_PASSWORD secret by default. An insecure local cluster ignores it.
+    defaults: "{{ secret('COCKROACH_PASSWORD') }}"
+
+  - id: include_schemas
+    type: STRING
+    displayName: Schemas to audit
+    description: Comma separated schema names. Empty means every user schema in the connected database.
+    defaults: ""
+
+  - id: min_observation_hours
+    type: INT
+    displayName: Minimum observation window (hours)
+    description: >-
+      The counters in crdb_internal.index_usage_statistics are held in memory per node and reset when
+      a node restarts, so a cluster that restarted an hour ago reports every index as unused. The run
+      compares this window against the shortest node uptime in the cluster and refuses to drop
+      anything when the counters are younger. Set it to longer than your slowest reporting cycle, so
+      a monthly job that is the only reader of an index has had a chance to run.
+    defaults: 168
+
+  - id: min_index_age_hours
+    type: INT
+    displayName: Minimum index age (hours)
+    description: An index created more recently than this is reported but never dropped. A brand new index has no reads yet because nothing has had the chance to use it.
+    defaults: 168
+
+  - id: max_indexes_dropped
+    type: INT
+    displayName: Maximum indexes dropped per run
+    description: Per run ceiling on DROP INDEX, oldest index first. Whatever is left over is reported and picked up by the next run.
+    defaults: 3
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow DROP INDEX. Dropping an index is slow to undo, since rebuilding a large index costs real time and IO, so this is off by default.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any index is dropped. The approval Pause still has to be answered after that.
+    defaults: true
+
+variables:
+  uptime_sql: |
+    SELECT current_database() AS database_name,
+           count(*) FILTER (WHERE is_live)::INT8 AS live_nodes,
+           count(*)::INT8 AS known_nodes,
+           max(started_at)::STRING AS newest_node_start,
+           extract(EPOCH FROM (now()::TIMESTAMP - max(started_at)))::INT8 AS counter_window_seconds,
+           round(extract(EPOCH FROM (now()::TIMESTAMP - max(started_at)))::FLOAT8 / 3600.0, 2) AS counter_window_hours,
+           (extract(EPOCH FROM (now()::TIMESTAMP - max(started_at)))::INT8
+              >= {{ inputs.min_observation_hours }} * 3600) AS counters_trusted
+      FROM crdb_internal.gossip_nodes
+
+  audit_sql: |
+    WITH scope AS (
+      SELECT ct.table_id,
+             ct.schema_name,
+             ct.name AS table_name,
+             format('%I.%I.%I', ct.database_name, ct.schema_name, ct.name) AS qualified_name
+        FROM crdb_internal.tables ct
+        JOIN information_schema.tables it
+          ON it.table_schema = ct.schema_name AND it.table_name = ct.name
+       WHERE ct.database_name = current_database()
+         AND ct.state = 'PUBLIC'
+         AND it.table_type = 'BASE TABLE'
+         AND ct.schema_name NOT IN ('crdb_internal', 'pg_catalog', 'pg_extension', 'information_schema')
+         AND (length(btrim('{{ inputs.include_schemas }}')) = 0
+              OR ct.schema_name = ANY (string_to_array(btrim('{{ inputs.include_schemas }}'), ',')))
+    ), fkcols AS (
+      SELECT conrelid::INT8 AS table_id, conkey::INT8[] AS cols
+        FROM pg_catalog.pg_constraint WHERE contype = 'f' AND conkey IS NOT NULL
+      UNION ALL
+      SELECT confrelid::INT8 AS table_id, confkey::INT8[] AS cols
+        FROM pg_catalog.pg_constraint WHERE contype = 'f' AND confkey IS NOT NULL
+    ), keycols AS (
+      SELECT descriptor_id, index_id, array_agg(column_id) AS cols
+        FROM crdb_internal.index_columns
+       WHERE column_type = 'key' AND implicit = false
+       GROUP BY 1, 2
+    ), idx AS (
+      SELECT s.table_id, s.schema_name, s.table_name, s.qualified_name,
+             ti.index_id, ti.index_name, ti.index_type, ti.is_unique, ti.is_visible,
+             coalesce(ti.created_at::STRING, 'unknown') AS created_at_text,
+             coalesce(kc.cols, ARRAY[]::INT8[]) AS key_cols,
+             coalesce(us.total_reads, 0) AS total_reads,
+             coalesce(us.last_read::STRING, 'never') AS last_read,
+             coalesce(extract(EPOCH FROM (now()::TIMESTAMP - ti.created_at))::INT8, 999999999) AS index_age_seconds
+        FROM scope s
+        JOIN crdb_internal.table_indexes ti ON ti.descriptor_id = s.table_id
+        LEFT JOIN keycols kc ON kc.descriptor_id = ti.descriptor_id AND kc.index_id = ti.index_id
+        LEFT JOIN crdb_internal.index_usage_statistics us
+          ON us.table_id = ti.descriptor_id AND us.index_id = ti.index_id
+    ), cls AS (
+      SELECT i.*,
+             EXISTS (SELECT 1 FROM fkcols f
+                      WHERE f.table_id = i.table_id AND f.cols <@ i.key_cols) AS backs_fk
+        FROM idx i
+    ), v AS (
+      SELECT c.*,
+             CASE WHEN c.index_type = 'primary' THEN 'PRIMARY_PROTECTED'
+                  WHEN c.is_unique THEN 'UNIQUE_PROTECTED'
+                  WHEN c.backs_fk THEN 'FOREIGN_KEY_PROTECTED'
+                  WHEN NOT c.is_visible THEN 'INVISIBLE_UNPROVEN'
+                  WHEN c.total_reads > 0 THEN 'IN_USE'
+                  WHEN c.index_age_seconds < {{ inputs.min_index_age_hours }} * 3600 THEN 'TOO_NEW'
+                  ELSE 'UNUSED' END AS verdict
+        FROM cls c
+    )
+    SELECT table_id, schema_name, table_name, qualified_name, index_id, index_name,
+           verdict, total_reads, last_read, created_at_text, index_age_seconds,
+           is_unique, is_visible, backs_fk, key_cols::STRING AS key_cols_text,
+           count(*) FILTER (WHERE verdict = 'UNUSED') OVER ()::INT8 AS unused_total,
+           'DROP INDEX ' || qualified_name || '@' || quote_ident(index_name) AS drop_sql,
+           CASE WHEN verdict = 'UNUSED'
+                THEN row_number() OVER (PARTITION BY CASE WHEN verdict = 'UNUSED' THEN 0 ELSE 1 END
+                                        ORDER BY index_age_seconds DESC, qualified_name, index_name)
+                ELSE 0 END::INT8 AS drop_rank
+      FROM v
+     ORDER BY CASE WHEN verdict = 'UNUSED' THEN 0 ELSE 1 END, qualified_name, index_name
+     LIMIT 500
+
+  verify_sql: |
+    WITH checks(table_id, index_name, intent) AS (
+      VALUES (0::INT8, '', 'sentinel'){% for r in outputs.audit.rows %}, ({{ r.table_id }}::INT8, '{{ r.index_name | replace({"'": "''"}) }}', '{{ (r.verdict == 'UNUSED' and r.drop_rank <= inputs.max_indexes_dropped) ? 'drop' : 'keep' }}'){% endfor %}
+
+    ), live AS (
+      SELECT descriptor_id, index_name FROM crdb_internal.table_indexes
+    )
+    SELECT count(*) FILTER (WHERE c.intent = 'drop')::INT8 AS targets_checked,
+           count(*) FILTER (WHERE c.intent = 'drop' AND l.index_name IS NOT NULL)::INT8 AS targets_surviving,
+           count(*) FILTER (WHERE c.intent = 'keep')::INT8 AS protected_checked,
+           count(*) FILTER (WHERE c.intent = 'keep' AND l.index_name IS NULL)::INT8 AS protected_missing,
+           coalesce(string_agg(c.index_name, '; ')
+                    FILTER (WHERE c.intent = 'drop' AND l.index_name IS NOT NULL), '') AS survivors,
+           coalesce(string_agg(c.index_name, '; ')
+                    FILTER (WHERE c.intent = 'keep' AND l.index_name IS NULL), '') AS lost_protected,
+           coalesce(string_agg(c.index_name, '; ')
+                    FILTER (WHERE c.intent = 'keep' AND l.index_name IS NOT NULL), '') AS protected_present
+      FROM checks c
+      LEFT JOIN live l ON l.descriptor_id = c.table_id AND l.index_name = c.index_name
+     WHERE c.table_id <> 0
+
+tasks:
+  - id: uptime
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. The shortest node uptime in the cluster, which is the age of the index usage
+      counters. This runs before the audit because a zero read count on a cluster that just restarted
+      says nothing at all.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.uptime_sql) }}"
+
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per index on every base table in scope, with its read count and a verdict.
+      Primary indexes, unique indexes, indexes covering a foreign key, invisible indexes and indexes
+      younger than the age floor are all classified as protected rather than dropped.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.db_user }}"
+    password: "{{ inputs.password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      CockroachDB indexes on {{ outputs.uptime.row.database_name }}: {{ outputs.audit.size }} indexes read,
+      counters {{ outputs.uptime.row.counter_window_hours }}h old across {{ outputs.uptime.row.live_nodes }} live node(s)
+      (newest node start {{ outputs.uptime.row.newest_node_start }}, window needed {{ inputs.min_observation_hours }}h,
+      counters {{ outputs.uptime.row.counters_trusted ? 'trusted' : 'NOT trusted' }}).
+      Drop cap {{ inputs.max_indexes_dropped }} per run.
+      {% for r in outputs.audit.rows %}{{ r.verdict }} {{ r.qualified_name }}@{{ r.index_name }}: {{ r.total_reads }} reads, last read {{ r.last_read }}, created {{ r.created_at_text }} ({{ r.index_age_seconds }}s ago), unique {{ r.is_unique }}, visible {{ r.is_visible }}, covers a foreign key {{ r.backs_fk }}, key columns {{ r.key_cols_text }}{{ r.drop_rank > 0 ? ', rank ' ~ r.drop_rank ~ (r.drop_rank <= inputs.max_indexes_dropped ? ' (in this pass)' : ' (next pass)') : '' }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: >-
+      {{ (outputs.audit.rows | jq('[.[] | select(.verdict == "UNUSED")] | length') | first) > 0 or not outputs.uptime.row.counters_trusted }}
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'CockroachDB ' ~ inputs.jdbc_url ~ ': ' ~ (outputs.audit.rows | jq('[.[] | select(.verdict == "UNUSED")] | length') | first) ~ ' index(es) with zero reads out of ' ~ outputs.audit.size ~ ' read. Counters are ' ~ outputs.uptime.row.counter_window_hours ~ 'h old and the window is ' ~ inputs.min_observation_hours ~ 'h, so they are ' ~ (outputs.uptime.row.counters_trusted ? 'trusted' : 'NOT trusted and nothing will be dropped') ~ '. ' ~ (outputs.audit.rows | jq('[.[] | select(.verdict == "UNUSED")] | if length == 0 then "No unused index" else map("\(.qualified_name)@\(.index_name) (0 reads since \(.created_at_text))") | join("; ") end') | first) ~ '. Protected: ' ~ (outputs.audit.rows | jq('[.[] | select(.verdict != "UNUSED")] | if length == 0 then "none" else map("\(.index_name) \(.verdict)") | join("; ") end') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Waiting on an approval to drop up to ' ~ inputs.max_indexes_dropped ~ ' this pass.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: window_gate
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          The counters in crdb_internal.index_usage_statistics live in each node's memory and start at
+          zero when that node starts, so the age of the youngest node is the age of the evidence. Below
+          the window this branch reports and stops, because dropping on a reset counter set would drop
+          every index in the database.
+        condition: "{{ outputs.uptime.row.counters_trusted }}"
+        then:
+          - id: remediate_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+            then:
+              - id: approval_gate
+                type: io.kestra.plugin.core.flow.Pause
+                description: >-
+                  Hold the run until a human approves. Dropping an index is cheap and rebuilding one is
+                  not, so the drop never starts on its own even with remediation turned on.
+                pauseDuration: PT2H
+                behavior: FAIL
+                onResume:
+                  - id: approved
+                    type: BOOL
+                    defaults: false
+                    description: Set true to drop the listed indexes. Anything else leaves every index in place.
+
+              - id: apply
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+                then:
+                  - id: remediate_drop
+                    type: io.kestra.plugin.core.flow.Loop
+                    description: One DROP INDEX at a time. Two schema changes on the same table collide, so the iterations are serialised.
+                    concurrencyLimit: 1
+                    values: >-
+                      {{ outputs.audit.rows | jq('map(select(.verdict == "UNUSED" and .drop_rank <= ' ~ inputs.max_indexes_dropped ~ ') | .drop_sql)') | first | toJson }}
+                    tasks:
+                      - id: drop_one
+                        type: io.kestra.plugin.jdbc.postgresql.Query
+                        description: A rejected statement leaves the loop running so the re-read below is what decides the run.
+                        allowFailure: true
+                        url: "{{ inputs.jdbc_url }}"
+                        username: "{{ inputs.db_user }}"
+                        password: "{{ inputs.password }}"
+                        fetchType: NONE
+                        sql: "{{ item.value }}"
+
+                  - id: verify
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: Read-only. Reads the index catalog again and checks both directions, that every target is gone and that every protected index is still there.
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ inputs.db_user }}"
+                    password: "{{ inputs.password }}"
+                    fetchType: FETCH_ONE
+                    sql: "{{ render(vars.verify_sql) }}"
+
+                  - id: verify_result
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ outputs.verify.row.targets_surviving > 0 or outputs.verify.row.protected_missing > 0 }}"
+                    then:
+                      - id: remediation_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          The re-read after remediation did not come back clean.
+                          {{ outputs.verify.row.targets_surviving }} of {{ outputs.verify.row.targets_checked }}
+                          targeted indexes are still in the catalog{{ outputs.verify.row.survivors == '' ? '' : ': ' ~ outputs.verify.row.survivors }}.
+                          {{ outputs.verify.row.protected_missing }} of {{ outputs.verify.row.protected_checked }}
+                          protected indexes are gone{{ outputs.verify.row.lost_protected == '' ? '' : ': ' ~ outputs.verify.row.lost_protected }}.
+                          A surviving target means the DROP INDEX was rejected, the role lacks the privilege on that
+                          table or the index was recreated between the audit and the drop, so read the drop_one logs.
+                          A missing protected index means something outside this run changed the schema, which is
+                          worth looking at before the next pass.
+                    else:
+                      - id: remediated
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          Dropped {{ outputs.verify.row.targets_checked }} of
+                          {{ outputs.audit.rows | jq('[.[] | select(.verdict == "UNUSED")] | length') | first }} unused indexes,
+                          cap {{ inputs.max_indexes_dropped }} per run.
+                          Still present, every one of them checked: {{ outputs.verify.row.protected_present }}.
+                          Counters were {{ outputs.uptime.row.counter_window_hours }}h old, window {{ inputs.min_observation_hours }}h.
+
+                else:
+                  - id: declined
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      The approval was not given, so no index was dropped. Would have run:
+                      {{ outputs.audit.rows | jq('map(select(.verdict == "UNUSED" and .drop_rank <= ' ~ inputs.max_indexes_dropped ~ ') | .drop_sql) | if length == 0 then "nothing" else join("; ") end') | first }}.
+
+            else:
+              - id: no_change
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Reporting only (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}).
+                  Would run: {{ outputs.audit.rows | jq('map(select(.verdict == "UNUSED" and .drop_rank <= ' ~ inputs.max_indexes_dropped ~ ') | .drop_sql) | if length == 0 then "nothing" else join("; ") end') | first }}.
+                  Would refuse: {{ outputs.audit.rows | jq('[.[] | select(.verdict != "UNUSED")] | if length == 0 then "nothing" else map("\(.index_name) \(.verdict)") | join("; ") end') | first }}.
+
+        else:
+          - id: refuse_window
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              REFUSED. The index usage counters are only {{ outputs.uptime.row.counter_window_hours }}h old
+              and min_observation_hours is {{ inputs.min_observation_hours }}h, so a zero read count proves
+              nothing yet. The newest of the {{ outputs.uptime.row.known_nodes }} known node(s) started at
+              {{ outputs.uptime.row.newest_node_start }} and every counter in
+              crdb_internal.index_usage_statistics restarted with it. Nothing was dropped. The
+              {{ outputs.audit.rows | jq('[.[] | select(.verdict == "UNUSED")] | length') | first }} index(es)
+              reported with zero reads are listed above for information only. Leave the cluster running and
+              let this schedule come back.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every one of the {{ outputs.audit.size }} indexes in {{ outputs.uptime.row.database_name }} has been read at least once or is protected. Counters are {{ outputs.uptime.row.counter_window_hours }}h old against a {{ inputs.min_observation_hours }}h window."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'CockroachDB unused index drop guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). An index nobody reads costs write throughput silently, so a guard that cannot run is worth reading. Check the logs.'} | toJson }}
+
+triggers:
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled. Always runs in safe mode.
+    cron: "0 3 * * 1"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: CockroachDB Unused Index Drop Guard
+  shortDescription: Find CockroachDB secondary indexes with zero reads in crdb_internal.index_usage_statistics, refuse to act on counters younger than an observation window, then drop them one at a time behind an approval and verify the index list.
+  metaTitle: CockroachDB Unused Index Drop Guard with Kestra
+  metaDescription: Detect CockroachDB indexes no query reads, guard against reset usage counters, drop them behind an approval and re-read the index list.
+  description: |
+    A secondary index that no query reads still costs you on every write. Each INSERT, UPDATE and DELETE on the table maintains it, it takes storage, it is replicated across the cluster, it is backed up with the table. Indexes pile up from abandoned features, from experiments nobody cleaned up and from someone adding one just in case. Nothing in a database tells you an index is dead weight. The write amplification shows up as a slightly slower cluster, with no statement to blame.
+
+    CockroachDB does keep the answer. `crdb_internal.index_usage_statistics` holds a `total_reads` counter per index. A count of zero means the optimizer has not chosen that index once since the counters started. This blueprint reads it for every index on every base table in the connected database, classifies each one, drops the unused ones behind a dry run and a human approval, then reads the catalog again and fails the run if a target is still there.
+
+    The counters are the hard part, so most of the flow is about not trusting them.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    - **The counters reset when a node restarts. Nothing in the view says so.** They live in each node's memory. After a rolling restart, a version upgrade or a pod reschedule, `total_reads` is zero for every index in the cluster, which reads exactly like "nothing uses any of these". Acting on that would drop the whole secondary index set of a healthy database. So the first task reads `crdb_internal.gossip_nodes` and takes the newest `started_at` across the cluster, because the youngest node is the age of the evidence. Below `min_observation_hours` the run reports and refuses, then says which node start it is reading from.
+    - **CockroachDB v24.1 will drop an index backing a UNIQUE constraint without any complaint. The uniqueness goes with it.** Measured: after `DROP INDEX orders@uq_orders_ref` on a table holding one row per `order_ref`, a plain INSERT of a duplicate `order_ref` was accepted. No error, no warning, no CASCADE needed. The `pg_constraint` row disappeared along with the index. An index built with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` behaves the same way. The `is_unique` filter in this flow is not a nicety on top of an engine guard. It is the only thing standing in front of silent data corruption.
+    - **An index covering a foreign key is dropped just as quietly. The constraint stays correct while becoming unbounded work.** After the index on the referencing column went away, the foreign key was still enforced, so an insert of a missing parent key was still rejected. The lookup behind that check just stopped being a point read. Every write to the child table, plus any cascade on the parent, now scans. That is why the flow refuses these too.
+    - **`DROP INDEX` does refuse the primary index**, with `cannot drop the primary index of a table using DROP INDEX`. That is the one case where the engine protects you, which makes it the one case where this flow's own filter is belt and braces rather than the belt.
+    - **`pg_constraint.conindid` is not usable for this on CockroachDB.** Two different constraints on two different tables came back with the same `conindid` value, so joining an index to its constraint through that column is wrong. Uniqueness is read from `crdb_internal.table_indexes.is_unique`, which is the index's own property. Foreign key coverage is derived from `conkey` and `confkey` against the index key columns in `crdb_internal.index_columns`.
+    - **An invisible index cannot earn a zero read verdict.** `NOT VISIBLE` tells the optimizer to ignore the index, so of course nothing reads it. Making an index invisible is the right rehearsal before dropping it, but the counter from that period is evidence of the setting, not of the workload. These are reported as `INVISIBLE_UNPROVEN` and never dropped. Make it visible again, wait out the window, then let the guard decide.
+    - **`crdb_internal.tables` is cluster wide but lists views with no type column**, while `information_schema.tables` has the type for the connected database only. The scope query joins the two and keeps `BASE TABLE`, which is also why one run audits one database, the one named in the JDBC URL.
+
+    ## Safety
+
+    - Four classes of index are never dropped. Each is a predicate in the SQL rather than a line in this document: `index_type = 'primary'`, `is_unique`, any index whose key columns cover a foreign key's columns on either side of the reference, plus any index with `is_visible = false`.
+    - The foreign key test is deliberately wider than "the index the planner would pick". An index is refused when the foreign key's column set is contained in the index's own key columns, so a composite index that merely happens to cover a reference is kept. Over-refusing wastes an index. Under-refusing turns every constrained write into a scan.
+    - `min_index_age_hours` keeps a new index out of the drop set. An index created yesterday has no reads because nothing has had the chance to use it yet.
+    - Nothing is dropped unless `auto_remediate` is true, `dry_run` is false and the approval Pause is answered true. An unanswered Pause reads as a decline, since the gate is `onResume.approved ?? false`.
+    - `max_indexes_dropped` bounds one pass, oldest index first, so a database with forty dead indexes is worked through over successive runs and each pass is small enough to reason about.
+    - The drop loop runs with `concurrencyLimit: 1`, so two schema changes never collide on the same table.
+    - The only statement the flow ever writes is `DROP INDEX <table>@<index>` against names read from the catalog. No CASCADE, no table rewrite, no setting change, no user data touched.
+    - The re-read checks both directions. Every target must be gone and every protected index must still be present. A protected index that vanished during the run fails it.
+
+    ## How it works
+
+    1. `uptime` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) reads `crdb_internal.gossip_nodes` and returns the newest node start, the counter window in hours and whether that window clears `min_observation_hours`.
+    2. `audit` reads one row per index on every base table in scope, joining `crdb_internal.table_indexes`, `crdb_internal.index_columns`, `crdb_internal.index_usage_statistics` and `pg_catalog.pg_constraint`, then gives each index a verdict.
+
+       | Verdict | Meaning |
+       |---|---|
+       | `UNUSED` | Secondary, not unique, no foreign key coverage, visible, old enough, zero reads. The only droppable class |
+       | `IN_USE` | `total_reads` above zero, so the optimizer has chosen it |
+       | `PRIMARY_PROTECTED` | The table's primary index |
+       | `UNIQUE_PROTECTED` | Enforces uniqueness, which is a correctness guarantee |
+       | `FOREIGN_KEY_PROTECTED` | Covers a foreign key's columns, so the constraint check depends on it |
+       | `INVISIBLE_UNPROVEN` | `NOT VISIBLE`, so its zero read count describes the setting rather than the workload |
+       | `TOO_NEW` | Created inside `min_index_age_hours` |
+
+    3. `summary` logs every index with its read count, its last read, its age, its key columns and its verdict, so a run is readable without opening the database.
+    4. `route` (`io.kestra.plugin.core.flow.If`) splits on whether anything is unused or the counters are untrusted.
+       - **clean:** logs that every index has been read or is protected.
+       - **findings:** `alert` posts the unused list, the protected list and the counter age to Slack.
+    5. `window_gate` is the guard that matters. With the counters younger than `min_observation_hours`, `refuse_window` logs the refusal with the node start it read, then the run ends without touching anything.
+    6. `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false. Otherwise `no_change` prints the exact statements it would have issued plus the indexes it would have refused.
+    7. `approval_gate` (`io.kestra.plugin.core.flow.Pause`) holds the run for a human. `remediate_drop` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) then issues one `DROP INDEX <table>@<index>` per target, up to the cap.
+    8. `verify` reads the index catalog again and `verify_result` fails the run through `io.kestra.plugin.core.execution.Fail` when a target survived or a protected index went missing.
+    9. `errors` alerts Slack when the audit itself cannot run.
+
+    ## What you get
+
+    - The indexes in your cluster that no query has read, with the read count, the last read time and the creation time beside each one, so the verdict is auditable rather than asserted.
+    - A refusal you can trust after a restart. The run tells you the counters are too young and names the node start it read, instead of handing you a list of every index in the database.
+    - The indexes it will not touch, with the reason: primary, unique, foreign key, invisible, too new. That list is the proof the detector is precise, not just loud.
+    - A drop that is safe to leave scheduled. It reports until an operator turns on remediation and answers the approval for that run.
+    - A before and after read of the catalog, so a green run means the indexes are actually gone and the protected ones are actually still there.
+
+    ## Who it's for
+
+    - Teams on CockroachDB whose write latency has crept up with no deploy to point at, which is what a pile of unread indexes looks like from the outside.
+    - Anyone inheriting a schema with indexes nobody can explain, where the honest question is which ones are load-bearing.
+    - Platform engineers who want index cleanup to be a reviewed, reversible, scheduled step rather than a one-off afternoon with a SQL client.
+
+    ## Why orchestrate this with Kestra
+
+    The signal here is only valid if it has been accumulating, which makes this a schedule rather than an alert. Kestra runs the audit weekly, keeps each run with its numbers so you can see an index stay at zero reads across passes, posts the findings to Slack and holds the drop behind `auto_remediate`, `dry_run` and a Pause that a named human answers. The re-read after the drop makes the run report success only once the catalog agrees. The per run cap lets a schedule work through a large backlog a few indexes at a time.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against a CockroachDB v24.1 single node cluster reached with the PostgreSQL plugin, with a local HTTP sink standing in for Slack. The seed carried a table with a primary key, one secondary index nothing ever queried, one secondary index queried on purpose so its counter climbed, a unique index and an index covering a foreign key. Every result was read back in the cockroach client, from `SHOW INDEXES FROM` plus `crdb_internal.table_indexes` joined to `crdb_internal.index_usage_statistics`, never from the Kestra log.
+
+    | Run | Cluster state | Result |
+    |---|---|---|
+    | 1 | 9 indexes, counters 9 minutes old against a 168h window | REFUSED. The counter age plus the node start it read are named, nothing dropped |
+    | 2 | same cluster in full write mode (`auto_remediate: true`, `dry_run: false`), 2 targets found, window still 168h | REFUSED again. The approval Pause was never reached |
+    | 3 | same, `min_observation_hours: 0` | 2 `UNUSED`, 2 `IN_USE` at 2 reads plus 1 read, 3 `PRIMARY_PROTECTED`, 1 `UNIQUE_PROTECTED`, 1 `FOREIGN_KEY_PROTECTED`. Alert sent, no change |
+    | 4 | same, `auto_remediate: true`, `dry_run: true` | Both statements printed, all 9 indexes still in the SQL client |
+    | 5 | same, `dry_run: false`, Pause answered false | Nothing dropped, catalog unchanged |
+    | 6 | same, Pause answered true, `max_indexes_dropped: 1` | `idx_orders_region` dropped, the second target reported for the next pass, re-read clean, 8 indexes left |
+    | 7 | the next pass at cap 3 | `idx_items_sku` dropped, 7 left. The unique index, the foreign key index, the read index plus all 3 primaries still present in the client |
+    | 8 | 7 indexes, every one read or protected | Clean. 0 findings |
+    | 9 | an index added `NOT VISIBLE` | `INVISIBLE_UNPROVEN`, reported, never offered for dropping |
+    | 10 | 2 unused again, run as a role holding SELECT but no privilege to drop | Both `DROP INDEX` rejected, the re-read found both survivors, the run FAILED. `errors` alert sent |
+    | 11 | the same 10 indexes with one read given to each unused index | 0 findings on the schema that reported 2 the run before |
+    | 12 | unreachable host | `errors` alert sent |
+
+    ## Prerequisites
+
+    - A CockroachDB cluster reachable over the Postgres wire protocol, which is what the PostgreSQL plugin speaks to it. There is no separate CockroachDB plugin.
+    - The audited database is the one named in `jdbc_url`.
+    - The role needs to read `crdb_internal.index_usage_statistics`, `crdb_internal.table_indexes`, `crdb_internal.index_columns` and `crdb_internal.gossip_nodes`. The node list is admin scoped, so grant the `VIEWCLUSTERMETADATA` system privilege or use a member of `admin`. Dropping an index needs `CREATE` on the table.
+    - Leave `min_observation_hours` longer than your slowest reporting cycle. A monthly report that is the only reader of an index will make it look dead for 29 days of every month.
+    - A cluster that restarts often, for example one rescheduled by an orchestrator, may never clear the window. That is the correct answer rather than a limitation: these counters cannot support a drop decision on a cluster whose nodes do not stay up.
+
+    ### Secrets
+
+    - `COCKROACH_PASSWORD`: the SQL password, read by the `password` input's default. An insecure local node ignores it.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:26257/defaultdb?sslmode=require` | Any node plus the database to audit |
+    | `db_user` | `root` | The role the queries connect as |
+    | `password` | `{{ secret('COCKROACH_PASSWORD') }}` | SQL password |
+    | `include_schemas` | empty | Comma separated schemas, empty means every user schema |
+    | `min_observation_hours` | `168` | How long the usage counters must have been accumulating before a drop is allowed |
+    | `min_index_age_hours` | `168` | An index younger than this is reported, never dropped |
+    | `max_indexes_dropped` | `3` | Per run ceiling on `DROP INDEX` |
+    | `auto_remediate` | `false` | Allow the drop |
+    | `dry_run` | `true` | Must be `false` before anything is dropped |
+
+    ## Quick start
+
+    1. Add the `COCKROACH_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url` to a node, with the database you want audited in the path.
+    3. Run it once as it ships. Read the counter age line first. If it refuses, that is the flow working.
+    4. Once the window clears, read the `UNUSED` list and the protected list beside it. Check the protected list looks right for your schema before trusting the other one.
+    5. Drop with `auto_remediate: true` and `dry_run: false`, then answer the Pause. Start with `max_indexes_dropped: 1`.
+    6. Enable the `weekly` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Make each target `NOT VISIBLE` first instead of dropping it, wait a cycle, then drop it. The flow already refuses to drop an invisible index, so an invisible index that nobody has complained about is a cleaner handover between the two passes.
+    - Record each index's read count in a KV key per run and require N consecutive zero-read passes before offering it, which survives a restart that the uptime guard would otherwise have to wait out.
+    - Capture `create_statement` from `crdb_internal.table_indexes` into the Slack message or a file before the drop, so rebuilding an index someone turns out to need is a copy and paste.
+    - Loop over several databases or clusters by passing a list of JDBC URLs, since one run audits the database in its own URL.
+    - Add a branch that compares the index's storage size from `crdb_internal.ranges` so the Slack message leads with the indexes whose removal frees the most.
+
+    ## Links
+
+    - Index usage statistics and unused indexes: https://www.cockroachlabs.com/docs/v24.1/show-index
+    - DROP INDEX: https://www.cockroachlabs.com/docs/v24.1/drop-index
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Performance
+    - Maintenance & Optimization
+  ee: false
+  demo: false
