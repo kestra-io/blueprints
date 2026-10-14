@@ -1,0 +1,489 @@
+id: postgres-temp-spill-work-mem-tuning-guard
+namespace: company.team
+
+description: |
+  Find the PostgreSQL roles whose queries keep spilling sorts and hashes to disk, by reading
+  temp_blks_written per role and database from pg_stat_statements. Only the roles with
+  no work_mem override of their own are kept. work_mem is per sort or hash node and per connection,
+  so a reporting role left on the server default writes temp files under pgsql_tmp on every big
+  sort while nothing errors. Alert Slack with a value computed from the measured spill and
+  bounded by a host memory budget, then behind a dry run and a Pause set it with ALTER ROLE,
+  re-read pg_db_role_setting and fail the run if the override did not land.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    defaults: "jdbc:postgresql://localhost:5432/app"
+
+  - id: excluded_roles
+    type: ARRAY
+    itemType: STRING
+    displayName: Roles not tuned
+    description: Roles whose spilling is accepted, for example a nightly batch role you want on disk.
+    defaults:
+      - migration_bot
+
+  - id: override_scope
+    type: SELECT
+    displayName: Scope of the override
+    description: ROLE sets it for the role everywhere. ROLE_IN_DATABASE sets it only in the database where the role spills worst.
+    values:
+      - ROLE
+      - ROLE_IN_DATABASE
+    defaults: ROLE
+
+  - id: min_total_temp_mb
+    type: INT
+    displayName: Minimum temp megabytes written before a role is reported
+    defaults: 64
+
+  - id: high_severity_temp_mb
+    type: INT
+    displayName: Temp megabytes written that make a finding HIGH
+    defaults: 1024
+
+  - id: headroom_multiplier
+    type: FLOAT
+    displayName: Headroom over the worst measured single call
+    description: An in-memory sort holds more than the packed tape bytes an external merge writes. Measured at 1.7 times on a 400000 row text sort, so the default leaves some margin.
+    defaults: 2.0
+
+  - id: max_work_mem_mb
+    type: INT
+    displayName: Hard ceiling for the proposed work_mem
+    defaults: 256
+
+  - id: ram_fraction_for_work_mem
+    type: FLOAT
+    displayName: Fraction of host memory the sum of all work_mem may claim
+    description: Used with max_connections and shared_buffers to cap the proposal, because work_mem is charged per node and per connection.
+    defaults: 0.25
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for ALTER ROLE to run.
+    defaults: true
+
+variables:
+  audit_sql: |
+    WITH params AS (
+      SELECT (SELECT setting::bigint FROM pg_settings WHERE name = 'block_size') AS block_size,
+             (SELECT setting::bigint FROM pg_settings WHERE name = 'max_connections') AS max_connections,
+             (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers') AS shared_buffers_blocks,
+             (SELECT setting FROM pg_settings WHERE name = 'work_mem') AS server_work_mem_kb
+    ), budget AS (
+      SELECT p.*,
+             p.shared_buffers_blocks * p.block_size AS shared_buffers_bytes,
+             greatest(((p.shared_buffers_blocks * p.block_size * 4)::numeric * {{ inputs.ram_fraction_for_work_mem }} / p.max_connections / 1024)::bigint, 1024::bigint) AS budget_kb
+        FROM params p
+    ), cfg AS (
+      SELECT s.setrole, s.setdatabase, split_part(c, '=', 1) AS name,
+             substr(c, length(split_part(c, '=', 1)) + 2) AS value
+        FROM pg_db_role_setting s, unnest(s.setconfig) c
+    ), stmt AS (
+      SELECT q.userid, q.dbid, q.calls, q.temp_blks_written,
+             (q.temp_blks_written::numeric / q.calls) AS blks_per_call,
+             left(regexp_replace(q.query, '[[:space:]]+', ' ', 'g'), 110) AS query_sample
+        FROM pg_stat_statements q
+       WHERE q.temp_blks_written > 0 AND q.calls > 0
+    ), per_db AS (
+      SELECT s.userid, s.dbid, sum(s.calls) AS calls, sum(s.temp_blks_written) AS temp_blks,
+             max(s.blks_per_call) AS max_blks_per_call,
+             (array_agg(s.query_sample ORDER BY s.blks_per_call DESC))[1] AS worst_query
+        FROM stmt s GROUP BY s.userid, s.dbid
+    ), named AS (
+      SELECT r.oid AS roleoid, r.rolname, r.rolsuper, d.oid AS dboid, d.datname, p.calls, p.temp_blks,
+             p.max_blks_per_call, p.worst_query
+        FROM per_db p
+        JOIN pg_roles r ON r.oid = p.userid
+        JOIN pg_database d ON d.oid = p.dbid
+       WHERE d.datallowconn AND NOT d.datistemplate AND r.rolname !~ '^pg_'
+    ), ranked AS (
+      SELECT n.*,
+             row_number() OVER (PARTITION BY n.roleoid ORDER BY n.max_blks_per_call DESC, n.datname) AS rn,
+             sum(n.temp_blks) OVER (PARTITION BY n.roleoid) AS role_temp_blks,
+             sum(n.calls) OVER (PARTITION BY n.roleoid) AS role_calls,
+             max(n.max_blks_per_call) OVER (PARTITION BY n.roleoid) AS role_max_blks_per_call,
+             string_agg(n.datname, '+') OVER (PARTITION BY n.roleoid) AS role_databases
+        FROM named n
+    ), resolved AS (
+      SELECT w.roleoid, w.rolname, w.rolsuper, w.dboid, w.datname, w.worst_query,
+             w.role_temp_blks, w.role_calls, w.role_max_blks_per_call, w.role_databases,
+             b.block_size, b.budget_kb, b.max_connections, b.shared_buffers_bytes, b.server_work_mem_kb,
+             coalesce(rd.value, ro.value, dbs.value, b.server_work_mem_kb) AS eff_raw,
+             CASE WHEN rd.value IS NOT NULL THEN 'ROLE_IN_DATABASE'
+                  WHEN ro.value IS NOT NULL THEN 'ROLE'
+                  WHEN dbs.value IS NOT NULL THEN 'DATABASE'
+                  ELSE 'SERVER' END AS eff_source,
+             EXISTS (SELECT 1 FROM cfg c WHERE c.setrole = w.roleoid AND c.name = 'work_mem') AS has_role_override
+        FROM ranked w CROSS JOIN budget b
+        LEFT JOIN cfg rd ON rd.setrole = w.roleoid AND rd.setdatabase = w.dboid AND rd.name = 'work_mem'
+        LEFT JOIN cfg ro ON ro.setrole = w.roleoid AND ro.setdatabase = 0 AND ro.name = 'work_mem'
+        LEFT JOIN cfg dbs ON dbs.setrole = 0 AND dbs.setdatabase = w.dboid AND dbs.name = 'work_mem'
+       WHERE w.rn = 1
+    ), sized AS (
+      SELECT r.*,
+             round(r.role_temp_blks * r.block_size / 1048576.0, 1) AS total_temp_mb,
+             round(r.role_max_blks_per_call * r.block_size / 1048576.0, 1) AS worst_call_temp_mb,
+             CASE WHEN r.eff_raw ~* '^[0-9]+[[:space:]]*kb$' THEN (regexp_replace(r.eff_raw, '[^0-9]', '', 'g'))::bigint
+                  WHEN r.eff_raw ~* '^[0-9]+[[:space:]]*mb$' THEN (regexp_replace(r.eff_raw, '[^0-9]', '', 'g'))::bigint * 1024
+                  WHEN r.eff_raw ~* '^[0-9]+[[:space:]]*gb$' THEN (regexp_replace(r.eff_raw, '[^0-9]', '', 'g'))::bigint * 1048576
+                  WHEN r.eff_raw ~ '^[0-9]+$' THEN r.eff_raw::bigint END AS eff_kb,
+             least({{ inputs.max_work_mem_mb }}::bigint * 1024, r.budget_kb) AS cap_kb,
+             greatest(ceil(r.role_max_blks_per_call * r.block_size * {{ inputs.headroom_multiplier }} / 1024.0)::bigint, 1024::bigint) AS need_kb
+        FROM resolved r
+    ), proposal AS (
+      SELECT s.*,
+             least(s.cap_kb, (ceil(s.need_kb / 1024.0)::bigint * 1024))::bigint AS proposed_kb
+        FROM sized s
+    ), classified AS (
+      SELECT p.*,
+             CASE WHEN p.proposed_kb % 1024 = 0 THEN (p.proposed_kb / 1024)::text || 'MB' ELSE p.proposed_kb::text || 'kB' END AS proposed_display,
+             CASE WHEN p.rolsuper THEN 'SPILL_BY_SUPERUSER_SKIPPED'
+                  WHEN p.rolname IN ({{ inputs.excluded_roles | jq('if length == 0 then "\u0027\u0027" else map("\u0027" + gsub("\u0027"; "\u0027\u0027") + "\u0027") | join(",") end') | first }}) THEN 'SPILL_ROLE_EXCLUDED'
+                  WHEN p.has_role_override THEN 'SPILL_WITH_OVERRIDE_PRESENT'
+                  WHEN p.proposed_kb <= coalesce(p.eff_kb, 0) THEN 'SPILL_ALREADY_SIZED'
+                  ELSE 'TEMP_SPILL_NO_WORK_MEM_OVERRIDE' END AS finding
+        FROM proposal p
+       WHERE round(p.role_temp_blks * p.block_size / 1048576.0, 1) >= {{ inputs.min_total_temp_mb }}
+    )
+    SELECT c.finding,
+           CASE WHEN c.finding <> 'TEMP_SPILL_NO_WORK_MEM_OVERRIDE' THEN 'INFO'
+                WHEN c.total_temp_mb >= {{ inputs.high_severity_temp_mb }} THEN 'HIGH'
+                ELSE 'MEDIUM' END AS severity,
+           c.rolname AS role, c.datname AS database, c.role_databases AS databases,
+           '{{ inputs.override_scope }}' AS scope,
+           c.role_calls AS calls, c.total_temp_mb, c.worst_call_temp_mb,
+           c.eff_raw AS effective_work_mem, c.eff_source AS effective_source, c.eff_kb AS effective_kb,
+           c.proposed_kb, c.proposed_display, c.cap_kb, c.budget_kb, c.need_kb,
+           (c.need_kb > c.cap_kb) AS clamped_by_budget, c.worst_query,
+           format('%s wrote %s MB of temp files over %s calls in %s, worst single call %s MB. Effective work_mem is %s from %s. Proposal %s (worst call x %s headroom, rounded up to a whole MB), ceiling %s kB from max_work_mem_mb and a host budget of %s kB (shared_buffers %s bytes, max_connections %s)',
+                  c.rolname, c.total_temp_mb, c.role_calls, c.role_databases, c.worst_call_temp_mb,
+                  c.eff_raw, c.eff_source, c.proposed_display, {{ inputs.headroom_multiplier }}, c.cap_kb, c.budget_kb,
+                  c.shared_buffers_bytes, c.max_connections) AS detail,
+           CASE WHEN c.finding <> 'TEMP_SPILL_NO_WORK_MEM_OVERRIDE' THEN NULL
+                WHEN '{{ inputs.override_scope }}' = 'ROLE_IN_DATABASE'
+                  THEN format('ALTER ROLE %I IN DATABASE %I SET work_mem = %L', c.rolname, c.datname, c.proposed_display)
+                ELSE format('ALTER ROLE %I SET work_mem = %L', c.rolname, c.proposed_display) END AS fix_sql
+      FROM classified c
+     ORDER BY (c.finding = 'TEMP_SPILL_NO_WORK_MEM_OVERRIDE') DESC, c.total_temp_mb DESC, c.rolname
+
+  reverify_sql: |
+    WITH targets(role, database, want_kb) AS (
+      VALUES {{ fromJson(outputs.actionable.values.items) | jq('map("(\u0027" + (.role | gsub("\u0027"; "\u0027\u0027")) + "\u0027,\u0027" + (.database | gsub("\u0027"; "\u0027\u0027")) + "\u0027," + (.proposed_kb | tostring) + ")") | join(",")') | first }}
+    ), cfg AS (
+      SELECT s.setrole, s.setdatabase, split_part(c, '=', 1) AS name,
+             substr(c, length(split_part(c, '=', 1)) + 2) AS value
+        FROM pg_db_role_setting s, unnest(s.setconfig) c
+    ), found AS (
+      SELECT t.role, t.database, t.want_kb, c.value AS actual_raw,
+             CASE WHEN c.value ~* '^[0-9]+[[:space:]]*kb$' THEN (regexp_replace(c.value, '[^0-9]', '', 'g'))::bigint
+                  WHEN c.value ~* '^[0-9]+[[:space:]]*mb$' THEN (regexp_replace(c.value, '[^0-9]', '', 'g'))::bigint * 1024
+                  WHEN c.value ~* '^[0-9]+[[:space:]]*gb$' THEN (regexp_replace(c.value, '[^0-9]', '', 'g'))::bigint * 1048576
+                  WHEN c.value ~ '^[0-9]+$' THEN c.value::bigint END AS actual_kb
+        FROM targets t
+        LEFT JOIN pg_roles r ON r.rolname = t.role
+        LEFT JOIN pg_database d ON d.datname = t.database
+        LEFT JOIN cfg c ON c.setrole = r.oid AND c.name = 'work_mem'
+                       AND (('{{ inputs.override_scope }}' = 'ROLE' AND c.setdatabase = 0)
+                         OR ('{{ inputs.override_scope }}' = 'ROLE_IN_DATABASE' AND c.setdatabase = d.oid))
+    )
+    SELECT f.role, f.database, '{{ inputs.override_scope }}' AS scope, f.want_kb, f.actual_raw, f.actual_kb,
+           CASE WHEN f.actual_kb IS NULL THEN 'MISSING'
+                WHEN f.actual_kb = f.want_kb THEN 'OK'
+                ELSE 'MISMATCH' END AS status
+      FROM found f
+     ORDER BY f.role, f.database
+
+tasks:
+  - id: precheck
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read-only. The spill counters come from pg_stat_statements, so confirm it is installed before reading it.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: SELECT count(*)::int AS installed FROM pg_extension WHERE extname = 'pg_stat_statements'
+
+  - id: precheck_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.precheck.row.installed < 1 }}"
+    then:
+      - id: extension_missing
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          pg_stat_statements is not installed in this database, so per role temp file counters are not available. Add pg_stat_statements to shared_preload_libraries, restart PostgreSQL, then run CREATE EXTENSION pg_stat_statements.
+
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read-only. Joins pg_stat_statements temp_blks_written per role and database against pg_db_role_setting. Computes a bounded proposal.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: actionable
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Superusers, excluded roles, roles that already carry an override and roles whose effective value already covers the spill stay in the report as INFO only.
+    values:
+      items: "{{ outputs.audit.rows | jq('map(select(.severity != \"INFO\"))') | first | toJson }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Temp spill audit on {{ inputs.jdbc_url }}: {{ outputs.audit.size }} roles over the reporting threshold, {{ fromJson(outputs.actionable.values.items) | length }} of them with no work_mem override.
+      {% for r in outputs.audit.rows %}{{ r.severity }} {{ r.finding }} {{ r.detail }}. Worst statement: {{ r.worst_query }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.actionable.values.items) | length > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'PostgreSQL ' ~ inputs.jdbc_url ~ ': roles spilling sorts and hashes to disk with no work_mem override of their own: ' ~ (fromJson(outputs.actionable.values.items) | jq('map("\(.role) \(.total_temp_mb) MB temp over \(.calls) calls, worst call \(.worst_call_temp_mb) MB, now \(.effective_work_mem) from \(.effective_source), proposing \(.proposed_display)") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Waiting for approval to apply.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Hold the run until a human approves the value. work_mem is charged per sort or hash node and per connection, so a value that is right for one report can exhaust host memory once many sessions run it at once. Read the proposal, the ceiling and the host budget in the finding. Check the value against what the box really has before approving.
+            pauseDuration: PT2H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: >-
+                  Set true to run ALTER ROLE SET work_mem for the listed roles. Anything else leaves them on the value they have now.
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+            then:
+              - id: remediate_overrides
+                type: io.kestra.plugin.core.flow.Loop
+                description: Sequential on purpose. Concurrent ALTER ROLE SET on the same role collide in pg_db_role_setting with tuple concurrently updated.
+                concurrencyLimit: 1
+                values: "{{ fromJson(outputs.actionable.values.items) | jq('map(.fix_sql) | unique') | first | toJson }}"
+                tasks:
+                  - id: set_work_mem
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: A rejected statement is allowed to pass here, because the re-read below is what decides the run.
+                    allowFailure: true
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('POSTGRES_USERNAME') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: NONE
+                    sql: "{{ item.value }}"
+
+              - id: reverify
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Reads pg_db_role_setting again and compares the stored value with the one that was proposed.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH
+                sql: "{{ render(vars.reverify_sql) }}"
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.reverify.rows | jq('map(select(.status != \"OK\")) | length') | first > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      The work_mem override did not land for {{ outputs.reverify.rows | jq('map(select(.status != "OK")) | map("\(.role)/\(.database) \(.status) actual=\(.actual_raw // "none") wanted=\(.want_kb) kB") | join(", ")') | first }}. The connecting role needs to be a superuser or hold ADMIN on the target role. The value also has to be inside the valid range for work_mem.
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Applied and re-read from pg_db_role_setting: {{ outputs.reverify.rows | jq('map("\(.role)/\(.database) work_mem=\(.actual_raw)") | join("; ")') | first }}. This proves the override is stored. It does not prove the spilling stopped, which depends on the queries that run next. Settings are read at connect time, so sessions these roles already hold keep the old value until they reconnect.
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval was declined or the resume carried no answer, so nothing was changed. The roles still run on {{ fromJson(outputs.actionable.values.items) | jq('map("\(.role)=\(.effective_work_mem) from \(.effective_source)") | join(", ")') | first }}.
+        else:
+          - id: would_change
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              No change applied (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}). The statements this run would have proposed for approval: {{ fromJson(outputs.actionable.values.items) | jq('map(.fix_sql) | unique | join("; ")') | first }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No role is spilling more than {{ inputs.min_total_temp_mb }} MB of temp files without a work_mem override of its own. {{ outputs.audit.size }} rows are in the report, all of them INFO.
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'PostgreSQL temp spill work_mem tuning guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled. Always in safe mode.
+    cron: "20 6 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: PostgreSQL Temp Spill work_mem Tuning Guard
+  shortDescription: Find the PostgreSQL roles whose sorts and hashes keep spilling to disk with no work_mem override of their own, size a value from the measured spill under a host memory budget, set it with ALTER ROLE behind an approval, then re-read pg_db_role_setting and fail the run if it did not land.
+  metaTitle: PostgreSQL Temp Spill work_mem Tuning Guard with Kestra
+  metaDescription: Find PostgreSQL roles spilling sorts to disk with no work_mem override, size a value from the measured spill, set it with ALTER ROLE and verify.
+  description: |
+    `work_mem` is the memory one sort or one hash node may use before it spills to disk. The default is 4MB. It is charged per node rather than per query, so a reporting role running wide sorts and hash joins spills on almost every statement. PostgreSQL writes temp files under `pgsql_tmp`, the query slows by an order of magnitude, nothing errors, nothing is logged by default. The only trace is `temp_blks_written` in `pg_stat_statements` plus `temp_files` and `temp_bytes` in `pg_stat_database`. The analyst just reports that the dashboard is slow.
+
+    This blueprint reads `temp_blks_written` per role and per database from `pg_stat_statements`, keeps the roles that have no `work_mem` override of their own in `pg_db_role_setting`, computes a value from the worst single call they measured, caps it against a host memory budget, then behind a dry run and a `Pause` applies it with `ALTER ROLE ... SET work_mem` and re-reads `pg_db_role_setting` to prove the override is stored.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    | Finding | Severity | Meaning |
+    |---|---|---|
+    | `TEMP_SPILL_NO_WORK_MEM_OVERRIDE` | High or Medium | The role spills past the reporting threshold with no `work_mem` setting of its own. This is the only finding that gets a statement |
+    | `SPILL_WITH_OVERRIDE_PRESENT` | Info | The role spills but already carries its own `work_mem`. Somebody tuned it, so the flow leaves it alone |
+    | `SPILL_ALREADY_SIZED` | Info | The role spills, but the value it already gets covers the measured spill. A budget cap sitting below that value has the same effect, so a change would not help |
+    | `SPILL_BY_SUPERUSER_SKIPPED` | Info | A superuser spilled. Superusers are never altered |
+    | `SPILL_ROLE_EXCLUDED` | Info | The role is in `excluded_roles` |
+
+    The effective value is resolved the way PostgreSQL resolves it at login: `ALTER ROLE ... IN DATABASE`, then `ALTER ROLE`, then `ALTER DATABASE`, then the server setting.
+
+    ## Safety
+
+    `work_mem` is charged per sort or hash node and per connection, so a value times many concurrent sessions is what exhausts host memory. That is the real risk here, which is why the write sits behind a `Pause` and why the proposal is bounded twice.
+
+    - The proposal comes from the worst single call the role actually measured, not from a number somebody picked. Two forces pull against each other there. The measured bytes are the total for the whole statement, which is above what any single node inside it needed. The tuples an external merge packs onto tape are smaller than the same tuples held in memory for a quicksort, measured here at 1.7 times, which is what `headroom_multiplier` covers. The proposal is therefore an estimate, so a role that still spills after the change wants a higher multiplier rather than a hand picked number.
+    - `max_work_mem_mb` is a hard ceiling.
+    - A second ceiling comes from the server itself: `shared_buffers` is conventionally a quarter of host memory, so four times `shared_buffers` is used as a memory proxy, `ram_fraction_for_work_mem` of it is the whole allowance for sorting. `max_connections` then divides it. A proposal above that comes back clamped with `clamped_by_budget` set, so a tiny instance is never handed a large value.
+    - The override is per role, not per database or per server, so the blast radius is the reporting role rather than the whole instance. OLTP roles keep the value they have.
+    - Superusers, `pg_*` roles, template databases and `excluded_roles` are never touched.
+
+    **What the verification proves, exactly.** The second read of `pg_db_role_setting` proves the override is stored at the scope that was asked for, with the value that was proposed. It does not prove the spilling stopped. That depends on the queries that run next, on how many nodes each plan has, on how skewed the data is. Settings are read at connect time, so sessions the role already holds keep the old value until they reconnect. To see the payoff, open a new session as the role, check `SHOW work_mem`, then run the same query and compare `Sort Method` in `EXPLAIN (ANALYZE, BUFFERS)` and `temp_blks_written` before against after.
+
+    ## How it works
+
+    1. `precheck` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) confirms `pg_stat_statements` is installed. `precheck_gate` fails with a clear message if it is not, since the spill counters live nowhere else.
+    2. `audit` (read-only) sums `temp_blks_written` and `calls` per role and database from `pg_stat_statements`, takes the worst single call, resolves the effective `work_mem` and its source from `pg_db_role_setting`, computes `need_kb` from the worst call times `headroom_multiplier`, clamps it to the ceiling and the host budget, then builds one `ALTER ROLE ... SET work_mem` per role with `format('%I')` plus `%L`.
+    3. `actionable` keeps only the roles with no override of their own. `summary` logs every row with its numbers.
+    4. `route` (`io.kestra.plugin.core.flow.If`): nothing actionable logs it, otherwise `alert` posts the roles, their spill and the proposed value to Slack.
+    5. `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false. In any other combination `would_change` logs the exact statements and stops.
+    6. `approval_gate` (`io.kestra.plugin.core.flow.Pause`) holds the run. On approval, `remediate_overrides` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs one statement at a time, because concurrent `ALTER ROLE ... SET` on the same role collide in `pg_db_role_setting`.
+    7. `reverify` reads `pg_db_role_setting` again and compares the stored value with the proposed one. `verify_result` fails the run through `io.kestra.plugin.core.execution.Fail` on any `MISSING` or `MISMATCH`.
+    8. `errors` alerts Slack when the run fails.
+
+    ## What you get
+
+    - The roles whose queries are really spilling, measured in temp bytes per role rather than guessed from a slow dashboard.
+    - A value derived from the spill the role measured, with the arithmetic and both ceilings printed in the finding, so the number can be argued with before it is approved.
+    - A per role change, so one bad value cannot reach the whole instance.
+    - A second read of `pg_db_role_setting` that fails the run when the statement was rejected, which is what happens when the connecting role lacks the rights or the value is outside the range PostgreSQL accepts.
+    - Spilling roles that someone already tuned, superusers and roles you exclude, all visible in the report, none of them altered.
+
+    ## Who it's for
+
+    - Teams with a reporting or BI role whose dashboards got slow with no error anywhere.
+    - DBAs who have found gigabytes under `pgsql_tmp` and want the per role fix done, bounded and proven.
+    - Platform engineers who need the memory arithmetic written down rather than carried in somebody's head.
+
+    ## Why orchestrate this with Kestra
+
+    The measurement lives in `pg_stat_statements` and accumulates between resets, so it wants reading on a schedule rather than during an incident. Kestra reads it, sizes the change against the server's own memory numbers, posts the proposal to Slack, applies it only behind `auto_remediate`, `dry_run` and a human approval, one statement at a time, re-reads the catalog to prove it landed. The record of who approved what stays in Kestra.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against PostgreSQL 16.15 with `pg_stat_statements` preloaded, `shared_buffers` 2GB, `max_connections` 20, server `work_mem` 4MB. A local HTTP sink stood in for Slack. Seed: a 50MB table of 400000 rows, then the same unindexed `ORDER BY` run three times as each of four roles, so every role wrote 86.3MB of temp files over 3 calls with a worst single call of 28.8MB. `reporting` had no override, `analytics_tuned` had `work_mem=8MB`, `migration_bot` was in `excluded_roles`, `admin_super` is a superuser. The budget worked out at 104858kB per connection, so the proposal for `reporting` was 58MB (28.8MB times the 2.0 default) with no clamp.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults | 4 roles over the threshold, exactly 1 actionable: `reporting`, proposal `58MB`. The other three came back `SPILL_WITH_OVERRIDE_PRESENT`, `SPILL_ROLE_EXCLUDED` and `SPILL_BY_SUPERUSER_SKIPPED`. `pg_db_role_setting` unchanged |
+    | 2 | `auto_remediate: true`, `dry_run: true` | Same report, no statement run, still no row for `reporting` in `pg_db_role_setting` |
+    | 3 | `auto_remediate: true`, `dry_run: false`, resumed with `approved=false` | Paused, then nothing changed |
+    | 4 | `auto_remediate: true`, `dry_run: false`, approved | `ALTER ROLE reporting SET work_mem = '58MB'` applied. `pg_db_role_setting` went from no row to `{work_mem=58MB}`. A new session as `reporting` returned `58MB` from `SHOW work_mem`, the same query's `Sort Method` moved from `external merge  Disk: 29368kB` to `quicksort  Memory: 49379kB`, so the statement's `temp_blks_written` stayed at 11046 across a fourth call |
+    | 5 | defaults, after run 4 | 0 actionable. `reporting` is now reported as `SPILL_WITH_OVERRIDE_PRESENT` |
+    | 6 | approved, inputs pushed until the proposal leaves the range PostgreSQL accepts | The statement was rejected with `invalid value for parameter "work_mem"`, `reverify` reported `MISSING`, the run FAILED, `errors` posted to Slack |
+    | 7 | approved, the role renamed during the `Pause` | The statement hit a role that no longer existed, `reverify` reported `MISSING`, the run FAILED |
+    | 8 | a database with no `pg_stat_statements` | `precheck_gate` failed with the install instruction instead of reading a view that is not there |
+    | 9 | unreachable host | The `errors` block posted to Slack |
+
+    The in-memory sort for that workload took 49379kB while the external merge had written 29368kB to tape, a ratio of 1.7, which is where the 2.0 default for `headroom_multiplier` comes from. At 1.5 the proposal was 44MB, the setting landed, the sort still spilled. That is the honest shape of this: the flow proves the override is stored, the operator proves the spill is gone.
+
+    ## Prerequisites
+
+    - `pg_stat_statements` in `shared_preload_libraries` plus `CREATE EXTENSION pg_stat_statements` in the database the flow connects to. Without it there is no per role spill counter.
+    - A role that can read `pg_stat_statements`, `pg_db_role_setting` and `pg_settings`. For the change, a superuser or a role holding `ADMIN OPTION` on the target role.
+    - Local testing:
+      - `docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=pg postgres:16 -c shared_preload_libraries=pg_stat_statements`;
+      - `CREATE EXTENSION pg_stat_statements`, create a login role, give it a big table with an unindexed column, then run `ORDER BY` on that column as the role until `temp_blks_written` climbs.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` / `POSTGRES_PASSWORD`: credentials used by every query.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/app` | Database to read the counters from |
+    | `excluded_roles` | `[migration_bot]` | Roles whose spilling is accepted |
+    | `override_scope` | `ROLE` | `ROLE` or `ROLE_IN_DATABASE` |
+    | `min_total_temp_mb` | `64` | Temp megabytes a role must have written to be reported |
+    | `high_severity_temp_mb` | `1024` | Temp megabytes that make a finding `HIGH` |
+    | `headroom_multiplier` | `1.5` | Scale over the worst measured call |
+    | `max_work_mem_mb` | `256` | Hard ceiling for the proposal |
+    | `ram_fraction_for_work_mem` | `0.25` | Share of the memory proxy all sorting may claim |
+    | `auto_remediate` | `false` | Allow `ALTER ROLE` |
+    | `dry_run` | `true` | Must be `false` for a statement to run |
+
+    ## Quick start
+
+    1. Add the `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow, set `jdbc_url`, then list in `excluded_roles` anything you are happy to leave on disk.
+    3. Run it once with the defaults and read the proposal, the ceiling and the budget in the findings.
+    4. Agree the value with whoever owns the host memory, then run with `auto_remediate: true` and `dry_run: false` and answer the `Pause`.
+    5. Reconnect as the role, check `SHOW work_mem`, re-run the slow query and compare `Sort Method` in `EXPLAIN (ANALYZE, BUFFERS)`.
+    6. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Call `pg_stat_statements_reset()` on a schedule so the counters describe a window rather than all time. Keep the window bounds in a KV pair.
+    - Read `temp_files` and `temp_bytes` from `pg_stat_database` as a second signal, which also catches spilling from statements that have aged out of `pg_stat_statements`.
+    - Tune `hash_mem_multiplier` alongside `work_mem` for hash heavy plans.
+    - Add a per role map of agreed values. Let the computed proposal only lower them.
+    - Set `maintenance_work_mem` the same way for roles that build indexes.
+
+    ## Links
+
+    - Resource consumption, including `work_mem`: https://www.postgresql.org/docs/current/runtime-config-resource.html
+    - pg_stat_statements: https://www.postgresql.org/docs/current/pgstatstatements.html
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - PostgreSQL
+    - Performance
+    - Day 2 Operations
+  ee: false
+  demo: false
