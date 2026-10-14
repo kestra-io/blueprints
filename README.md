@@ -69,7 +69,7 @@ Required & recommended fields
   - `tags`: primary category (`Data`, `AI`, `Infrastructure`, `Business`, `Cloud`, `Core`).
   - `subTags`: faceted filter tags selected from the controlled taxonomy below.
   - `ee`: `true`/`false` (`true` only if using Enterprise Edition plugins).
-  - `demo`: `true`/`false` (`true` **only** if runnable with zero secrets and zero external databases; `false` if real credentials or services are required).
+  - `demo`: always `false` for contributed blueprints; the Kestra team flips it on the few flows wired to the public demo instance.
 
 ### Canonical Documentation Sections (`description`)
 
