@@ -1,0 +1,301 @@
+id: postgres-pitr-restore-drill
+namespace: company.team
+description: |
+  Prove that your PostgreSQL backups restore, to the second you choose. The drill takes the latest base backup and the
+  archived WAL, replays them into a throwaway PostgreSQL to a target time, runs your checks against the recovered
+  database, and measures how long it took against your recovery time objective (RTO). Demo mode needs only Docker:
+  it builds a small database, "accidentally" deletes every row, and recovers to the moment before the DELETE.
+
+triggers:
+  - id: after_base_backup
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this when the nightly base backup has been uploaded, so every new backup is proven restorable.
+    key: "{{ secret('PITR_DRILL_WEBHOOK_KEY') }}"
+  - id: weekly_drill
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: A weekly drill even when no backup job calls the webhook. Shipped disabled; enable it once the S3 inputs are yours.
+    cron: "13 3 * * 1"
+    disabled: true
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+sla:
+  - id: restore_deadline
+    type: MAX_DURATION
+    duration: PT1H
+    behavior: FAIL
+    labels:
+      drill: deadline_exceeded
+
+inputs:
+  - id: mode
+    type: SELECT
+    values: [demo, s3]
+    defaults: demo
+    description: demo builds and restores its own database inside the drill container. s3 restores your base backup and WAL archive from S3 (or MinIO).
+  - id: s3_bucket
+    type: STRING
+    required: false
+    description: Bucket that holds the base backup and the WAL archive (s3 mode).
+  - id: s3_base_prefix
+    type: STRING
+    defaults: base/latest/
+    description: Prefix of the base backup made with `pg_basebackup -Ft -z`, i.e. base.tar.gz and (if WAL was streamed) pg_wal.tar.gz.
+  - id: s3_wal_prefix
+    type: STRING
+    defaults: wal/
+    description: Prefix your archive_command writes WAL segments to, e.g. `aws s3 cp %p s3://bucket/wal/%f`.
+  - id: s3_endpoint
+    type: STRING
+    required: false
+    description: Custom S3 endpoint (MinIO, Ceph, R2). Leave empty for AWS.
+  - id: target_time
+    type: STRING
+    required: false
+    description: Recover to this moment, e.g. "2026-10-14 03:00:00+00". Empty means replay every archived WAL segment. Demo mode picks its own target.
+  - id: checks
+    type: ARRAY
+    itemType: STRING
+    required: false
+    description: One SQL query per item, run on the recovered database. Each must return rows with a boolean `ok` and a text `detail`. Demo mode adds its own check.
+  - id: rto_minutes
+    type: INT
+    defaults: 30
+    description: Recovery time objective. A restore that takes longer fails the drill even if every check passes.
+  - id: postgres_image
+    type: STRING
+    defaults: postgres:16-alpine
+    description: Use the major version of your server; WAL can only be replayed by the same major version.
+
+tasks:
+  - id: validate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode == 's3' and (inputs.s3_bucket ?? '') == '' }}"
+    then:
+      - id: missing_bucket
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: s3 mode needs s3_bucket (and the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets).
+
+  - id: restore
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: |
+      Everything happens inside one throwaway container: fetch the base backup, configure recovery (restore_command,
+      recovery_target_time), start PostgreSQL, wait until recovery ends, then run the checks and report as JSON.
+    containerImage: "{{ inputs.postgres_image }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: IF_NOT_PRESENT
+    interpreter: [sh, -c]
+    env:
+      MODE: "{{ inputs.mode }}"
+      S3_BUCKET: "{{ inputs.s3_bucket ?? '' }}"
+      S3_BASE_PREFIX: "{{ inputs.s3_base_prefix }}"
+      S3_WAL_PREFIX: "{{ inputs.s3_wal_prefix }}"
+      S3_ENDPOINT: "{{ inputs.s3_endpoint ?? '' }}"
+      TARGET_TIME: "{{ inputs.target_time ?? '' }}"
+      CHECKS: "{{ (inputs.checks ?? []) | join('\n') }}"
+      AWS_ACCESS_KEY_ID: "{{ inputs.mode == 's3' ? secret('AWS_ACCESS_KEY_ID') : '' }}"
+      AWS_SECRET_ACCESS_KEY: "{{ inputs.mode == 's3' ? secret('AWS_SECRET_ACCESS_KEY') : '' }}"
+      AWS_DEFAULT_REGION: us-east-1
+    commands:
+      - |
+        set -eu
+        W=/tmp/drill; rm -rf $W; mkdir -p $W/archive $W/base $W/restore; chown -R postgres $W
+        pg() { su-exec postgres "$@"; }
+        fail() { echo "DRILL FAILED: $*" >&2; exit 1; }
+        if [ "$MODE" = demo ]; then
+          # a source cluster that archives its WAL, a base backup, more writes, then the accident
+          pg initdb -D $W/src -A trust --no-locale -E UTF8 >/dev/null 2>&1
+          printf "wal_level = replica\narchive_mode = on\narchive_command = 'cp %%p $W/archive/%%f'\nlisten_addresses = ''\nunix_socket_directories = '$W'\n" >> $W/src/postgresql.conf
+          pg pg_ctl -D $W/src -w -l $W/src.log start >/dev/null
+          SQL="psql -h $W -p 5432 -U postgres -qAt -v ON_ERROR_STOP=1"
+          pg $SQL -c "CREATE TABLE orders (id int PRIMARY KEY, total numeric)" -c "INSERT INTO orders SELECT i, i * 1.5 FROM generate_series(1, 1000) i"
+          pg pg_basebackup -h $W -p 5432 -U postgres -D $W/base -Ft -z -X stream
+          pg $SQL -c "INSERT INTO orders SELECT i, i * 1.5 FROM generate_series(1001, 2000) i"
+          sleep 1; TARGET_TIME=$(pg $SQL -c "SELECT now()"); sleep 1
+          pg $SQL -c "DELETE FROM orders" -c "SELECT pg_switch_wal()" >/dev/null
+          sleep 2; pg pg_ctl -D $W/src -m fast -w stop >/dev/null
+          echo "demo: 2000 orders existed at $TARGET_TIME, then every row was deleted; recovering to $TARGET_TIME"
+          RESTORE_CMD="cp $W/archive/%f %p"
+          CHECKS="SELECT count(*) = 2000 AS ok, count(*) || ' orders recovered (2000 at the target time, 0 after the accidental DELETE)' AS detail FROM orders
+        $CHECKS"
+        else
+          command -v aws >/dev/null || apk add --no-cache aws-cli >/dev/null || fail "aws-cli is not installed and could not be installed"
+          EP=""; [ -n "$S3_ENDPOINT" ] && EP="--endpoint-url $S3_ENDPOINT"
+          aws s3 cp "s3://$S3_BUCKET/$S3_BASE_PREFIX" $W/base --recursive --only-show-errors $EP || fail "could not download s3://$S3_BUCKET/$S3_BASE_PREFIX"
+          [ -f $W/base/base.tar.gz ] || fail "no base.tar.gz under s3://$S3_BUCKET/$S3_BASE_PREFIX (expected pg_basebackup -Ft -z output)"
+          RESTORE_CMD="aws s3 cp s3://$S3_BUCKET/$S3_WAL_PREFIX%f %p --only-show-errors $EP"
+        fi
+        BACKUP_MB=$(du -sm $W/base | cut -f1)
+        START=$(date +%s)
+        tar xzf $W/base/base.tar.gz -C $W/restore || fail "base.tar.gz is not a readable tar.gz archive"
+        [ -f $W/base/pg_wal.tar.gz ] && tar xzf $W/base/pg_wal.tar.gz -C $W/restore/pg_wal
+        printf "restore_command = '%s'\nrecovery_target_action = 'promote'\narchive_mode = off\nlisten_addresses = ''\nunix_socket_directories = '$W'\nport = 5433\n" "$RESTORE_CMD" >> $W/restore/postgresql.auto.conf
+        [ -n "$TARGET_TIME" ] && echo "recovery_target_time = '$TARGET_TIME'" >> $W/restore/postgresql.auto.conf
+        touch $W/restore/recovery.signal; chown -R postgres $W; chmod 700 $W/restore
+        if ! pg pg_ctl -D $W/restore -l $W/restore.log -w -t 3000 start >/dev/null; then
+          tail -n 15 $W/restore.log >&2; fail "PostgreSQL did not start from the backup: $(grep -E 'FATAL|PANIC' $W/restore.log | tail -n 1)"
+        fi
+        SQL="psql -h $W -p 5433 -U postgres -qAt -v ON_ERROR_STOP=1"
+        # pg_ctl returns once the server accepts read-only connections; recovery can still fail after that (a WAL gap)
+        until [ "$(pg $SQL -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" = f ]; do
+          pg pg_ctl -D $W/restore status >/dev/null || { tail -n 15 $W/restore.log >&2; fail "recovery stopped: $(grep -E 'FATAL|PANIC' $W/restore.log | tail -n 1 | sed 's/.*\(FATAL\|PANIC\): *//')"; }
+          sleep 1
+        done
+        SECONDS_TAKEN=$(( $(date +%s) - START ))
+        STOPPED=$(grep -o 'recovery stopping before .*' $W/restore.log | tail -n 1 || true)
+        LAST=$(grep -o 'last completed transaction was at log time .*' $W/restore.log | tail -n 1 | sed 's/.*log time //' || true)
+        WAL=$(grep -c 'restored log file' $W/restore.log || true)
+        echo "recovered in ${SECONDS_TAKEN}s, $WAL WAL segments from the archive. ${STOPPED:-replayed to the end of the archive}"
+        RESULTS=$(printf '%s\n' "$CHECKS" | while IFS= read -r q; do
+          [ -z "$q" ] && continue
+          pg $SQL -c "SELECT coalesce(json_agg(json_build_object('ok', ok, 'detail', detail)), '[]') FROM ($q) c" 2>$W/check.err \
+            || echo "[{\"ok\": false, \"detail\": \"check could not run: $(head -n 1 $W/check.err | tr -d '\"\\\\')\"}]"
+        done | tr '\n' ',' | sed 's/,$//')
+        # psql only interpolates :'variables' in scripts read from stdin, not in -c
+        OUT=$(echo "SELECT json_build_object('restore_seconds', :'secs'::int, 'wal_segments', :'wal'::int, 'backup_mb', :'mb'::int, 'target', :'target', 'recovered_to', :'last',
+                  'checks', (SELECT json_agg(e) FROM json_array_elements(:'results'::json) a, json_array_elements(a) e),
+                  'all_ok', coalesce((SELECT bool_and((e->>'ok')::boolean) FROM json_array_elements(:'results'::json) a, json_array_elements(a) e), true))" \
+          | pg $SQL -v results="[${RESULTS}]" -v secs="$SECONDS_TAKEN" -v wal="$WAL" -v mb="$BACKUP_MB" -v target="${TARGET_TIME:-end of archive}" -v last="${LAST:-unknown}" -f -)
+        pg pg_ctl -D $W/restore -m fast -w stop >/dev/null
+        echo "::{\"outputs\":$OUT}::"
+
+  - id: verdict
+    type: io.kestra.plugin.core.flow.If
+    description: The drill passes only when every check passed and the restore was faster than the RTO.
+    condition: "{{ outputs.restore.vars.all_ok == true and outputs.restore.vars.restore_seconds <= inputs.rto_minutes * 60 }}"
+    then:
+      - id: remember_good_restore
+        type: io.kestra.plugin.core.kv.Set
+        key: pitr_drill_last_good
+        kvType: JSON
+        value: "{{ {'at': execution.startDate, 'mode': inputs.mode, 'restore_seconds': outputs.restore.vars.restore_seconds, 'target': outputs.restore.vars.target} | toJson }}"
+      - id: report_pass
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          PostgreSQL restore drill PASSED ({{ inputs.mode }}): recovered to {{ outputs.restore.vars.target }} in {{ outputs.restore.vars.restore_seconds }} s (RTO {{ inputs.rto_minutes }} min), {{ outputs.restore.vars.wal_segments }} WAL segments replayed from a {{ outputs.restore.vars.backup_mb }} MB base backup.
+          {% for c in outputs.restore.vars.checks %}- {{ c.ok ? 'ok' : 'FAILED' }}: {{ c.detail }}
+          {% endfor %}
+    else:
+      - id: drill_failed
+        type: io.kestra.plugin.core.execution.Fail
+        description: The report goes out once, through `errors`, like every other failure.
+        errorMessage: |
+          DRILL FAILED: {% if outputs.restore.vars.restore_seconds > inputs.rto_minutes * 60 %}the restore took {{ outputs.restore.vars.restore_seconds }} s, over the {{ inputs.rto_minutes }} min RTO. {% endif %}{% if not outputs.restore.vars.all_ok %}a check failed on the recovered database. {% endif %}Recovered to {{ outputs.restore.vars.target }} ({{ inputs.mode }} mode).
+          {% for c in outputs.restore.vars.checks %}- {{ c.ok ? 'ok' : 'FAILED' }}: {{ c.detail }}
+          {% endfor %}
+
+errors:
+  - id: unless_deadline
+    type: io.kestra.plugin.core.flow.If
+    description: A run stopped by the SLA is reported by afterExecution instead, so it is never reported twice.
+    condition: "{{ (labels.drill ?? '') != 'deadline_exceeded' }}"
+    then:
+      - id: alert_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          PostgreSQL restore drill FAILED in execution {{ execution.id }}{% if errorLogs() | length > 0 and (errorLogs()[0]['taskId'] ?? '') != '' %} at `{{ errorLogs()[0]['taskId'] }}`{% endif %}: {% if errorLogs() | length > 0 %}{{ errorLogs() | jq('([.[] | select(.message | test("DRILL FAILED"))] + [.[] | select(.message | test("ERROR:|FATAL:"))] + .)[0].message | sub("^DRILL FAILED: "; "")') | first }}{% else %}see the execution logs.{% endif %}
+          Last good drill: {{ (kv('pitr_drill_last_good', errorOnMissing=false) ?? {}).at ?? 'never' }}
+
+afterExecution:
+  - id: deadline_alert
+    type: io.kestra.plugin.core.flow.If
+    description: afterExecution runs whatever the final state, so a drill the SLA stopped is always reported, once.
+    condition: "{{ (labels.drill ?? '') == 'deadline_exceeded' }}"
+    then:
+      - id: alert_deadline
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          PostgreSQL restore drill FAILED in execution {{ execution.id }}: stopped by its SLA deadline (1 hour) before the restore finished, for example a download or a WAL fetch that hangs.
+          Last good drill: {{ (kv('pitr_drill_last_good', errorOnMissing=false) ?? {}).at ?? 'never' }}
+
+outputs:
+  - id: result
+    type: JSON
+    value: "{{ outputs.restore.vars ?? {} }}"
+
+extend:
+  title: Prove Your Postgres Backups Restore to the Second You Need
+  shortDescription: Restore the latest base backup and replay archived WAL to a chosen moment in a throwaway PostgreSQL, run your checks on the recovered data, and fail the drill when it is slower than your RTO. Demo mode needs only Docker.
+  metaTitle: PostgreSQL Point-in-Time Restore Drill with Kestra
+  metaDescription: Restore a Postgres base backup and WAL to a target time in a throwaway container, check the data, and fail when the restore misses your RTO.
+  description: |
+    A backup you have never restored is a hope, not a backup. Point-in-time recovery (PITR) is what saves you from the accidental `DELETE` at 14:03: restore last night's base backup, replay the WAL archive up to 14:02:59, and the rows are back. But PITR breaks quietly. A WAL segment that never reached the bucket, an `archive_command` that started failing, a base backup from the wrong major version — you only find out during the incident.
+
+    This blueprint runs the recovery for real, on a schedule or right after each base backup, and tells you whether it worked and how long it took.
+
+    ## How it works
+    1. `after_base_backup` (`Webhook`, called by your backup job) or `weekly_drill` (`Schedule`, shipped disabled) starts a drill. `concurrency` runs one drill at a time.
+    2. `validate` (`If`) stops early when s3 mode has no bucket.
+    3. `restore` runs one throwaway PostgreSQL container (Docker task runner):
+       - **demo mode** builds a source cluster with WAL archiving, takes a `pg_basebackup`, writes 1000 more orders, notes the time, then deletes every order. The drill must bring back all 2000 orders.
+       - **s3 mode** downloads `base.tar.gz` (and `pg_wal.tar.gz`) from `s3_base_prefix` and sets `restore_command` to `aws s3 cp s3://<bucket>/<wal prefix>%f %p`, the same layout an `archive_command` such as `aws s3 cp %p s3://bucket/wal/%f` writes.
+       - It writes `recovery.signal`, `recovery_target_time` and `recovery_target_action = 'promote'`, starts PostgreSQL, and waits until recovery has ended and the server was promoted.
+       - Each SQL in `checks` runs on the recovered database and must return `ok` and `detail`.
+    4. `verdict` (`If`) passes the drill only when every check passed and the restore took less than `rto_minutes`. The last good drill is kept in the KV store and quoted in every failure message.
+    5. The flow `sla` (`MAX_DURATION`, 1 hour) fails a drill that hangs, for example on a download that never ends, and labels it `drill: deadline_exceeded`; `afterExecution` reports it.
+
+    ## Error handling
+    - **A WAL gap fails the drill, with PostgreSQL's reason.** PostgreSQL accepts read-only connections before recovery is finished, then shuts down when a segment is missing. The drill watches the server and reports "recovery stopped: recovery ended before configured recovery target was reached".
+    - **Wrong or missing base backup:** "no base.tar.gz under s3://bucket/base/latest/ (expected pg_basebackup -Ft -z output)". A backup the server cannot start from fails with the FATAL line from its log.
+    - **A check that cannot run** (wrong table, syntax error) counts as failed and quotes the database error, so a broken check never passes silently.
+    - **Slower than the RTO is a failure**, even when the data is right: "the restore took 2 s, over the 0 min RTO" (a test with `rto_minutes: 0`).
+    - **Hung drills are stopped by the SLA.** Every failure sends one Slack message with the task, the cause and the date of the last good drill. A run the SLA stops is reported from `afterExecution`, because `errors` is not guaranteed to run after an SLA failure.
+    - **Nothing touches production.** The drill only reads the bucket; the recovered database lives and dies inside the container.
+
+    ## What this blueprint teaches about Kestra
+    - **A flow-level `sla`** (`MAX_DURATION` with `behavior: FAIL` and labels) as a deadline for the whole run, next to an RTO check on the measured duration, and **`afterExecution`** to alert on a run the SLA stopped.
+    - The Docker task runner as a disposable environment: a full PostgreSQL server starts, recovers and is thrown away in one task.
+    - Script outputs (`::{"outputs": ...}::`) built as JSON by PostgreSQL itself, then used in `If` conditions and Slack messages.
+    - The KV store as memory between runs ("last good drill").
+    - `Webhook` + `Schedule`: event-driven after each backup, with a periodic safety net.
+
+    ## Prerequisites
+    - A Kestra worker that can run Docker containers.
+    - For s3 mode: a base backup made with `pg_basebackup -Ft -z` (for example `pg_basebackup -D /tmp/b -Ft -z -X stream` then `aws s3 cp /tmp/b s3://bucket/base/latest/ --recursive`), and WAL archived with `archive_command = 'aws s3 cp %p s3://bucket/wal/%f'`.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+    - `PITR_DRILL_WEBHOOK_KEY`: a long random string, the key in the webhook URL your backup job calls.
+    - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: read access to the bucket (s3 mode only; demo mode needs no AWS secrets).
+
+    ### Inputs
+    - `mode` (SELECT `demo` or `s3`, default `demo`).
+    - `s3_bucket`, `s3_base_prefix` (`base/latest/`), `s3_wal_prefix` (`wal/`), `s3_endpoint` (MinIO, Ceph or R2; empty for AWS).
+    - `target_time` (STRING): recover to this moment; empty replays every archived segment.
+    - `checks` (ARRAY of SQL): each returns `ok` (boolean) and `detail` (text), for example `SELECT count(*) > 0 AS ok, count(*) || ' orders' AS detail FROM orders`.
+    - `rto_minutes` (INT, default 30), `postgres_image` (default `postgres:16-alpine`; match your server's major version).
+
+    ### Outputs
+    - `result` (JSON): restore seconds, WAL segments replayed, base backup size, target, last replayed transaction time, and every check with its result.
+
+    ## Quick start
+    1. Add `SLACK_WEBHOOK_URL` and `PITR_DRILL_WEBHOOK_KEY`, then run the flow with the defaults. The demo deletes every order and recovers to the second before the DELETE: "PostgreSQL restore drill PASSED (demo): recovered to … in 2 s … ok: 2000 orders recovered (2000 at the target time, 0 after the accidental DELETE)".
+    2. Switch to `s3`, set the bucket, prefixes and your own `checks`, and add the AWS secrets.
+    3. Call the webhook at the end of your base backup job (`curl -X POST "$KESTRA/api/v1/main/executions/webhook/company.team/postgres-pitr-restore-drill/$KEY"`), and enable `weekly_drill` as a safety net.
+
+    ## How to extend
+    - Restore from pgBackRest or WAL-G instead: replace the download and `restore_command` lines with `pgbackrest restore --type=time` or `wal-g backup-fetch` / `wal-g wal-fetch`.
+    - Record `restore_seconds` in a table and alert when it trends towards the RTO.
+    - Run checks that matter to your business: the newest order is less than an hour older than the target, invoices balance, no table is empty.
+
+    ## Plugins used
+    - [Shell Commands](https://kestra.io/plugins/plugin-script-shell) with the [Docker task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.scripts.runner.docker.docker)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Webhook trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.webhook), [Schedule trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Disaster Recovery
+    - Day 2 Operations
+  ee: false
+  demo: false
