@@ -1,0 +1,574 @@
+id: delta-lake-change-feed-sync
+namespace: company.team
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: demo_mode
+    type: BOOL
+    displayName: Build throwaway demo tables
+    description: When true, the flow builds a small source table with change data feed and works on local demo tables. Turn it off to sync your own tables.
+    defaults: true
+
+  - id: demo_scenario
+    type: SELECT
+    displayName: Demo starting state
+    description: Only used in demo mode. INCREMENTAL starts with a target that is behind and applies the new changes. BOOTSTRAP starts with no target and creates it. UP_TO_DATE starts with a target that is already current. FALLEN_BEHIND starts with a target whose change history was cleaned up at the source.
+    values:
+      - INCREMENTAL
+      - BOOTSTRAP
+      - UP_TO_DATE
+      - FALLEN_BEHIND
+    defaults: INCREMENTAL
+
+  - id: source_uri
+    type: STRING
+    displayName: Source Delta table URI
+    description: Only used when demo_mode is false. The table to read changes from. It needs delta.enableChangeDataFeed set to true. Any location delta-rs can open from inside the task container, for example an object store URI. A local path on your host is not visible in the container. Credentials are not wired in, see "Using it on your own tables".
+    required: false
+
+  - id: target_uri
+    type: STRING
+    displayName: Target Delta table URI
+    description: Only used when demo_mode is false. The copy to keep up to date. The flow creates it on the first run. Point it at a location that holds no table, and let nothing else write to it.
+    required: false
+
+  - id: key_columns
+    type: STRING
+    displayName: Key columns
+    description: Only used when demo_mode is false. Comma separated column names that identify a row, for example region,sku. The key has to be unique in the source.
+    required: false
+
+  - id: fallen_behind_action
+    type: SELECT
+    displayName: When the change history is gone
+    description: FAIL stops the run and changes nothing. FULL_RESYNC rebuilds the target from the current source version, which overwrites the target.
+    values:
+      - FAIL
+      - FULL_RESYNC
+    defaults: FAIL
+
+triggers:
+  - id: poll
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Look for new source versions every 15 minutes. Disabled by default. Turn demo_mode off and set the table inputs before enabling it, because every demo run builds new tables.
+    cron: "*/15 * * * *"
+    disabled: true
+
+tasks:
+  - id: work
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One directory holds the script and, in demo mode, the demo tables and the expected state. Every execution gets a new directory.
+    inputFiles:
+      cdf.py: |
+        """Incremental sync of a Delta table's change data feed into another Delta table (delta-rs).
+
+        Usage: python cdf.py prepare | inspect | snapshot | apply | verify
+
+        Every commit the target receives also records the source version it has caught up to,
+        as a Delta transaction identifier. The next run reads that number back and asks the
+        source only for the changes after it.
+        """
+        import json
+        import os
+        import re
+        import sys
+
+        DEMO = os.environ.get("DEMO_MODE", "true").strip().lower() == "true"
+        SOURCE = "source" if DEMO else os.environ.get("SOURCE_URI", "").strip()
+        TARGET = "target" if DEMO else os.environ.get("TARGET_URI", "").strip()
+        KEYS = ["order_id"] if DEMO else [k.strip() for k in os.environ.get("KEY_COLUMNS", "").split(",") if k.strip()]
+        APP_ID = "kestra-cdf-sync:" + SOURCE
+        CDF_COLUMNS = ("_change_type", "_commit_version", "_commit_timestamp")
+        # Error texts delta-rs 1.6.6 gives when the change feed of a version can no longer be read.
+        HISTORY_GONE = ("Invalid table version", "change data enabled", " not found")
+
+
+        def stop(message):
+            sys.exit("ERROR: " + message)
+
+
+        def check_config():
+            if not SOURCE or not TARGET:
+                stop("source_uri and target_uri are required when demo_mode is false.")
+            if SOURCE == TARGET:
+                stop("source_uri and target_uri must be different.")
+            if not KEYS:
+                stop("key_columns is required when demo_mode is false.")
+            for key in KEYS:
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    stop("key column %r is not a plain column name." % key)
+
+
+        def commit_properties(version):
+            from deltalake import CommitProperties, Transaction
+            return CommitProperties(app_transactions=[Transaction(app_id=APP_ID, version=version)])
+
+
+        def marker():
+            """Source version the target has caught up to, or None when the target does not exist."""
+            from deltalake import DeltaTable
+            if not DeltaTable.is_deltatable(TARGET):
+                return None
+            value = DeltaTable(TARGET).transaction_version(APP_ID)
+            if value is None:
+                stop("The target table exists but has no sync marker for this source. "
+                     "This flow only continues a target it created. Use a new target_uri.")
+            return value
+
+
+        def read_changes(start, end):
+            import pyarrow as pa
+            from deltalake import DeltaTable
+            return pa.table(DeltaTable(SOURCE).load_cdf(starting_version=start, ending_version=end).read_all())
+
+
+        def missing_history(version):
+            """None when the changes of this version can be read, else why they cannot.
+            Unknown errors are raised, so a network problem never looks like lost history."""
+            try:
+                read_changes(version, version)
+                return None
+            except Exception as err:
+                text = str(err)
+                if any(known in text for known in HISTORY_GONE):
+                    return text.splitlines()[0][:300]
+                raise
+
+
+        def collapse(rows):
+            """One change per key. The newest version wins. Inside one version an upsert beats a delete,
+            which is how an overwrite shows up. update_preimage rows are the old values and are skipped."""
+            best = {}
+            for row in rows:
+                if row["_change_type"] == "update_preimage":
+                    continue
+                key = tuple(row[k] for k in KEYS)
+                old = best.get(key)
+                if old is None or row["_commit_version"] > old["_commit_version"]:
+                    best[key] = row
+                elif row["_commit_version"] == old["_commit_version"]:
+                    if row["_change_type"] == "delete":
+                        continue
+                    if old["_change_type"] == "delete":
+                        best[key] = row
+                    else:
+                        stop("Key %s appears twice in source version %d. Is it unique in the source?"
+                             % (key, row["_commit_version"]))
+            return best
+
+
+        def snapshot(version, partition_by=None):
+            """Copy the source as of one version into the target and record that version as the marker."""
+            from deltalake import DeltaTable, write_deltalake
+            reader = DeltaTable(SOURCE, version=version).to_pyarrow_dataset().scanner().to_reader()
+            write_deltalake(TARGET, reader, mode="overwrite", schema_mode="overwrite",
+                            partition_by=partition_by, commit_properties=commit_properties(version))
+
+
+        def inspect():
+            from deltalake import DeltaTable
+            from kestra import Kestra
+            check_config()
+            if not DeltaTable.is_deltatable(SOURCE):
+                stop("The source %s is not a Delta table." % SOURCE)
+            source = DeltaTable(SOURCE)
+            if source.metadata().configuration.get("delta.enableChangeDataFeed") != "true":
+                stop("Change data feed is not enabled on the source. Set delta.enableChangeDataFeed to true on it. "
+                     "Only changes made after that are recorded.")
+            latest = source.version()
+            done = marker()
+            policy = os.environ.get("FALLEN_BEHIND_ACTION", "FAIL")
+            if done is None:
+                action = "SNAPSHOT"
+                reason = "The target does not exist yet. It will be created from source version %d." % latest
+            elif done > latest:
+                stop("The target is ahead of the source: marker %d, source version %d. "
+                     "Was the source table recreated?" % (done, latest))
+            elif done == latest:
+                action = "UP_TO_DATE"
+                reason = "The target is already at source version %d." % latest
+            else:
+                gone = missing_history(done + 1)
+                if gone is None:
+                    action = "INCREMENTAL"
+                    reason = "Applying source versions %d to %d." % (done + 1, latest)
+                elif policy == "FULL_RESYNC":
+                    action = "SNAPSHOT"
+                    reason = ("The change history after version %d is gone (%s). Rebuilding the target from source "
+                              "version %d." % (done, gone, latest))
+                else:
+                    action = "FALLEN_BEHIND"
+                    reason = ("The target is at source version %d but the change history after it is gone (%s). "
+                              "Nothing was changed. Set fallen_behind_action to FULL_RESYNC to rebuild the target "
+                              "from source version %d." % (done, gone, latest))
+            print("Source version %d, target marker %s -> %s. %s"
+                  % (latest, "none" if done is None else done, action, reason))
+            Kestra.outputs({"action": action, "reason": reason, "source_version": latest,
+                            "marker": -1 if done is None else done})
+
+
+        def run_snapshot():
+            from deltalake import DeltaTable
+            from kestra import Kestra
+            check_config()
+            version = int(os.environ["SOURCE_VERSION"])
+            partitions = DeltaTable(SOURCE).metadata().partition_columns or None
+            snapshot(version, partitions)
+            rows = DeltaTable(TARGET).to_pyarrow_dataset().count_rows()
+            print("Target written from source version %d: %d rows, marker %d." % (version, rows, version))
+            Kestra.outputs({"rows": rows, "marker": version})
+
+
+        def apply():
+            import pyarrow as pa
+            from deltalake import DeltaTable, write_deltalake
+            from kestra import Kestra
+            check_config()
+            end = int(os.environ["SOURCE_VERSION"])
+            done = marker()
+            if done is None or done >= end:
+                stop("Nothing to apply: marker %s, source version %d." % (done, end))
+            changes = read_changes(done + 1, end)
+            source_columns = [c for c in changes.column_names if c not in CDF_COLUMNS]
+            target = DeltaTable(TARGET)
+            schema = target.to_pyarrow_dataset().schema
+            columns = schema.names
+            if sorted(source_columns) != sorted(columns):
+                stop("The source columns %s differ from the target columns %s. Schema changes are not synced. "
+                     "Add the column to the target, or use a new target_uri." % (source_columns, columns))
+            for key in KEYS:
+                if key not in columns:
+                    stop("key column %r is not in the table." % key)
+
+            rows = changes.to_pylist()
+            latest = collapse(rows)
+            counts = {"inserted": 0, "updated": 0, "deleted": 0}
+            if not latest:
+                # Only commits without data changes, for example OPTIMIZE. The marker still has to move forward,
+                # and an empty append is what writes a commit for it.
+                write_deltalake(TARGET, pa.Table.from_pylist([], schema=schema), mode="append",
+                                commit_properties=commit_properties(end))
+            else:
+                data = []
+                for row in latest.values():
+                    item = {c: row[c] for c in columns}
+                    item["_op"] = "delete" if row["_change_type"] == "delete" else "upsert"
+                    data.append(item)
+                source = pa.Table.from_pylist(data, schema=schema.append(pa.field("_op", pa.string())))
+                predicate = " AND ".join("t.%s = s.%s" % (k, k) for k in KEYS)
+                values = {c: "s." + c for c in columns}
+                result = (target.merge(source, predicate, source_alias="s", target_alias="t",
+                                       commit_properties=commit_properties(end))
+                          .when_matched_delete(predicate="s._op = 'delete'")
+                          .when_matched_update(updates=values, predicate="s._op = 'upsert'")
+                          .when_not_matched_insert(updates=values, predicate="s._op = 'upsert'")
+                          .execute())
+                counts = {"inserted": result["num_target_rows_inserted"],
+                          "updated": result["num_target_rows_updated"],
+                          "deleted": result["num_target_rows_deleted"]}
+            print("Applied source versions %d to %d: %d change rows, %d keys changed. Target: %d inserted, %d updated, "
+                  "%d deleted. Marker is now %d." % (done + 1, end, len(rows), len(latest), counts["inserted"],
+                                                      counts["updated"], counts["deleted"], end))
+            Kestra.outputs(dict(counts, from_version=done + 1, to_version=end, change_rows=len(rows),
+                                keys_changed=len(latest), marker=end))
+
+
+        # ---------------------------------------------------------------- demo only
+
+        DEMO_SCHEMA = [("order_id", "int64"), ("customer", "string"), ("status", "string"), ("amount_cents", "int64")]
+        DEMO_SNAPSHOT_VERSION = 1
+
+
+        def prepare():
+            """Build a source table with change data feed and a plain-Python model of what the target must hold."""
+            import pyarrow as pa
+            from deltalake import DeltaTable, write_deltalake
+            scenario = os.environ.get("DEMO_SCENARIO", "INCREMENTAL")
+            schema = pa.schema([(name, getattr(pa, kind)()) for name, kind in DEMO_SCHEMA])
+            model = {}
+
+            def table(rows):
+                return pa.Table.from_pylist(rows, schema=schema)
+
+            def remember(rows):
+                for row in rows:
+                    model[row["order_id"]] = dict(row)
+
+            orders = [{"order_id": i, "customer": "customer-%d" % i, "status": "new", "amount_cents": 1000 * i}
+                      for i in range(1, 7)]
+            write_deltalake(SOURCE, table(orders), configuration={"delta.enableChangeDataFeed": "true"})   # v0
+            remember(orders)
+            DeltaTable(SOURCE).update(updates={"status": "'paid'", "amount_cents": "2500"},
+                                      predicate="order_id = 2")                                           # v1
+            model[2].update(status="paid", amount_cents=2500)
+            DeltaTable(SOURCE).update(updates={"amount_cents": "2600"}, predicate="order_id = 2")          # v2
+            model[2]["amount_cents"] = 2600
+            DeltaTable(SOURCE).delete("order_id = 3")                                                     # v3
+            model.pop(3)
+            changes = [{"order_id": 1, "customer": "customer-1", "status": "shipped", "amount_cents": 1000},
+                       {"order_id": 7, "customer": "customer-7", "status": "new", "amount_cents": 7000}]
+            (DeltaTable(SOURCE).merge(table(changes), "t.order_id = s.order_id", source_alias="s", target_alias="t")
+             .when_matched_update_all().when_not_matched_insert_all().execute())                           # v4
+            remember(changes)
+            DeltaTable(SOURCE).delete("order_id = 7")                                                     # v5
+            model.pop(7)
+            again = [{"order_id": 3, "customer": "customer-3-new", "status": "new", "amount_cents": 3300}]
+            write_deltalake(SOURCE, table(again), mode="append")                                          # v6
+            remember(again)
+            DeltaTable(SOURCE).delete("order_id = 5")                                                     # v7
+            model.pop(5)
+            newest = [{"order_id": 8, "customer": "customer-8", "status": "new", "amount_cents": 8000}]
+            write_deltalake(SOURCE, table(newest), mode="append")                                         # v8
+            remember(newest)
+            DeltaTable(SOURCE).optimize.compact()                                                         # v9, no data change
+            latest = DeltaTable(SOURCE).version()
+            with open("expected.json", "w") as f:
+                json.dump({"rows": {str(k): v for k, v in model.items()}}, f)
+            print("Source built: versions 0 to %d, %d orders expected in the target." % (latest, len(model)))
+
+            if scenario in ("INCREMENTAL", "FALLEN_BEHIND"):
+                snapshot(DEMO_SNAPSHOT_VERSION)
+                print("Target created from source version %d." % DEMO_SNAPSHOT_VERSION)
+            elif scenario == "UP_TO_DATE":
+                snapshot(latest)
+                print("Target created from source version %d." % latest)
+            if scenario == "FALLEN_BEHIND":
+                DeltaTable(SOURCE).create_checkpoint()
+                for version in range(0, 5):
+                    os.remove("%s/_delta_log/%020d.json" % (SOURCE, version))
+                print("Simulated log cleanup: source commits 0 to 4 removed. The target needs version 2.")
+
+
+        def verify():
+            from deltalake import DeltaTable
+            from kestra import Kestra
+            with open("expected.json") as f:
+                expected = {int(k): v for k, v in json.load(f)["rows"].items()}
+            actual = {r["order_id"]: r for r in DeltaTable(TARGET).to_pyarrow_table().to_pylist()}
+            different = sorted(k for k in set(expected) | set(actual) if expected.get(k) != actual.get(k))
+            results = []
+
+            def check(name, got, want):
+                ok = got == want
+                results.append(ok)
+                print("%s  %s: got %s, expected %s" % ("PASS" if ok else "FAIL", name, got, want))
+
+            check("row count", len(actual), len(expected))
+            check("orders that differ from the expected state", different, [])
+            check("marker equals the source version", DeltaTable(TARGET).transaction_version(APP_ID),
+                  DeltaTable(SOURCE).version())
+            Kestra.outputs({"rows": len(actual), "passed": all(results)})
+            if not all(results):
+                stop("The target does not match the expected state.")
+            print("Verification passed: %d orders, marker at the source version." % len(actual))
+
+
+        if __name__ == "__main__":
+            modes = {"prepare": prepare, "inspect": inspect, "snapshot": run_snapshot, "apply": apply, "verify": verify}
+            if len(sys.argv) != 2 or sys.argv[1] not in modes:
+                sys.exit("Usage: python cdf.py prepare | inspect | snapshot | apply | verify")
+            modes[sys.argv[1]]()
+
+    tasks:
+      - id: prepare_demo
+        type: io.kestra.plugin.scripts.python.Commands
+        description: Demo only. Build a source table with change data feed and 10 commits, a plain-Python model of the expected result, and a target in the starting state chosen by demo_scenario.
+        runIf: "{{ inputs.demo_mode }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install -q deltalake==1.6.6 pyarrow==25.0.1 kestra==2.0.0
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+          DEMO_SCENARIO: "{{ inputs.demo_scenario }}"
+        commands:
+          - python cdf.py prepare
+
+      - id: check_versions
+        type: io.kestra.plugin.scripts.python.Commands
+        description: Read the source version and the version recorded in the target, then decide what to do. It changes nothing. The decision is SNAPSHOT, INCREMENTAL, UP_TO_DATE or FALLEN_BEHIND.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install -q deltalake==1.6.6 pyarrow==25.0.1 kestra==2.0.0
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+          SOURCE_URI: "{{ inputs.source_uri ?? '' }}"
+          TARGET_URI: "{{ inputs.target_uri ?? '' }}"
+          KEY_COLUMNS: "{{ inputs.key_columns ?? '' }}"
+          FALLEN_BEHIND_ACTION: "{{ inputs.fallen_behind_action }}"
+        commands:
+          - python cdf.py inspect
+
+      - id: copy_snapshot
+        type: io.kestra.plugin.scripts.python.Commands
+        description: Create the target from the source as of one pinned version, or rebuild it after FULL_RESYNC. The version is recorded in the same commit.
+        runIf: "{{ outputs.check_versions.vars.action == 'SNAPSHOT' }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install -q deltalake==1.6.6 pyarrow==25.0.1 kestra==2.0.0
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+          SOURCE_URI: "{{ inputs.source_uri ?? '' }}"
+          TARGET_URI: "{{ inputs.target_uri ?? '' }}"
+          KEY_COLUMNS: "{{ inputs.key_columns ?? '' }}"
+          SOURCE_VERSION: "{{ outputs.check_versions.vars.source_version }}"
+        commands:
+          - python cdf.py snapshot
+
+      - id: apply_changes
+        type: io.kestra.plugin.scripts.python.Commands
+        description: Read the change feed after the recorded version up to the pinned source version, keep one change per key and apply it with a single MERGE. The new version is recorded in the same commit.
+        runIf: "{{ outputs.check_versions.vars.action == 'INCREMENTAL' }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install -q deltalake==1.6.6 pyarrow==25.0.1 kestra==2.0.0
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+          SOURCE_URI: "{{ inputs.source_uri ?? '' }}"
+          TARGET_URI: "{{ inputs.target_uri ?? '' }}"
+          KEY_COLUMNS: "{{ inputs.key_columns ?? '' }}"
+          SOURCE_VERSION: "{{ outputs.check_versions.vars.source_version }}"
+        commands:
+          - python cdf.py apply
+
+      - id: verify_demo
+        type: io.kestra.plugin.scripts.python.Commands
+        description: Demo only. Compare the target with the expected state computed in plain Python and fail the run on any difference.
+        runIf: "{{ inputs.demo_mode and outputs.check_versions.vars.action != 'FALLEN_BEHIND' }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install -q deltalake==1.6.6 pyarrow==25.0.1 kestra==2.0.0
+        env:
+          DEMO_MODE: "{{ inputs.demo_mode }}"
+        commands:
+          - python cdf.py verify
+
+  - id: stop_if_fallen_behind
+    type: io.kestra.plugin.core.flow.If
+    description: End the run as FAILED when the change history the target needs is gone and fallen_behind_action is FAIL. Nothing was changed.
+    condition: "{{ outputs.check_versions.vars.action == 'FALLEN_BEHIND' }}"
+    then:
+      - id: fail_fallen_behind
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "{{ outputs.check_versions.vars.reason }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Delta change feed sync: {{ outputs.check_versions.vars.action }}. {{ outputs.check_versions.vars.reason }}
+      {{ outputs.check_versions.vars.action == 'INCREMENTAL' ? 'Applied versions ' ~ outputs.apply_changes.vars.from_version ~ ' to ' ~ outputs.apply_changes.vars.to_version ~ ': ' ~ outputs.apply_changes.vars.inserted ~ ' inserted, ' ~ outputs.apply_changes.vars.updated ~ ' updated, ' ~ outputs.apply_changes.vars.deleted ~ ' deleted.' : '' }}
+      {{ outputs.check_versions.vars.action == 'SNAPSHOT' ? 'Target written with ' ~ outputs.copy_snapshot.vars.rows ~ ' rows at version ' ~ outputs.copy_snapshot.vars.marker ~ '.' : '' }}
+      {{ inputs.demo_mode ? 'Demo check: ' ~ outputs.verify_demo.vars.rows ~ ' rows, matches the expected state.' : '' }}
+
+errors:
+  - id: report_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Delta change feed sync failed in {{ flow.id }}, execution {{ execution.id }}. Read the check_versions log first, it says what the flow found and why it stopped. Usual causes: change data feed is not enabled on the source, the target holds a table this flow did not create, the source and target columns differ, or the container cannot reach PyPI for the pip install. A failed run leaves the target at its last recorded version, so it is safe to run again."
+
+extend:
+  title: Sync a Delta table to a copy from its change data feed
+  metaTitle: Delta Lake Change Data Feed Sync with Kestra
+  shortDescription: Apply only the new inserts, updates and deletes of a Delta table to a copy, record the progress in the target commit, and stop when the change history is gone.
+  metaDescription: Kestra flow that syncs a Delta table to a copy from its change data feed. It applies new inserts, updates and deletes, and stops if the history is gone.
+  description: |
+    Copying a whole Delta table on every run gets slow and costly, and a copy that misses a delete or applies an update twice is wrong without anyone noticing. This flow keeps a second Delta table current from the first table's change data feed. Each run applies only what changed since the last run, handles inserts, updates and deletes by key, and records how far it got in the same commit as the data. If the source no longer has the change history the target needs, the run stops and changes nothing, instead of skipping changes. The demo runs offline on local tables, with no credentials.
+
+    ## How it works
+    1. `prepare_demo` (demo mode only) builds a source table with change data feed and 10 commits, a model of the expected result computed in plain Python, and a target in the starting state chosen by `demo_scenario`.
+    2. `check_versions` reads the source version and the source version recorded in the target. It changes nothing and decides one of four things:
+       - `SNAPSHOT`: the target does not exist yet.
+       - `INCREMENTAL`: the target is behind and the changes after its version can still be read.
+       - `UP_TO_DATE`: nothing to do.
+       - `FALLEN_BEHIND`: the changes after the target's version are gone from the source.
+    3. `copy_snapshot` runs on `SNAPSHOT`. It copies the source as of one pinned version into the target, keeping the partition columns, and records that version.
+    4. `apply_changes` runs on `INCREMENTAL`. It reads the change feed from the recorded version up to the pinned source version and applies it with one MERGE.
+    5. `stop_if_fallen_behind` ends the run as FAILED on `FALLEN_BEHIND` and explains why. Nothing was changed. With `fallen_behind_action` set to `FULL_RESYNC` the flow runs `copy_snapshot` instead.
+    6. `verify_demo` (demo mode only) compares the target with the expected state and fails the run on any difference. `summary` logs what happened. The `poll` Schedule is disabled.
+
+    ## How the changes are applied
+    - The marker is a Delta transaction identifier: the pair (app id, source version) written in the same commit as the data. The next run reads it back with `transaction_version`.
+    - `update_preimage` rows hold the old values and are skipped.
+    - For each key the change from the newest source version wins. A row updated twice is applied once, and a row inserted and then deleted inside one range is not applied at all.
+    - An overwrite at the source shows up as a delete and an insert of the same key in one version. The insert wins.
+    - A key inserted twice in one source version stops the run.
+    - MERGE rejects several source rows for one key in delta-rs 1.6.6, which is why the changes are reduced to one row per key first.
+    - A range with no data changes, for example an OPTIMIZE commit, still moves the marker. An empty append writes the commit that carries it.
+    - Rerunning a finished run does nothing, because the marker equals the source version.
+    - Change data feed files follow the table's retention, and VACUUM deletes them (Delta docs). A target that is paused for longer than that cannot catch up from the feed. The flow detects it by reading the first version it needs. A read error it does not recognise stops the run, and never leads to a rebuild.
+
+    ## Prerequisites
+    - A worker that can run Docker, to start `python:3.12-slim`.
+    - Network access to pull the image and install `deltalake`, `pyarrow` and `kestra` from PyPI. The versions are pinned.
+    - For your own tables: `delta.enableChangeDataFeed` set to `true` on the source. Only changes made after that are recorded.
+    - Secrets: none required for the demo.
+
+    ## Quick start
+    1. Import the flow into the `company.team` namespace, or paste it into the editor.
+    2. Execute it with the default inputs. Nothing else needs to be set up.
+    3. Read the logs of `check_versions`, `apply_changes` and `verify_demo`.
+    4. Execute it again with the other values of `demo_scenario` to see each branch.
+    5. For `FALLEN_BEHIND`, also try `fallen_behind_action` set to `FULL_RESYNC`.
+    6. The `poll` Schedule stays disabled. Enabling it makes sense only with `demo_mode` off, because every demo run builds new tables.
+
+    ## Inputs
+    - `demo_mode` (BOOL, default true): build and use local demo tables.
+    - `demo_scenario` (SELECT, default INCREMENTAL, allowed INCREMENTAL, BOOTSTRAP, UP_TO_DATE, FALLEN_BEHIND): the starting state of the demo tables.
+    - `source_uri` (STRING, optional): the source table, used when `demo_mode` is false.
+    - `target_uri` (STRING, optional): the copy, used when `demo_mode` is false. The flow creates it.
+    - `key_columns` (STRING, optional): comma separated key columns, used when `demo_mode` is false. Plain column names only.
+    - `fallen_behind_action` (SELECT, default FAIL, allowed FAIL, FULL_RESYNC): what to do when the change history is gone.
+
+    ## Outputs
+    The flow produces no files. The tasks expose values through `vars`:
+    - `outputs.check_versions.vars.action`, one of `SNAPSHOT`, `INCREMENTAL`, `UP_TO_DATE`, `FALLEN_BEHIND`
+    - `outputs.check_versions.vars.source_version` and `marker`, the source version and the version recorded in the target, `-1` when there is no target
+    - `outputs.apply_changes.vars.inserted`, `updated`, `deleted`, `from_version` and `to_version`
+    - `outputs.copy_snapshot.vars.rows`
+    - `outputs.verify_demo.vars.rows` and `passed`
+
+    ## Expected result
+    With the defaults the execution ends in SUCCESS. `check_versions` logs `Source version 9, target marker 1 -> INCREMENTAL. Applying source versions 2 to 9.` `apply_changes` logs `Applied source versions 2 to 9: 10 change rows, 6 keys changed. Target: 1 inserted, 3 updated, 1 deleted. Marker is now 9.` `verify_demo` ends with `Verification passed: 6 orders, marker at the source version.`
+
+    - `BOOTSTRAP`: SUCCESS. `copy_snapshot` creates the target at version 9 and `apply_changes` is skipped.
+    - `UP_TO_DATE`: SUCCESS. `copy_snapshot` and `apply_changes` are skipped.
+    - `FALLEN_BEHIND` with `FAIL`: FAILED at `fail_fallen_behind`, with the reason in the error message. The target is untouched.
+    - `FALLEN_BEHIND` with `FULL_RESYNC`: SUCCESS. The target is rebuilt from version 9.
+
+    ## Using it on your own tables
+    1. Turn on change data feed at the source: `delta.enableChangeDataFeed` = `true`.
+    2. Set `demo_mode` to false and fill in `source_uri`, `target_uri` and `key_columns`.
+    3. The first run creates the target from the source as of its current version. Later runs apply the changes.
+    4. Pass storage credentials through `env` on the three script tasks with `{{ secret('NAME') }}`. This flow does not exercise that path.
+    5. Enable the `poll` Schedule. Runs queue behind each other because of `concurrency`.
+
+    ## Limits
+    - The target has to be created by this flow, and nothing else should write to it. A target that exists without a sync marker is refused.
+    - The marker belongs to the source URI as written. A renamed source needs a new target.
+    - Schema changes at the source are not synced. The run stops when the columns differ.
+    - Each run reads its whole change range into memory. Schedule it often enough to keep the range small.
+    - `FULL_RESYNC` overwrites the target. It is off by default.
+    - Tables with deletion vectors or column mapping, and storage other than local files, were not tested.
+
+    ## Links
+    - [plugin-script-python](https://kestra.io/plugins/plugin-script-python)
+    - [Delta change data feed](https://docs.delta.io/delta-change-data-feed/)
+    - [Delta protocol, transaction identifiers](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+  ee: false
+  demo: false

@@ -58,53 +58,101 @@ Minimum 3 runnable tasks
 
 Required & recommended fields
 - `id` (required): hyphen-case, must match filename.
-- `namespace` (required): owner/team namespace.
+- `namespace` (required): owner/team namespace (e.g., `company.analytics`, `company.ai`, `company.team`).
 - `tasks` (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
-- `extend` (required): use this metadata block to explain the Blueprint for the catalog UI.
-  - `title`: concise human title (one line).
-  - `description`: long explanation, prerequisites, steps to run, expected outputs, warnings.
-  - `metaDescription`: short summary (<= 160 chars) used for search/cards.
-  - `tags`: categories to improve discoverability.
-  - `ee`: true/false (Flows that require Enterprise Edition).
-  - `demo`: true/false (mark runnable demo flows).
+- `extend` (required): metadata block powering the [Kestra Blueprints Catalog](https://kestra.io/blueprints). All 9 fields are standard across the catalog:
+  - `title`: concise human-friendly title (one line, not the id slug).
+  - `metaTitle`: SEO title for the browser tab.
+  - `shortDescription`: 1–2 sentence summary used for UI preview cards.
+  - `metaDescription`: search snippet strictly **<= 160 characters**.
+  - `description`: comprehensive documentation following the **8 canonical sections** below (~1,500 to 3,000 characters).
+  - `tags`: primary category (`Data`, `AI`, `Infrastructure`, `Business`, `Cloud`, `Core`).
+  - `subTags`: faceted filter tags selected from the controlled taxonomy below.
+  - `ee`: `true`/`false` (`true` only if using Enterprise Edition plugins).
+  - `demo`: always `false` for contributed blueprints; the Kestra team flips it on the few flows wired to the public demo instance.
 
-Documentation checklist for each blueprint
-1. Tasks: include multiple tasks.
-2. Prerequisites: list required secrets, services, images.
-3. Secrets: list each secret name and exact purpose (do NOT include values).
-4. Inputs: document each input (type, default, allowed values).
-5. Outputs: show primary outputs and example paths (e.g., `{{ outputs.task.uri }}`).
-6. Links: include links to plugin docs or external APIs used.
+### Canonical Documentation Sections (`description`)
 
-Style & best practices
-- Keep `metaDescription` short and searchable.
-- Title should be human-friendly (not the same as id).
-- Put examples for common pitfalls (e.g., enabling schedules, how to set secrets, expressions).
-- Avoid hardcoding credentials — use `{{ secret('NAME') }}` placeholders.
-- Add task-level `description` fields liberally to explain purpose and side-effects.
+To ensure consistency and quality across the catalog, the `description` block must include all 8 canonical sections:
 
-Example `extend` template to copy-paste:
+1. `## How it works`: Numbered step-by-step walkthrough of triggers, tasks, and flow control logic.
+2. `## What you get`: Bulleted list of tangible outputs, failure safeguards, and automation benefits.
+3. `## Who it's for`: Target personas (e.g., Analytics Engineers, Platform Teams, AI Practitioners).
+4. `## Why orchestrate this with Kestra`: Value of declarative orchestration, retries, and state tracking over raw scripts or cron.
+5. `## Prerequisites`: Required container runtimes, services, or IAM permissions.
+   - `### Secrets`: List each secret name and its exact purpose (never include actual values).
+6. `## Quick start`: Numbered instructions to configure secrets, test-run the flow, and enable the schedule.
+7. `## How to extend`: Practical enhancement ideas (e.g., alert channels, downstream BI cache warming).
+8. `## Links`: Direct markdown links to Kestra plugin documentation and external tool APIs.
+
+### Approved SubTags Taxonomy
+
+Subtags are strictly validated against the catalog taxonomy. Do not invent custom strings. Common valid subtags by primary category include:
+
+- **`Data`**: `Testing & Quality`, `dbt Transformations`, `ELT & Warehouse Loading`, `ELT & Data Landing`, `Day 2 Operations`, `Data Warehouses`, `Monitoring & Alerting`, `Realtime & Streaming`, `Spark & Big Data`, `File & Data Processing Basics`, `Vector Stores & RAG`.
+- **`AI`**: `Agents & Structured Output`, `Monitoring & Alerting`, `Vector Stores & RAG`, `Content Generation`, `Classification & Moderation`, `Policy & Compliance`, `Incident Response`, `RAG & Knowledge Retrieval`, `Testing & Quality`.
+- **`Infrastructure`**: `CI/CD & Deployment`, `Infrastructure Automation`, `Kubernetes Operations`, `Day 2 Operations`, `Incident Response`, `Approval Gates`, `FinOps & Cost Management`, `GitOps & Flow Sync`, `Monitoring & Alerting`.
+- **`Business`**: `Reporting & Digests`, `Approval Gates`, `HR & Ops Automation`, `CRM & Marketing Ops`, `Scheduling`, `Policy & Compliance`.
+- **`Core`**: `Flow Control & Conditions`, `Failure Alerting Mechanics`, `Namespace & Git Management`.
+
+### Example `extend` template to copy-paste:
+
 ```yaml
 extend:
-  title: Short human-friendly title here
+  title: Concise Human-Friendly Title Here
+  metaTitle: SEO Title for Search Engines | Kestra
+  shortDescription: Short 1-2 sentence preview used for UI catalog cards.
+  metaDescription: Concise summary strictly <= 160 characters for search snippet.
   description: |
-    Short summary: what the Blueprint does.
+    Brief 1-paragraph overview of what this workflow accomplishes and the problem it solves.
 
-    Prerequisites:
-      - Secrets:
-        - NAME: purpose (required)
-      - Services: Redis, Postgres, SMTP, etc.
-    Quick start:
-      1. Set secrets
-      2. Upload flow
-      3. (Optional) Enable schedule and run
-    Expected outputs:
-      - outputs.my_task.uri: CSV file with results
+    ## How it works
+
+    1. Trigger description (e.g. Schedule or event-driven Webhook).
+    2. Step-by-step task execution walkthrough explaining non-obvious configurations.
+    3. Downstream routing, notifications, or failure handling.
+
+    ## What you get
+
+    - Bullet points of tangible outcomes and operational safeguards.
+    - Automated alerts directing engineers straight to root-cause issues.
+
+    ## Who it's for
+
+    - Target engineering personas and operational teams.
+
+    ## Why orchestrate this with Kestra
+
+    - Advantages of declarative YAML orchestration, retries, and secret masking over standalone scripts.
+
+    ## Prerequisites
+
+    - Required runner, worker, or service access.
+
+    ### Secrets
+
+    - `SECRET_NAME`: Purpose of secret (required).
+
+    ## Quick start
+
+    1. Configure required secrets in your Kestra namespace.
+    2. Import this blueprint and click **Execute** with default inputs.
+    3. Verify execution logs and activate the trigger.
+
+    ## How to extend
+
+    - Practical suggestions for adding alert channels, downstream BI triggers, or cloud storage syncs.
+
+    ## Links
+
+    - [Plugin Documentation](https://kestra.io/plugins/...)
+    - [External Tool Documentation](https://...)
   tags:
-    - Getting Started # Check Blueprints page or other Blueprints for all possible tags
+    - Data
+  subTags:
+    - Testing & Quality
   ee: false
-  demo: true
-  metaDescription: One-line summary suitable for search (<=160 chars)
+  demo: false
 ```
 
 Thank you for contributing — clear docs make Blueprints far more reusable, so be as detailed as you can :D
