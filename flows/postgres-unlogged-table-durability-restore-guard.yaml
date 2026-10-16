@@ -1,0 +1,344 @@
+id: postgres-unlogged-table-durability-restore-guard
+namespace: company.team
+description: Restore crash durability for small PostgreSQL tables left unlogged outside staging schemas.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: postgres_url
+    type: STRING
+    defaults: jdbc:postgresql://postgres:5432/app
+    description: PostgreSQL JDBC URL. The worker must reach this database. The flow adds connection and statement timeouts.
+  - id: postgres_username
+    type: STRING
+    defaults: "{{ secret('POSTGRES_USERNAME') }}"
+    description: Table owner or a role that can SET ROLE to the owner. Override only for a disposable sandbox.
+  - id: postgres_password
+    type: STRING
+    defaults: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: Database password. Prefer the POSTGRES_PASSWORD secret.
+  - id: schema_filter
+    type: STRING
+    defaults: public
+    description: One exact allowed schema name. Empty and system schemas are refused. This value is a bound SQL parameter.
+  - id: staging_schemas
+    type: ARRAY
+    itemType: STRING
+    defaults: [staging]
+    description: Exact schemas where unlogged tables are intentional. Never remediated. Names are passed as bound JSON.
+  - id: watch_key
+    type: STRING
+    defaults: postgres_unlogged_durability
+    description: Persistent first-seen KV key. Use a distinct key for every database and schema scope. Do not change it between scheduled runs.
+  - id: grace_minutes
+    type: INT
+    defaults: 1440
+    min: 0
+    description: Minimum time this exact OID, name and storage file has been observed unlogged. Zero is for a supervised test.
+  - id: max_table_mb
+    type: INT
+    defaults: 16
+    min: 1
+    max: 1024
+    description: Maximum total table and index size in MiB per conversion. Oversized tables remain reported. There is no unlimited mode.
+  - id: max_tables
+    type: INT
+    defaults: 3
+    min: 1
+    max: 10
+    description: Maximum eligible tables converted per approved run. Tables are ordered by OID. Further tables wait for the next run.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Report findings and retain first-seen observations without changing PostgreSQL.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: With dry_run false, request approval before converting the bounded target set.
+  - id: slack_webhook_url
+    type: STRING
+    defaults: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    description: Slack incoming webhook. Override with a local HTTP sink only in a disposable test.
+
+variables:
+  jdbc_url: "{{ inputs.postgres_url }}{{ inputs.postgres_url contains '?' ? '&' : '?' }}connectTimeout=5&socketTimeout=40&options=-c%20statement_timeout%3D30000%20-c%20lock_timeout%3D2000"
+  detect_sql: |
+    WITH candidates AS MATERIALIZED (
+      SELECT c.oid, c.relfilenode, c.relname, n.nspname
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r' AND c.relpersistence = 'u'
+        AND NOT c.relispartition
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND n.nspname NOT LIKE 'pg\_%'
+        AND n.nspname = CAST(:schema_filter AS text)
+        AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(CAST(:staging_json AS jsonb)) s(name) WHERE s.name = n.nspname)
+        AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
+      ORDER BY c.oid LIMIT 201
+    ), observed AS MATERIALIZED (
+      SELECT *, pg_total_relation_size(oid) AS table_bytes,
+        CASE WHEN pg_total_relation_size(oid) <= CAST(:max_table_mb AS bigint) * 1048576 THEN
+          CAST(query_to_xml(format('SELECT count(*) AS row_count, md5(coalesce(string_agg(md5(CAST(row_to_json(x) AS text)), %L ORDER BY md5(CAST(row_to_json(x) AS text)) COLLATE "C"), %L)) AS content_hash FROM ONLY %I.%I x', '', '', nspname, relname), false, true, '') AS text)
+        END AS content_snapshot
+      FROM candidates
+    )
+    SELECT CAST(oid AS bigint) AS table_oid, CAST(relfilenode AS bigint) AS storage_file,
+      nspname AS schema_name, relname AS table_name,
+      format('%I.%I', nspname, relname) AS qualified_name,
+      table_bytes, content_snapshot,
+      CAST(extract(epoch FROM statement_timestamp()) AS bigint) AS now_epoch,
+      format($outer$
+        DO $guard$
+        DECLARE target record; current_snapshot text;
+        BEGIN
+          SELECT c.*, n.nspname INTO target FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.oid = CAST(%1$s AS oid) AND n.nspname = %2$L AND c.relname = %3$L;
+          IF NOT FOUND THEN RAISE EXCEPTION 'Approved table identity changed'; END IF;
+          EXECUTE format('LOCK TABLE ONLY %%I.%%I IN ACCESS EXCLUSIVE MODE', target.nspname, target.relname);
+          SELECT c.*, n.nspname INTO target FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.oid = CAST(%1$s AS oid) AND n.nspname = %2$L AND c.relname = %3$L
+            AND c.relkind = 'r' AND c.relpersistence = 'u'
+            AND c.relfilenode = CAST(%4$s AS oid) AND NOT c.relispartition
+            AND pg_total_relation_size(c.oid) <= CAST(%5$s AS bigint) * 1048576
+            AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid);
+          IF NOT FOUND THEN RAISE EXCEPTION 'Approved table is no longer eligible'; END IF;
+          current_snapshot := CAST(query_to_xml(format('SELECT count(*) AS row_count, md5(coalesce(string_agg(md5(CAST(row_to_json(x) AS text)), %%L ORDER BY md5(CAST(row_to_json(x) AS text)) COLLATE "C"), %%L)) AS content_hash FROM ONLY %%I.%%I x', '', '', target.nspname, target.relname), false, true, '') AS text);
+          IF current_snapshot IS DISTINCT FROM %6$L THEN RAISE EXCEPTION 'Approved table content changed. Replan before conversion'; END IF;
+          EXECUTE format('ALTER TABLE ONLY %%I.%%I SET LOGGED', target.nspname, target.relname);
+          current_snapshot := CAST(query_to_xml(format('SELECT count(*) AS row_count, md5(coalesce(string_agg(md5(CAST(row_to_json(x) AS text)), %%L ORDER BY md5(CAST(row_to_json(x) AS text)) COLLATE "C"), %%L)) AS content_hash FROM ONLY %%I.%%I x', '', '', target.nspname, target.relname), false, true, '') AS text);
+          IF current_snapshot IS DISTINCT FROM %6$L THEN RAISE EXCEPTION 'Converted table content did not match approval. Conversion rolled back'; END IF;
+        END $guard$;
+      $outer$, oid, nspname, relname, relfilenode, CAST(:max_table_mb AS bigint), content_snapshot) AS apply_sql
+    FROM observed ORDER BY oid
+
+triggers:
+  - id: daily_durability_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 3 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: allowed_schema
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ inputs.schema_filter != '' and inputs.schema_filter != 'pg_catalog' and inputs.schema_filter != 'information_schema' and not (inputs.schema_filter contains 'pg_') }}"
+    errorMessage: Choose one exact user schema. Empty or system schema selection is refused.
+
+  - id: detect
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    connectionPooling: false
+    url: "{{ render(vars.jdbc_url) }}"
+    username: "{{ inputs.postgres_username }}"
+    password: "{{ inputs.postgres_password }}"
+    fetchType: FETCH
+    parameters:
+      schema_filter: "{{ inputs.schema_filter }}"
+      staging_json: "{{ inputs.staging_schemas | toJson }}"
+      max_table_mb: "{{ inputs.max_table_mb }}"
+    sql: "{{ render(vars.detect_sql) }}"
+
+  - id: bounded_scan
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.detect.size <= 200 }}"
+    errorMessage: More than 200 unlogged candidates. Narrow schema_filter before approving a rewrite.
+
+  - id: read_watch
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.watch_key }}"
+    errorOnMissing: false
+
+  - id: observation
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      context: "{{ {'rows': outputs.detect.rows, 'old': (outputs.read_watch.value ?? ''), 'grace': inputs.grace_minutes * 60, 'cap': inputs.max_table_mb * 1048576, 'limit': inputs.max_tables} | toJson }}"
+
+  - id: plan
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      all_json: >-
+        {{ outputs.observation.values.context | jq('(.old | if type == "string" then (if . == "" then "{}" else . end | fromjson) elif . == null then {} else . end) as $old | (.grace|tonumber) as $grace | (.cap|tonumber) as $cap | [.rows[] | ((.table_oid|tostring)+":"+(.storage_file|tostring)+":"+.qualified_name) as $key | . + {watch_id:$key, first_seen:($old[$key] // .now_epoch)} | . + {age:(.now_epoch - .first_seen)} | . + {eligible:(.age >= $grace and .table_bytes <= $cap)}]') | first | toJson }}
+
+  - id: targets
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      selected_json: "{{ {'rows': fromJson(outputs.plan.values.all_json), 'limit': inputs.max_tables} | toJson | jq('.limit as $limit | [.rows[] | select(.eligible)][:($limit|tonumber)]') | first | toJson }}"
+      cursor_json: "{{ outputs.plan.values.all_json | jq('map({(.watch_id): .first_seen}) | add // {}') | first | toJson }}"
+
+  - id: write_watch
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.watch_key }}"
+    value: "{{ outputs.targets.values.cursor_json }}"
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Unlogged ordinary tables outside staging: {{ outputs.detect.size }}.
+      Bounded plan: {{ outputs.targets.values.selected_json }}.
+      Fresh or oversized tables remain report-only: {{ outputs.plan.values.all_json }}.
+      Every conversion can block readers and writers for up to the 30s statement budget.
+
+  - id: findings
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.detect.size > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ inputs.slack_webhook_url }}"
+        payload: "{{ {'text': 'PostgreSQL durability guard found ' ~ outputs.detect.size ~ ' unlogged ordinary tables outside staging. They can be truncated after a crash. Read the bounded plan in execution ' ~ execution.id ~ '. dry_run=' ~ inputs.dry_run ~ ' auto_remediate=' ~ inputs.auto_remediate} | toJson }}"
+      - id: mode
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and (outputs.targets.values.selected_json | jq('length') | first) > 0 }}"
+        then:
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: PT1H
+            behavior: FAIL
+            description: Approve the exact plan. SET LOGGED rewrites each table and its indexes, generates WAL and takes ACCESS EXCLUSIVE. Check disk and WAL headroom first. Lock wait is 2s and each statement is capped at 30s.
+            onResume:
+              - id: approved
+                type: BOOL
+                required: false
+                description: Set true to approve. Omitted or false means no change.
+          - id: approved_only
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval.onResume.approved ?? false }}"
+            then:
+              - id: convert_tables
+                type: io.kestra.plugin.core.flow.Loop
+                concurrencyLimit: 1
+                values: "{{ outputs.targets.values.selected_json }}"
+                tasks:
+                  - id: convert_one
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    allowFailure: true
+                    connectionPooling: false
+                    url: "{{ render(vars.jdbc_url) }}"
+                    username: "{{ inputs.postgres_username }}"
+                    password: "{{ inputs.postgres_password }}"
+                    fetchType: NONE
+                    sql: "{{ fromJson(item.value).apply_sql }}"
+              - id: verify
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                connectionPooling: false
+                url: "{{ render(vars.jdbc_url) }}"
+                username: "{{ inputs.postgres_username }}"
+                password: "{{ inputs.postgres_password }}"
+                fetchType: FETCH
+                parameters:
+                  targets_json: "{{ outputs.targets.values.selected_json }}"
+                sql: |
+                  SELECT p->>'qualified_name' AS approved_name,
+                    CAST(p->>'table_oid' AS bigint) AS approved_oid,
+                    CAST(c.relpersistence AS text) AS persistence, c.oid IS NOT NULL AS same_identity,
+                    coalesce(c.relpersistence = 'p', false) AS durable
+                  FROM jsonb_array_elements(CAST(:targets_json AS jsonb)) p
+                  LEFT JOIN pg_class c ON c.oid = CAST(p->>'table_oid' AS oid)
+                    AND c.relname = p->>'table_name'
+                    AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = p->>'schema_name')
+                    AND c.relkind = 'r'
+                  ORDER BY CAST(p->>'table_oid' AS bigint)
+              - id: verdict
+                type: io.kestra.plugin.core.execution.Assert
+                conditions:
+                  - "{{ (outputs.verify.rows | jq('map(select(.durable != true)) | length') | first) == 0 }}"
+                errorMessage: An approved table remains unlogged or its identity changed. Inspect convert_one logs, resolve ownership, locks or drift then run again. Completed conversions remain logged.
+              - id: restored
+                type: io.kestra.plugin.core.log.Log
+                message: "Verified approved identities are logged: {{ outputs.verify.rows | toJson }}. PostgreSQL now WAL-logs their data."
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: Approval declined or omitted. PostgreSQL was unchanged.
+        else:
+          - id: report_only
+            type: io.kestra.plugin.core.log.Log
+            message: Dry run, remediation disabled or no mature bounded targets. PostgreSQL was unchanged.
+    else:
+      - id: healthy
+        type: io.kestra.plugin.core.log.Log
+        message: No unlogged standalone ordinary tables outside staging in this schema scope.
+
+errors:
+  - id: failure_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ inputs.slack_webhook_url }}"
+    payload: "{{ {'text': 'PostgreSQL durability guard failed in execution ' ~ execution.id ~ '. Read the approved identities and PostgreSQL error before retrying. Completed conversions are retained.'} | toJson }}"
+
+extend:
+  title: Restore durability for forgotten unlogged PostgreSQL tables
+  shortDescription: Find small non-staging unlogged tables, approve a bounded conversion and verify their original identities are logged.
+  metaTitle: PostgreSQL unlogged table durability guard
+  metaDescription: Restore crash durability for small PostgreSQL tables left unlogged with first-seen grace, approval, locked identity checks and verification.
+  tags: [Data, Infrastructure]
+  subTags: [Day 2 Operations, Approval Gates]
+  ee: false
+  demo: false
+  description: |
+    ## How it works
+
+    PostgreSQL unlogged tables bypass WAL. After an unclean shutdown PostgreSQL truncates them. This guard detects standalone ordinary tables left unlogged outside approved staging schemas. Partition members and inheritance trees are excluded because they need a coordinated plan.
+
+    The first observation starts a persistent grace clock keyed by OID, storage file and quoted name. A storage rewrite or rename starts a fresh observation. The default grace is one day. The plan selects at most three tables of at most 16 MiB each. More than 200 candidates fails the scan and requires a narrower schema.
+
+    A real Pause approves the exact plan. Each native PostgreSQL Query takes an exclusive lock, then checks the OID, name, storage file, table kind and size again before SET LOGGED. Drift refuses the change. A second content snapshot under the same exclusive lock must match before commit. Conversions are sequential. A final query checks the original approved identities without reusing the age or size filter. Any unresolved table fails the execution.
+
+    ## What you get
+
+    A bounded durability recovery plan, first-seen observations, approval history and a verdict tied to the approved tables. Intentional staging tables remain unlogged. The locked transaction checks row count and a sorted MD5 digest before commit. Successful conversions receive normal PostgreSQL crash recovery guarantees.
+
+    ## Who it's for
+
+    PostgreSQL operators who use unlogged tables for bulk loading but need the resulting data to survive crashes after loading finishes.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra retains observations between scheduled scans, requests approval and records partial recovery across a sequence of table rewrites. PostgreSQL performs the lock and rewrite itself. Independent reads decide whether the approved identities reached the promised state.
+
+    ## Tested end to end
+
+    Tested on Kestra 2.0.5 with PostgreSQL 16.15 and JDBC PostgreSQL 2.1.0. A 1,000-row target became logged with its OID and checksum retained. An immediate PostgreSQL shutdown followed by crash recovery retained all 1,000 rows with checksum `67d2b67328b0dc1cb9287f08be5f2c1e`. A healthy logged control retained 100 rows. The intentional unlogged staging control was unchanged by conversion then reset to zero rows during crash recovery. A fresh pinned fixture reproduced these results.
+
+    Healthy detection, dry run and declined approval left PostgreSQL unchanged. The detector excluded staging, inheritance and partition controls. A 2.5 MiB table remained reported outside a 1 MiB conversion budget. A first observation with a 60-minute grace remained report-only. A one-table cap converted one of two eligible tables. A repeat after recovery performed no rewrite.
+
+    A reader-owned table converted before ownership refused a second table. The final verdict failed with the second table still unlogged. A retry repaired only the remaining table and preserved the first table's storage file and checksum. Content changed during approval caused a failed verdict without converting the changed table. An enabled Schedule probe with identical task and input declarations ran in safe mode. The shipped Schedule stays disabled. Notifications used a local HTTP sink instead of Slack.
+
+    ## Prerequisites
+
+    PostgreSQL 16 with PL/pgSQL and Kestra 2.0.5 with JDBC PostgreSQL 2.1.0 and Slack 2.1.0. The database user needs schema USAGE, catalog visibility, SELECT on observed small tables and effective ownership of each target table. SET LOGGED needs no superuser role when the user owns the table. A role with SELECT can scan but ownership checks still restrict conversion. Reading every visible row is required for the content comparison. Row-level security and custom type output need a separate review before adoption.
+
+    SET LOGGED rewrites the table and indexes and emits WAL. Check free disk, WAL retention and replication capacity before approving. ACCESS EXCLUSIVE blocks readers and writers. Every statement has a 30-second budget, every lock wait has a two-second budget and the connection is capped at five seconds. A timeout rolls back that one table. There are no automatic write retries. Use a maintenance window for larger work.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` and `POSTGRES_PASSWORD`: database credentials.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    Set `postgres_url`, exact `schema_filter` and `staging_schemas`. Give each database and schema scope a distinct stable `watch_key`. Keep `dry_run: true` and `auto_remediate: false` for scheduled scans. `grace_minutes`, `max_table_mb` and `max_tables` bound the work. An empty schema filter, pg_catalog, information_schema and any schema name containing pg_ are refused. This conservative restriction also excludes some user schema names. Schema names are bound parameters and SQL identifiers are quoted by PostgreSQL.
+
+    ## Quick start
+
+    Configure the three secrets and database URL. Run in safe mode and inspect the table identities and size. Wait for the grace window then run with dry_run false and auto_remediate true. Confirm disk and WAL capacity and approve the Pause. Read the final verification rows. A failed table leaves successful earlier conversions intact, so fix the refusal and run again with the same watch key.
+
+    The Schedule is disabled and forces safe mode. Enable it after checking the scope. Flow concurrency serializes executions of this flow id. Clones, different flow ids and external operators are outside that scope, so the database lock and identity recheck remain necessary. The grace clock measures continuous observations, not PostgreSQL table creation time. A table that becomes logged and unlogged again between scans can retain its observation if its identity is unchanged.
+
+    ## How to extend
+
+    Add a separately reviewed policy for partition or inheritance families. Keep their topology and lock effects explicit. Pair this guard with replication lag and WAL capacity monitoring. If a table is intentionally unlogged, move it into an allowlisted staging schema rather than increasing unattended rewrite budgets.
+
+    Conversion enables normal WAL logging but does not create a backup or prove replica availability. The guard checks content while the conversion lock is held then verifies durable identities after commit. Legitimate writers can change data after commit. The sorted MD5 digest is an accidental-change check, not a cryptographic proof of hostile tampering. Crash survival is demonstrated in an owned disposable fixture rather than by crashing a production database.
+
+    ## Links
+
+    - [PostgreSQL CREATE TABLE: UNLOGGED](https://www.postgresql.org/docs/16/sql-createtable.html)
+    - [PostgreSQL ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html)
+    - [Kestra PostgreSQL Query](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.query)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
