@@ -1,0 +1,972 @@
+id: opensearch-rollover-write-alias-repair-guard
+namespace: company.team
+description: >-
+  Find a declared OpenSearch rollover alias that has no write index or whose
+  write index is not the member you expect, repair only the is_write_index flags
+  behind an approval gate, then prove the fix by writing a canary document
+  through the alias and checking which index it landed in.
+
+labels:
+  project: opensearch-rollover-write-alias-repair-guard
+  team: platform
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: opensearch_url
+    type: STRING
+    displayName: OpenSearch URL
+    defaults: "{{ secret('OPENSEARCH_HOST') }}"
+    description: Cluster URL reachable from the Kestra worker, for example http://opensearch:9200.
+
+  - id: opensearch_username
+    type: STRING
+    displayName: OpenSearch username
+    defaults: "{{ secret('OPENSEARCH_USERNAME') }}"
+    description: >-
+      Account that can read index metadata and documents on the declared members,
+      manage aliases and create plus delete one canary document.
+
+  - id: opensearch_password
+    type: STRING
+    displayName: OpenSearch password
+    defaults: "{{ secret('OPENSEARCH_PASSWORD') }}"
+
+  - id: alias_name
+    type: STRING
+    displayName: Write alias to repair
+    description: >-
+      One exact alias name. No wildcard, no comma, no leading dot. This is the
+      only alias the flow will ever write to.
+
+  - id: expected_index
+    type: STRING
+    displayName: Index that should receive writes
+    description: >-
+      The member that is supposed to be the write index, normally the newest one
+      a rollover created. It has to appear in member_indices.
+
+  - id: member_indices
+    type: ARRAY
+    itemType: STRING
+    displayName: Complete alias membership
+    description: >-
+      Every index the alias is expected to point at, 1 to 10 of them. If the
+      cluster returns a different set the run stops: the flow never discovers
+      members for itself, so an index that joined the alias behind your back
+      cannot be written to.
+
+  - id: expected_uuids_json
+    type: STRING
+    displayName: Expected index UUIDs
+    description: >-
+      JSON object mapping each member name to the index UUID you intend to act
+      on, for example {"logs-000002": "I0uhvcPSQraR6w-XqvROcQ"}. An index that
+      was deleted and recreated under the same name has a new UUID, so this
+      stops the repair from adopting a replacement index.
+
+  - id: canary_source_json
+    type: STRING
+    displayName: Canary document
+    defaults: '{"kestra_alias_probe": true}'
+    description: >-
+      The document written through the alias to prove where writes land. It has
+      to be accepted by the member mappings. It is deleted again in the same
+      run and only if its sequence number and primary term still match the
+      write this execution made.
+
+  - id: max_documents
+    type: INT
+    displayName: Document ceiling
+    min: 1
+    max: 1000
+    defaults: 100
+    description: >-
+      The flow compares every existing document before and after the repair to
+      prove none changed. Above this count it refuses to run rather than compare
+      a truncated snapshot, so point it at a small index family or raise it.
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    defaults: true
+    description: >-
+      When true the flow reports the alias state and the exact actions it would
+      send. It writes nothing.
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Allow remediation
+    defaults: false
+    description: >-
+      When false the flow only reports. A repair needs this true, dry_run false
+      plus an explicit approval on the pause.
+
+  - id: slack_webhook_url
+    type: STRING
+    displayName: Slack webhook
+    defaults: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    description: Incoming webhook the finding and any failure are posted to.
+
+variables:
+  scope: |
+    {
+      "alias": "{{ inputs.alias_name }}",
+      "expected": "{{ inputs.expected_index }}",
+      "members": {{ inputs.member_indices | toJson }},
+      "uuids": {{ inputs.expected_uuids_json }},
+      "maxDocuments": {{ inputs.max_documents }},
+      "canaryId": "kestra-alias-probe-{{ execution.id }}"
+    }
+  guard: |
+    """Shared reader for the alias repair guard.
+
+    Every task that looks at the cluster mounts this file, so the declared
+    scope, the snapshot the approval is bound to and the healthy or degraded
+    verdict are defined exactly once.
+    """
+    import json
+    import re
+    import sys
+
+    NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
+    ALIAS_OPTIONS = {
+        "filter",
+        "routing",
+        "index_routing",
+        "search_routing",
+        "is_hidden",
+        "is_write_index",
+    }
+
+
+    def load(name):
+        with open(name) as handle:
+            return json.load(handle)
+
+
+    def refuse(message):
+        sys.exit("REFUSED: " + message)
+
+
+    def scope():
+        """The declared blast radius. Nothing here is discovered from the cluster."""
+        sc = load("scope.json")
+        for name in [sc["alias"], sc["expected"]] + sc["members"]:
+            if not NAME.fullmatch(name) or name.startswith("."):
+                refuse(
+                    "'%s' is not one exact non-system name. Wildcards, commas, "
+                    "uppercase and leading dots are refused so the endpoints this "
+                    "flow builds cannot widen." % name
+                )
+        if not 1 <= len(sc["members"]) <= 10 or len(set(sc["members"])) != len(sc["members"]):
+            refuse("member_indices must list 1 to 10 distinct index names.")
+        if sc["expected"] not in sc["members"]:
+            refuse("expected_index %s is not one of member_indices." % sc["expected"])
+        if sorted(sc["uuids"]) != sorted(sc["members"]):
+            refuse("expected_uuids_json must name exactly the indexes in member_indices.")
+        return sc
+
+
+    def documents(search):
+        """Id, source, routing and version of every document, ordered so two reads compare."""
+        rows = [
+            {
+                "index": hit["_index"],
+                "id": hit["_id"],
+                "source": hit["_source"],
+                "version": hit.get("_version"),
+                "routing": hit.get("_routing"),
+            }
+            for hit in search["hits"]["hits"]
+        ]
+        return sorted(rows, key=lambda row: (row["index"], row["id"]))
+
+
+    def metadata(sc, indices):
+        """Index identity and every alias option, from one GET.
+
+        GET /<index1>,<index2> returns settings, mappings and every alias with
+        every alias option, so there is no second metadata call to drift against.
+        """
+        alias, expected, members = sc["alias"], sc["expected"], sc["members"]
+        if sorted(indices) != sorted(members):
+            refuse(
+                "the cluster returned indexes %s but member_indices declared %s."
+                % (sorted(indices), sorted(members))
+            )
+        uuids = {name: indices[name]["settings"]["index"]["uuid"] for name in members}
+        if uuids != sc["uuids"]:
+            refuse("index UUID mismatch, so a declared name points at a different index now: %s" % uuids)
+        for name in members:
+            aliases = indices[name]["aliases"]
+            if alias not in aliases:
+                refuse(
+                    "%s does not carry alias %s. This flow only changes write flags, it "
+                    "never adds or removes alias membership." % (name, alias)
+                )
+            unknown = sorted(set(aliases[alias]) - ALIAS_OPTIONS)
+            if unknown:
+                refuse(
+                    "alias %s on %s carries options this flow cannot carry forward: %s"
+                    % (alias, name, unknown)
+                )
+            if indices[name]["settings"]["index"].get("hidden") == "true":
+                refuse("%s is a hidden index and is out of scope." % name)
+            if indices[name]["mappings"] != indices[expected]["mappings"]:
+                refuse(
+                    "%s and %s have different mappings, so a canary accepted by one is "
+                    "not evidence for the other." % (name, expected)
+                )
+        return {
+            "uuids": uuids,
+            "aliases": {name: indices[name]["aliases"] for name in members},
+            "mappings": {name: indices[name]["mappings"] for name in members},
+        }
+
+
+    def snapshot(sc, indices, search):
+        """Everything one approval is bound to: the alias metadata plus every document."""
+        if search["_shards"]["failed"] or search.get("timed_out"):
+            refuse("the document read was partial, so conservation cannot be proven.")
+        total = search["hits"]["total"]
+        if total["relation"] != "eq" or total["value"] > sc["maxDocuments"]:
+            refuse(
+                "%s documents is over the max_documents ceiling of %s."
+                % (total["value"], sc["maxDocuments"])
+            )
+        if len(search["hits"]["hits"]) != total["value"]:
+            refuse("the document snapshot came back truncated.")
+        bound = metadata(sc, indices)
+        bound["documents"] = documents(search)
+        return bound
+
+
+    def verdict(sc, snap):
+        """The verdict: healthy or the repair that preserves every other option.
+
+        OpenSearch refuses to accept two write indexes on one alias, so a healthy
+        alias is one whose single write index is the expected member. An alias with
+        exactly one member and no flag at all routes writes there implicitly and is
+        healthy too: that lookalike must not be touched.
+        """
+        alias, expected, members = sc["alias"], sc["expected"], sc["members"]
+        options = {name: snap["aliases"][name][alias] for name in members}
+        writers = [name for name in members if options[name].get("is_write_index") is True]
+        implicit = len(members) == 1 and "is_write_index" not in options[expected]
+        planned = {name: dict(options[name], is_write_index=(name == expected)) for name in members}
+        return {
+            "healthy": writers == [expected] or implicit,
+            "writers": writers,
+            "implicit": implicit,
+            "options": options,
+            "planned": planned,
+            "actions": {
+                "actions": [
+                    {"add": dict(planned[name], index=name, alias=alias)} for name in members
+                ]
+            },
+            "routing": planned[expected].get("index_routing", planned[expected].get("routing", "")),
+        }
+
+
+    def emit(**outputs):
+        print("::" + json.dumps({"outputs": outputs}) + "::")
+
+triggers:
+  - id: daily_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    description: >-
+      Enable this to check the alias every morning in report-only mode. It forces
+      dry_run true plus auto_remediate false, so turning the schedule on can never
+      write an alias on its own. Replace the placeholder scope with your own.
+    cron: "0 7 * * *"
+    timezone: UTC
+    inputs:
+      dry_run: true
+      auto_remediate: false
+      alias_name: replace-me
+      expected_index: replace-me-000002
+      member_indices:
+        - replace-me-000001
+        - replace-me-000002
+      expected_uuids_json: '{"replace-me-000001": "replace-me", "replace-me-000002": "replace-me"}'
+
+tasks:
+  - id: read_members
+    type: io.kestra.plugin.opensearch.Request
+    description: >-
+      Read the declared members through the OpenSearch plugin. One GET on an
+      explicit comma separated list returns the settings, mappings and every
+      alias with every alias option for each index, which is the whole detector
+      input.
+    connection:
+      hosts:
+        - "{{ inputs.opensearch_url }}"
+      basicAuth:
+        username: "{{ inputs.opensearch_username }}"
+        password: "{{ inputs.opensearch_password }}"
+    method: GET
+    endpoint: "{{ inputs.member_indices | join(',') }}"
+    timeout: PT25S
+
+  - id: read_documents
+    type: io.kestra.plugin.opensearch.Request
+    description: >-
+      Read every existing document with its version and routing. This is the
+      baseline the flow later proves it did not disturb, not a sample.
+    connection:
+      hosts:
+        - "{{ inputs.opensearch_url }}"
+      basicAuth:
+        username: "{{ inputs.opensearch_username }}"
+        password: "{{ inputs.opensearch_password }}"
+    method: GET
+    endpoint: "{{ inputs.member_indices | join(',') }}/_search"
+    timeout: PT25S
+    body:
+      size: "{{ inputs.max_documents + 1 }}"
+      track_total_hits: true
+      version: true
+      query:
+        match_all: {}
+
+  - id: inspect
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Decide healthy or degraded and build the repair. Degraded means either no
+      member carries is_write_index true, so OpenSearch answers every write
+      through the alias with "no write index is defined" or the write index is
+      a member other than expected_index, so documents are landing in the wrong
+      place. An alias with one member and no flag at all is healthy and is left
+      alone. The planned actions copy each member's filter, routing and hidden
+      options forward and change nothing but the write flag.
+    containerImage: python:3.13-slim
+    inputFiles:
+      guard.py: "{{ vars.guard }}"
+      scope.json: "{{ vars.scope }}"
+      members.json: "{{ outputs.read_members.response | toJson }}"
+      documents.json: "{{ outputs.read_documents.response | toJson }}"
+    script: |
+      import json
+
+      import guard
+
+      sc = guard.scope()
+      snap = guard.snapshot(sc, guard.load("members.json"), guard.load("documents.json"))
+      found = guard.verdict(sc, snap)
+
+      if found["healthy"] and found["implicit"]:
+          report = ("Alias %s has one member and no explicit write flag, so writes go to %s "
+                    "implicitly. Healthy, nothing to repair." % (sc["alias"], sc["expected"]))
+      elif found["healthy"]:
+          report = ("Alias %s routes writes to %s, which is the expected index. Healthy."
+                    % (sc["alias"], sc["expected"]))
+      elif found["writers"]:
+          report = ("Alias %s routes writes to %s, not to the expected %s. Every document "
+                    "written through the alias is landing in the wrong index."
+                    % (sc["alias"], found["writers"][0], sc["expected"]))
+      else:
+          report = ("Alias %s has no write index across %s member(s), so OpenSearch rejects "
+                    "every write through it with 'no write index is defined'."
+                    % (sc["alias"], len(sc["members"])))
+
+      print(report)
+      for name in sc["members"]:
+          flag = found["options"][name].get("is_write_index", "unset")
+          carried = sorted(set(found["options"][name]) - {"is_write_index"})
+          print("  %s is_write_index=%s options carried forward: %s" % (name, flag, carried or "none"))
+      print("%s existing document(s) and %s index UUID(s) are now bound to this plan."
+            % (len(snap["documents"]), len(snap["uuids"])))
+      if not found["healthy"]:
+          print("Actions that a repair would send:")
+          print(json.dumps(found["actions"], indent=2, sort_keys=True))
+
+      guard.emit(
+          healthy=found["healthy"],
+          report=report,
+          writers=found["writers"],
+          snapshot=json.dumps(snap, sort_keys=True),
+          documentCount=len(snap["documents"]),
+          canaryId=sc["canaryId"],
+      )
+
+  - id: log_findings
+    type: io.kestra.plugin.core.log.Log
+    description: The verdict and the per-member write flags, in the execution log.
+    message: |
+      {{ outputs.inspect.vars.report }}
+      healthy={{ outputs.inspect.vars.healthy }} write_index_holders={{ outputs.inspect.vars.writers | join(' ') }} documents={{ outputs.inspect.vars.documentCount }}
+
+  - id: handle_degraded
+    type: io.kestra.plugin.core.flow.If
+    description: Everything below runs only when the alias is actually broken.
+    condition: "{{ outputs.inspect.vars.healthy == false }}"
+    then:
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: >-
+          Post the finding and the per-member write flags, so the person who has
+          to approve the repair sees the alias state before the pause.
+        url: "{{ inputs.slack_webhook_url }}"
+        messageText: >-
+          :warning: {{ outputs.inspect.vars.report }} Expected write index
+          `{{ inputs.expected_index }}`, members
+          `{{ inputs.member_indices | join(' ') }}`, {{ outputs.inspect.vars.documentCount }}
+          existing document(s). Execution {{ execution.id }}.
+
+      - id: route_remediation
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          A write needs auto_remediate true and dry_run false at the same time.
+          Miss either and the run stays a report of the actions it would have sent.
+        condition: "{{ inputs.auto_remediate == true and inputs.dry_run == false }}"
+        then:
+          - id: approve_repair
+            type: io.kestra.plugin.core.flow.Pause
+            timeout: PT1H
+            description: >-
+              Moving a write alias decides where the next documents go. Read the
+              findings first: if the alias has no write index because a rollover
+              was interrupted, the newest index is usually right, but if someone
+              moved the flag on purpose then expected_index is wrong and this
+              repair would send writes to the wrong place.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: >-
+                  Set true to send the alias actions. Anything else, including a
+                  resume that answers nothing, leaves the alias untouched.
+
+          - id: apply_if_approved
+            type: io.kestra.plugin.core.flow.If
+            description: An unanswered pause reads as a refusal, never as approval.
+            condition: "{{ (outputs.approve_repair.onResume.approved ?? false) == true }}"
+            then:
+              - id: recheck_members
+                type: io.kestra.plugin.opensearch.Request
+                description: >-
+                  Read the members again. The approval is a snapshot of how the
+                  alias looked before a person was asked. An hour can pass.
+                connection:
+                  hosts:
+                    - "{{ inputs.opensearch_url }}"
+                  basicAuth:
+                    username: "{{ inputs.opensearch_username }}"
+                    password: "{{ inputs.opensearch_password }}"
+                method: GET
+                endpoint: "{{ inputs.member_indices | join(',') }}"
+                timeout: PT25S
+
+              - id: recheck_documents
+                type: io.kestra.plugin.opensearch.Request
+                description: Read the documents again, for the same reason.
+                connection:
+                  hosts:
+                    - "{{ inputs.opensearch_url }}"
+                  basicAuth:
+                    username: "{{ inputs.opensearch_username }}"
+                    password: "{{ inputs.opensearch_password }}"
+                method: GET
+                endpoint: "{{ inputs.member_indices | join(',') }}/_search"
+                timeout: PT25S
+                body:
+                  size: "{{ inputs.max_documents + 1 }}"
+                  track_total_hits: true
+                  version: true
+                  query:
+                    match_all: {}
+
+              - id: recheck_plan
+                type: io.kestra.plugin.scripts.python.Script
+                description: >-
+                  Compare the cluster against the exact snapshot that was
+                  approved and fail the run before any write if it moved. The
+                  alias API is atomic but it is not a compare and set, so sending
+                  the approved actions after someone changed a filter, a routing
+                  value or the flags would quietly overwrite that change. The
+                  actions sent to OpenSearch are rebuilt here, from this read.
+                containerImage: python:3.13-slim
+                inputFiles:
+                  guard.py: "{{ vars.guard }}"
+                  scope.json: "{{ vars.scope }}"
+                  members.json: "{{ outputs.recheck_members.response | toJson }}"
+                  documents.json: "{{ outputs.recheck_documents.response | toJson }}"
+                  approved.json: "{{ outputs.inspect.vars.snapshot }}"
+                script: |
+                  import json
+
+                  import guard
+
+                  sc = guard.scope()
+                  approved = guard.load("approved.json")
+                  snap = guard.snapshot(sc, guard.load("members.json"), guard.load("documents.json"))
+                  found = guard.verdict(sc, snap)
+
+                  if snap != approved:
+                      drift = [key for key in sorted(approved) if snap[key] != approved[key]]
+                      for key in drift:
+                          print("DRIFT in %s" % key)
+                          print("  approved: %s" % json.dumps(approved[key], sort_keys=True)[:600])
+                          print("  now:      %s" % json.dumps(snap[key], sort_keys=True)[:600])
+                      guard.refuse(
+                          "the cluster changed while the approval waited: %s no longer match the "
+                          "snapshot that was approved. Sending the approved actions now would "
+                          "overwrite whatever changed, so nothing was written. Someone may have "
+                          "repaired the alias already. Run again to plan from current state."
+                          % ", ".join(drift)
+                      )
+
+                  print("The approved snapshot still matches the cluster, so the plan is not stale.")
+                  print("Setting is_write_index on %s and clearing it on the other member(s), "
+                        "carrying every other alias option forward:" % sc["expected"])
+                  print(json.dumps(found["actions"], indent=2, sort_keys=True))
+
+                  guard.emit(
+                      actions=json.dumps(found["actions"], sort_keys=True),
+                      planned=json.dumps(found["planned"], sort_keys=True),
+                      routing=found["routing"],
+                  )
+
+              - id: repair_alias
+                type: io.kestra.plugin.opensearch.Request
+                description: >-
+                  One atomic _aliases batch. OpenSearch applies every action in a
+                  batch or none of them, so the alias is never left halfway
+                  between two write indexes. The body is the action set that
+                  recheck_plan just rebuilt, carrying each member's filter,
+                  routing and hidden options forward untouched.
+                connection:
+                  hosts:
+                    - "{{ inputs.opensearch_url }}"
+                  basicAuth:
+                    username: "{{ inputs.opensearch_username }}"
+                    password: "{{ inputs.opensearch_password }}"
+                method: POST
+                endpoint: _aliases
+                timeout: PT25S
+                body: "{{ outputs.recheck_plan.vars.actions }}"
+                parameters:
+                  timeout: 10s
+                  master_timeout: 10s
+
+              - id: repair_acknowledged
+                type: io.kestra.plugin.core.execution.Assert
+                description: >-
+                  A 200 with acknowledged false means the cluster state change
+                  did not reach every node inside master_timeout. Stop there
+                  rather than read a half applied alias.
+                conditions:
+                  - "{{ outputs.repair_alias.response.acknowledged == true }}"
+                errorMessage: >-
+                  The _aliases batch returned {{ outputs.repair_alias.status }} without
+                  acknowledgement. Read the alias with GET _alias/{{ inputs.alias_name }}
+                  before running again.
+
+              - id: prove_with_canary
+                type: io.kestra.plugin.core.flow.Sequential
+                description: >-
+                  The alias metadata reading back correctly is necessary but not
+                  sufficient: a write blocked index, a closed index or a mapping
+                  conflict all leave the flag looking right while writes still
+                  fail. So write one real document through the alias and see
+                  where it lands. The finally block removes it on every path.
+                tasks:
+                  - id: canary_write
+                    type: io.kestra.plugin.opensearch.Request
+                    description: >-
+                      PUT through the alias, never through the index, with
+                      require_alias true so OpenSearch refuses the write unless
+                      the name really is an alias with a write index. The id is
+                      derived from this execution, so a retry cannot delete a
+                      document another run wrote.
+                    connection:
+                      hosts:
+                        - "{{ inputs.opensearch_url }}"
+                      basicAuth:
+                        username: "{{ inputs.opensearch_username }}"
+                        password: "{{ inputs.opensearch_password }}"
+                    method: PUT
+                    endpoint: "{{ inputs.alias_name }}/_create/{{ outputs.inspect.vars.canaryId }}"
+                    timeout: PT25S
+                    body: "{{ inputs.canary_source_json }}"
+                    parameters:
+                      refresh: "true"
+                      require_alias: "true"
+
+                  - id: canary_read
+                    type: io.kestra.plugin.opensearch.Request
+                    description: >-
+                      Read the canary straight from the index that was supposed
+                      to receive it, using the alias write routing. A 404 here
+                      means the write went somewhere else.
+                    connection:
+                      hosts:
+                        - "{{ inputs.opensearch_url }}"
+                      basicAuth:
+                        username: "{{ inputs.opensearch_username }}"
+                        password: "{{ inputs.opensearch_password }}"
+                    method: GET
+                    endpoint: "{{ inputs.expected_index }}/_doc/{{ outputs.inspect.vars.canaryId }}"
+                    timeout: PT25S
+                    parameters:
+                      routing: "{{ outputs.recheck_plan.vars.routing }}"
+
+                  - id: verify_members
+                    type: io.kestra.plugin.opensearch.Request
+                    description: Read the alias state back from the cluster after the write.
+                    connection:
+                      hosts:
+                        - "{{ inputs.opensearch_url }}"
+                      basicAuth:
+                        username: "{{ inputs.opensearch_username }}"
+                        password: "{{ inputs.opensearch_password }}"
+                    method: GET
+                    endpoint: "{{ inputs.member_indices | join(',') }}"
+                    timeout: PT25S
+
+                  - id: verify_repair
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: >-
+                      Exit non-zero, which fails the run, unless all of this
+                      holds: the alias options are exactly the approved plan,
+                      unrelated aliases on the same members are untouched, the
+                      canary was created in and read back from expected_index
+                      with the source it was written with and it was not
+                      modified between the write and the read.
+                    containerImage: python:3.13-slim
+                    inputFiles:
+                      guard.py: "{{ vars.guard }}"
+                      scope.json: "{{ vars.scope }}"
+                      members.json: "{{ outputs.verify_members.response | toJson }}"
+                      approved.json: "{{ outputs.inspect.vars.snapshot }}"
+                      planned.json: "{{ outputs.recheck_plan.vars.planned }}"
+                      created.json: "{{ outputs.canary_write.response | toJson }}"
+                      read.json: "{{ outputs.canary_read.response | toJson }}"
+                      canary_source.json: "{{ inputs.canary_source_json }}"
+                    script: |
+                      import json
+                      import sys
+
+                      import guard
+
+                      sc = guard.scope()
+                      approved = guard.load("approved.json")
+                      planned = guard.load("planned.json")
+                      created = guard.load("created.json")
+                      fetched = guard.load("read.json")
+                      source = guard.load("canary_source.json")
+                      after = guard.metadata(sc, guard.load("members.json"))
+
+                      alias, expected, canary = sc["alias"], sc["expected"], sc["canaryId"]
+                      failures = []
+
+                      now = {name: after["aliases"][name][alias] for name in sc["members"]}
+                      if now != planned:
+                          failures.append("the alias is not the approved plan. wanted %s, got %s"
+                                          % (json.dumps(planned, sort_keys=True),
+                                             json.dumps(now, sort_keys=True)))
+                      for name in sc["members"]:
+                          before = {k: v for k, v in approved["aliases"][name].items() if k != alias}
+                          kept = {k: v for k, v in after["aliases"][name].items() if k != alias}
+                          if before != kept:
+                              failures.append("unrelated aliases on %s changed from %s to %s"
+                                              % (name, json.dumps(before, sort_keys=True),
+                                                 json.dumps(kept, sort_keys=True)))
+
+                      if created.get("_index") != expected:
+                          failures.append("the canary was written to %s, not to %s"
+                                          % (created.get("_index"), expected))
+                      if not fetched.get("found") or fetched.get("_index") != expected:
+                          failures.append("the canary could not be read back from %s" % expected)
+                      if fetched.get("_source") != source:
+                          failures.append("the canary read back with a different source than it was written with")
+                      if (fetched.get("_seq_no"), fetched.get("_primary_term")) != (
+                          created.get("_seq_no"), created.get("_primary_term")):
+                          failures.append("the canary changed between the write and the read, "
+                                          "so cleanup must not delete it")
+
+                      print("Alias %s now routes writes to %s." % (alias, expected))
+                      print("Canary %s was created in %s at seq_no %s and read back from %s."
+                            % (canary, created.get("_index"), created.get("_seq_no"), fetched.get("_index")))
+                      for name in sc["members"]:
+                          print("  %s %s" % (name, json.dumps(now[name], sort_keys=True)))
+                      for line in failures:
+                          print("FAILED CHECK: " + line)
+
+                      guard.emit(
+                          canaryIndex=created.get("_index"),
+                          canarySeqNo=created.get("_seq_no"),
+                          failureCount=len(failures),
+                      )
+                      if failures:
+                          sys.exit("the repair did not land as approved: %s check(s) failed." % len(failures))
+
+                  - id: log_repaired
+                    type: io.kestra.plugin.core.log.Log
+                    description: What the run actually achieved, in one line.
+                    message: >-
+                      Alias {{ inputs.alias_name }} was repaired and a real write through it
+                      reached {{ outputs.verify_repair.vars.canaryIndex }} at sequence number
+                      {{ outputs.verify_repair.vars.canarySeqNo }}. The canary is removed and
+                      the document set checked in the finally block below.
+                finally:
+                  - id: cleanup_canary
+                    type: io.kestra.plugin.core.flow.If
+                    description: >-
+                      Remove the canary whether the verification passed or failed,
+                      but only if this execution's write actually created it.
+                    condition: '{{ (outputs.canary_write.response.result ?? "none") == "created" }}'
+                    then:
+                      - id: delete_canary
+                        type: io.kestra.plugin.opensearch.Request
+                        description: >-
+                          Delete by the id this execution wrote, guarded by the
+                          sequence number and primary term that write returned.
+                          If anything touched the document in between, OpenSearch
+                          answers 409 and the deletion does not happen.
+                        connection:
+                          hosts:
+                            - "{{ inputs.opensearch_url }}"
+                          basicAuth:
+                            username: "{{ inputs.opensearch_username }}"
+                            password: "{{ inputs.opensearch_password }}"
+                        method: DELETE
+                        endpoint: "{{ inputs.expected_index }}/_doc/{{ outputs.inspect.vars.canaryId }}"
+                        timeout: PT25S
+                        parameters:
+                          routing: "{{ outputs.recheck_plan.vars.routing }}"
+                          if_seq_no: "{{ outputs.canary_write.response._seq_no }}"
+                          if_primary_term: "{{ outputs.canary_write.response._primary_term }}"
+                          refresh: "true"
+
+                      - id: cleanup_documents
+                        type: io.kestra.plugin.opensearch.Request
+                        description: Read the documents one last time to prove what is left.
+                        connection:
+                          hosts:
+                            - "{{ inputs.opensearch_url }}"
+                          basicAuth:
+                            username: "{{ inputs.opensearch_username }}"
+                            password: "{{ inputs.opensearch_password }}"
+                        method: GET
+                        endpoint: "{{ inputs.member_indices | join(',') }}/_search"
+                        timeout: PT25S
+                        body:
+                          size: "{{ inputs.max_documents + 1 }}"
+                          track_total_hits: true
+                          version: true
+                          query:
+                            match_all: {}
+
+                      - id: verify_cleanup
+                        type: io.kestra.plugin.scripts.python.Script
+                        description: >-
+                          Fail the run if the document set is not back to exactly
+                          what it was before the repair. That covers a canary left
+                          behind and an existing document changed by accident.
+                        containerImage: python:3.13-slim
+                        inputFiles:
+                          guard.py: "{{ vars.guard }}"
+                          scope.json: "{{ vars.scope }}"
+                          documents.json: "{{ outputs.cleanup_documents.response | toJson }}"
+                          approved.json: "{{ outputs.inspect.vars.snapshot }}"
+                        script: |
+                          import sys
+
+                          import guard
+
+                          sc = guard.scope()
+                          approved = guard.load("approved.json")
+                          after = guard.documents(guard.load("documents.json"))
+                          leftover = [row for row in after if row["id"] == sc["canaryId"]]
+
+                          print("Documents after cleanup: %s. Baseline: %s. Canaries left behind: %s."
+                                % (len(after), len(approved["documents"]), len(leftover)))
+                          if after != approved["documents"]:
+                              sys.exit("cleanup did not restore the original document set. Canary %s or an "
+                                       "existing document differs from the approved snapshot. Delete the "
+                                       "canary by hand before the next run." % sc["canaryId"])
+                          print("Every pre-existing document is exactly what it was and no canary is left behind.")
+            else:
+              - id: log_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Nothing was written. The alias is still broken.
+                message: >-
+                  Approval declined or left unanswered, so the alias was not touched.
+                  {{ outputs.inspect.vars.report }}
+        else:
+          - id: log_report_only
+            type: io.kestra.plugin.core.log.Log
+            description: The dry run exit. The actions are in the inspect task log.
+            message: >-
+              Report only, nothing was written. auto_remediate={{ inputs.auto_remediate }}
+              dry_run={{ inputs.dry_run }}. Set auto_remediate true with dry_run false to be
+              offered the approval gate. The exact alias actions a repair would send are in
+              the inspect task log.
+    else:
+      - id: log_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: >-
+          The healthy exit, which a second run after a repair also takes. No
+          canary is written and no alias action is sent when there is nothing
+          to fix.
+        message: "{{ outputs.inspect.vars.report }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: >-
+      Fires on any failure, including a stale plan refused after the approval and
+      a canary that never reached the expected index.
+    url: "{{ inputs.slack_webhook_url }}"
+    messageText: >-
+      :rotating_light: Write alias repair failed for `{{ inputs.alias_name }}` in execution
+      {{ execution.id }}. The alias may already be repaired: the canary write and the
+      verification run after the alias actions. Read GET _alias/{{ inputs.alias_name }} and
+      check for a leftover document `kestra-alias-probe-{{ execution.id }}` in
+      `{{ inputs.expected_index }}` before running again.
+
+extend:
+  title: Repair a rollover write alias and prove where writes land
+  shortDescription: Find an OpenSearch write alias with no write index or the wrong one, repair only the write flags behind an approval gate then prove a canary reaches the intended index.
+  metaTitle: Repair an OpenSearch rollover write alias with Kestra
+  metaDescription: Detect an OpenSearch write alias with no write index, repair the flags behind an approval then prove a canary lands in the intended index.
+  tags: [Infrastructure, Data]
+  subTags: [Day 2 Operations, Approval Gates]
+  ee: false
+  demo: false
+  description: |
+    ## Safety
+
+    An alias is how applications address a rollover index family. When no member carries `is_write_index`, OpenSearch answers every write through the alias with `no write index is defined` and ingestion stops. When the flag sits on an older member, writes succeed in the wrong index and nobody notices until a retention job deletes them. Both states are fixed with one `POST _aliases` call, which is exactly why doing it by hand is risky: an alias action body replaces the whole alias definition on that index, so a hand written batch silently drops the filter, the routing or the hidden flag that was there. It can also move writes to an index that is not the one you meant. So this flow refuses by default and each guard below is load bearing. Every one of them was proven by its own execution.
+
+    | Guard | What it stops |
+    | --- | --- |
+    | One exact `alias_name`, `expected_index` and complete `member_indices`, no wildcard, no comma, no leading dot | the endpoints the flow builds widening to indexes you did not name |
+    | `expected_uuids_json` compared with `settings.index.uuid` | adopting an index that was deleted then recreated under the same name |
+    | The membership the cluster returns has to equal `member_indices` | writing to an index that joined the alias unnoticed |
+    | Alias options outside the known set are refused | dropping an option the flow cannot carry forward |
+    | Members have to share the mappings of `expected_index` | treating a canary accepted by one member as evidence for another |
+    | `max_documents` ceiling, exact total hits, no shard failures | approving a plan built on a truncated document snapshot |
+    | A one member alias with no flag at all counts as healthy | moving an implicit write target that already works |
+    | `dry_run` true, `auto_remediate` false, `Pause` read as `onResume.approved ?? false` | three separate gates before one write |
+    | Recheck of UUIDs, every alias option and every document after the approval | acting on a plan that went stale while a person was deciding |
+    | One atomic `_aliases` batch whose actions are rebuilt from the recheck | an alias left halfway between two write indexes |
+    | Only `is_write_index` is changed, membership is never added or removed | changing which indexes the alias covers |
+    | A canary written through the alias with `require_alias`, read back from `expected_index` | a `200 acknowledged` being reported as a working write path |
+    | Cleanup deletes only this execution's canary id under `if_seq_no` and `if_primary_term` | deleting a document another run wrote |
+    | A final document comparison against the approved snapshot | a canary left behind or an existing document disturbed |
+    | `concurrency: limit 1` with `QUEUE` | two executions repairing the same alias at the same time |
+
+    ## How it works
+
+    1. `read_members` (`io.kestra.plugin.opensearch.Request`) sends one GET to the explicit comma separated member list. That single response carries the settings, the mappings and every alias with every alias option, which is the whole detector input. `read_documents` reads every document with its version and routing, with `track_total_hits`.
+    2. `inspect` (`io.kestra.plugin.scripts.python.Script`) validates the declared scope, compares the index UUIDs, refuses unknown alias options, mismatched mappings and a truncated or oversized document set, then decides the verdict. Degraded means no member carries `is_write_index: true` or the member that does is not `expected_index`. A one member alias with no flag at all routes writes implicitly and is healthy. The planned actions copy each member's `filter`, `index_routing`, `search_routing` and `is_hidden` forward and change nothing but the write flag. The task emits the full snapshot, which is what the approval is bound to.
+    3. `log_findings` (`io.kestra.plugin.core.log.Log`) prints the verdict with the per member flag and the options being carried forward. `handle_degraded` (`io.kestra.plugin.core.flow.If`) stops here when the alias is healthy, through `log_healthy`.
+    4. `notify_findings` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts the finding before the pause. `route_remediation` (`If`) requires `auto_remediate` true and `dry_run` false together, otherwise `log_report_only` ends the run and the exact action set stays in the `inspect` log.
+    5. `approve_repair` (`io.kestra.plugin.core.flow.Pause`) waits up to an hour. `apply_if_approved` reads `onResume.approved ?? false`, so a resume that answers nothing is a refusal and `log_declined` records it.
+    6. `recheck_members` and `recheck_documents` read the cluster again. `recheck_plan` compares it with the approved snapshot and exits non-zero on any difference, which fails the run before a single write. The actions that go to OpenSearch are rebuilt from this read, not from the approved copy.
+    7. `repair_alias` sends one `POST _aliases` batch with `timeout` and `master_timeout`. `repair_acknowledged` (`io.kestra.plugin.core.execution.Assert`) fails the run when the cluster did not acknowledge it.
+    8. `prove_with_canary` (`io.kestra.plugin.core.flow.Sequential`) writes one document through the alias with `require_alias=true` and an id derived from `execution.id` (`canary_write`), reads it back straight from `expected_index` with the alias write routing (`canary_read`), reads the alias state again (`verify_members`) then `verify_repair` exits non-zero unless the alias matches the approved plan, unrelated aliases on the same members are untouched, the canary was created in and read from `expected_index` with the source it was written with and its sequence number did not move.
+    9. The `finally` block runs on every path. `cleanup_canary` (`If`) deletes the canary only when this execution created it, guarded by `if_seq_no` and `if_primary_term`, then `verify_cleanup` fails the run unless the document set is byte for byte the pre-repair snapshot.
+    10. `errors.alert_failure` posts any failure to Slack with the alias name, the execution id and the canary id to look for.
+
+    The outputs worth reading afterwards: `{{ outputs.inspect.vars.report }}` is the verdict, `{{ outputs.inspect.vars.snapshot }}` is the full state the approval is bound to, `{{ outputs.recheck_plan.vars.actions }}` is the exact alias batch that was sent and `{{ outputs.verify_repair.vars.canaryIndex }}` is the index a real write through the alias reached.
+
+    ## What you get
+
+    - Ingestion restored on a rollover family whose alias lost its write index, without a hand written alias body.
+    - Writes moved off the wrong member, with the filter, routing and hidden options of every member preserved.
+    - Proof by a real write, not by metadata. A blocked, closed or mapping conflicted target makes the run fail even though the flag reads back correctly.
+    - Existing documents, their versions and routing, plus unrelated aliases on the same indexes, all left as they were.
+
+    ## Who it's for
+
+    Teams running OpenSearch rollover index families, log and metric pipelines in particular, where an interrupted rollover, a half applied alias edit or an ISM action can leave the write alias with no write index or the wrong one.
+
+    ## Why orchestrate this with Kestra
+
+    The manual fix is a `curl -XPOST _aliases` body pasted together during an incident, with no record of what the alias looked like before, no check that the person is still looking at current state and no proof that writes work afterwards. As a flow the detection, the Slack finding, the approval, the recheck, the atomic write, the canary verdict and the cleanup are one audited execution. The `Pause` is what makes a change this sharp safe to automate: a person decides with the per member flags in front of them. The plan is then rebuilt from a fresh read after they answer. OpenSearch applies an alias batch atomically but it has no compare and set, so re-reading inside the same execution is the only way to avoid overwriting a change made in the meantime.
+
+    ## Tested end to end
+
+    Kestra 2.0.5, OpenSearch plugin 1.6.1, OpenSearch 2.19.6 (build hash `97d3c13bf22a`) in Docker. Flow validate on stock Kestra 2.0.5 was clean: no constraint, no warning, no deprecation. The fixture is two indexes of three documents each behind one alias that carries a filter, index routing, search routing and `is_hidden`, plus a second unrelated alias on the older member and a separate one member alias. Every state below was read with the OpenSearch REST API directly, never from a flow output. The operational payoff was measured by an independent `PUT <alias>/_create/...?require_alias=true` through the alias before and after the repair.
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy | `rAaF4JvU9WI9uGyacZI46` | SUCCESS. The expected member already held the flag, no write task ran |
+    | One member alias, no flag (lookalike) | `60aqPTacuGHhTkr4srqqjh` | SUCCESS. Spared as healthy, the approval was never offered |
+    | One member alias, `is_write_index: false` (boundary) | `7ZWoEWCPmD3S5j6Hf5mOOC` | SUCCESS. Reported degraded, nothing written |
+    | Wrong write index | `4DVQJ7iWFTXHG6t8wioARE` | SUCCESS. Named `logs-000001` as the holder against an expected `logs-000002`, no write |
+    | Degraded dry run | `2OPzSrJIATijAnVwagL39C` | SUCCESS. Printed the exact action set, the alias still had no write index afterwards |
+    | Declined approval | `5qqQhjMELO7zeBnqsy95u` | SUCCESS. Resumed with `approved: false`, alias untouched |
+    | Remediation | `1BWkrJRO1HaxXGWrPGldQU` | SUCCESS. An independent write through the alias went from **HTTP 400 `no write index is defined`** to **HTTP 201 landing in `logs-000002`**. The canary was created in `logs-000002` at sequence number 7, read back identical, deleted again. All 6 documents, their versions and routing unchanged, the unrelated alias unchanged, both filters carried forward |
+    | Repeat | `5V2Do5aWiNT4xOBNXAtiYF` | SUCCESS. Took the healthy exit, sent no second alias batch and wrote no second canary |
+    | Ineffective write | `24lThDJGr8EOU2GLM5HSzP` | FAILED as intended. With `index.blocks.write` on the target, the alias batch still returned `acknowledged: true` and the flag read back correct, then the canary was refused with 403 `cluster_block_exception` and the run failed |
+    | Change during the pause | `7P3NlMQpG2DiXpZkADJKd7` | FAILED as intended. An administrator changed the alias filter from `term` to `terms` while the approval waited. `recheck_plan` named the drift and refused before any write, so the new filter survived |
+    | UUID mismatch | `6A7FC1hMextnICwl7by3Pi` | FAILED as intended. A declared UUID that no longer matched stopped the run at `inspect`, before any read of documents mattered |
+
+    All eleven ran on the final revision. A second fixture on a fresh container repeated the three that matter: healthy `4LpPtNPsxntbvjwyCEreXK`, remediation `3tj3t3Xy1t7FA6t1L620N2` with the same 400 to 201 and 6 conserved documents, then the pause race `4bGn8JQs4v7Nt2skr7bDuI` refused again. Slack was a local HTTP sink that recorded both the finding and the failure alerts.
+
+    ## Prerequisites
+
+    - OpenSearch 2.19 reachable from the Kestra worker. Tested on 2.19.6 only.
+    - Kestra 2.0.5 with the OpenSearch and Slack plugins plus the Docker task runner for the Python steps.
+    - Minimum permissions on the named members only: `indices:admin/get` and `indices:data/read/search` to detect, `indices:admin/aliases` to repair, `indices:data/write/index` and `indices:data/write/delete` for the one canary. No cluster manage right is needed.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    | Secret | What it is |
+    | --- | --- |
+    | `OPENSEARCH_HOST` | cluster URL the worker can reach, for example `http://opensearch:9200` |
+    | `OPENSEARCH_USERNAME` | account with the rights above |
+    | `OPENSEARCH_PASSWORD` | its password |
+    | `SLACK_WEBHOOK_URL` | incoming webhook for the finding and the failure alert |
+
+    ### Inputs
+
+    | Input | Type | Default | What it does |
+    | --- | --- | --- | --- |
+    | `alias_name` | STRING | none | the one alias the flow may write to |
+    | `expected_index` | STRING | none | the member that should receive writes |
+    | `member_indices` | ARRAY | none | complete expected membership, 1 to 10 names |
+    | `expected_uuids_json` | STRING | none | member name to index UUID map you intend to act on |
+    | `canary_source_json` | STRING | `{"kestra_alias_probe": true}` | the document written through the alias to prove the destination |
+    | `max_documents` | INT | `100` | ceiling for the before and after document comparison |
+    | `dry_run` | BOOL | `true` | report the actions without sending them |
+    | `auto_remediate` | BOOL | `false` | allow a repair to be considered at all |
+
+    ## Quick start
+
+    1. Add the four secrets to your Kestra instance.
+    2. Read your own scope: `GET _cat/aliases/<alias>?v` for the membership and `GET <members>?filter_path=**.uuid` for the UUIDs.
+    3. Execute with the defaults. `dry_run` true and `auto_remediate` false report the per member flags plus the exact alias batch a repair would send. Nothing is written.
+    4. Check that `expected_index` is really where the next documents belong. If someone moved the flag on purpose, stop here.
+    5. Stop other alias administrators for the next minute, then execute with `dry_run: false` and `auto_remediate: true`. The execution pauses.
+    6. Approve it. The flow rechecks, sends one atomic batch, writes a canary through the alias, verifies where it landed, removes it then proves your documents are untouched.
+    7. Enable the `daily_check` schedule once you trust the report. It forces report-only mode and ships with a placeholder scope to replace.
+
+    ## How to extend
+
+    - Point `canary_source_json` at a document shaped like your own data, so the mappings are exercised by the probe.
+    - Run one execution per alias family from a parent flow, so each keeps its own approval, recheck and canary.
+    - Send the finding to PagerDuty instead of Slack when a stalled write alias means dropped ingestion.
+    - Keep a copy of `{{ outputs.inspect.vars.snapshot }}` in your incident record: it is the alias definition before the change, which is what a rollback needs.
+    - Pair it with an ISM policy review when the same alias loses its write index repeatedly, since the rollover action is usually the cause.
+
+    Limits: the flow changes `is_write_index` only. It never adds or removes alias membership, never creates an index and never rolls over, so an alias whose newest index does not exist yet is out of scope, as is an alias with no members. It refuses rather than acts when membership, a UUID, the mappings or an alias option is not what you declared. The document conservation proof needs a quiet family under `max_documents`: with live writers the counts move on their own and the run fails on its own evidence. The recheck closes the window from approval to write but it is not a lock, so another administrator can still change the alias a moment later. Tested against OpenSearch 2.19.6 with the security plugin disabled and basic auth in the connection block. Elasticsearch was not tested.
+
+    ## Links
+
+    - [OpenSearch alias API](https://docs.opensearch.org/2.19/api-reference/index-apis/alias/)
+    - [OpenSearch index rollover](https://docs.opensearch.org/2.19/api-reference/index-apis/rollover/)
+    - [Kestra OpenSearch Request task](https://kestra.io/plugins/plugin-opensearch/io.kestra.plugin.opensearch.request)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
