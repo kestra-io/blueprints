@@ -1,0 +1,370 @@
+id: jfrog-artifactory-quota-and-retention-gate
+namespace: company.team
+description: |
+  Artifactory storage quotas overflow and retention sweeps delete artifacts
+  that services still reference, yet only container registries are gated today.
+  An export job POSTs the storage report to a keyed webhook, a WorkingDirectory
+  stages the report when no body arrived, Python scores every repository
+  against the quota threshold and every old artifact against the retention
+  window with its downstream references, and an If escalates violations to
+  Slack and can fail the run. Clean reports are logged, and the verdict with
+  the offending repositories and artifacts is published as outputs.
+
+triggers:
+  - id: post_storage_report
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: The Artifactory export job POSTs the storage report JSON here after each quota snapshot so violations surface while the numbers are still current.
+    key: "{{ secret('ARTIFACTORY_REPORT_WEBHOOK_KEY') }}"
+  - id: daily_quota_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Daily 06:00 UTC net that rescores the last storage report, shipped disabled until the webhook path is trusted in your environment.
+    cron: "0 6 * * *"
+    disabled: true
+
+inputs:
+  - id: quota_threshold_pct
+    type: FLOAT
+    defaults: 90.0
+    description: Repository usage percentage at or above which a repository counts as over quota for the gate.
+  - id: retention_days
+    type: INT
+    defaults: 180
+    description: Artifact age in days past which the artifact is beyond the retention policy, escalated only while downstream references remain.
+  - id: fail_on_violations
+    type: BOOL
+    defaults: true
+    description: Whether any quota or retention violation turns the execution red after the Slack alert, flip to false for report only runs.
+
+tasks:
+  # --- 1. storage report grade ---
+  - id: quota_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the staged storage report and the Python grade read the same file for the whole run.
+    tasks:
+      # --- 2. report fixture ---
+      - id: stage_storage_report
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Store the posted storage report when a job delivered one, otherwise write the bundled example report with a heredoc so trial runs always have a report to grade.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          entryPoint: []
+        containerImage: alpine:3.20
+        env:
+          REPORT_BODY: "{{ trigger.body ?? '' }}"
+        commands:
+          - |
+            set -u
+            if [ -n "${REPORT_BODY}" ]; then
+              printf '%s' "${REPORT_BODY}" > storage_report.json
+              echo "stored $(wc -c < storage_report.json) bytes of posted storage report"
+            else
+              cat > storage_report.json <<'REPORT_EOF'
+            {
+              "generated_at": "2026-10-14T02:00:00Z", "instance": "acme-docker.jfrog.io",
+              "repos": [
+                {"key": "docker-prod-local", "type": "docker",
+                 "quota_gb": 5000, "used_gb": 4870.0, "usage_pct": 97.4,
+                 "oldest_artifacts": [
+                   {"path": "registry/acme/payments", "age_days": 412, "downstream_references": 7},
+                   {"path": "registry/acme/ledger", "age_days": 96, "downstream_references": 4}]},
+                {"key": "maven-releases", "type": "maven",
+                 "quota_gb": 2000, "used_gb": 1180.0, "usage_pct": 59.0,
+                 "oldest_artifacts": [{"path": "com/acme/core/2.11.0/core-2.11.0.jar", "age_days": 200, "downstream_references": 0}]},
+                {"key": "npm-virtual", "type": "npm",
+                 "quota_gb": 1000, "used_gb": 950.0, "usage_pct": 95.0,
+                 "oldest_artifacts": [{"path": "@acme/ui/-/ui-4.2.1.tgz", "age_days": 95, "downstream_references": 3}]},
+                {"key": "generic-scans", "type": "generic",
+                 "quota_gb": 500, "used_gb": 120.0, "usage_pct": 24.0,
+                 "oldest_artifacts": [{"path": "scans/2025-q3/platform-report.pdf", "age_days": 260, "downstream_references": 12}]}
+              ]
+            }
+            REPORT_EOF
+              echo "staged bundled storage report fixture $(wc -c < storage_report.json) bytes"
+            fi
+
+      # --- 3. quota and retention parse ---
+      - id: evaluate_quotas
+        type: io.kestra.plugin.scripts.python.Script
+        description: Score every repository against the quota threshold and every old artifact against the retention window, keeping only artifacts that still carry downstream references, then emit the verdict through the outputs protocol.
+        containerImage: python:3.12-slim
+        env:
+          QUOTA_THRESHOLD_PCT: "{{ inputs.quota_threshold_pct }}"
+          RETENTION_DAYS: "{{ inputs.retention_days }}"
+        script: |
+          import json
+          import os
+
+          REPORT_FILE = "storage_report.json"
+
+
+          def env_float(name, default):
+              try:
+                  return float(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return float(default)
+
+
+          def env_int(name, default):
+              try:
+                  return int(float(os.environ.get(name, default)))
+              except (TypeError, ValueError):
+                  return int(default)
+
+
+          QUOTA_THRESHOLD_PCT = env_float("QUOTA_THRESHOLD_PCT", 90.0)
+          RETENTION_DAYS = env_int("RETENTION_DAYS", 180)
+
+
+          def load_report(path):
+              if not os.path.exists(path) or os.path.getsize(path) == 0:
+                  return None, "storage report file is missing or empty"
+              try:
+                  with open(path, "r", encoding="utf-8") as handle:
+                      document = json.load(handle)
+              except ValueError:
+                  return None, "storage report is not valid JSON"
+              if isinstance(document, str):
+                  try:
+                      document = json.loads(document)
+                  except ValueError:
+                      return None, "storage report resolves to a JSON string that does not parse"
+              if not isinstance(document, dict):
+                  return None, "storage report is not a JSON object"
+              if not isinstance(document.get("repos"), list):
+                  return None, "storage report carries no repos array"
+              return document, ""
+
+
+          payload = {
+              "report_ok": False,
+              "violations_found": False,
+              "over_quota_repos": [],
+              "at_risk_artifacts": [],
+              "over_quota_names": "",
+              "at_risk_paths": "",
+              "over_quota_count": 0,
+              "at_risk_count": 0,
+              "worst_usage_pct": 0.0,
+              "repos_checked": 0,
+              "error": "",
+          }
+
+          document, problem = load_report(REPORT_FILE)
+
+          if document is None:
+              payload["error"] = problem
+          else:
+              repos = [entry for entry in document.get("repos") if isinstance(entry, dict)]
+              if not repos:
+                  payload["error"] = "storage report contains no repositories"
+              else:
+                  over_quota = []
+                  at_risk = []
+                  worst_usage = 0.0
+                  for repo in repos:
+                      name = str(repo.get("key") or "unknown-repo")
+                      try:
+                          usage = float(repo.get("usage_pct"))
+                      except (TypeError, ValueError):
+                          usage = None
+                      try:
+                          quota_gb = float(repo.get("quota_gb") or 0.0)
+                          used_gb = float(repo.get("used_gb") or 0.0)
+                      except (TypeError, ValueError):
+                          quota_gb, used_gb = 0.0, 0.0
+                      if usage is None and quota_gb > 0:
+                          usage = used_gb * 100.0 / quota_gb
+                      if usage is None:
+                          usage = 0.0
+                      worst_usage = max(worst_usage, usage)
+                      if usage >= QUOTA_THRESHOLD_PCT:
+                          over_quota.append({
+                              "repo": name,
+                              "usage_pct": round(usage, 1),
+                              "used_gb": round(used_gb, 1),
+                              "quota_gb": quota_gb,
+                          })
+                      artifacts = repo.get("oldest_artifacts")
+                      if not isinstance(artifacts, list):
+                          continue
+                      for artifact in artifacts:
+                          if not isinstance(artifact, dict):
+                              continue
+                          try:
+                              age_days = int(artifact.get("age_days") or 0)
+                          except (TypeError, ValueError):
+                              age_days = 0
+                          try:
+                              references = int(artifact.get("downstream_references") or 0)
+                          except (TypeError, ValueError):
+                              references = 0
+                          if age_days > RETENTION_DAYS and references > 0:
+                              at_risk.append({
+                                  "repo": name,
+                                  "path": str(artifact.get("path") or "unknown-artifact"),
+                                  "age_days": age_days,
+                                  "downstream_references": references,
+                              })
+                  payload.update({
+                      "report_ok": True,
+                      "violations_found": bool(over_quota or at_risk),
+                      "over_quota_repos": over_quota,
+                      "at_risk_artifacts": at_risk,
+                      "over_quota_names": ", ".join(entry["repo"] for entry in over_quota),
+                      "at_risk_paths": ", ".join(entry["path"] for entry in at_risk),
+                      "over_quota_count": len(over_quota),
+                      "at_risk_count": len(at_risk),
+                      "worst_usage_pct": round(worst_usage, 1),
+                      "repos_checked": len(repos),
+                  })
+
+          print("report_ok=%s repos=%d over_quota=%d at_risk=%d worst=%.1f violations=%s" % (
+              payload["report_ok"], payload["repos_checked"], payload["over_quota_count"],
+              payload["at_risk_count"], payload["worst_usage_pct"], payload["violations_found"]))
+          print("::" + json.dumps({"outputs": payload}) + "::")
+
+  # --- 4. violation gate ---
+  - id: violation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Branch on a scored report that carries any quota or retention violation, so alerts and failure fire only when something is actually wrong.
+    condition: "{{ outputs.evaluate_quotas.vars.report_ok and outputs.evaluate_quotas.vars.violations_found }}"
+    then:
+      # --- 5. violation escalation ---
+      - id: alert_violations
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the over quota repositories, the worst usage percentage and the at risk artifacts so the platform team acts before deletion or denial.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Artifactory quota and retention gate TRIPPED - {{ outputs.evaluate_quotas.vars.over_quota_count }} repo(s) at or above {{ inputs.quota_threshold_pct }} percent usage ({{ outputs.evaluate_quotas.vars.over_quota_names }}), worst usage {{ outputs.evaluate_quotas.vars.worst_usage_pct }} percent, {{ outputs.evaluate_quotas.vars.at_risk_count }} artifact(s) past {{ inputs.retention_days }} days retention with live downstream references ({{ outputs.evaluate_quotas.vars.at_risk_paths }}). Execution {{ execution.id }}."
+          }
+      - id: enforce_quota_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Apply the fail on violations policy, turning the run red for gating pipelines and staying report only when the input is flipped off.
+        condition: "{{ inputs.fail_on_violations }}"
+        then:
+          - id: fail_execution
+            type: io.kestra.plugin.core.execution.Fail
+            description: Fail the execution so the export pipeline stops instead of reporting a green run over a saturated instance.
+            errorMessage: "Artifactory quota and retention gate found {{ outputs.evaluate_quotas.vars.over_quota_count }} over quota repo(s) and {{ outputs.evaluate_quotas.vars.at_risk_count }} at risk artifact(s), worst usage {{ outputs.evaluate_quotas.vars.worst_usage_pct }} percent."
+        else:
+          - id: log_gate_softened
+            type: io.kestra.plugin.core.log.Log
+            description: Record the violations without failing, keeping the run green for report only estates.
+            message: "artifactory violations found - {{ outputs.evaluate_quotas.vars.over_quota_count }} over quota repo(s), {{ outputs.evaluate_quotas.vars.at_risk_count }} at risk artifact(s), fail_on_violations is {{ inputs.fail_on_violations }}, alert sent only"
+    else:
+      - id: check_report_health
+        type: io.kestra.plugin.core.flow.If
+        description: Split a report that graded cleanly from one that could not be read, so a broken export never reads as compliance.
+        condition: "{{ outputs.evaluate_quotas.vars.report_ok }}"
+        then:
+          - id: log_within_policy
+            type: io.kestra.plugin.core.log.Log
+            description: Record the clean verdict with the repository count and the worst usage so the history doubles as evidence.
+            message: "artifactory report graded - {{ outputs.evaluate_quotas.vars.repos_checked }} repo(s) checked against {{ inputs.quota_threshold_pct }} percent quota and {{ inputs.retention_days }} day retention, worst usage {{ outputs.evaluate_quotas.vars.worst_usage_pct }} percent, no violations"
+        else:
+          - id: alert_unreadable_report
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Tell the ops channel the storage report could not be graded and name the load problem.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {"text": "Artifactory storage report unreadable - {{ outputs.evaluate_quotas.vars.error }}. Execution {{ execution.id }}."}
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: violations_found
+    type: BOOL
+    description: True when the graded report holds at least one over quota repository or one at risk artifact, false for a clean or unreadable report.
+    value: "{{ outputs.evaluate_quotas.vars.violations_found }}"
+  - id: over_quota_repos
+    type: ARRAY
+    description: Repositories at or above the quota threshold with their usage percentage, used gigabytes and quota gigabytes, for example docker-prod-local at 97.4 percent.
+    value: "{{ outputs.evaluate_quotas.vars.over_quota_repos }}"
+  - id: at_risk_artifacts
+    type: ARRAY
+    description: Artifacts past the retention window that still carry downstream references, with their repository, path, age in days and reference count.
+    value: "{{ outputs.evaluate_quotas.vars.at_risk_artifacts }}"
+  - id: worst_usage_pct
+    type: FLOAT
+    description: Highest repository usage percentage seen in the graded report, for example 97.4 when the docker repository is nearly full.
+    value: "{{ outputs.evaluate_quotas.vars.worst_usage_pct }}"
+
+extend:
+  title: Gate Artifactory Quotas and Retention Before Artifacts Vanish
+  metaTitle: Artifactory Quota and Retention Gate on Kestra
+  shortDescription: Score an Artifactory storage report for quota and retention violations, alert Slack with the offenders, and optionally fail the run.
+  metaDescription: "Score an Artifactory storage report for repositories over quota and artifacts past retention with live references, alert Slack, and gate the run."
+  description: |
+    ## How it works
+
+    1. `post_storage_report` (`io.kestra.plugin.core.trigger.Webhook`, keyed with the `ARTIFACTORY_REPORT_WEBHOOK_KEY` secret) receives the storage report JSON from your Artifactory export job right after each quota snapshot. `daily_quota_sweep` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 6 * * *`) is the safety net and ships `disabled: true` until an operator turns it on.
+    2. `quota_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) opens one shared directory so the staged report and the scorer see the same file, because default tasks are stateless and a temp dir is purged when a task completes.
+    3. `stage_storage_report` (`io.kestra.plugin.scripts.shell.Commands` on the `io.kestra.plugin.scripts.runner.docker.Docker` runner, image `alpine:3.20`) stores the posted body when one arrived and otherwise writes `storage_report.json` with a quoted heredoc. The bundled report holds four repositories, two over the quota threshold, one old artifact past retention without references and two past retention that services still call.
+    4. `evaluate_quotas` (`io.kestra.plugin.scripts.python.Script` on `python:3.12-slim`) flags a repository as over quota when its usage percentage meets `quota_threshold_pct` (deriving the percentage from used and quota gigabytes when the field is missing), and flags an artifact as at risk only when its age passes `retention_days` and its `downstream_references` count is still above zero, so a retention sweep that only reclaims orphaned bytes never pages anyone. The verdict, the offenders and the worst usage are printed as a single `::{"outputs": ...}::` line.
+    5. `violation_gate` (`io.kestra.plugin.core.flow.If`) branches on a parseable report that carries violations. Violations reach `alert_violations` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) with the offender lists, then `enforce_quota_gate` (`io.kestra.plugin.core.flow.If`) applies the `fail_on_violations` policy with `fail_execution` (`io.kestra.plugin.core.execution.Fail`) or the report only `log_gate_softened`. A clean report lands on `log_within_policy`, and an unreadable report routes through `check_report_health` and `alert_unreadable_report` instead of reading as compliance.
+    6. The flow level `errors` handler (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) reports any failure with the execution id, because a gate that dies silently is indistinguishable from a quiet instance.
+
+    ## What you get
+
+    - One gateable verdict, quota and retention violations found or not, that any export pipeline can branch on.
+    - Offender lists that name the exact repositories over quota and the exact artifact paths past retention with live references, not just counts.
+    - A retention rule that distinguishes dangerous deletions from harmless cleanup by checking downstream references.
+    - `violations_found`, `over_quota_repos`, `at_risk_artifacts` and `worst_usage_pct` as typed outputs for ticket automation and capacity reports.
+    - A disabled daily sweep as a second net once the webhook path is trusted.
+
+    ## Who it's for
+
+    - Platform teams running shared Artifactory instances who need quotas enforced before the disk fills.
+    - Release engineers who have seen retention rules delete artifacts that a still deployed service resolves at startup.
+    - FinOps reviewers who want storage consumption evidence attached to executions instead of buried in an export job log.
+
+    ## Why orchestrate this with Kestra
+
+    Artifactory reports usage but never gates anything on it, so quota overflow and risky retention wait for someone to open the storage page. Kestra gives the export job a webhook to land on, a shared workspace where the fixture and the scorer read one file, threshold policy as version controlled inputs, a branch that separates escalation from the all clear, and outputs a ticket or capacity report can consume. A cron job on the export host gives you none of that, it only prints a summary nobody triages.
+
+    ## Prerequisites
+
+    - A worker with Docker access, the fixture runs in `alpine:3.20` and the scorer in `python:3.12-slim`.
+    - An export step that POSTs a storage report shaped as a `repos` array whose entries carry `key`, `usage_pct` or used and quota gigabytes, and an `oldest_artifacts` array with `path`, `age_days` and `downstream_references`, for example assembled from the Artifactory storage stats API.
+    - A Slack incoming webhook for the violation alert, the unreadable report alert and failure alerts.
+
+    ### Secrets
+
+    - `ARTIFACTORY_REPORT_WEBHOOK_KEY`: key segment guarding the storage report webhook URL, anyone holding it can trigger a grading run.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the violation alert, the unreadable report alert and failure alerts.
+
+    ## Quick start
+
+    1. Add the two secrets to your Kestra namespace.
+    2. Run the flow once with the default inputs and confirm `violations_found` reads true, `over_quota_count` lands at 2 with `docker-prod-local` and `npm-virtual`, `at_risk_count` lands at 2, `worst_usage_pct` reads 97.4, and the Slack alert arrived.
+    3. Set `fail_on_violations` to false and re-run to watch `log_gate_softened` keep the execution green while the alert still fires.
+    4. Point your export job at `/api/v1/{tenant}/executions/webhook/{namespace}/jfrog-artifactory-quota-and-retention-gate/{ARTIFACTORY_REPORT_WEBHOOK_KEY}`, and enable `daily_quota_sweep` once the path is trusted.
+
+    ## How to extend
+
+    - Replace the staged fixture with an `io.kestra.plugin.core.http.Request` that pulls the live storage report from the Artifactory storage stats API with an `ARTIFACTORY_TOKEN` secret before scoring, keeping the heredoc as the offline fallback.
+    - Add a per repository grace period by extending the scorer with a `first_over_quota_seen` field so a repo gets warned at 90 percent and failed only after two consecutive sweeps.
+    - Archive every graded report to object storage with `io.kestra.plugin.aws.s3.Upload` to build a capacity evidence trail for FinOps reviews.
+    - Fan out across Artifactory instances with `io.kestra.plugin.core.flow.ForEachItem` over an instance list, each subflow grading one instance of its own.
+
+    ## Links
+
+    - [JFrog Artifactory storage and cleanup documentation](https://jfrog.com/help/r/artifactory-jfrog-artifactory/storage-management)
+    - [Kestra WorkingDirectory task](https://kestra.io/plugins/core/tasks/flow/io.kestra.plugin.core.flow.workingdirectory)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Kestra Webhook trigger](https://kestra.io/docs/workflow-components/triggers/webhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - FinOps & Cost Management
+    - Reporting & Digests
+  ee: false
+  demo: false
