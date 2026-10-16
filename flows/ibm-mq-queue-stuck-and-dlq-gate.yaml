@@ -1,0 +1,348 @@
+id: ibm-mq-queue-stuck-and-dlq-gate
+namespace: company.team
+description: |
+  IBM MQ queues stall while depth climbs and dead letters pile up, and the
+  outage only becomes visible when downstream consumers miss their delivery
+  SLAs. A keyed webhook receives the queue status snapshot from your MQ
+  exporter, a shared working directory stages a deterministic fixture for
+  trial runs, and Python grades every queue against a staleness SLA and a
+  dead letter threshold. A dead letter pile past its threshold alerts Slack
+  and fails the run first, the remaining verdicts route through a map shaped
+  Switch where a stuck queue alerts and fails, and the verdict, the stuck
+  queue list, the deepest queue and the dead letter total are published as
+  flow outputs.
+
+triggers:
+  - id: on_queue_status
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Your MQ metrics exporter or monitoring relay POSTs the queue status snapshot here so the stall grade runs the moment new depths land.
+    key: "{{ secret('IBM_MQ_STATUS_WEBHOOK_KEY') }}"
+  - id: hourly_queue_net
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Disabled hourly net that rescores the staged queue snapshot, shipped off until the webhook path is trusted in your environment.
+    cron: "0 * * * *"
+    disabled: true
+
+inputs:
+  - id: stale_age_minutes
+    type: INT
+    defaults: 30
+    description: Minutes a message may sit as the oldest on a queue with depth before that queue counts as stuck.
+  - id: dlq_threshold
+    type: INT
+    defaults: 50
+    description: Dead letter count at or above which the dead letter gate alerts Slack and fails the run on its own.
+  - id: qmanager_name
+    type: STRING
+    defaults: QM1.PROD
+    description: Queue manager the snapshot was taken from, echoed in the Slack alerts and the failure messages.
+
+tasks:
+  # --- 1. queue workspace ---
+  - id: queue_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the staged queue status snapshot and the scorer read the same file for the whole run.
+    tasks:
+      # --- 2. snapshot fixture ---
+      - id: write_queue_status_fixture
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Write a deterministic queue status fixture with a heredoc, one request queue stalled 95 minutes and an orders queue at depth capacity, so the scorer always has a snapshot to read when no exporter has posted.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          entryPoint: []
+        containerImage: alpine:3.20
+        commands:
+          - |
+            set -u
+            cat > queue_status.json <<'JSON'
+            {
+              "qmanager": "QM1.PROD",
+              "collected_at": "2026-10-15T10:00:00Z",
+              "queues": [
+                {"name": "APP.REQUEST.Q", "qmanager": "QM1.PROD", "current_depth": 1450, "q_max_depth": 5000, "oldest_message_age_minutes": 95.0, "dlq_count": 12},
+                {"name": "APP.REPLY.Q", "qmanager": "QM1.PROD", "current_depth": 8, "q_max_depth": 2000, "oldest_message_age_minutes": 1.5, "dlq_count": 0},
+                {"name": "ORDERS.QUEUE", "qmanager": "QM1.PROD", "current_depth": 900, "q_max_depth": 1000, "oldest_message_age_minutes": 4.0, "dlq_count": 3}
+              ]
+            }
+            JSON
+            echo "wrote $(wc -c < queue_status.json) bytes of queue status"
+
+      # --- 3. stall score ---
+      - id: score_queues
+        type: io.kestra.plugin.scripts.python.Script
+        description: Read the posted snapshot or the staged fixture, mark every queue whose oldest message crossed the staleness SLA as stuck, flag depth pressure and per queue dead letters as degraded, and emit the verdict and the counters through the outputs protocol.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        env:
+          QUEUE_STATUS_JSON: "{{ trigger.body ?? '' }}"
+          STALE_AGE_MINUTES: "{{ inputs.stale_age_minutes }}"
+          DLQ_THRESHOLD: "{{ inputs.dlq_threshold }}"
+        script: |
+          import json
+          import os
+
+          STALE_DEFAULT_MINUTES = 30.0
+          DLQ_DEFAULT_THRESHOLD = 50
+          DEPTH_WATCH_RATIO = 0.8
+
+
+          def as_int(value, fallback=0):
+              try:
+                  return int(value)
+              except (TypeError, ValueError):
+                  try:
+                      return int(float(value))
+                  except (TypeError, ValueError):
+                      return fallback
+
+
+          def as_float(value, fallback=0.0):
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return fallback
+
+
+          def load_snapshot():
+              raw = (os.environ.get("QUEUE_STATUS_JSON") or "").strip()
+              if raw:
+                  try:
+                      return json.loads(raw)
+                  except ValueError:
+                      return None
+              path = "queue_status.json"
+              if not os.path.exists(path) or os.path.getsize(path) == 0:
+                  return None
+              try:
+                  with open(path, "r", encoding="utf-8") as handle:
+                      return json.load(handle)
+              except ValueError:
+                  return None
+
+
+          stale_minutes = as_float(os.environ.get("STALE_AGE_MINUTES"), STALE_DEFAULT_MINUTES)
+          dlq_threshold = as_int(os.environ.get("DLQ_THRESHOLD"), DLQ_DEFAULT_THRESHOLD)
+
+          outputs = {
+              "parse_ok": False,
+              "verdict": "unknown",
+              "queue_count": 0,
+              "stuck_count": 0,
+              "stuck_queues": "none",
+              "max_depth": 0,
+              "dlq_total": 0,
+              "oldest_stuck_age_minutes": 0.0,
+          }
+
+          doc = load_snapshot()
+          if doc is not None:
+              queues = doc.get("queues") if isinstance(doc, dict) else doc
+              if not isinstance(queues, list):
+                  queues = []
+              stuck = []
+              oldest_stuck = 0.0
+              max_depth = 0
+              dlq_total = 0
+              degraded = False
+              counted = 0
+              for queue in queues:
+                  if not isinstance(queue, dict):
+                      continue
+                  counted += 1
+                  name = str(queue.get("name") or "unnamed")
+                  depth = max(0, as_int(queue.get("current_depth")))
+                  oldest = max(0.0, as_float(queue.get("oldest_message_age_minutes")))
+                  dlq = max(0, as_int(queue.get("dlq_count")))
+                  capacity = max(1, as_int(queue.get("q_max_depth"), 1))
+                  max_depth = max(max_depth, depth)
+                  dlq_total += dlq
+                  if depth > 0 and oldest >= stale_minutes:
+                      stuck.append(name)
+                      oldest_stuck = max(oldest_stuck, oldest)
+                  elif dlq >= dlq_threshold or depth >= DEPTH_WATCH_RATIO * capacity:
+                      degraded = True
+              if stuck:
+                  verdict = "stuck"
+              elif degraded:
+                  verdict = "degraded"
+              else:
+                  verdict = "healthy"
+              outputs.update({
+                  "parse_ok": True,
+                  "verdict": verdict,
+                  "queue_count": counted,
+                  "stuck_count": len(stuck),
+                  "stuck_queues": ", ".join(stuck) if stuck else "none",
+                  "max_depth": max_depth,
+                  "dlq_total": dlq_total,
+                  "oldest_stuck_age_minutes": round(oldest_stuck, 1),
+              })
+
+          print("verdict=%s stuck=%d max_depth=%d dlq_total=%d" % (
+              outputs["verdict"], outputs["stuck_count"],
+              outputs["max_depth"], outputs["dlq_total"]))
+          print("::" + json.dumps({"outputs": outputs}) + "::")
+
+  # --- 4. dead letter gate ---
+  - id: dlq_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Decide on the dead letter total first, because a pile at or past the threshold fails the run before anyone studies individual queue ages.
+    condition: "{{ outputs.score_queues.vars.dlq_total >= inputs.dlq_threshold }}"
+    then:
+      # --- 5. dead letter escalation ---
+      - id: alert_dlq_accumulation
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the messaging channel the dead letter total, the deepest queue and the stall verdict so the operator knows what to drain first.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "IBM MQ dead letter gate FAILED for {{ inputs.qmanager_name }} - {{ outputs.score_queues.vars.dlq_total }} dead letter(s) across the snapshot, past the {{ inputs.dlq_threshold }} threshold, deepest queue depth {{ outputs.score_queues.vars.max_depth }}, stall verdict {{ outputs.score_queues.vars.verdict }}. Drain the DLQ and replay before consumers fall further behind. Execution {{ execution.id }}."
+          }
+      - id: fail_dlq
+        type: io.kestra.plugin.core.execution.Fail
+        description: Turn the execution red so the release or consumer pipeline watching this gate stops instead of running on a growing dead letter pile.
+        errorMessage: "IBM MQ dead letter total {{ outputs.score_queues.vars.dlq_total }} reached the {{ inputs.dlq_threshold }} threshold on {{ inputs.qmanager_name }}."
+    else:
+      # --- 6. stall routing ---
+      - id: route_stall
+        type: io.kestra.plugin.core.flow.Switch
+        description: Route the stall verdict, alerting and failing on a stuck queue while a degraded or healthy QManager is recorded for the execution history.
+        value: "{{ outputs.score_queues.vars.verdict }}"
+        cases:
+          stuck:
+            - id: alert_stuck
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              description: Name every stuck queue, the deepest depth and the oldest message age so the on-call engineer knows which channel to repair.
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              payload: |
+                {
+                  "text": "IBM MQ queues STUCK on {{ inputs.qmanager_name }} - {{ outputs.score_queues.vars.stuck_count }} queue(s) past the {{ inputs.stale_age_minutes }} minute staleness SLA, oldest message {{ outputs.score_queues.vars.oldest_stuck_age_minutes }} minute(s), deepest queue depth {{ outputs.score_queues.vars.max_depth }}, stuck queues {{ outputs.score_queues.vars.stuck_queues }}. Consumers are falling behind. Execution {{ execution.id }}."
+                }
+            - id: fail_stuck
+              type: io.kestra.plugin.core.execution.Fail
+              description: Turn the execution red so dependent flows stop consuming a queue manager whose messages are no longer moving.
+              errorMessage: "IBM MQ stuck queues {{ outputs.score_queues.vars.stuck_queues }} on {{ inputs.qmanager_name }} with oldest message age {{ outputs.score_queues.vars.oldest_stuck_age_minutes }} minute(s)."
+          degraded:
+            - id: log_degraded
+              type: io.kestra.plugin.core.log.Log
+              description: Record the degraded queue manager, depth pressure or early dead letters that did not yet trip a gate, so the trend is visible in the execution history.
+              message: "IBM MQ qmanager {{ inputs.qmanager_name }} degraded but moving - max depth {{ outputs.score_queues.vars.max_depth }}, {{ outputs.score_queues.vars.dlq_total }} dead letter(s) under the {{ inputs.dlq_threshold }} threshold, no queue past the {{ inputs.stale_age_minutes }} minute staleness SLA."
+          healthy:
+            - id: log_healthy
+              type: io.kestra.plugin.core.log.Log
+              description: Record the quiet QManager so the execution history doubles as delivery SLA evidence.
+              message: "IBM MQ qmanager {{ inputs.qmanager_name }} healthy - {{ outputs.score_queues.vars.queue_count }} queue(s) checked, deepest depth {{ outputs.score_queues.vars.max_depth }}, {{ outputs.score_queues.vars.dlq_total }} dead letter(s), every oldest message under the {{ inputs.stale_age_minutes }} minute staleness SLA."
+        defaults:
+          - id: log_unknown_status
+            type: io.kestra.plugin.core.log.Log
+            description: Flag the unparseable snapshot so a broken exporter is investigated instead of being mistaken for a quiet queue manager.
+            message: "IBM MQ stall verdict unknown for {{ inputs.qmanager_name }} - the posted snapshot could not be parsed, fix the exporter and re-run the gate."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    description: Stall verdict for the snapshot, stuck when a queue crossed the staleness SLA, degraded under depth or dead letter pressure, healthy when quiet, unknown when unparsed.
+    value: "{{ outputs.score_queues.vars.verdict }}"
+  - id: stuck_queues
+    type: STRING
+    description: Comma separated names of every queue whose oldest message crossed the staleness SLA, or none when no queue stalled.
+    value: "{{ outputs.score_queues.vars.stuck_queues }}"
+  - id: stuck_count
+    type: INT
+    description: Number of queues whose oldest message crossed the staleness SLA in the scored snapshot.
+    value: "{{ outputs.score_queues.vars.stuck_count }}"
+  - id: max_depth
+    type: INT
+    description: Largest current depth observed across every queue in the snapshot.
+    value: "{{ outputs.score_queues.vars.max_depth }}"
+  - id: dlq_total
+    type: INT
+    description: Sum of per queue dead letter counts across the whole snapshot, gated against the dlq_threshold input.
+    value: "{{ outputs.score_queues.vars.dlq_total }}"
+  - id: oldest_stuck_age_minutes
+    type: FLOAT
+    description: Age in minutes of the oldest message on the worst stuck queue, or 0.0 when no queue stalled.
+    value: "{{ outputs.score_queues.vars.oldest_stuck_age_minutes }}"
+
+extend:
+  title: Gate on Stuck IBM MQ Queues and Dead Letter Growth
+  metaTitle: IBM MQ Queue Stall and Dead Letter Gate
+  shortDescription: Grade IBM MQ queue depth and oldest message age against a stall SLA, alert Slack and fail stuck queues, and gate on dead letter growth.
+  metaDescription: "Score IBM MQ queue depth and oldest message age against a stall SLA, fail stuck queues with Slack alerts, and gate on dead letter queue accumulation."
+  description: |
+    ## How it works
+
+    1. `on_queue_status` (`io.kestra.plugin.core.trigger.Webhook`, keyed with the `IBM_MQ_STATUS_WEBHOOK_KEY` secret) receives the queue status snapshot from your MQ exporter. `hourly_queue_net` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 * * * *`) is the safety net and ships `disabled: true` until an operator turns it on.
+    2. `queue_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) opens one shared directory so the staged fixture and the scorer read the same file, a scratch directory outside a `WorkingDirectory` is purged between tasks and would break that hand-off.
+    3. `write_queue_status_fixture` (`io.kestra.plugin.scripts.shell.Commands` on the `io.kestra.plugin.scripts.runner.docker.Docker` runner, image `alpine:3.20`) writes `queue_status.json` with a heredoc. The fixture holds a request queue at depth 1450 whose oldest message is 95 minutes old, a quiet reply queue and an orders queue sitting at ninety percent of its depth capacity, the shape a stalled QManager produces. `entryPoint: []` clears the image entrypoint so the shell script runs instead of the default command.
+    4. `score_queues` (`io.kestra.plugin.scripts.python.Script` on `python:3.12-slim`) prefers the posted webhook body when present and falls back to the staged file. A queue with depth above zero whose oldest message age meets `stale_age_minutes` is stuck, a queue at eighty percent of its depth capacity or carrying `dlq_threshold` dead letters on its own is degraded, and the overall verdict reads stuck when any queue stalled, degraded when only pressure signals fired, healthy when the QManager is quiet and unknown when the snapshot could not be parsed. The verdict, the stuck queue list, the deepest depth, the dead letter total and the oldest stuck age are printed as a single `::{"outputs": ...}::` line.
+    5. `dlq_gate` (`io.kestra.plugin.core.flow.If`) runs first on the dead letter total. A pile at or past `dlq_threshold` reaches `alert_dlq_accumulation` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) and then `fail_dlq` (`io.kestra.plugin.core.execution.Fail`). Every other run reaches `route_stall` (`io.kestra.plugin.core.flow.Switch`), whose map shaped cases alert and fail on a stuck queue through `alert_stuck` and `fail_stuck`, record a degraded QManager on `log_degraded`, record a quiet one on `log_healthy` and fall through to `log_unknown_status` when the snapshot could not be parsed.
+    6. The flow level `errors` handler (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) reports any failure with the execution id, because a dead scorer looks exactly like a healthy queue manager.
+
+    ## What you get
+
+    - A three way stall verdict, stuck, degraded or healthy, that separates a stopped consumer channel from a merely busy one.
+    - Two hard gates, a dead letter total at or past `dlq_threshold` and any queue past the staleness SLA, both fail the execution and alert Slack with the exact counters.
+    - Channel context that names the stuck queues, the deepest depth and the oldest message age instead of a bare page.
+    - `verdict`, `stuck_queues`, `stuck_count`, `max_depth`, `dlq_total` and `oldest_stuck_age_minutes` as typed outputs for delivery SLA dashboards.
+    - A disabled hourly schedule as a second net once the webhook path is trusted.
+
+    ## Who it's for
+
+    - Messaging platform teams that own IBM MQ queue managers and need stalled queues named before consumers miss delivery SLAs.
+    - SREs on call for dead letter growth who want the drain list and the deepest queue in the page itself.
+    - Integration engineers wiring queue health into a release or batch window gate instead of watching channels by eye.
+
+    ## Why orchestrate this with Kestra
+
+    MQ depth and dead letter counters live in the QManager, but nothing correlates a stale oldest-message age with a growing DLQ and stops the line when both fire. Kestra gives the check a keyed webhook for on demand scoring, a disabled schedule as the safety net, a fixture driven scorer whose stall rules live in version control, a dead letter gate that fails fast, and a map shaped Switch that routes each stall verdict into Slack and execution failure from one declarative file. A cron script with a queue manager client gives you none of the history, the branching or the gateable outputs.
+
+    ## Prerequisites
+
+    - A worker with Docker access, the fixture runs in `alpine:3.20` and the scorer in `python:3.12-slim`.
+    - An MQ exporter or monitoring relay that can POST queue status JSON with per queue depth, oldest message age and dead letter count to the webhook, or rely on the staged fixture for trial runs.
+    - A Slack incoming webhook for the stall alerts and for failure alerts.
+
+    ### Secrets
+
+    - `IBM_MQ_STATUS_WEBHOOK_KEY`: key segment guarding the queue status webhook URL, anyone holding it can trigger a scoring run.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used by the DLQ alert, the stuck alert and the `errors` block.
+
+    ## Quick start
+
+    1. Add the two secrets to your Kestra namespace.
+    2. Run the flow once with the default inputs. The staged fixture carries a 95 minute old message on `APP.REQUEST.Q` and 15 dead letters in total, so the DLQ gate passes, the Switch routes stuck, Slack names `APP.REQUEST.Q` and the execution fails.
+    3. Re-run with `stale_age_minutes` at 120 to watch the same fixture route degraded, because the request queue recovers while the orders queue still sits at depth capacity.
+    4. Re-run with `dlq_threshold` at 10 to watch the DLQ gate fire first with the full dead letter total before the Switch is ever reached.
+    5. Point your exporter at `/api/v1/{tenant}/executions/webhook/{namespace}/ibm-mq-queue-stuck-and-dlq-gate/{IBM_MQ_STATUS_WEBHOOK_KEY}` and enable `hourly_queue_net` once the path is trusted.
+
+    ## How to extend
+
+    - Score each queue manager separately by fanning out with `io.kestra.plugin.core.flow.ForEachItem` over a subflow that grades one QManager snapshot each.
+    - Persist every scored snapshot with `io.kestra.plugin.jdbc.postgresql.Queries` to trend depth and dead letter growth per queue over the week.
+    - Add a per queue override map inside `score_queues` so critical queues get a shorter staleness SLA than bulk archives.
+    - Swap the Slack alerts for a PagerDuty integration when a stuck queue should page the messaging on-call instead of posting to a channel.
+
+    ## Links
+
+    - [IBM MQ dead letter queue handling](https://www.ibm.com/docs/en/ibm-mq/9.3?topic=queues-dead-letter)
+    - [Kestra Switch task](https://kestra.io/plugins/core/tasks/flow/io.kestra.plugin.core.flow.switch)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Kestra Webhook trigger](https://kestra.io/docs/workflow-components/triggers/webhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Monitoring & Alerting
+    - Failure Alerting
+  ee: false
+  demo: false

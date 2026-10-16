@@ -1,0 +1,261 @@
+id: postgres-unindexed-foreign-key-guard
+namespace: company.team
+
+description: |
+  Find PostgreSQL foreign keys whose referencing columns have no index. Every DELETE or key
+  UPDATE on the parent table then scans the whole child table, and ON DELETE CASCADE turns one
+  delete into a long lock. Report them with the child table size, alert Slack, and optionally
+  create the missing indexes with CREATE INDEX CONCURRENTLY, one at a time, then audit again to
+  prove each foreign key is covered by a valid index. Small tables are only reported.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    defaults: "jdbc:postgresql://localhost:5432/app"
+
+  - id: min_table_rows
+    type: INT
+    displayName: Index only tables with at least (rows)
+    description: Foreign keys on smaller child tables are reported but never indexed.
+    defaults: 10000
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, for CREATE INDEX to run.
+    defaults: true
+
+variables:
+  audit_sql: |
+    WITH fk AS (
+      SELECT c.oid, c.conname, c.conrelid, c.confrelid, c.conkey, c.confdeltype,
+             (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS cols
+        FROM pg_constraint c
+        JOIN pg_namespace n ON n.oid = (SELECT relnamespace FROM pg_class WHERE oid = c.conrelid)
+       WHERE c.contype = 'f' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    )
+    SELECT fk.conname AS constraint_name, fk.conrelid::regclass::text AS child_table, fk.confrelid::regclass::text AS parent_table,
+           array_to_string(fk.cols, ', ') AS columns,
+           CASE fk.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END AS on_delete,
+           greatest(cl.reltuples, 0)::bigint AS child_rows,
+           pg_relation_size(fk.conrelid) AS child_bytes,
+           greatest(cl.reltuples, 0) >= {{ inputs.min_table_rows }} AS will_index,
+           format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %s (%s)',
+                  left(cl.relname || '_' || array_to_string(fk.cols, '_') || '_fk_idx', 63), fk.conrelid::regclass,
+                  (SELECT string_agg(quote_ident(c), ', ') FROM unnest(fk.cols) c)) AS fix_sql
+      FROM fk
+      JOIN pg_class cl ON cl.oid = fk.conrelid
+     WHERE NOT EXISTS (
+       SELECT 1 FROM pg_index i
+        WHERE i.indrelid = fk.conrelid AND i.indisvalid AND i.indpred IS NULL
+          AND (i.indkey::int2[])[0:array_length(fk.conkey, 1) - 1] @> fk.conkey
+          AND (i.indkey::int2[])[0:array_length(fk.conkey, 1) - 1] <@ fk.conkey)
+     ORDER BY child_rows DESC, 1
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. A foreign key is covered when a valid, non-partial index starts with exactly its columns, in any order.
+      Statements are built with format('%I') and regclass.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Unindexed foreign keys on {{ inputs.jdbc_url }}: {{ outputs.audit.size }}.
+      {% for r in outputs.audit.rows %}{{ r.child_table }}({{ r.columns }}) -> {{ r.parent_table }}, ON DELETE {{ r.on_delete }}, {{ r.child_rows }} rows{{ r.will_index ? '' : ', below min_table_rows, report only' }}. {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.size > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'PostgreSQL ' ~ inputs.jdbc_url ~ ': ' ~ outputs.audit.size ~ ' foreign keys without an index, each delete on the parent scans the child table: ' ~ (outputs.audit.rows | jq('map("\(.child_table)(\(.columns)) \(.child_rows) rows, ON DELETE \(.on_delete)") | join("; ")') | first) ~ '.' ~ (inputs.auto_remediate and not inputs.dry_run ? ' Creating the indexes now.' : ' No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.audit.rows | jq('map(select(.will_index)) | length') | first > 0 }}"
+        then:
+          - id: remediate
+            type: io.kestra.plugin.core.flow.Loop
+            concurrencyLimit: 1
+            description: One CREATE INDEX CONCURRENTLY at a time, so writes are never blocked and one failure stays isolated.
+            values: "{{ outputs.audit.rows | jq('map(select(.will_index) | .fix_sql)') | first | toJson }}"
+            tasks:
+              - id: create_index
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: NONE
+                sql: "{{ item.value }}"
+
+          - id: reaudit
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.audit_sql) }}"
+
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            description: Every foreign key that was indexed must now be covered by a valid index. A failed concurrent build leaves an invalid index, which does not count.
+            condition: >-
+              {{ {'b': outputs.audit.rows, 'a': outputs.reaudit.rows ?? []} | jq('([.a[] | .constraint_name + "|" + .child_table]) as $a
+                 | [.b[] | select(.will_index) | .constraint_name + "|" + .child_table | select(. as $x | $a | index($x))] | length') | first > 0 }}
+            then:
+              - id: remediation_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Some foreign keys are still not covered by a valid index: {{ outputs.reaudit.rows | jq('map(select(.will_index) | \"\\(.child_table)(\\(.columns))\") | join(\", \")') | first }}. A failed concurrent build leaves an INVALID index to drop or rebuild."
+            else:
+              - id: remediated
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Indexed and verified: {{ outputs.audit.rows | jq('map(select(.will_index) | "\(.child_table)(\(.columns))") | join(", ")') | first }}.
+                  Still unindexed (below min_table_rows): {{ outputs.reaudit.size }}.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: "Every foreign key is covered by an index."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'PostgreSQL unindexed foreign key guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled, and always in safe mode.
+    cron: "0 4 * * 1"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: PostgreSQL Unindexed Foreign Key Guard
+  shortDescription: Find PostgreSQL foreign keys with no index on the referencing columns, alert Slack, and optionally create the missing indexes with CREATE INDEX CONCURRENTLY one at a time and verify each one.
+  metaTitle: PostgreSQL Unindexed Foreign Key Guard with Kestra
+  metaDescription: Find PostgreSQL foreign keys without an index, alert Slack, create the indexes with CREATE INDEX CONCURRENTLY and verify every key is covered.
+  description: |
+    PostgreSQL indexes the referenced side of a foreign key (it needs a primary key or a unique constraint), but never the referencing side. So every `DELETE` on the parent table, and every update of its key, has to scan the whole child table for matching rows. With `ON DELETE CASCADE`, deleting one order can lock and scan millions of line items. It works fine in development, and becomes a nightly cleanup job that runs for hours, or a lock that blocks the checkout.
+
+    This blueprint finds every foreign key whose columns are not covered by an index, with the size of the child table and the delete rule. It alerts Slack, and can create the missing indexes with `CREATE INDEX CONCURRENTLY`, one at a time and without blocking writes. It then audits again, so the run only succeeds when each key is covered by a valid index.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) lists the foreign keys outside system schemas that no valid, non-partial index covers. An index covers a key when its leading columns are exactly the key's columns, in any order. Each row has the child and parent tables, the columns, the delete rule, the child row count, and a `CREATE INDEX CONCURRENTLY IF NOT EXISTS` statement built with `format('%I')` and `regclass`.
+    2. `summary` logs every finding. Child tables below `min_table_rows` are marked report only: an index there costs more than it saves.
+    3. `route` (`io.kestra.plugin.core.flow.If`):
+       - **covered:** logs it.
+       - **findings:** `alert` posts to Slack.
+         - `remediate_gate` runs only when `auto_remediate` is true and `dry_run` is false.
+         - `remediate` (`io.kestra.plugin.core.flow.Loop`) builds one index at a time, each in its own task.
+         - `reaudit` runs the audit again, and `verify_result` fails if an indexed key is still uncovered. A failed concurrent build leaves an `INVALID` index, which does not count as coverage.
+    4. `errors` alerts Slack when the audit cannot run.
+
+    ## What you get
+
+    - Every foreign key that turns parent deletes into child table scans, sorted by child table size.
+    - Indexes built concurrently, one at a time, with names derived from the table and columns.
+    - Proof that each key is covered by a valid index after the run.
+
+    ## Who it's for
+
+    - Teams whose schemas grew through migrations and ORMs that create foreign keys without indexes.
+    - DBAs tracking down slow deletes, cascading deletes and lock waits on parent tables.
+    - Teams evaluating the PostgreSQL plugin who want an example of a catalog query driving index builds.
+
+    ## Why orchestrate this with Kestra
+
+    The catalog query finds the keys once. Kestra runs it every week, after every migration lands, and turns the result into a Slack alert. It builds the indexes behind `auto_remediate` and `dry_run`, one per task so one failure stays isolated, verifies the result, and keeps a history of which index was added where and when.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against PostgreSQL 16, with a local HTTP sink standing in for Slack. Foreign keys without an index:
+    - `order_items.order_id`: 400,000 rows, `ON DELETE CASCADE` to `orders`;
+    - `shipments.customer_id`: 150,000 rows;
+    - `invoices(region, cust_id)`: an empty table.
+
+    `shipments.order_id` already has an index.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults | 3 unindexed keys, `invoices` marked report only (0 rows). `shipments.order_id` not flagged. Alert sent |
+    | 2 | `auto_remediate: true`, `dry_run: true` | Same report, no index created |
+    | 3 | `auto_remediate: true`, `dry_run: false` | 2 indexes built concurrently and verified, both valid in `pg_index`. Deleting 500 orders in a transaction went from 9,734 ms to 7.8 ms |
+    | 4 | `min_table_rows: 0`, remediate | The composite index on `invoices(region, cust_id)` built and verified |
+    | 5 | defaults | Every foreign key covered |
+    | 6 | unreachable database | `errors` alert sent |
+
+    ## Prerequisites
+
+    - For the audit, any role can read the catalog. For remediation, the owner of the child tables. Concurrent builds need no long lock, but they read the whole table.
+    - Local testing:
+      - `docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=pg postgres:16`;
+      - create a parent and a large child table with a `REFERENCES` constraint and no index.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` / `POSTGRES_PASSWORD`: credentials used by every query.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/app` | Database |
+    | `min_table_rows` | `10000` | Smallest child table that gets an index |
+    | `auto_remediate` | `false` | Allow index builds |
+    | `dry_run` | `true` | Must be `false` for an index to be created |
+
+    ## Quick start
+
+    1. Add the `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url`.
+    3. Run it once and read the unindexed keys, largest child tables first.
+    4. Run it with `auto_remediate: true` and `dry_run: false` outside peak hours.
+    5. Enable the `weekly` trigger, which always runs in safe mode, or call the flow at the end of your migration pipeline.
+
+    ## How to extend
+
+    - Only index keys whose parent table actually sees deletes, using `n_tup_del` from `pg_stat_user_tables`.
+    - Loop over a list of JDBC URLs to check every database of a cluster.
+    - Chain the invalid index rebuild guard after this flow, to clean up a build that failed.
+    - Ask for approval with a `Pause` before building indexes on very large tables.
+
+    ## Links
+
+    - Foreign keys: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
