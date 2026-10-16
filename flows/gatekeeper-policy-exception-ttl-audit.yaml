@@ -1,0 +1,355 @@
+id: gatekeeper-policy-exception-ttl-audit
+namespace: company.team
+description: |
+  Gatekeeper constraint exceptions and waivers age out silently, so an
+  expired exception keeps bypassing admission policy long after its owner
+  stopped watching it. This flow exports the exception registry from the
+  cluster with kubectl (falling back to a bundled snapshot when no apiserver
+  is reachable), ages every waiver against an audit date, and flags expired
+  waivers plus those expiring inside a warning window. When anything has
+  expired, or the snapshot cannot be read, a Slack alert carries the expired
+  list to the ops channel, and the verdict, the expired list, the counts, and
+  the snapshot URI are published as flow outputs.
+
+triggers:
+  - id: exception_registry_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Ops tooling POSTs here to run an on-demand audit, for example right after a waiver is granted or before a policy review.
+    key: "{{ secret('GATEKEEPER_WEBHOOK_KEY') }}"
+  - id: weekly_ttl_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Standing weekly TTL audit cadence that ships disabled until an operator switches it on.
+    cron: "0 5 * * 1"
+    disabled: true
+
+inputs:
+  - id: cluster_alias
+    type: STRING
+    defaults: prod-gke-cluster
+    description: Human name of the cluster whose registry is audited, carried into the Slack message.
+  - id: warning_window_days
+    type: INT
+    defaults: 7
+    description: Days before an expiry date at which a waiver counts as soon expiring instead of comfortably valid.
+  - id: audit_date
+    type: STRING
+    defaults: ""
+    description: ISO date the audit ages waivers against; leave empty to use the current UTC date.
+
+tasks:
+  # --- 1. export the exception registry ---
+  - id: registry_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the kubectl export and the parser that ages the waivers read the same snapshot file.
+    tasks:
+      - id: export_exceptions
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Write a bundled registry snapshot with a heredoc, try a live kubectl export, and fall back to the snapshot when no apiserver is reachable so the audit runs offline too.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: bitnami/kubectl:latest
+        outputFiles:
+          - registry-snapshot.json
+        commands:
+          - |
+            set -u
+            cat > mock-registry.json <<'JSON'
+            {
+              "apiVersion": "exceptions.gatekeeper.sh/v1alpha1",
+              "kind": "ConstraintExceptionList",
+              "items": [
+                {
+                  "metadata": {"name": "allow-privileged-payments", "namespace": "team-payments"},
+                  "spec": {"constraint": "deny-privileged-containers", "expires": "2026-09-30", "owner": "payments-oncall", "reason": "PCI migration window"}
+                },
+                {
+                  "metadata": {"name": "allow-latest-tag-batch", "namespace": "team-batch"},
+                  "spec": {"constraint": "require-image-tags", "expires": "2026-10-10", "owner": "batch-platform", "reason": "vendor image drop"}
+                },
+                {
+                  "metadata": {"name": "host-network-debug", "namespace": "team-observability"},
+                  "spec": {"constraint": "deny-host-network", "expires": "2026-10-18", "owner": "observability-oncall", "reason": "node exporter rollout"}
+                },
+                {
+                  "metadata": {"name": "allow-privileged-devtools", "namespace": "team-devtools"},
+                  "spec": {"constraint": "deny-privileged-containers", "expires": "2026-10-20", "owner": "devtools-lead", "reason": "debug container sprint"}
+                },
+                {
+                  "metadata": {"name": "allow-root-fs-staging", "namespace": "team-staging"},
+                  "spec": {"constraint": "deny-root-user", "expires": "2027-01-15", "owner": "staging-platform", "reason": "stateful migration"}
+                },
+                {
+                  "metadata": {"name": "skip-vpa-mutation", "namespace": "team-platform"},
+                  "spec": {"constraint": "deny-vpa-mutation", "owner": "platform", "reason": "carry-over waiver"}
+                }
+              ]
+            }
+            JSON
+
+            kubectl get constraintexceptions -A -o json > registry-snapshot.json 2>/dev/null || true
+
+            if [ ! -s registry-snapshot.json ]; then
+              cp mock-registry.json registry-snapshot.json
+              echo "no apiserver reachable from this worker, using the bundled registry snapshot"
+            fi
+
+            echo "snapshot bytes $(wc -c < registry-snapshot.json)"
+
+      - id: audit_exceptions
+        type: io.kestra.plugin.scripts.python.Script
+        description: Age every waiver against the audit date, flag expired and soon expiring exceptions, and emit the verdict through the outputs protocol.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        env:
+          AUDIT_DATE: "{{ inputs.audit_date }}"
+          WARNING_WINDOW_DAYS: "{{ inputs.warning_window_days }}"
+          CLUSTER_ALIAS: "{{ inputs.cluster_alias }}"
+        script: |
+          import datetime as dt
+          import json
+          import os
+
+          EXPIRY_KEYS = ("expires", "expiresAt", "expiration", "expiry")
+
+          def parse_expiry(value):
+              text = str(value or "").strip()
+              if not text:
+                  return None
+              try:
+                  return dt.date.fromisoformat(text[:10])
+              except ValueError:
+                  pass
+              try:
+                  return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+              except ValueError:
+                  return None
+
+          parse_error = ""
+          audit_raw = (os.environ.get("AUDIT_DATE") or "").strip()
+          today = dt.datetime.now(dt.timezone.utc).date()
+          if audit_raw:
+              try:
+                  audit_date = dt.date.fromisoformat(audit_raw[:10])
+              except ValueError:
+                  audit_date = today
+                  parse_error = "audit_date is not an ISO date (%s)" % audit_raw
+          else:
+              audit_date = today
+
+          try:
+              window = int(os.environ.get("WARNING_WINDOW_DAYS") or "7")
+          except ValueError:
+              window = 7
+              parse_error = parse_error or "warning_window_days is not an integer"
+
+          cluster = os.environ.get("CLUSTER_ALIAS") or "unknown-cluster"
+          registry_path = os.environ.get("REGISTRY_FILE") or "registry-snapshot.json"
+          items = []
+
+          if not parse_error:
+              if not os.path.exists(registry_path):
+                  parse_error = "registry snapshot file is missing"
+              else:
+                  with open(registry_path, "r") as handle:
+                      raw = handle.read()
+                  try:
+                      doc = json.loads(raw)
+                  except ValueError as exc:
+                      parse_error = "registry snapshot is not valid JSON (%s)" % exc
+                  else:
+                      if isinstance(doc, dict):
+                          candidate = doc.get("items")
+                          if isinstance(candidate, list):
+                              items = candidate
+                          elif "metadata" in doc:
+                              items = [doc]
+                          else:
+                              parse_error = "registry snapshot object carries no items list"
+                      elif isinstance(doc, list):
+                          items = doc
+                      else:
+                          parse_error = "registry snapshot is neither an object nor an array"
+                      if not parse_error and any(not isinstance(item, dict) for item in items):
+                          parse_error = "registry snapshot contains entries that are not objects"
+                          items = []
+
+          expired_list = []
+          soon_list = []
+          no_expiry_count = 0
+          total = len(items)
+
+          if not parse_error:
+              for item in items:
+                  meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                  spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+                  name = str(meta.get("name") or "unnamed")
+                  namespace = str(meta.get("namespace") or "cluster-scoped")
+                  label = "%s (%s)" % (name, namespace)
+                  owner = str(spec.get("owner") or "unassigned")
+                  raw_expiry = None
+                  for key in EXPIRY_KEYS:
+                      if spec.get(key):
+                          raw_expiry = spec.get(key)
+                          break
+                  expiry = parse_expiry(raw_expiry)
+                  if raw_expiry is not None and expiry is None:
+                      expired_list.append("%s has an unreadable expiry %s (owner %s)" % (label, raw_expiry, owner))
+                      continue
+                  if expiry is None:
+                      no_expiry_count += 1
+                      expired_list.append("%s carries no expiry date (owner %s)" % (label, owner))
+                      continue
+                  days_left = (expiry - audit_date).days
+                  if days_left < 0:
+                      expired_list.append("%s expired %d day(s) ago on %s (owner %s)" % (
+                          label, -days_left, expiry.isoformat(), owner))
+                  elif days_left <= window:
+                      soon_list.append("%s expires in %d day(s) on %s (owner %s)" % (
+                          label, days_left, expiry.isoformat(), owner))
+
+          expired_count = len(expired_list)
+          soon_count = len(soon_list)
+          if parse_error:
+              verdict = "SCAN_ERROR"
+          elif expired_count > 0:
+              verdict = "FAIL"
+          else:
+              verdict = "PASS"
+
+          payload = {"outputs": {
+              "verdict": verdict,
+              "expired_list": expired_list,
+              "expired_count": expired_count,
+              "soon_count": soon_count,
+              "total_exceptions": total,
+              "no_expiry_count": no_expiry_count,
+              "audit_date": audit_date.isoformat(),
+              "warning_window_days": window,
+              "cluster_alias": cluster,
+              "parse_error": parse_error,
+          }}
+          print("gatekeeper exception audit %s on %s, %d expired, %d soon, %d total" % (
+              verdict, cluster, expired_count, soon_count, total))
+          print("::" + json.dumps(payload) + "::")
+
+  # --- 2. expiry gate and escalation ---
+  - id: gate_on_expiry
+    type: io.kestra.plugin.core.flow.If
+    description: Escalate when the verdict is not PASS, which covers both expired waivers and a snapshot that could not be read, and record the all-clear otherwise.
+    condition: "{{ outputs.audit_exceptions.vars.verdict != 'PASS' }}"
+    then:
+      - id: alert_expired_exceptions
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the expired waiver list and the soon expiring count to the ops channel while there is still time to renew or revoke.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Gatekeeper exception TTL audit {{ outputs.audit_exceptions.vars.verdict }} for {{ inputs.cluster_alias }} - {{ outputs.audit_exceptions.vars.expired_count }} of {{ outputs.audit_exceptions.vars.total_exceptions }} waiver(s) expired or without an expiry, {{ outputs.audit_exceptions.vars.soon_count }} expiring within {{ inputs.warning_window_days }} day(s). {{ outputs.audit_exceptions.vars.expired_list | join(' | ') }}. Execution {{ execution.id }}."
+          }
+    else:
+      - id: log_compliant
+        type: io.kestra.plugin.core.log.Log
+        description: Record the compliant registry so the execution history doubles as audit evidence.
+        message: "No expired Gatekeeper waivers in {{ inputs.cluster_alias }} on {{ outputs.audit_exceptions.vars.audit_date }}, {{ outputs.audit_exceptions.vars.total_exceptions }} waiver(s) checked."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    value: "{{ outputs.audit_exceptions.vars.verdict }}"
+  - id: expired_list
+    type: ARRAY
+    value: "{{ outputs.audit_exceptions.vars.expired_list | toJson }}"
+  - id: expired_count
+    type: INT
+    value: "{{ outputs.audit_exceptions.vars.expired_count }}"
+  - id: soon_count
+    type: INT
+    value: "{{ outputs.audit_exceptions.vars.soon_count }}"
+  - id: total_exceptions
+    type: INT
+    value: "{{ outputs.audit_exceptions.vars.total_exceptions }}"
+  - id: snapshot_uri
+    type: STRING
+    value: "{{ outputs.export_exceptions.outputFiles['registry-snapshot.json'] }}"
+
+extend:
+  title: Audit Gatekeeper Policy Exceptions Before an Expired Waiver Bypasses Admission
+  metaTitle: Gatekeeper Policy Exception TTL Audit with Kestra
+  shortDescription: Export the Gatekeeper exception registry, age every waiver against an audit date, and alert Slack listing the expired ones by owner.
+  metaDescription: Audit Gatekeeper constraint exceptions for expired and soon expiring waivers, then alert Slack with the expired list and their owners.
+  description: |
+    ## How it works
+
+    1. `exception_registry_webhook` (`io.kestra.plugin.core.trigger.Webhook`, keyed with `GATEKEEPER_WEBHOOK_KEY`) runs an audit on demand, for example right after a waiver is granted or before an external review. `weekly_ttl_audit` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 5 * * 1`) is the standing cadence and ships with `disabled: true` until an operator switches it on.
+    2. `registry_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) gives the export step and the parser one shared directory, a scratch directory outside a `WorkingDirectory` is purged between tasks and would break the file hand-off.
+    3. `export_exceptions` (`io.kestra.plugin.scripts.shell.Commands` on the `io.kestra.plugin.scripts.runner.docker.Docker` runner, image `bitnami/kubectl:latest`) first writes a bundled snapshot of the `ConstraintException` registry with a heredoc, then runs `kubectl get constraintexceptions -A -o json > registry-snapshot.json || true`. When no apiserver or kubeconfig is reachable from the worker the redirect comes up empty and the snapshot is copied in, so the audit behaves the same offline and online.
+    4. `audit_exceptions` (`io.kestra.plugin.scripts.python.Script` on `python:3.12-slim`) ages every waiver against `audit_date`, flags anything already past `spec.expires` as expired, counts waivers due within `warning_window_days`, and treats a waiver with no expiry date as expired, it can never age out on its own. An unreadable snapshot becomes `SCAN_ERROR` instead of a silent pass.
+    5. `gate_on_expiry` (`io.kestra.plugin.core.flow.If`) branches when `verdict` is anything but `PASS`. Over that line `alert_expired_exceptions` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) posts the expired list with namespaces, dates, and owners plus the soon expiring count; a clean registry records `log_compliant`.
+    6. The `errors` block alerts Slack when the container or the parser itself breaks, because a dead auditor looks exactly like a clean registry.
+
+    ## What you get
+
+    - Gateable numbers, `verdict`, `expired_list`, `expired_count`, `soon_count`, `total_exceptions`, and `snapshot_uri` are flow outputs any downstream policy check can branch on.
+    - A Slack alert that names each expired waiver, its namespace, its expiry date, and the owner who signed it off, so follow-up lands on a person instead of a list.
+    - A warning horizon, `soon_count` reports waivers about to lapse inside `warning_window_days`, which is the window a renewal decision can still be made in.
+    - Evidence, every execution keeps the exported registry snapshot in internal storage next to the verdict.
+
+    ## Who it's for
+
+    - Kubernetes platform teams that run OPA Gatekeeper with an internal waiver or exception process on top of it.
+    - Security and compliance engineers who must show that expired exceptions were found before the review, not after the finding.
+    - Cluster operators who inherit waivers nobody owns anymore and need the expiry dates pulled out of YAML into a channel people read.
+
+    ## Why orchestrate this with Kestra
+
+    A waiver list lives in a custom resource or a Git file and its dates pass quietly, nobody is paged by an exception that quietly keeps bypassing a policy. Kestra gives the audit a disabled-by-default weekly schedule, a keyed webhook for on-demand runs, a containerized kubectl export with a bundled offline fallback, an explicit aging policy in code, and a branch that turns expired waivers into a named Slack alert, all in one versioned file whose execution history doubles as evidence.
+
+    ## Prerequisites
+
+    - A worker with Docker access, the export runs in the kubectl container and the parser in `python:3.12-slim`.
+    - A cluster and kubeconfig (or service account) allowed to `get constraintexceptions` for a live export. Without one the flow still completes on the bundled snapshot, which is what makes it safe to run in CI or on a laptop.
+    - A Slack incoming webhook for the expiry alert and for the failure alert.
+
+    ### Secrets
+
+    - `GATEKEEPER_WEBHOOK_KEY`: key segment guarding the webhook URL, anyone holding it can start an audit.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL used by the expiry alert and by the `errors` block.
+
+    ## Quick start
+
+    1. Add the two secrets to the Kestra namespace.
+    2. Run the flow once with the default inputs. The audit ages the bundled snapshot against today's UTC date, the two waivers dated in the past and the carry-over waiver with no expiry date at all land in `expired_list`, so expect `verdict: FAIL` and a Slack message naming each one.
+    3. Pin `audit_date` to an ISO date before a review to reproduce the exact verdict that date produced, and raise or lower `warning_window_days` to see `soon_count` react.
+    4. Point your ops tooling at `/api/v1/{tenant}/executions/webhook/{namespace}/gatekeeper-policy-exception-ttl-audit/{GATEKEEPER_WEBHOOK_KEY}` to run an audit right after a waiver is granted.
+    5. Enable `weekly_ttl_audit` once the worker has a kubeconfig with permission to read the exception registry.
+
+    ## How to extend
+
+    - Rename the resource in the kubectl export step when your platform uses its own waiver CRD instead of `constraintexceptions`.
+    - Fan out over a fleet of clusters with `io.kestra.plugin.core.flow.Loop`, one export and one audit per cluster alias, then merge the expired lists before alerting.
+    - Open a GitHub issue per owner with `io.kestra.plugin.github.issues.Create` inside `gate_on_expiry` so every expired waiver becomes tracked work.
+    - Feed `expired_list` into a warehouse table with a JDBC query task to trend waiver aging across review cycles.
+
+    ## Links
+
+    - [OPA Gatekeeper](https://github.com/open-policy-agent/gatekeeper)
+    - [Gatekeeper policy library](https://github.com/open-policy-agent/gatekeeper-library)
+    - [Kestra webhook trigger](https://kestra.io/docs/workflow-components/triggers/webhook-trigger)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Kubernetes Operations
+    - Reporting & Digests
+  ee: false
+  demo: false
