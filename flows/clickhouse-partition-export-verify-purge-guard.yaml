@@ -1,0 +1,1428 @@
+id: clickhouse-partition-export-verify-purge-guard
+namespace: company.team
+description: >-
+  Archive ClickHouse partitions that are past retention, prove every archive file
+  parses back into identical rows by restoring it into a probe table, then drop
+  only the partitions whose round trip matched, behind an approval gate that is
+  re-checked against live state immediately before the DDL runs.
+
+labels:
+  project: clickhouse-partition-export-verify-purge-guard
+  team: data-platform
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: clickhouse_url
+    type: STRING
+    displayName: ClickHouse JDBC URL
+    defaults: jdbc:clickhouse://localhost:8123/default
+    description: >-
+      JDBC URL of the server that holds the table. The archive files are written
+      by the server itself, so this has to be the node whose user_files directory
+      you want the archive in.
+
+  - id: clickhouse_username
+    type: STRING
+    displayName: ClickHouse user
+    defaults: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    description: >-
+      User that reads system.parts, writes the archive through the file table
+      function, creates the restore probe table plus runs ALTER TABLE DROP
+      PARTITION on the tables you allowlisted.
+
+  - id: clickhouse_password
+    type: STRING
+    displayName: ClickHouse password
+    defaults: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    description: Password for that user.
+
+  - id: database
+    type: STRING
+    displayName: Database
+    defaults: default
+    description: Database holding the table to archive.
+
+  - id: table
+    type: STRING
+    displayName: Table
+    defaults: events
+    description: >-
+      MergeTree family table with a date based partition key, for example
+      PARTITION BY toYYYYMM(ts). The partition key is read out of system.tables,
+      never guessed, so the archive file names match the server's own partition
+      ids by construction.
+
+  - id: retention_days
+    type: INT
+    displayName: Retention window (days)
+    defaults: 90
+    description: >-
+      A partition is a candidate once its newest row is older than this. This
+      only decides what is READ. Nothing is archived or dropped on age alone.
+
+  - id: archive_dir
+    type: STRING
+    displayName: Archive directory
+    defaults: clickhouse-archive
+    description: >-
+      Directory under the server's user_files path where the archive files live.
+      One file per partition, named table-partitionid.format.
+
+  - id: archive_format
+    type: STRING
+    displayName: Archive format
+    defaults: Native
+    description: >-
+      ClickHouse format for the archive. Native is the default because it is
+      lossless, so the restored rows hash identically to the live rows. The file
+      extension is the lowercased format name.
+
+  - id: purgeable_tables
+    type: ARRAY
+    itemType: STRING
+    displayName: Tables a partition may be dropped from
+    defaults: []
+    description: >-
+      Write allowlist, entries written as database.table. It ships EMPTY, so a
+      run in live mode has nothing it is allowed to drop until you name the table
+      here. Everything else is still read, archived in dry run reporting plus
+      reported in full.
+
+  - id: protected_partitions
+    type: ARRAY
+    itemType: STRING
+    displayName: Partition ids that are never dropped
+    defaults: []
+    description: >-
+      Denylist of partition ids, for example 202601. A partition listed here is
+      reported plus archived like any other, then refused at the drop step. Use it
+      for the periods a regulator or an open investigation still needs online.
+
+  - id: max_partitions_per_run
+    type: INT
+    displayName: Per-run ceiling
+    defaults: 3
+    description: >-
+      At most this many partitions are archived plus dropped in one run, oldest
+      first. A table with fifty expired partitions is a migration, not a cleanup
+      job, plus the ceiling bounds the full table scan the checksum needs.
+
+  - id: restore_probe
+    type: BOOL
+    displayName: Restore each archive into a probe table
+    defaults: true
+    description: >-
+      When true the archive is not only parsed, it is inserted into a throwaway
+      clone of the table plus the restored rows are hashed there. That is the
+      difference between proving the file can be read plus proving the data comes
+      back. Turn it off only when the table is too large to stage twice.
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    defaults: true
+    description: >-
+      When true the flow reads system.parts, reports every candidate partition
+      with the state of its archive plus writes nothing at all, no archive file
+      and no DDL.
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Allow remediation
+    defaults: false
+    description: >-
+      When false the flow only reports. Archiving plus dropping need this true,
+      dry_run false plus an explicit approval on the pause.
+
+  - id: slack_channel
+    type: STRING
+    displayName: Slack channel
+    defaults: "#data-platform"
+    description: Channel the findings plus the failure alert are posted to.
+
+variables:
+  parts_sql: |
+    SELECT
+      partition AS partition,
+      partition_id AS partition_id,
+      sum(rows) AS rows_total,
+      sum(bytes_on_disk) AS bytes_total,
+      count() AS parts,
+      toString(max(greatest(max_time, toDateTime(max_date)))) AS newest_ts
+    FROM system.parts
+    WHERE database = '{{ inputs.database }}'
+      AND table = '{{ inputs.table }}'
+      AND active = 1
+    GROUP BY partition, partition_id
+    ORDER BY newest_ts
+
+  fingerprint_sql: |
+    SELECT
+      _partition_id AS partition_id,
+      count() AS rows_live,
+      toString(sum(cityHash64(toString(tuple(*))))) AS checksum_live
+    FROM {{ inputs.database }}.{{ inputs.table }}
+    WHERE _partition_id IN splitByChar(',', '{{ outputs.assess_archives.vars.targetCsv }}')
+    GROUP BY partition_id
+    ORDER BY partition_id
+
+  archive_read_sql: |
+    SELECT
+      _file AS archive_file,
+      count() AS rows_archive,
+      toString(sum(cityHash64(toString(tuple(*))))) AS checksum_archive
+    FROM file(
+      '{{ outputs.assess_archives.vars.targetGlob }}',
+      {{ inputs.archive_format }},
+      '{{ outputs.check_table_shape.vars.structure }}'
+    )
+    GROUP BY archive_file
+    ORDER BY archive_file
+
+triggers:
+  - id: weekly_archive_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    description: >-
+      Enable this to sweep every Monday in report-only mode. It pins dry_run true
+      plus auto_remediate false, so turning the schedule on can never archive or
+      drop anything on its own.
+    cron: "0 2 * * 1"
+    timezone: UTC
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: read_table_catalog
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      Read the engine, the PARTITION BY expression plus the full column list out
+      of system.tables and system.columns. The partition expression is reused
+      verbatim when the archive is written, so the file names carry the server's
+      own partition ids instead of ids this flow computed itself.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        t.engine AS engine,
+        t.partition_key AS partition_key,
+        (
+          SELECT arrayStringConcat(groupArray(concat(name, ' ', type)), ', ')
+          FROM (
+            SELECT name, type
+            FROM system.columns
+            WHERE database = '{{ inputs.database }}' AND table = '{{ inputs.table }}'
+            ORDER BY position
+          )
+        ) AS structure
+      FROM system.tables AS t
+      WHERE t.database = '{{ inputs.database }}' AND t.name = '{{ inputs.table }}'
+
+  - id: check_table_shape
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Refuse up front on a table this flow cannot archive safely, which is a table
+      that does not exist, a non MergeTree engine or a table with no partition key
+      at all. A table with no PARTITION BY holds everything in one partition, so
+      dropping that partition truncates the table.
+    containerImage: python:3.13-slim
+    inputFiles:
+      catalog.json: "{{ outputs.read_table_catalog | toJson }}"
+    env:
+      DATABASE: "{{ inputs.database }}"
+      TABLE: "{{ inputs.table }}"
+      ARCHIVE_FORMAT: "{{ inputs.archive_format }}"
+    script: |
+      import json
+      import os
+      import sys
+
+      with open("catalog.json") as handle:
+          payload = json.load(handle)
+
+      rows = payload.get("rows") or []
+      target = f"{os.environ['DATABASE']}.{os.environ['TABLE']}"
+
+      if not rows:
+          print(f"{target} does not exist on this server.", file=sys.stderr)
+          sys.exit(1)
+
+      row = rows[0]
+      engine = row.get("engine") or ""
+      partition_key = (row.get("partition_key") or "").strip()
+      structure = (row.get("structure") or "").strip()
+
+      print(f"table={target} engine={engine}")
+      print(f"partition_key={partition_key or '<none>'}")
+      print(f"structure={structure}")
+
+      if "MergeTree" not in engine:
+          print(f"engine {engine} is not a MergeTree family engine, so it has no "
+                "DROP PARTITION. Refusing.", file=sys.stderr)
+          sys.exit(1)
+      if not partition_key:
+          print(f"{target} has no PARTITION BY. Its whole content is one partition, "
+                "so dropping it would truncate the table. Refusing.", file=sys.stderr)
+          sys.exit(1)
+      if not structure:
+          print(f"could not read a column list for {target}. Refusing.", file=sys.stderr)
+          sys.exit(1)
+
+      print("::" + json.dumps({"outputs": {
+          "engine": engine,
+          "partitionKey": partition_key,
+          "structure": structure,
+          "extension": os.environ["ARCHIVE_FORMAT"].lower(),
+      }}) + "::")
+
+  - id: read_partitions
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      Read every active partition of the table out of system.parts with its row
+      count, its size on disk plus the newest row it holds.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: "{{ render(vars.parts_sql) }}"
+
+  - id: read_archive_index
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      List the archive files that already exist for this table using format One,
+      which returns one row per file without parsing a single byte of content. A
+      truncated or empty file still shows up here, which is what lets the next
+      task tell a missing archive apart from an unreadable one.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT _file AS archive_file
+      FROM file('{{ inputs.archive_dir }}/{{ inputs.table }}-*.{{ outputs.check_table_shape.vars.extension }}', One)
+      ORDER BY archive_file
+
+  - id: plan_candidates
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Pick the candidate partitions and sort every other partition into the bucket
+      that explains why it was spared. A partition is a candidate only when its
+      newest row is older than the retention window, its newest row is a real
+      timestamp rather than the epoch placeholder a non temporal partition key
+      leaves in system.parts, it is not on the protected list plus it fits under
+      the per-run ceiling, oldest first. It also splits the archive files on disk
+      into the ones that belong to a partition still in the table and the ones
+      whose partition is already gone, because those two cases need opposite
+      treatment: the first can be rewritten from the table, the second cannot.
+    containerImage: python:3.13-slim
+    inputFiles:
+      parts.json: "{{ outputs.read_partitions | toJson }}"
+      index.json: "{{ outputs.read_archive_index | toJson }}"
+    env:
+      DATABASE: "{{ inputs.database }}"
+      TABLE: "{{ inputs.table }}"
+      EXTENSION: "{{ outputs.check_table_shape.vars.extension }}"
+      ARCHIVE_DIR: "{{ inputs.archive_dir }}"
+      RETENTION_DAYS: "{{ inputs.retention_days }}"
+      MAX_PARTITIONS: "{{ inputs.max_partitions_per_run }}"
+      PROTECTED: "{{ inputs.protected_partitions | toJson }}"
+      PURGEABLE: "{{ inputs.purgeable_tables | toJson }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      def load(name, key=None):
+          with open(name) as handle:
+              payload = json.load(handle)
+          return payload if key is None else (payload.get(key) or [])
+
+      parts = load("parts.json", "rows")
+      index = load("index.json", "rows")
+
+      retention_days = int(os.environ["RETENTION_DAYS"])
+      max_partitions = int(os.environ["MAX_PARTITIONS"])
+      protected = set(json.loads(os.environ["PROTECTED"]))
+      purgeable = set(json.loads(os.environ["PURGEABLE"]))
+      database = os.environ["DATABASE"]
+      table = os.environ["TABLE"]
+      extension = os.environ["EXTENSION"]
+      archive_dir = os.environ["ARCHIVE_DIR"]
+      target = f"{database}.{table}"
+      now = datetime.now(timezone.utc)
+      epoch_floor = datetime(1970, 1, 2, tzinfo=timezone.utc)
+
+      def parse_ts(text):
+          return datetime.fromisoformat(str(text)).replace(tzinfo=timezone.utc)
+
+      def file_for(partition_id):
+          return f"{table}-{partition_id}.{extension}"
+
+      def pid_of(archive_file):
+          stem = archive_file.rsplit(".", 1)[0]
+          return stem[len(table) + 1:] if stem.startswith(f"{table}-") else None
+
+      def glob_for(ids):
+          chosen = ids or ["__w38_no_partition__"]
+          return f"{archive_dir}/{table}-" + "{" + ",".join(chosen) + "}." + extension
+
+      archive_files = [row.get("archive_file") for row in index]
+      live_ids = {row.get("partition_id") for row in parts}
+
+      rows_table = sum(int(row.get("rows_total") or 0) for row in parts)
+      bytes_table = sum(int(row.get("bytes_total") or 0) for row in parts)
+
+      candidates = []
+      spared = []
+      for row in parts:
+          newest = parse_ts(row.get("newest_ts"))
+          age_days = (now - newest).total_seconds() / 86400.0
+          entry = {
+              "partition": row.get("partition"),
+              "partitionId": row.get("partition_id"),
+              "rows": int(row.get("rows_total") or 0),
+              "bytes": int(row.get("bytes_total") or 0),
+              "parts": int(row.get("parts") or 0),
+              "newestTs": str(row.get("newest_ts")),
+              "ageDays": round(age_days, 1),
+              "archiveFile": file_for(row.get("partition_id")),
+          }
+          if newest <= epoch_floor:
+              entry["verdict"] = "no_temporal_bound"
+              entry["note"] = ("system.parts carries no real date for this partition, which "
+                               "is what a non temporal partition key looks like. A retention "
+                               "rule cannot judge it, so it is never a candidate.")
+              spared.append(entry)
+          elif age_days < retention_days:
+              entry["verdict"] = "within_retention"
+              entry["note"] = (f"newest row {entry['ageDays']} day(s) old, inside the "
+                               f"{retention_days} day window.")
+              spared.append(entry)
+          elif entry["partitionId"] in protected:
+              entry["verdict"] = "protected_partition"
+              entry["note"] = ("Refused by the protected list. It is reported like any other "
+                               "partition, never archived and never dropped.")
+              spared.append(entry)
+          else:
+              candidates.append(entry)
+
+      candidates.sort(key=lambda row: row["newestTs"])
+      targets = candidates[:max_partitions]
+      for row in candidates[max_partitions:]:
+          row["verdict"] = "over_ceiling"
+          row["note"] = (f"Held back by the {max_partitions} partition per-run ceiling. "
+                         "The next run picks it up.")
+          spared.append(row)
+
+      table_allowed = target in purgeable
+      if not table_allowed:
+          for row in targets:
+              row["note"] = (f"{target} is not on the purgeable_tables allowlist, so this "
+                             "partition is reported plus assessed in full, then refused at "
+                             "the write. Nothing is archived or dropped.")
+
+      candidate_ids = [row["partitionId"] for row in targets]
+      # Split the files on disk. A file whose partition is still in the table can always be
+      # rewritten from the table. A file whose partition is already dropped cannot.
+      purged_files = []
+      foreign_files = []
+      for archive_file in archive_files:
+          partition_id = pid_of(archive_file)
+          if partition_id is None:
+              foreign_files.append(archive_file)
+          elif partition_id not in live_ids:
+              purged_files.append({"archiveFile": archive_file, "partitionId": partition_id})
+
+      lines = []
+      for row in targets:
+          lines.append(f"candidate: {row['partition']} id={row['partitionId']} "
+                       f"rows={row['rows']} newest={row['newestTs']} "
+                       f"age={row['ageDays']}d archive={row['archiveFile']}"
+                       + ("" if table_allowed else ". " + row["note"]))
+      for row in spared:
+          lines.append(f"{row['verdict']}: {row['partition']} id={row['partitionId']} "
+                       f"rows={row['rows']} age={row['ageDays']}d. {row['note']}")
+      for line in lines:
+          print(line)
+
+      buckets = {}
+      for row in spared:
+          buckets[row["verdict"]] = buckets.get(row["verdict"], 0) + 1
+
+      print(f"partitions={len(parts)} candidates={len(targets)} spared={len(spared)} "
+            f"archive_files={len(archive_files)} purged_archives={len(purged_files)} "
+            f"table_allowed={table_allowed}")
+
+      print("::" + json.dumps({"outputs": {
+          "candidates": targets,
+          "candidateCount": len(targets),
+          "candidateIds": candidate_ids,
+          "candidateCsv": ",".join(candidate_ids),
+          "candidateGlob": glob_for(candidate_ids),
+          "spared": spared,
+          "sparedCount": len(spared),
+          "buckets": buckets,
+          "purgedFiles": purged_files,
+          "purgedFileCount": len(purged_files),
+          "purgedGlob": glob_for([row["partitionId"] for row in purged_files]),
+          "foreignFiles": foreign_files,
+          "archiveFileCount": len(archive_files),
+          "tableAllowed": table_allowed,
+          "rowsTableBefore": rows_table,
+          "bytesTableBefore": bytes_table,
+          "report": "\n".join(lines) if lines else f"No partition of {target} is past retention.",
+      }}) + "::")
+
+  - id: fingerprint_live
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      Hash the live rows of each candidate partition. The hash is a sum of per-row
+      hashes, so it does not depend on the order rows come back in, plus every
+      column is cast to text first so a NULL cannot silently drop out of the sum.
+      This is the number the archive has to reproduce.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        _partition_id AS partition_id,
+        count() AS rows_live,
+        toString(sum(cityHash64(toString(tuple(*))))) AS checksum_live
+      FROM {{ inputs.database }}.{{ inputs.table }}
+      WHERE _partition_id IN splitByChar(',', '{{ outputs.plan_candidates.vars.candidateCsv }}')
+      GROUP BY partition_id
+      ORDER BY partition_id
+
+  - id: read_candidate_archives
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      Parse the archive files that belong to the candidate partitions plus hash the
+      rows that come out. allowFailure is set because a half written file from a
+      killed run raises a read error instead of returning rows. The right answer there
+      is to export it again from the table, which still holds every row. The
+      error is not swallowed: it turns into a re-export plus a fresh verification.
+    allowFailure: true
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        _file AS archive_file,
+        count() AS rows_archive,
+        toString(sum(cityHash64(toString(tuple(*))))) AS checksum_archive
+      FROM file(
+        '{{ outputs.plan_candidates.vars.candidateGlob }}',
+        {{ inputs.archive_format }},
+        '{{ outputs.check_table_shape.vars.structure }}'
+      )
+      GROUP BY archive_file
+      ORDER BY archive_file
+
+  - id: read_purged_archives
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: >-
+      Parse the archive files whose partition is no longer in the table. These are
+      the files that are already the only copy of their data, so one of them failing
+      to read is loss that has happened, not a risk. allowFailure is set so the run
+      can report which files exist before it stops.
+    allowFailure: true
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ inputs.clickhouse_username }}"
+    password: "{{ inputs.clickhouse_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        _file AS archive_file,
+        count() AS rows_archive,
+        toString(sum(cityHash64(toString(tuple(*))))) AS checksum_archive
+      FROM file(
+        '{{ outputs.plan_candidates.vars.purgedGlob }}',
+        {{ inputs.archive_format }},
+        '{{ outputs.check_table_shape.vars.structure }}'
+      )
+      GROUP BY archive_file
+      ORDER BY archive_file
+
+  - id: assess_archives
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Compare the archive file of every candidate against the live fingerprint and
+      label it verified, missing, mismatched or unreadable. A mismatched or
+      unreadable candidate archive is re-exported rather than trusted, because the
+      table still holds every one of its rows. It also judges the archives whose
+      partition is already gone: one of those failing to read is loss that has
+      already happened, which is what stops the run further down. This task builds
+      the exact file glob the later SQL uses, so no task has to guess a file name.
+    containerImage: python:3.13-slim
+    inputFiles:
+      candidates.json: "{{ outputs.plan_candidates.vars.candidates | toJson }}"
+      purged.json: "{{ outputs.plan_candidates.vars.purgedFiles | toJson }}"
+      live.json: "{{ outputs.fingerprint_live | toJson }}"
+      candidate_archives.json: "{{ (outputs.read_candidate_archives.rows ?? []) | toJson }}"
+      purged_archives.json: "{{ (outputs.read_purged_archives.rows ?? []) | toJson }}"
+    env:
+      DATABASE: "{{ inputs.database }}"
+      TABLE: "{{ inputs.table }}"
+      EXTENSION: "{{ outputs.check_table_shape.vars.extension }}"
+      ARCHIVE_DIR: "{{ inputs.archive_dir }}"
+      CANDIDATE_PARSED: "{{ outputs.read_candidate_archives.size ?? -1 }}"
+      PURGED_PARSED: "{{ outputs.read_purged_archives.size ?? -1 }}"
+    script: |
+      import json
+      import os
+
+      def load(name, key=None):
+          with open(name) as handle:
+              payload = json.load(handle)
+          return payload if key is None else (payload.get(key) or [])
+
+      candidates = load("candidates.json")
+      purged_files = load("purged.json")
+      live_rows = load("live.json", "rows")
+      candidate_archives = load("candidate_archives.json")
+      purged_archives = load("purged_archives.json")
+
+      table = os.environ["TABLE"]
+      extension = os.environ["EXTENSION"]
+      archive_dir = os.environ["ARCHIVE_DIR"]
+      candidate_parse_failed = int(os.environ["CANDIDATE_PARSED"]) < 0
+      purged_parse_failed = int(os.environ["PURGED_PARSED"]) < 0
+
+      live = {row.get("partition_id"): row for row in live_rows}
+      parsed = {row.get("archive_file"): row for row in candidate_archives}
+      purged_parsed = {row.get("archive_file"): row for row in purged_archives}
+
+      plan = []
+      for entry in candidates:
+          partition_id = entry["partitionId"]
+          archive_file = entry["archiveFile"]
+          live_row = live.get(partition_id)
+          archive_row = parsed.get(archive_file)
+          item = dict(entry)
+          item["rowsLive"] = int(live_row.get("rows_live")) if live_row else 0
+          item["checksumLive"] = str(live_row.get("checksum_live")) if live_row else ""
+          if live_row is None:
+              item["archiveState"] = "partition_vanished"
+              item["note"] = ("system.parts listed this partition but the table read "
+                              "returned nothing for it, so the plan is already stale.")
+          elif candidate_parse_failed:
+              item["archiveState"] = "unreadable"
+              item["note"] = ("An existing archive file for a candidate could not be parsed, "
+                              "so every candidate archive is written again from the table, "
+                              "which still holds every row.")
+          elif archive_row is None:
+              item["archiveState"] = "missing"
+              item["note"] = "No readable archive yet. It will be exported."
+          elif (int(archive_row.get("rows_archive") or 0) == item["rowsLive"]
+                and str(archive_row.get("checksum_archive")) == item["checksumLive"]):
+              item["archiveState"] = "verified"
+              item["rowsArchive"] = int(archive_row.get("rows_archive") or 0)
+              item["checksumArchive"] = str(archive_row.get("checksum_archive"))
+              item["note"] = ("An archive from an earlier run already matches the live rows, "
+                              "so the export is skipped plus that work is kept.")
+          else:
+              item["archiveState"] = "mismatch"
+              item["rowsArchive"] = int(archive_row.get("rows_archive") or 0)
+              item["checksumArchive"] = str(archive_row.get("checksum_archive"))
+              item["note"] = (f"Archive holds {item['rowsArchive']} row(s) against "
+                              f"{item['rowsLive']} live. It will be re-exported, never trusted.")
+          plan.append(item)
+
+      # Archives whose partition is already dropped. A readable one is the normal, healthy
+      # end state. An unreadable or empty one is data that is already gone.
+      orphans = []
+      for row in purged_files:
+          archive_file = row["archiveFile"]
+          parsed_row = purged_parsed.get(archive_file)
+          if purged_parse_failed:
+              orphans.append({"archiveFile": archive_file, "partitionId": row["partitionId"],
+                              "rows": 0, "verdict": "purged_archive_unreadable",
+                              "note": "The batch read over the archives of already dropped "
+                                      "partitions raised an error, so this file cannot be shown "
+                                      "to hold its rows. At least one file in this set is lost "
+                                      "data, not a risk, so the whole set is treated as unproven."})
+          elif parsed_row is None:
+              orphans.append({"archiveFile": archive_file, "partitionId": row["partitionId"],
+                              "rows": 0, "verdict": "purged_archive_empty",
+                              "note": "The file is present but produced no rows. Its partition "
+                                      "is already dropped, so this is lost data."})
+          else:
+              orphans.append({"archiveFile": archive_file, "partitionId": row["partitionId"],
+                              "rows": int(parsed_row.get("rows_archive") or 0),
+                              "checksum": str(parsed_row.get("checksum_archive")),
+                              "verdict": "purged_archive_ok",
+                              "note": "Readable archive for an already dropped partition."})
+
+      damaged = [row for row in orphans if row["verdict"] != "purged_archive_ok"]
+
+      to_export = [row for row in plan
+                   if row["archiveState"] in ("missing", "mismatch", "unreadable")]
+      verified = [row for row in plan if row["archiveState"] == "verified"]
+      blocked = [row for row in plan if row["archiveState"] == "partition_vanished"]
+      actionable = to_export + verified
+
+      for row in plan:
+          print(f"{row['archiveState']}: {row['partition']} id={row['partitionId']} "
+                f"live_rows={row['rowsLive']} file={row['archiveFile']}. {row['note']}")
+      for row in orphans:
+          print(f"{row['verdict']}: {row['archiveFile']} rows={row['rows']}. {row['note']}")
+      print(f"plan={len(plan)} export={len(to_export)} already_verified={len(verified)} "
+            f"blocked={len(blocked)} purged_archives={len(orphans)} damaged={len(damaged)}")
+
+      target_ids = [row["partitionId"] for row in actionable]
+      glob = (f"{archive_dir}/{table}-" + "{"
+              + ",".join(target_ids or ["__w38_no_partition__"]) + "}." + extension)
+
+      print("::" + json.dumps({"outputs": {
+          "plan": plan,
+          "planCount": len(plan),
+          "exportIds": [row["partitionId"] for row in to_export],
+          "exportCsv": ",".join(row["partitionId"] for row in to_export),
+          "exportCount": len(to_export),
+          "verifiedCount": len(verified),
+          "blocked": blocked,
+          "blockedCount": len(blocked),
+          "orphans": orphans,
+          "damagedArchives": damaged,
+          "damagedArchiveCount": len(damaged),
+          "purgedArchiveCount": len(orphans),
+          "targetIds": target_ids,
+          "targetCsv": ",".join(target_ids),
+          "targetGlob": glob,
+          "targetCount": len(target_ids),
+          "targetRows": sum(row["rowsLive"] for row in actionable),
+      }}) + "::")
+
+  - id: log_findings
+    type: io.kestra.plugin.core.log.Log
+    description: One line per partition plus one per archive file, with the verdict.
+    message: |
+      ClickHouse {{ inputs.database }}.{{ inputs.table }}: {{ outputs.plan_candidates.vars.candidateCount }} candidate partition(s) past {{ inputs.retention_days }} day(s), {{ outputs.plan_candidates.vars.sparedCount }} spared, {{ outputs.plan_candidates.vars.archiveFileCount }} archive file(s) on disk.
+      Archive plan: export={{ outputs.assess_archives.vars.exportCount }} already_verified={{ outputs.assess_archives.vars.verifiedCount }} blocked={{ outputs.assess_archives.vars.blockedCount }} buckets={{ outputs.plan_candidates.vars.buckets }}
+      Purged-partition archives: {{ outputs.assess_archives.vars.purgedArchiveCount }} checked, {{ outputs.assess_archives.vars.damagedArchiveCount }} damaged.
+      Mode: dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }} table_allowed={{ outputs.plan_candidates.vars.tableAllowed }}
+      {{ outputs.plan_candidates.vars.report }}
+
+  - id: handle_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Alert whenever there is a candidate partition or a damaged archive.
+    condition: "{{ outputs.plan_candidates.vars.candidateCount > 0 or outputs.assess_archives.vars.damagedArchiveCount > 0 }}"
+    then:
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: >-
+          One message per run listing each candidate partition, its row count plus
+          the state of its archive, so a human sees the retention breach plus the
+          archive health even when nothing is written.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ inputs.slack_channel }}",
+            "text": ":package: ClickHouse `{{ inputs.database }}.{{ inputs.table }}`: {{ outputs.plan_candidates.vars.candidateCount }} partition(s) past {{ inputs.retention_days }} day(s), {{ outputs.assess_archives.vars.damagedArchiveCount }} damaged archive file(s). dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}.{% for row in outputs.assess_archives.vars.plan %}\n• `{{ row.partition }}` id `{{ row.partitionId }}` {{ row.rowsLive }} row(s), archive *{{ row.archiveState }}*. {{ row.note }}{% endfor %}{% for row in outputs.assess_archives.vars.damagedArchives %}\n• :rotating_light: `{{ row.archiveFile }}` *{{ row.verdict }}*. {{ row.note }}{% endfor %}"
+          }
+
+  - id: archive_store_breaker
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      Circuit breaker. If an archive file whose partition is already dropped cannot
+      be read or produces no rows, the run stops here in every mode including dry
+      run. That file was the only copy of its data, so the archive pipeline has
+      already lost something. It does not get handed more data to lose.
+    condition: "{{ outputs.assess_archives.vars.damagedArchiveCount > 0 }}"
+    then:
+      - id: archive_store_failed
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          Refusing to archive or drop anything for {{ inputs.database }}.{{ inputs.table }}.
+          {{ outputs.assess_archives.vars.damagedArchiveCount }} archive file(s) whose
+          partition is already dropped are unreadable or empty:
+          {{ outputs.assess_archives.vars.damagedArchives | jq('map(.archiveFile) | join(", ")') | first }}.
+          That is data that is already gone, so this run will not create more of it.
+          Restore those files from backup or move them aside, then run again.
+
+  - id: route_remediation
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      Archiving plus dropping need four things at once. auto_remediate lets
+      remediation be considered, dry_run false lets it be written, the table has
+      to be on the purgeable_tables allowlist plus there has to be a candidate
+      partition left after the retention window, the epoch guard, the protected
+      list and the per-run ceiling. Miss one and the run stays a report.
+    condition: "{{ inputs.auto_remediate == true and inputs.dry_run == false and outputs.plan_candidates.vars.tableAllowed == true and outputs.assess_archives.vars.targetCount > 0 }}"
+    then:
+      - id: export_partitions
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: >-
+          Write one archive file per partition that needs one, using the table's own
+          PARTITION BY expression read from system.tables so the partition id in the
+          file name is the server's, not this flow's. truncate_on_insert replaces a
+          damaged or half written file from an earlier run, which is safe here
+          because every partition being exported is still live in the table, so the
+          table is still the source of truth. Partitions whose archive already
+          matched are not re-exported.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ inputs.clickhouse_username }}"
+        password: "{{ inputs.clickhouse_password }}"
+        fetchType: NONE
+        sql: |
+          INSERT INTO FUNCTION file(
+            '{{ inputs.archive_dir }}/{{ inputs.table }}-{_partition_id}.{{ outputs.check_table_shape.vars.extension }}',
+            {{ inputs.archive_format }}
+          )
+          PARTITION BY {{ outputs.check_table_shape.vars.partitionKey }}
+          SELECT * FROM {{ inputs.database }}.{{ inputs.table }}
+          WHERE _partition_id IN splitByChar(',', '{{ outputs.assess_archives.vars.exportCsv }}')
+          SETTINGS engine_file_truncate_on_insert = 1
+
+      - id: verify_export
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: >-
+          Read every byte of every target archive file back through the format
+          parser plus hash what comes out. No allowFailure here. If a file cannot
+          be parsed at this point the run fails without touching the table.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ inputs.clickhouse_username }}"
+        password: "{{ inputs.clickhouse_password }}"
+        fetchType: FETCH
+        sql: "{{ render(vars.archive_read_sql) }}"
+
+      - id: run_restore_probe
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          Parsing a file proves it is readable. Restoring it into a table proves the
+          data comes back. This stage does the second one.
+        condition: "{{ inputs.restore_probe == true }}"
+        then:
+          - id: restore_into_probe
+            type: io.kestra.plugin.jdbc.clickhouse.Queries
+            description: >-
+              Create a throwaway clone of the table, which copies its engine, its
+              partition key plus its sort order, empty it in case an earlier failed
+              run left rows behind, then insert the archive files into it.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: NONE
+            sql: |
+              CREATE TABLE IF NOT EXISTS {{ inputs.database }}.{{ inputs.table }}_export_verify_probe
+                AS {{ inputs.database }}.{{ inputs.table }};
+              TRUNCATE TABLE {{ inputs.database }}.{{ inputs.table }}_export_verify_probe;
+              INSERT INTO {{ inputs.database }}.{{ inputs.table }}_export_verify_probe
+                SELECT * FROM file(
+                  '{{ outputs.assess_archives.vars.targetGlob }}',
+                  {{ inputs.archive_format }},
+                  '{{ outputs.check_table_shape.vars.structure }}'
+                );
+
+          - id: fingerprint_restored
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: >-
+              Hash the restored rows in the probe table, grouped by partition id.
+              Because the probe is a clone, its partition ids are computed by the
+              same expression as the real table, so a row that landed in the wrong
+              partition shows up here as a mismatch.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: FETCH
+            sql: |
+              SELECT
+                _partition_id AS partition_id,
+                count() AS rows_restored,
+                toString(sum(cityHash64(toString(tuple(*))))) AS checksum_restored
+              FROM {{ inputs.database }}.{{ inputs.table }}_export_verify_probe
+              GROUP BY partition_id
+              ORDER BY partition_id
+
+          - id: drop_probe_table
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: Remove the probe table so the verification leaves nothing behind.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: NONE
+            sql: "DROP TABLE IF EXISTS {{ inputs.database }}.{{ inputs.table }}_export_verify_probe"
+
+      - id: confirm_restorable
+        type: io.kestra.plugin.scripts.python.Script
+        description: >-
+          The gate. A partition may be dropped only when the archive parsed back to
+          the same row count plus the same checksum as the live partition and, when
+          the restore probe ran, the rows restored into a real table matched too. If
+          any single target fails, the whole pass is refused with a non-zero exit
+          rather than dropping the ones that did pass, because a verification that
+          failed means the archive path is misbehaving right now.
+        containerImage: python:3.13-slim
+        inputFiles:
+          plan.json: "{{ outputs.assess_archives.vars.plan | toJson }}"
+          live.json: "{{ outputs.fingerprint_live | toJson }}"
+          archive.json: "{{ outputs.verify_export | toJson }}"
+          restored.json: "{{ (outputs.fingerprint_restored.rows ?? []) | toJson }}"
+        env:
+          TABLE: "{{ inputs.table }}"
+          RESTORE_PROBE: "{{ inputs.restore_probe }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          with open("plan.json") as handle:
+              plan = json.load(handle)
+          with open("live.json") as handle:
+              live_rows = json.load(handle).get("rows") or []
+          with open("archive.json") as handle:
+              archive_rows = json.load(handle).get("rows") or []
+          with open("restored.json") as handle:
+              restored_rows = json.load(handle)
+
+          probe_on = os.environ["RESTORE_PROBE"].lower() == "true"
+          live = {row.get("partition_id"): row for row in live_rows}
+          archive = {row.get("archive_file"): row for row in archive_rows}
+          restored = {row.get("partition_id"): row for row in restored_rows}
+
+          confirmed = []
+          failures = []
+          for entry in plan:
+              partition_id = entry["partitionId"]
+              archive_file = entry["archiveFile"]
+              live_row = live.get(partition_id)
+              archive_row = archive.get(archive_file)
+              restored_row = restored.get(partition_id)
+
+              if live_row is None:
+                  failures.append(f"{partition_id}: the live partition disappeared "
+                                  "between planning and verification")
+                  continue
+              rows_live = int(live_row.get("rows_live") or 0)
+              checksum_live = str(live_row.get("checksum_live"))
+
+              if archive_row is None:
+                  failures.append(f"{partition_id}: no rows parsed out of {archive_file}")
+                  continue
+              rows_archive = int(archive_row.get("rows_archive") or 0)
+              checksum_archive = str(archive_row.get("checksum_archive"))
+
+              if rows_archive != rows_live:
+                  failures.append(f"{partition_id}: archive holds {rows_archive} row(s), "
+                                  f"the partition holds {rows_live}")
+                  continue
+              if checksum_archive != checksum_live:
+                  failures.append(f"{partition_id}: archive checksum {checksum_archive} "
+                                  f"does not match the partition checksum {checksum_live} "
+                                  f"at the same row count {rows_live}")
+                  continue
+
+              if probe_on:
+                  if restored_row is None:
+                      failures.append(f"{partition_id}: the restore probe produced no rows "
+                                      f"for this partition out of {archive_file}")
+                      continue
+                  rows_restored = int(restored_row.get("rows_restored") or 0)
+                  checksum_restored = str(restored_row.get("checksum_restored"))
+                  if rows_restored != rows_live or checksum_restored != checksum_live:
+                      failures.append(f"{partition_id}: restored {rows_restored} row(s) "
+                                      f"checksum {checksum_restored} against live "
+                                      f"{rows_live} row(s) checksum {checksum_live}")
+                      continue
+                  print(f"verified: {partition_id} {rows_live} row(s) parsed from "
+                        f"{archive_file} plus restored into a table, checksum "
+                        f"{checksum_live} on all three reads")
+              else:
+                  print(f"verified: {partition_id} {rows_live} row(s) parsed from "
+                        f"{archive_file}, checksum {checksum_live} on both reads")
+
+              confirmed.append({
+                  "partitionId": partition_id,
+                  "partition": entry["partition"],
+                  "archiveFile": archive_file,
+                  "rows": rows_live,
+                  "checksum": checksum_live,
+                  "bytes": entry.get("bytes", 0),
+              })
+
+          for line in failures:
+              print("refused: " + line)
+          print(f"confirmed={len(confirmed)} refused={len(failures)} restore_probe={probe_on}")
+
+          print("::" + json.dumps({"outputs": {
+              "purgePlan": confirmed,
+              "purgeTargets": [row["partitionId"] for row in confirmed],
+              "purgeCount": len(confirmed),
+              "purgeRows": sum(row["rows"] for row in confirmed),
+              "purgeBytes": sum(row["bytes"] for row in confirmed),
+              "failures": failures,
+          }}) + "::")
+
+          if failures:
+              print(f"export verification failed for {len(failures)} partition(s), so no "
+                    "partition is dropped in this run: " + "; ".join(failures),
+                    file=sys.stderr)
+              sys.exit(1)
+          if not confirmed:
+              print("nothing passed verification, so there is nothing to drop",
+                    file=sys.stderr)
+              sys.exit(1)
+
+      - id: approve_purge
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          DROP PARTITION is not recoverable from inside ClickHouse. The archive
+          files listed in the findings are the only copy afterwards. Read the
+          confirmed row counts plus checksums before approving, plus make sure the
+          archive directory is on storage you actually back up.
+        pauseDuration: PT4H
+        behavior: FAIL
+        onResume:
+          - id: approved
+            type: BOOL
+            defaults: false
+            description: >-
+              Set true to drop the verified partitions. Anything else leaves every
+              partition in place.
+
+      - id: apply_if_approved
+        type: io.kestra.plugin.core.flow.If
+        description: An unanswered pause reads as a refusal, never as an approval.
+        condition: "{{ (outputs.approve_purge.onResume.approved ?? false) == true }}"
+        then:
+          - id: recheck_live
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: >-
+              An approval can sit for hours, so the plan is a snapshot from before
+              it. Hash the live partitions again.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.fingerprint_sql) }}"
+
+          - id: recheck_archive
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: >-
+              Hash the archive files again too. The approval window is exactly when
+              a backup rotation, a disk filling up or a stray cleanup job damages
+              the only copy of the data that is about to be dropped.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.archive_read_sql) }}"
+
+          - id: confirm_plan_fresh
+            type: io.kestra.plugin.scripts.python.Script
+            description: >-
+              Compare both re-reads against the plan the human approved, keyed on
+              the partition id rather than on position. Any drift on either side
+              exits non-zero, which fails the run before a single DROP PARTITION is
+              issued. New rows in a partition, a rewritten archive or a vanished
+              archive all land here.
+            containerImage: python:3.13-slim
+            inputFiles:
+              plan.json: "{{ outputs.confirm_restorable.vars.purgePlan | toJson }}"
+              live.json: "{{ outputs.recheck_live | toJson }}"
+              archive.json: "{{ outputs.recheck_archive | toJson }}"
+            script: |
+              import json
+              import sys
+
+              with open("plan.json") as handle:
+                  plan = json.load(handle)
+              with open("live.json") as handle:
+                  live = {r.get("partition_id"): r for r in (json.load(handle).get("rows") or [])}
+              with open("archive.json") as handle:
+                  archive = {r.get("archive_file"): r
+                             for r in (json.load(handle).get("rows") or [])}
+
+              fresh = []
+              drift = []
+              for entry in plan:
+                  partition_id = entry["partitionId"]
+                  live_row = live.get(partition_id)
+                  archive_row = archive.get(entry["archiveFile"])
+
+                  if live_row is None:
+                      drift.append(f"{partition_id}: the partition is no longer in the "
+                                   "table, so somebody else already handled it")
+                      continue
+                  if int(live_row.get("rows_live") or 0) != entry["rows"]:
+                      drift.append(f"{partition_id}: live rows moved from {entry['rows']} "
+                                   f"to {live_row.get('rows_live')} during the approval, so "
+                                   "the archive no longer covers the partition")
+                      continue
+                  if str(live_row.get("checksum_live")) != entry["checksum"]:
+                      drift.append(f"{partition_id}: live checksum changed during the "
+                                   f"approval, {entry['checksum']} to "
+                                   f"{live_row.get('checksum_live')}, at the same row count")
+                      continue
+                  if archive_row is None:
+                      drift.append(f"{partition_id}: archive {entry['archiveFile']} no longer "
+                                   "returns rows, so the only copy is gone")
+                      continue
+                  if int(archive_row.get("rows_archive") or 0) != entry["rows"]:
+                      drift.append(f"{partition_id}: archive rows moved from {entry['rows']} "
+                                   f"to {archive_row.get('rows_archive')} during the approval")
+                      continue
+                  if str(archive_row.get("checksum_archive")) != entry["checksum"]:
+                      drift.append(f"{partition_id}: archive checksum changed during the "
+                                   f"approval, {entry['checksum']} to "
+                                   f"{archive_row.get('checksum_archive')}")
+                      continue
+
+                  print(f"still fresh: {partition_id} {entry['rows']} row(s) checksum "
+                        f"{entry['checksum']} on both the table and the archive")
+                  fresh.append(entry)
+
+              for line in drift:
+                  print("stale: " + line)
+              print(f"fresh={len(fresh)} stale={len(drift)}")
+
+              print("::" + json.dumps({"outputs": {
+                  "purgeTargets": [row["partitionId"] for row in fresh],
+                  "purgePlan": fresh,
+                  "purgeCount": len(fresh),
+                  "purgeRows": sum(row["rows"] for row in fresh),
+                  "purgeBytes": sum(row["bytes"] for row in fresh),
+                  "drift": drift,
+                  "driftCount": len(drift),
+              }}) + "::")
+
+              if drift:
+                  print(f"{len(drift)} target(s) changed between the approval and the drop, "
+                        "so nothing was dropped: " + "; ".join(drift), file=sys.stderr)
+                  sys.exit(1)
+              if not fresh:
+                  print("no target survived the re-check, so there is nothing to drop",
+                        file=sys.stderr)
+                  sys.exit(1)
+
+          - id: purge_remediation
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One partition at a time. concurrencyLimit 1 keeps two DROP PARTITION
+              statements off the same table at once plus it means a refused drop
+              cannot hide behind a sibling iteration.
+            values: "{{ outputs.confirm_plan_fresh.vars.purgeTargets | toJson }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: drop_one_partition
+                type: io.kestra.plugin.jdbc.clickhouse.Query
+                description: >-
+                  Drop one verified partition by its id. allowFailure is set so a
+                  server that refuses the drop, for instance through
+                  max_partition_size_to_drop or a missing ALTER grant, does not stop
+                  the pass here. The re-read below is the real gate, because a drop
+                  that returned no error is not evidence either.
+                allowFailure: true
+                url: "{{ inputs.clickhouse_url }}"
+                username: "{{ inputs.clickhouse_username }}"
+                password: "{{ inputs.clickhouse_password }}"
+                fetchType: NONE
+                sql: "ALTER TABLE {{ inputs.database }}.{{ inputs.table }} DROP PARTITION ID '{{ item.value }}'"
+
+              - id: drop_one_log
+                type: io.kestra.plugin.core.log.Log
+                message: "Issued DROP PARTITION ID '{{ item.value }}' on {{ inputs.database }}.{{ inputs.table }}."
+
+          - id: reread_partitions
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: >-
+              Read system.parts again. This is what decides whether the drop
+              actually landed.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.parts_sql) }}"
+
+          - id: reread_archive
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: >-
+              Read the archive files one last time, now that the partitions they
+              cover are the only copy. A drop that succeeded while the archive went
+              bad is still a failure.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ inputs.clickhouse_username }}"
+            password: "{{ inputs.clickhouse_password }}"
+            fetchType: FETCH
+            sql: "{{ render(vars.archive_read_sql) }}"
+
+          - id: verify_purge
+            type: io.kestra.plugin.scripts.python.Script
+            description: >-
+              Fail the run when a partition the flow claimed to drop is still in
+              system.parts or when its archive no longer holds exactly the rows
+              that were dropped. On success it prints the payoff as counts: rows
+              removed from the table, bytes reclaimed plus rows still readable in
+              the archive, which have to add up to the rows that were there before.
+            containerImage: python:3.13-slim
+            inputFiles:
+              plan.json: "{{ outputs.confirm_plan_fresh.vars.purgePlan | toJson }}"
+              parts.json: "{{ outputs.reread_partitions | toJson }}"
+              archive.json: "{{ outputs.reread_archive | toJson }}"
+            env:
+              ROWS_BEFORE: "{{ outputs.plan_candidates.vars.rowsTableBefore }}"
+              BYTES_BEFORE: "{{ outputs.plan_candidates.vars.bytesTableBefore }}"
+            script: |
+              import json
+              import os
+              import sys
+
+              with open("plan.json") as handle:
+                  plan = json.load(handle)
+              with open("parts.json") as handle:
+                  parts = json.load(handle).get("rows") or []
+              with open("archive.json") as handle:
+                  archive = {r.get("archive_file"): r
+                             for r in (json.load(handle).get("rows") or [])}
+
+              rows_before = int(os.environ["ROWS_BEFORE"])
+              bytes_before = int(os.environ["BYTES_BEFORE"])
+              rows_after = sum(int(r.get("rows_total") or 0) for r in parts)
+              bytes_after = sum(int(r.get("bytes_total") or 0) for r in parts)
+              present = {r.get("partition_id") for r in parts}
+
+              survivors = []
+              lost = []
+              preserved = 0
+              for entry in plan:
+                  partition_id = entry["partitionId"]
+                  archive_row = archive.get(entry["archiveFile"])
+                  still_there = partition_id in present
+                  if still_there:
+                      survivors.append(f"{partition_id}: still in system.parts after the drop")
+                  if archive_row is None:
+                      lost.append(f"{partition_id}: archive {entry['archiveFile']} returns no "
+                                  "rows after the drop")
+                      continue
+                  rows_archive = int(archive_row.get("rows_archive") or 0)
+                  checksum_archive = str(archive_row.get("checksum_archive"))
+                  if rows_archive != entry["rows"] or checksum_archive != entry["checksum"]:
+                      lost.append(f"{partition_id}: archive now holds {rows_archive} row(s) "
+                                  f"checksum {checksum_archive} against the {entry['rows']} "
+                                  f"row(s) checksum {entry['checksum']} that were dropped")
+                      continue
+                  if still_there:
+                      print(f"drop did not land: {partition_id} is still in system.parts, so the "
+                            f"server refused or ignored the DROP PARTITION. Its archive is intact "
+                            f"at {rows_archive} row(s) checksum {checksum_archive}, so nothing was "
+                            f"lost, but the partition was not purged.")
+                      continue
+                  preserved += rows_archive
+                  print(f"dropped and preserved: {partition_id} gone from system.parts, "
+                        f"{rows_archive} row(s) still readable in {entry['archiveFile']} "
+                        f"at checksum {checksum_archive}")
+
+              dropped_rows = sum(entry["rows"] for entry in plan)
+              print(f"table rows {rows_before} -> {rows_after} (removed {rows_before - rows_after}), "
+                    f"bytes {bytes_before} -> {bytes_after} "
+                    f"(reclaimed {bytes_before - bytes_after}), "
+                    f"archive rows preserved {preserved} of {dropped_rows} planned")
+
+              print("::" + json.dumps({"outputs": {
+                  "survivors": survivors,
+                  "survivorCount": len(survivors),
+                  "lost": lost,
+                  "lostCount": len(lost),
+                  "purgedCount": len(plan) - len(survivors),
+                  "rowsBefore": rows_before,
+                  "rowsAfter": rows_after,
+                  "rowsRemoved": rows_before - rows_after,
+                  "bytesBefore": bytes_before,
+                  "bytesAfter": bytes_after,
+                  "bytesReclaimed": bytes_before - bytes_after,
+                  "rowsPreservedInArchive": preserved,
+                  "rowsPlanned": dropped_rows,
+                  "conserved": preserved == dropped_rows == (rows_before - rows_after),
+              }}) + "::")
+
+              if survivors or lost:
+                  print("verification after the drop failed: "
+                        + "; ".join(survivors + lost), file=sys.stderr)
+                  sys.exit(1)
+
+          - id: log_purged
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Archived plus purged {{ outputs.verify_purge.vars.purgedCount }} partition(s)
+              of {{ inputs.database }}.{{ inputs.table }}.
+              Table rows {{ outputs.verify_purge.vars.rowsBefore }} to {{ outputs.verify_purge.vars.rowsAfter }},
+              {{ outputs.verify_purge.vars.bytesReclaimed }} byte(s) reclaimed,
+              {{ outputs.verify_purge.vars.rowsPreservedInArchive }} row(s) still readable in the
+              archive, conserved={{ outputs.verify_purge.vars.conserved }}.
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Approval declined or left unanswered, so nothing was dropped.
+              {{ outputs.confirm_restorable.vars.purgeCount }} verified partition(s) holding
+              {{ outputs.confirm_restorable.vars.purgeRows }} row(s) are still in
+              {{ inputs.database }}.{{ inputs.table }}. The archive files that were written
+              stay on disk and the next run reuses them instead of exporting again.
+    else:
+      - id: log_report_only
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          Report only, nothing was written. candidates={{ outputs.plan_candidates.vars.candidateCount }}
+          export_needed={{ outputs.assess_archives.vars.exportCount }}
+          already_verified={{ outputs.assess_archives.vars.verifiedCount }}
+          table_allowed={{ outputs.plan_candidates.vars.tableAllowed }}
+          auto_remediate={{ inputs.auto_remediate }} dry_run={{ inputs.dry_run }}.
+          Add {{ inputs.database }}.{{ inputs.table }} to purgeable_tables, then run with
+          auto_remediate true and dry_run false to be offered the approval gate.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: >-
+      Fires on any failure, including an export that did not verify, a plan that
+      went stale during the approval, a drop the server refused plus an archive
+      that stopped matching after the drop.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "{{ inputs.slack_channel }}",
+        "text": ":rotating_light: clickhouse-partition-export-verify-purge-guard failed on `{{ inputs.database }}.{{ inputs.table }}`. Execution {{ execution.id }}. If it failed at confirm_restorable or confirm_plan_fresh then nothing was dropped. If it failed at verify_purge then check whether the partition is gone and whether its archive file still reads back, because that is the case where data can be missing."
+      }
+
+extend:
+  title: ClickHouse Partition Export Verify Purge Guard
+  shortDescription: Archive expired ClickHouse partitions, restore every archive file back into a table to prove it reads, then drop only the partitions whose round trip matched.
+  metaTitle: ClickHouse Partition Archive and Purge Guard with Kestra
+  metaDescription: Export expired ClickHouse partitions, prove each archive restores to the same rows and checksum, then drop only what was proven, behind approval.
+  tags: [Data]
+  subTags: [Day 2 Operations, Data Warehouses]
+  ee: false
+  demo: false
+  description: |
+    ## Safety
+
+    `ALTER TABLE ... DROP PARTITION` is instant and there is no undo inside ClickHouse. Retention jobs usually export the partition to a file first and then drop it in the same script, on the assumption that the export worked. A `Native` or Parquet file truncated by a killed writer reads fine as a file while it is still the only copy. So does one written before somebody backfilled rows. The gap is found months later when an auditor asks for last January. This flow turns that assumption into a measurement: the archive is read back through the format parser, restored into a real table, hashed against the live partition and only then is the partition dropped. Every guard below is load bearing and each one was proven by its own execution.
+
+    | Guard | What it stops |
+    | --- | --- |
+    | Row count plus order-independent `cityHash64` checksum on live, parsed and restored rows | dropping a partition whose archive is short, stale or scrambled |
+    | `restore_probe`, a clone table the archive is inserted into | trusting a file that parses but does not land as the same data |
+    | Epoch guard on `system.parts` max time | judging a non temporal partition key, where no date exists to judge |
+    | `purgeable_tables` write allowlist, ships empty | archiving or dropping a table nobody named |
+    | `protected_partitions` denylist | dropping a period an investigation or regulator still needs |
+    | `max_partitions_per_run` ceiling, oldest first | turning a cleanup into an unbounded migration |
+    | Engine and partition key check from `system.tables` | truncating a table that has no `PARTITION BY` at all |
+    | Breaker on archives of already dropped partitions | handing more data to an archive path that has already lost some |
+    | `auto_remediate` false, `dry_run` true, `Pause` | three separate gates before one write |
+    | Re-read of live rows and archive bytes after the approval | acting on a plan that went stale while the approval waited |
+    | `Loop` with `concurrencyLimit: 1` and `allowFailure` on the drop | a refused drop hiding behind a sibling iteration |
+    | `system.parts` plus archive re-read after the drop | a `DROP PARTITION` that returned no error being reported as done |
+
+    ## How it works
+
+    1. `read_table_catalog` (`io.kestra.plugin.jdbc.clickhouse.Query`) reads the engine, the `PARTITION BY` expression and the full column list from `system.tables` and `system.columns`. `check_table_shape` (`io.kestra.plugin.scripts.python.Script`) refuses a missing table, a non MergeTree engine or a table with no partition key, because that table's whole content is one partition.
+    2. `read_partitions` reads every active partition with its rows, bytes and newest row from `system.parts`. `read_archive_index` lists the archive files already on disk with the `One` format, which returns one row per file without parsing a byte.
+    3. `plan_candidates` picks candidates: newest row older than `retention_days`, a real timestamp rather than the epoch placeholder a non temporal key leaves behind, not on `protected_partitions`, under the ceiling, oldest first. Every spared partition gets a named verdict. It also splits the files on disk into those whose partition is still live and those whose partition is already gone.
+    4. `fingerprint_live` hashes each candidate in place with `sum(cityHash64(toString(tuple(*))))`, a sum of per-row hashes so the result does not depend on row order, with every column cast to text so a NULL cannot drop out. `read_candidate_archives` and `read_purged_archives` parse the matching files through the `file` table function and hash what comes out.
+    5. `assess_archives` labels every candidate archive verified, missing, mismatched or unreadable. It judges the archives of already dropped partitions separately. `log_findings` and `notify_findings` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) report. `archive_store_breaker` fails the run in every mode, dry run included, when an archive whose partition is already gone cannot be shown to hold its rows.
+    6. `route_remediation` (`If`) needs `auto_remediate: true`, `dry_run: false`, the table on `purgeable_tables` and at least one target. Otherwise `log_report_only` ends the run.
+    7. `export_partitions` writes one file per partition with `INSERT INTO FUNCTION file('<dir>/<table>-{_partition_id}.<ext>')` and the table's own partition expression, so the id in the file name is the server's. Partitions whose archive already matched are not rewritten. `verify_export` parses every target file back with no `allowFailure`. `restore_into_probe` (`Queries`) clones the table, truncates the clone and inserts the archive files into it, `fingerprint_restored` hashes the restored rows per partition and `drop_probe_table` removes the clone.
+    8. `confirm_restorable` is the gate. A partition passes only when the parsed rows and checksum plus the restored rows and checksum all equal the live partition. One failure refuses the whole pass with a non-zero exit.
+    9. `approve_purge` (`Pause`) holds for a person. `apply_if_approved` reads `onResume.approved ?? false`, so an unanswered resume is a refusal. `recheck_live` and `recheck_archive` read both sides again. `confirm_plan_fresh` compares them to the approved plan by partition id. Any drift fails the run before a single DDL statement.
+    10. `purge_remediation` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) issues one `ALTER TABLE ... DROP PARTITION ID` per target with `allowFailure`, because the re-read is the real gate. `reread_partitions` and `reread_archive` read `system.parts` plus the files again. `verify_purge` fails the run when a partition is still there or its archive no longer holds exactly the rows that were dropped. On success it prints rows removed, bytes reclaimed and rows preserved, which have to add up. `alert_failure` posts any failure to Slack.
+
+    The `weekly_archive_sweep` Schedule trigger ships `disabled: true` and pins `dry_run: true` with `auto_remediate: false`, so enabling it cannot write.
+
+    ## What you get
+
+    - An alert naming every partition past retention, how many rows it holds and whether its archive is missing, stale or already verified.
+    - Archive files written by the server itself, one per partition, named with the server's own partition ids.
+    - A drop that happens only for partitions whose data was read back out of the file and restored into a table at the same checksum.
+    - Counts after the fact: rows removed from the table, bytes reclaimed and rows still readable in the archive, with a run that fails when they do not agree.
+
+    ## Who it's for
+
+    Data platform engineers and analytics DBAs who keep ClickHouse disks under control by archiving old partitions and need the archive to be worth something when it is the only copy.
+
+    ## Why orchestrate this with Kestra
+
+    The export, the read back, the restore, the human approval and the drop belong to one decision, but a shell script that chains them cannot pause for a person and cannot prove it rechecked the world after that person answered. Kestra holds the approval, re-reads both the table and the files immediately before the write, serialises the drops then keeps the evidence of each step in one execution. ClickHouse supplies the proof itself through `system.parts`, the `file` table function and a clone table, so nothing depends on this flow's own bookkeeping.
+
+    ## Tested end to end
+
+    Kestra 2.0.5, plugin-jdbc-clickhouse 2.1.0, plugin-slack 2.1.0, plugin-script-python 1.14.0, ClickHouse 25.3.6.56 on Alpine. Validate was clean on stock Kestra: no constraints, warnings or deprecations. The fixture is one `analytics.events` MergeTree table partitioned by `toYYYYMM(ts)` holding 300, 200, 150 and 120 rows in `202601`, `202602`, `202603` and `202610`, plus three lookalikes that must be spared: `analytics.metrics` which is never allowlisted, `analytics.by_region` partitioned by a `String` region plus `analytics.audit_log` with no `PARTITION BY`. Every number below was read back with `clickhouse-client` against `system.parts`, `system.query_log` and the `file` table function, never from a Kestra output. All twelve cases ran on the final revision 5 and carry 86 independent assertions.
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy | `gWKd9phPG2CT6TTpgMn7u` | SUCCESS. Live mode with a 3650 day window. Four partitions spared `within_retention`, no archive file written |
+    | Dry run | `7fIhZPMgdYT3i28I2isRuH` | SUCCESS. One candidate, the other three spared as `protected_partition`, `over_ceiling` and `within_retention`. Nothing on disk |
+    | Table not allowlisted | `6J4UVfjkq76cH2JUuYJkW3` | SUCCESS. Live mode, three expired partitions assessed in full, `purgeable_tables` empty, nothing written |
+    | Non temporal key | `23GKffilPrMVijtMOOdPf8` | SUCCESS. `by_region` allowlisted in live mode, all three partitions spared `no_temporal_bound`, nothing written |
+    | No partition key | `5weAxaM4qYHrBas87tIAEM` | FAILED as intended at `check_table_shape`. `audit_log` kept its 40 rows and the flow never read a partition |
+    | Declined approval | `76AazZZmQaWO9OmiM2QVCv` | SUCCESS. Both archives written and verified on three reads, **no DROP reached ClickHouse**, all four partitions intact, probe table gone |
+    | Reuse of the archive | `4U0O8jncWAxLpnRB20kx51` | SUCCESS. Second run found both archives already verified and exported nothing. The two files stayed **byte identical by SHA-256** |
+    | Change during the Pause | `6YmWgQP90fdDlV3JhHqkzD` | FAILED as intended. Five rows were appended to `202601` while the approval waited, 300 to 305. `confirm_plan_fresh` refused and `system.query_log` shows **no ALTER statement at all** |
+    | Refused write | `6JOFfyxVzm9gpOsCygl4qv` | FAILED as intended. `max_partition_size_to_drop` set to one byte. The drifted `202601` was re-exported at 305 rows, both drops were issued and **refused with code 359**, every partition survived and `verify_purge` failed the run |
+    | Remediation | `5GDzUaynJ5AgLhuj9kXMGT` | SUCCESS. Reconciled the refused pass without re-exporting. Table rows **775 to 270**, **8189 bytes reclaimed** by `system.parts`, **505 rows still readable** in the two files at the same checksums, `conserved=true`. `system.query_log` shows both ALTERs finishing with code 0. `202603` and `202610` untouched |
+    | Repeat | `73invG7C3sJKnasgGYLAKv` | SUCCESS. No candidate left, both purged archives re-verified readable, archive files byte identical, no drop and no probe table |
+    | Damaged archive | `5FZLlvg5uvHLE1VKxD4QbT` | FAILED as intended. One purged archive truncated to 40 bytes. The breaker stopped a dry run that had a candidate. Nothing was exported |
+
+    A second fresh fixture container repeated healthy, remediation and the change during the Pause from the pinned image and the same seed script, with its own execution ids. Slack was a local HTTP sink.
+
+    ## Prerequisites
+
+    - ClickHouse with a MergeTree family table and a date based partition key. Tested on 25.3.6.56 only.
+    - A writable `user_files` path on the server that holds the table, because the archive is written by the server through the `file` table function. Put it on storage you back up.
+    - Kestra 2.0.5 with the JDBC ClickHouse, Python script and Slack plugins.
+    - Minimum permissions: `SELECT` on the table, `system.tables`, `system.columns` and `system.parts`, the `FILE` source privilege to read and write the archive, `CREATE TABLE` plus `DROP TABLE` for the restore probe, then `ALTER DELETE` level rights for `DROP PARTITION` on the allowlisted tables only. No admin rights.
+
+    ### Secrets
+
+    - `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD`: the account used for every read and write.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for findings and failures.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    | --- | --- | --- |
+    | `clickhouse_url` | `jdbc:clickhouse://localhost:8123/default` | The node whose `user_files` directory the archive lands in |
+    | `database`, `table` | `default`, `events` | The table to archive |
+    | `retention_days` | `90` | A partition becomes a candidate once its newest row is older than this |
+    | `archive_dir` | `clickhouse-archive` | Directory under `user_files` holding one file per partition |
+    | `archive_format` | `Native` | Lossless by default, so restored rows hash identically |
+    | `purgeable_tables` | `[]` | Write allowlist as `database.table`. Empty means nothing may be dropped |
+    | `protected_partitions` | `[]` | Partition ids that are reported but never archived or dropped |
+    | `max_partitions_per_run` | `3` | Per-run ceiling, oldest first |
+    | `restore_probe` | `true` | Insert each archive into a clone table and hash it there |
+    | `dry_run` | `true` | Read and report only |
+    | `auto_remediate` | `false` | Allow the archive plus drop path at all |
+
+    ## Quick start
+
+    1. Add the three secrets and point `clickhouse_url` at the node that holds the table.
+    2. Execute with the defaults. Read the findings: one line per partition with its verdict, one per archive file.
+    3. Set `retention_days` to your policy and list anything an investigation needs in `protected_partitions`.
+    4. Check that `archive_dir` resolves to backed up storage inside the server's `user_files` path.
+    5. Execute with `auto_remediate: true`, `dry_run: false` and the table in `purgeable_tables`. Read the `confirm_restorable` lines, which name the row count and checksum proven on all three reads.
+    6. Approve the Pause. Read the closing line: rows removed, bytes reclaimed, rows still readable in the archive and `conserved`.
+    7. Enable `weekly_archive_sweep` once you want the report on a schedule.
+
+    ## How to extend
+
+    - Point `archive_dir` at an S3 backed disk and swap the `file` table function for `s3`, keeping the same read back and restore steps.
+    - Add a restore flow that takes a partition id and inserts its archive file into the live table, which is the other half of this contract.
+    - Raise `max_partitions_per_run` for a one-off migration. Lower it to one while you are learning what the detector picks.
+    - Feed `purgeable_tables` from a data catalog so the allowlist is owned where retention policy is owned.
+
+    Limits: the archive is written by the server into its own `user_files` path, so the flow cannot prove that path is backed up. `Native` files are also tied to the ClickHouse major version that wrote them. The checksum proves the rows match, not that the file will still be readable in five years. The purged-partition archives are parsed in one query, so one truncated file marks that whole set unproven and stops the run, which is deliberate but coarse. `DROP PARTITION` is not transactional with the verification, so the window between `confirm_plan_fresh` and the drop is small but real; rows inserted inside it are lost from the archive, which is why the per-run ceiling exists. Replicated tables were not tested, nor was a partition large enough to make the full-table checksum scan expensive.
+
+    ## Links
+
+    - [ClickHouse: ALTER TABLE DROP PARTITION](https://clickhouse.com/docs/sql-reference/statements/alter/partition)
+    - [ClickHouse: the file table function](https://clickhouse.com/docs/sql-reference/table-functions/file)
+    - [ClickHouse: system.parts](https://clickhouse.com/docs/operations/system-tables/parts)
+    - [Kestra ClickHouse Query](https://kestra.io/plugins/plugin-jdbc-clickhouse/io.kestra.plugin.jdbc.clickhouse.query)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
