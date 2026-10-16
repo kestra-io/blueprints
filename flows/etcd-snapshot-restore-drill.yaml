@@ -1,0 +1,508 @@
+id: etcd-snapshot-restore-drill
+namespace: company.team
+description: |
+  Prove that your newest etcd backup restores. The drill takes the latest snapshot from S3, checks its age against
+  your RPO, verifies the sha256 that etcd appends to every snapshot, restores it into a throwaway single-member etcd
+  and compares that member with the live cluster at the snapshot's revision (HashKV when the history is still
+  there, a key sample when it has been compacted). The result goes to Slack and to the flow outputs.
+
+triggers:
+  - id: after_backup
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: |
+      Call it at the end of the backup job. Send {"key": "<object key>"} to drill the snapshot that was just uploaded:
+      curl -X POST -H 'Content-Type: application/json' -d '{"key":"snapshots/etcd-....db"}' https://kestra.example.com/api/v1/main/executions/webhook/company.team/etcd-snapshot-restore-drill/<key>
+    key: "{{ secret('ETCD_DRILL_WEBHOOK_KEY') }}"
+  - id: nightly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Backstop that drills the newest snapshot even when the backup job never called the webhook. Shipped disabled.
+    cron: "40 5 * * *"
+    disabled: true
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: endpoints
+    type: STRING
+    defaults: http://127.0.0.1:2379,http://127.0.0.1:22379,http://127.0.0.1:32379
+    description: Client URLs of every member of the live cluster, comma-separated. Every member is asked for its HashKV, so list them all, not a load balancer.
+  - id: bucket
+    type: STRING
+    defaults: etcd-backups
+  - id: prefix
+    type: STRING
+    defaults: snapshots/
+    description: Where the backup job writes snapshots. The newest object under it is drilled.
+  - id: snapshot_key
+    type: STRING
+    required: false
+    description: Drill this object instead of the newest one. The webhook sets it from the request body.
+  - id: s3_endpoint
+    type: STRING
+    defaults: http://127.0.0.1:8333
+    description: The demo uses a local SeaweedFS. For AWS use https://s3.<region>.amazonaws.com; for MinIO, Ceph or R2 their S3 URL.
+  - id: region
+    type: STRING
+    defaults: us-east-1
+  - id: take_snapshot
+    type: BOOL
+    defaults: false
+    description: Save a fresh snapshot from the leader and upload it before the drill, so the flow is also the backup job. Leave false when another job writes the snapshots; the RPO check is only meaningful then.
+  - id: rpo_hours
+    type: INT
+    defaults: 24
+    description: The drilled snapshot must be younger than this. It is the most data you accept to lose.
+  - id: sample_keys
+    type: INT
+    defaults: 200
+    description: Keys compared one by one with the live cluster, in addition to HashKV. They are the only comparison once the live cluster has compacted past the snapshot's revision.
+  - id: quota_backend_mb
+    type: INT
+    defaults: 2048
+    description: The --quota-backend-bytes of your members, in MiB (etcd's default is 2048). A snapshot bigger than this restores into a member that starts in the NOSPACE alarm and refuses writes.
+  - id: skip_hash_check
+    type: BOOL
+    defaults: false
+    description: Only for files copied from a member's data directory (member/snap/db), which carry no hash. Files written by `etcdctl snapshot save` always have one.
+  - id: tls
+    type: BOOL
+    defaults: false
+    description: true reads the client certificate from the secrets ETCD_CA_PEM, ETCD_CERT_PEM and ETCD_KEY_PEM (the files kube-apiserver uses for etcd).
+  - id: etcd_version
+    type: STRING
+    defaults: v3.5.17
+    description: The etcd release the tools image is built from. Use the version your cluster runs; etcdutl restores snapshots of the same and older minor versions.
+  - id: build_image
+    type: BOOL
+    defaults: true
+    description: The official etcd image has no shell, so the flow builds one from Alpine plus the jq and etcd binaries. Set false when the image is already in your registry.
+
+variables:
+  image: "etcd-drill-tools:{{ inputs.etcd_version }}"
+  last_good_key: etcd_drill_last_good
+  tls_env: |
+    for v in CA:CACERT CERT:CERT KEY:KEY; do
+      pem=$(printenv "ETCD_${v%%:*}_PEM" || true)
+      [ -z "$pem" ] || { printf '%s\n' "$pem" > "/tmp/etcd-${v%%:*}.pem"; export "ETCDCTL_${v##*:}=/tmp/etcd-${v%%:*}.pem"; }
+    done
+
+tasks:
+  - id: tools_image
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.build_image }}"
+    then:
+      - id: build_tools
+        type: io.kestra.plugin.docker.Build
+        description: pull is false so nightly runs reuse the cached base images instead of asking Docker Hub every time (and hitting its rate limit).
+        pull: false
+        tags:
+          - "{{ render(vars.image) }}"
+        dockerfile: |
+          FROM quay.io/coreos/etcd:{{ inputs.etcd_version }} AS etcd
+          FROM ghcr.io/jqlang/jq:1.7.1 AS jq
+          FROM alpine:3.20
+          COPY --from=jq /jq /usr/local/bin/jq
+          COPY --from=etcd /usr/local/bin/etcd /usr/local/bin/etcdctl /usr/local/bin/etcdutl /usr/local/bin/
+
+  - id: cluster_status
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Asks every member for its status. Stops the drill when the cluster has no leader, since nothing could be compared.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+      pullPolicy: IF_NOT_PRESENT
+    containerImage: "{{ render(vars.image) }}"
+    env:
+      ENDPOINTS: "{{ inputs.endpoints }}"
+      ETCD_CA_PEM: "{{ inputs.tls ? secret('ETCD_CA_PEM') : '' }}"
+      ETCD_CERT_PEM: "{{ inputs.tls ? secret('ETCD_CERT_PEM') : '' }}"
+      ETCD_KEY_PEM: "{{ inputs.tls ? secret('ETCD_KEY_PEM') : '' }}"
+    commands:
+      - |
+        {{ render(vars.tls_env) }}
+        etcdctl --endpoints="$ENDPOINTS" --command-timeout=10s endpoint status -w json > status.json 2> err.txt || true
+        members=$(jq 'length' status.json 2>/dev/null || echo 0)
+        hint=""; case "$ENDPOINTS" in *https://*) [ -n "${ETCDCTL_CERT:-}" ] || hint=". The endpoints use https: if the cluster requires client certificates, set tls and the ETCD_*_PEM secrets";; esac
+        [ "$members" -gt 0 ] || { echo "DRILL FAILED: no member of $ENDPOINTS answered: $(tail -n 1 err.txt)$hint" >&2; exit 1; }
+        leader_id=$(jq -r '[.[].Status.leader] | map(select(. != 0)) | first // empty' status.json)
+        [ -n "$leader_id" ] || { echo "DRILL FAILED: the cluster has no leader" >&2; exit 1; }
+        expected=$(echo "$ENDPOINTS" | tr ',' '\n' | grep -c .)
+        alarms=$(etcdctl --endpoints="$ENDPOINTS" --command-timeout=10s alarm list 2>/dev/null | sed -n 's/.*alarm:\([A-Z]*\).*/\1/p' | sort -u | paste -sd, -)
+        jq -c --arg leader "$leader_id" --arg alarms "$alarms" --argjson expected "$expected" '{outputs: {
+            members_answering: length, members_expected: $expected,
+            leader: ([.[] | select((.Status.header.member_id | tostring) == $leader) | .Endpoint] | first),
+            cluster_id: (.[0].Status.header.cluster_id | tostring),
+            revision: ([.[].Status.header.revision] | max),
+            db_size_mb: (([.[].Status.dbSize] | max) / 1048576 | . * 10 | round / 10),
+            alarms: $alarms}} | "::" + tojson + "::"' -r status.json
+
+  - id: fresh_snapshot
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.take_snapshot }}"
+    then:
+      - id: save_snapshot
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: "`snapshot save` must target one member; the leader is the most up to date."
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: host
+          pullPolicy: IF_NOT_PRESENT
+        containerImage: "{{ render(vars.image) }}"
+        env:
+          ENDPOINTS: "{{ inputs.endpoints }}"
+          ETCD_CA_PEM: "{{ inputs.tls ? secret('ETCD_CA_PEM') : '' }}"
+          ETCD_CERT_PEM: "{{ inputs.tls ? secret('ETCD_CERT_PEM') : '' }}"
+          ETCD_KEY_PEM: "{{ inputs.tls ? secret('ETCD_KEY_PEM') : '' }}"
+        outputFiles:
+          - snapshot.db
+        commands:
+          - |
+            {{ render(vars.tls_env) }}
+            etcdctl --endpoints="{{ outputs.cluster_status.vars.leader }}" snapshot save snapshot.db > save.log 2>&1 \
+              || { cat save.log; echo "DRILL FAILED: snapshot save from {{ outputs.cluster_status.vars.leader }} failed: $(tail -n 1 save.log)" >&2; exit 1; }
+            rev=$(etcdutl snapshot status snapshot.db -w json | jq .revision)
+            echo "::{\"outputs\":{\"key\":\"{{ inputs.prefix }}etcd-{{ outputs.cluster_status.vars.cluster_id }}-$(date -u +%Y%m%dT%H%M%SZ)-rev$rev.db\",\"sha256\":\"$(sha256sum snapshot.db | cut -c1-64)\"}}::"
+      - id: upload_snapshot
+        type: io.kestra.plugin.aws.s3.Upload
+        endpointOverride: "{{ inputs.s3_endpoint }}"
+        forcePathStyle: true
+        compatibilityMode: true
+        region: "{{ inputs.region }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        from: "{{ outputs.save_snapshot.outputFiles['snapshot.db'] }}"
+        bucket: "{{ inputs.bucket }}"
+        key: "{{ outputs.save_snapshot.vars.key }}"
+        metadata:
+          sha256: "{{ outputs.save_snapshot.vars.sha256 }}"
+          cluster-id: "{{ outputs.cluster_status.vars.cluster_id }}"
+
+  - id: list_snapshots
+    type: io.kestra.plugin.aws.s3.List
+    endpointOverride: "{{ inputs.s3_endpoint }}"
+    forcePathStyle: true
+    compatibilityMode: true
+    region: "{{ inputs.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    bucket: "{{ inputs.bucket }}"
+    prefix: "{{ inputs.prefix }}"
+    filter: FILES
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: pick_snapshot
+    type: io.kestra.plugin.core.debug.Return
+    description: The object named by the input or the webhook body, else the newest one.
+    format: >-
+      {%- set wanted = (inputs.snapshot_key ?? '') != '' ? inputs.snapshot_key : (trigger.body.key ?? '') -%}
+      {%- set objects = outputs.list_snapshots.objects ?? [] -%}
+      {%- if wanted != '' -%}{{ objects | jq('[.[] | select(.key == "' ~ wanted ~ '")] | first // {}') | first | toJson }}
+      {%- else -%}{{ objects | jq('sort_by(.lastModified) | last // {}') | first | toJson }}{%- endif -%}
+
+  - id: snapshot_found
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.pick_snapshot.value).key is not defined }}"
+    then:
+      - id: no_snapshot
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "DRILL FAILED: {% if (inputs.snapshot_key ?? trigger.body.key ?? '') != '' %}{{ inputs.snapshot_key ?? trigger.body.key }} is not{% else %}no snapshot is{% endif %} in s3://{{ inputs.bucket }}/{{ inputs.prefix }}. The backup job is not writing where the drill looks, or not running at all."
+
+  - id: download_snapshot
+    type: io.kestra.plugin.aws.s3.Download
+    endpointOverride: "{{ inputs.s3_endpoint }}"
+    forcePathStyle: true
+    compatibilityMode: true
+    region: "{{ inputs.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    bucket: "{{ inputs.bucket }}"
+    key: "{{ fromJson(outputs.pick_snapshot.value).key }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: drill
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Restores the snapshot into a scratch member on random local ports, compares it with the live cluster and stops it again. Never writes to the live cluster.
+    inputFiles:
+      snapshot.db: "{{ outputs.download_snapshot.uri }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+      pullPolicy: IF_NOT_PRESENT
+    containerImage: "{{ render(vars.image) }}"
+    env:
+      ENDPOINTS: "{{ inputs.endpoints }}"
+      ETCD_CA_PEM: "{{ inputs.tls ? secret('ETCD_CA_PEM') : '' }}"
+      ETCD_CERT_PEM: "{{ inputs.tls ? secret('ETCD_CERT_PEM') : '' }}"
+      ETCD_KEY_PEM: "{{ inputs.tls ? secret('ETCD_KEY_PEM') : '' }}"
+      KEY: "{{ fromJson(outputs.pick_snapshot.value).key }}"
+      LAST_MODIFIED: "{{ fromJson(outputs.pick_snapshot.value).lastModified }}"
+      RPO_HOURS: "{{ inputs.rpo_hours }}"
+      SAMPLE: "{{ inputs.sample_keys }}"
+      QUOTA_MB: "{{ inputs.quota_backend_mb }}"
+      SKIP_HASH: "{{ inputs.skip_hash_check }}"
+    commands:
+      - |
+        {{ render(vars.tls_env) }}
+        problems=""; warnings=""
+        problem() { problems="$problems$*|"; }
+        warn() { warnings="$warnings$*|"; }
+        LIVE="$ENDPOINTS"
+
+        age_s=$(jq -n --arg t "$LAST_MODIFIED" 'now - ($t | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) | floor')
+        age_h=$(awk -v s="$age_s" 'BEGIN { printf "%.1f", s / 3600 }')
+        [ "$age_s" -le $((RPO_HOURS * 3600)) ] || problem "the snapshot is $age_h h old, over the $RPO_HOURS h RPO: the backup job has stopped writing new snapshots"
+
+        # etcdctl snapshot save appends the sha256 of the file; bbolt files are whole 512-byte pages, so the
+        # remainder tells a hashed snapshot (32), a raw member/snap/db copy (0) and a file cut short (anything else).
+        bad() { echo "::$(jq -cn --arg key "$KEY" --arg p "$1" '{outputs: {ok: false, key: $key, problems: $p}}')::"; exit 0; }
+        size=$(stat -c %s snapshot.db)
+        case $((size % 512)) in
+          32) want=$(tail -c 32 snapshot.db | od -An -tx1 | tr -d ' \n'); got=$(head -c $((size - 32)) snapshot.db | sha256sum | cut -c1-64)
+              [ "$want" = "$got" ] || bad "the sha256 etcd appended does not match the content ($size bytes): bytes changed after etcd wrote the file, in storage or in transit" ;;
+          0) [ "$SKIP_HASH" = true ] || bad "the file carries no sha256, so it is a copy of a member's member/snap/db and not the output of etcdctl snapshot save. Back up with snapshot save, or set skip_hash_check to drill such copies" ;;
+          *) bad "the file is $size bytes, not whole 512-byte pages plus etcd's 32-byte hash: it was cut short (an interrupted upload or copy, a full disk on the backup host)" ;;
+        esac
+
+        status=$(etcdutl snapshot status snapshot.db -w json 2> status.err) || {
+          bad "etcdutl cannot read the file: $(grep -m1 -E '^panic:|Error:' status.err | tr '\t' ' '). It is not an etcd snapshot"; }
+        R=$(echo "$status" | jq .revision)
+
+        start=$(date +%s)
+        flag=""; [ "$SKIP_HASH" != true ] || flag="--skip-hash-check"
+        for try in 1 2 3; do
+          CP=$((20000 + RANDOM % 20000)); PP=$((CP + 1)); SCR="http://127.0.0.1:$CP"
+          rm -rf restored
+          etcdutl snapshot restore snapshot.db $flag --data-dir restored --name drill \
+            --initial-cluster "drill=http://127.0.0.1:$PP" --initial-advertise-peer-urls "http://127.0.0.1:$PP" > restore.log 2>&1 || {
+            why=$(grep -oE '"error": ?"[^"]*"|Error: .*' restore.log | tail -n 1 | sed -E 's/^"error": ?"//; s/"$//; s/^Error: //' | tr '\t' ' ')
+            case "$why" in
+              *"missing hash"*) why="$why. The file carries no sha256, so it is a copy of a member's member/snap/db and not the output of etcdctl snapshot save. Back up with snapshot save, or set skip_hash_check to drill such copies";;
+              *hash*|*integrity*) why="$why. The file was changed after etcd wrote it: bytes flipped in storage or transit, or a copy taken while it was still being written";;
+            esac
+            echo "::$(jq -cn --arg p "the snapshot does not restore: $why" --arg key "$KEY" --argjson rev "$R" '{outputs: {ok: false, key: $key, snapshot_revision: $rev, problems: $p}}')::"; exit 0; }
+          etcd --data-dir restored --name drill --listen-client-urls "$SCR" --advertise-client-urls "$SCR" \
+            --listen-peer-urls "http://127.0.0.1:$PP" --initial-advertise-peer-urls "http://127.0.0.1:$PP" \
+            --initial-cluster "drill=http://127.0.0.1:$PP" --quota-backend-bytes $((QUOTA_MB * 1048576)) > scratch.log 2>&1 &
+          PID=$!; trap 'kill $PID 2>/dev/null' EXIT
+          for i in $(seq 1 60); do env -u ETCDCTL_CACERT -u ETCDCTL_CERT -u ETCDCTL_KEY etcdctl --endpoints="$SCR" endpoint health > /dev/null 2>&1 && break; kill -0 $PID 2>/dev/null || break; sleep 0.5; done
+          kill -0 $PID 2>/dev/null && break
+          grep -q 'address already in use' scratch.log || break
+        done
+        kill -0 $PID 2>/dev/null || { tail -n 5 scratch.log; echo "DRILL FAILED: the restored member did not start: $(grep -m1 -oE '"error":"[^"]*"' scratch.log)" >&2; exit 1; }
+        rto=$(( $(date +%s) - start ))
+        scr() { env -u ETCDCTL_CACERT -u ETCDCTL_CERT -u ETCDCTL_KEY etcdctl --endpoints="$SCR" "$@"; }
+
+        restored_keys=$(scr get "" --prefix --count-only -w fields | sed -n 's/^"Count" : //p')
+        db_mb=$(awk -v b="$(stat -c %s restored/member/snap/db)" 'BEGIN { printf "%.1f", b / 1048576 }')
+        awk -v d="$db_mb" -v q="$QUOTA_MB" 'BEGIN { exit !(d < q) }' || problem "the restored database is $db_mb MiB, at or above the $QUOTA_MB MiB backend quota: a member restored from it starts in the NOSPACE alarm. Restore with a larger --quota-backend-bytes and defragment"
+        scr alarm list | grep -q NOSPACE && problem "the restored member raised NOSPACE on start"
+
+        # Exact comparison: HashKV hashes every key revision between the compaction point and R. It needs the live
+        # members to still hold revision R, and both sides compacted at the same point. The scratch member is
+        # disposable, so it is compacted forward to the live cluster's compaction point when they differ.
+        mode=hashkv; live_hashes=""; live_hash=""; live_compact=""; hashed=0
+        for ep in $(echo "$LIVE" | tr ',' ' '); do
+          out=$(etcdctl --endpoints="$ep" --command-timeout=30s endpoint hashkv --rev="$R" -w json 2>&1) || {
+            case "$out" in *compacted*) mode=sample; break;; *) warn "$ep did not answer HashKV: $(echo "$out" | tail -n 1)"; continue;; esac; }
+          h=$(echo "$out" | jq '.[0].HashKV.hash'); c=$(echo "$out" | jq '.[0].HashKV.compact_revision')
+          live_hashes="$live_hashes $ep=$h"; live_hash=${live_hash:-$h}; live_compact=${live_compact:-$c}; hashed=$((hashed + 1))
+          [ "$h" = "$live_hash" ] || problem "the live members disagree on revision $R:$live_hashes. One member's data has diverged; check it with etcd's corruption check before trusting any backup taken from it"
+        done
+        scr_hash=""
+        if [ "$mode" = hashkv ] && [ -n "$live_hash" ]; then
+          scr_compact=$(scr endpoint hashkv --rev="$R" -w json | jq '.[0].HashKV.compact_revision')
+          if [ "$live_compact" -gt "$scr_compact" ]; then scr compaction "$live_compact" > /dev/null
+          elif [ "$live_compact" -lt "$scr_compact" ]; then problem "the snapshot was compacted at revision $scr_compact, later than the live cluster ($live_compact): it cannot come from this cluster's history"; fi
+          scr_hash=$(scr endpoint hashkv --rev="$R" -w json | jq '.[0].HashKV.hash')
+          [ "$scr_hash" = "$live_hash" ] || problem "HashKV at revision $R differs: restored $scr_hash, live $live_hash. The snapshot does not hold the keyspace the live cluster had at that revision (another cluster's snapshot, or corruption)"
+        fi
+        [ "$mode" = sample ] || [ -n "$live_hash" ] || mode=sample
+
+        # Sample: keys untouched since R must be identical. Keys changed or deleted since are expected.
+        scr get "" --prefix --keys-only -w json | jq -r '.kvs[]?.key' > keys.b64
+        total=$(wc -l < keys.b64); step=$(( total / SAMPLE )); [ "$step" -ge 1 ] || step=1
+        sampled=0; matched=0; changed=0; deleted=0; mismatched=""
+        for k in $(awk -v s=$step 'NR % s == 0' keys.b64 | head -n "$SAMPLE"); do
+          key=$(printf %s "$k" | base64 -d); sampled=$((sampled + 1))
+          a=$(scr get "$key" -w json | jq -r '.kvs[0].value')
+          b=$(etcdctl --endpoints="$LIVE" get "$key" -w json | jq -r '.kvs[0] // empty | "\(.mod_revision) \(.value)"')
+          if [ -z "$b" ]; then deleted=$((deleted + 1))
+          elif [ "${b%% *}" -gt "$R" ]; then changed=$((changed + 1))
+          elif [ "${b#* }" = "$a" ]; then matched=$((matched + 1))
+          else mismatched="$mismatched $key"; fi
+        done
+        [ -z "$mismatched" ] || problem "$(echo $mismatched | wc -w) sampled keys have a different value although the live cluster has not changed them since revision $R:$(echo $mismatched | cut -d' ' -f1-5)"
+        if [ "$sampled" -ge 10 ] && [ $((deleted * 2)) -gt "$sampled" ]; then
+          problem "$deleted of $sampled sampled keys do not exist in the live cluster: the snapshot is probably from another cluster, or most of the keyspace was deleted since"
+        fi
+
+        live_rev=$(etcdctl --endpoints="$LIVE" endpoint status -w json | jq '[.[].Status.header.revision] | max')
+        jq -cn --arg key "$KEY" --argjson age "$age_h" --argjson rev "$R" --argjson live_rev "$live_rev" \
+          --arg hash "$(echo "$status" | jq .hash)" --argjson restored_keys "${restored_keys:-0}" --argjson db_mb "$db_mb" \
+          --argjson rto "$rto" --arg mode "$mode" --argjson hashed "$hashed" --arg live_hash "$live_hash" --arg scr_hash "$scr_hash" \
+          --argjson sampled $sampled --argjson matched $matched --argjson changed $changed --argjson deleted $deleted \
+          --arg problems "${problems%|}" --arg warnings "${warnings%|}" \
+          '{outputs: {ok: ($problems == ""), key: $key, age_hours: $age, snapshot_revision: $rev, live_revision: $live_rev,
+            revisions_behind: ($live_rev - $rev), snapshot_hash: $hash, restored_keys: $restored_keys, restored_db_mb: $db_mb,
+            restore_seconds: $rto, compare: $mode, hashkv_members: $hashed, hashkv_live: $live_hash, hashkv_restored: $scr_hash,
+            sampled: $sampled, matched: $matched, changed_since: $changed, deleted_since: $deleted,
+            problems: $problems, warnings: $warnings}} | "::" + tojson + "::"' -r
+
+  - id: verdict
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.drill.vars.ok }}"
+    then:
+      - id: remember_good_drill
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ vars.last_good_key }}"
+        kvType: JSON
+        value: "{{ {'at': execution.startDate, 'key': outputs.drill.vars.key, 'revision': outputs.drill.vars.snapshot_revision} | toJson }}"
+      - id: report_pass
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          etcd restore drill PASSED: `{{ outputs.drill.vars.key }}` ({{ outputs.drill.vars.age_hours | numberFormat('0.0') }} h old, RPO {{ inputs.rpo_hours }} h) restored and serving in {{ outputs.drill.vars.restore_seconds }} s: {{ outputs.drill.vars.restored_keys }} keys, {{ outputs.drill.vars.restored_db_mb }} MiB, revision {{ outputs.drill.vars.snapshot_revision }} ({{ outputs.drill.vars.revisions_behind }} revisions behind the live cluster).
+          {% if outputs.drill.vars.compare == 'hashkv' %}HashKV at revision {{ outputs.drill.vars.snapshot_revision }} is identical on the restored member and the {{ outputs.drill.vars.hashkv_members }} live member{{ outputs.drill.vars.hashkv_members == 1 ? '' : 's' }} that answered ({{ outputs.drill.vars.hashkv_live }}).{% else %}The live cluster has compacted past revision {{ outputs.drill.vars.snapshot_revision }}, so no HashKV comparison: keys checked one by one instead.{% endif %} Sample: {{ outputs.drill.vars.matched }} of {{ outputs.drill.vars.sampled }} keys identical, {{ outputs.drill.vars.changed_since }} changed and {{ outputs.drill.vars.deleted_since }} deleted since the snapshot.{% if outputs.cluster_status.vars.alarms != '' %}
+          The live cluster has active alarms: {{ outputs.cluster_status.vars.alarms }}. NOSPACE means it refuses writes until you compact, defragment and `etcdctl alarm disarm`.{% endif %}{% if outputs.cluster_status.vars.members_answering < outputs.cluster_status.vars.members_expected %}
+          Only {{ outputs.cluster_status.vars.members_answering }} of {{ outputs.cluster_status.vars.members_expected }} members answered.{% endif %}{% if outputs.drill.vars.warnings != '' %}
+          {{ outputs.drill.vars.warnings | replace({'|': '; '}) }}{% endif %}
+    else:
+      - id: drill_failed
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "DRILL FAILED: {{ outputs.drill.vars.problems | replace({'|': '; '}) }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      etcd restore drill FAILED in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at {{ errorLogs() | jq('([.[] | select(.message | test("DRILL FAILED"))] + .)[0] | "`" + .taskId + "`: " + (.message | sub("^.*DRILL FAILED: "; "") | split("\n")[0])') | first }}{% endif %}
+      {% if outputs.drill.vars.key is defined %}Snapshot `{{ outputs.drill.vars.key }}`{% if outputs.drill.vars.snapshot_revision is defined %}, revision {{ outputs.drill.vars.snapshot_revision }}{% endif %}. {% endif %}Do not count on this backup for a restore. Last good drill: {{ (kv(vars.last_good_key, errorOnMissing=false) ?? {}).at ?? 'never' }}
+
+outputs:
+  - id: result
+    type: JSON
+    value: "{{ outputs.drill.vars ?? {} }}"
+
+extend:
+  title: Prove Your etcd Snapshots Restore, Revision for Revision
+  shortDescription: Restore the newest etcd snapshot from S3 into a throwaway member and compare it with the live cluster by HashKV.
+  metaTitle: etcd Snapshot Restore Drill with HashKV and S3 | Kestra
+  metaDescription: Restore the latest etcd snapshot from S3 into a scratch member, check RPO, hash and quota, and compare it with the live cluster by HashKV.
+  description: |
+    An etcd backup job that "succeeds" every night proves only that a file was uploaded. The file can be cut short by a failed multipart upload, taken from a member that had silently diverged, too old because the job died weeks ago, from the wrong cluster after a copy-paste in the bucket path, or too big to start under the backend quota. All of these surface on the day you need the restore, when the Kubernetes control plane is already down.
+
+    This blueprint restores the snapshot for real, every time: into a throwaway single-member etcd on random local ports inside the task container, never touching the live cluster. It then compares that member with the live cluster *at the snapshot's revision* using HashKV, etcd's own hash of every key revision, so a passing drill means the restored keyspace is identical to what the cluster held when the snapshot was taken, not "roughly the same number of keys". The demo runs with a local three-member cluster and SeaweedFS in Docker.
+
+    ## How it works
+    1. `build_tools` (`docker.Build`) builds Alpine with the jq and etcd binaries copied from their official images, so the build needs no package mirror. The official etcd image is distroless, so script tasks cannot run in it.
+    2. `cluster_status` (`shell.Commands`) asks every member for its status: leader, revision, database size, and active alarms (NOSPACE, CORRUPT). No leader stops the drill.
+    3. `fresh_snapshot` (`If`, off by default) saves a snapshot from the leader and uploads it with its sha256 in the object metadata, for teams that want the flow to be the backup job as well.
+    4. `list_snapshots` (`aws.s3.List`) and `pick_snapshot` choose the object named in the webhook body or input, else the newest one by `lastModified`, using the `jq` Pebble filter.
+    5. `download_snapshot` (`aws.s3.Download`), then `drill`:
+       - RPO: the object's age against `rpo_hours`.
+       - The file itself, before anything parses it: `etcdctl snapshot save` appends a sha256 to the file, and bbolt files are whole 512-byte pages, so the size tells a hashed snapshot, a raw copy of `member/snap/db` (no hash) and a file cut short apart. The hash is then verified. etcd uses the same rule when it restores.
+       - `etcdutl snapshot status`, then `etcdutl snapshot restore` into a scratch data directory.
+       - Starts the restored member with the live cluster's `--quota-backend-bytes` and measures how long until it serves (your restore time).
+       - HashKV at the snapshot's revision on every live member and on the restored one. The live members must agree with each other (a member that diverged is reported too), and the restored member must match. When the live cluster compacted after the snapshot, the scratch member is compacted to the same point first, since HashKV covers the revisions after the compaction point.
+       - A key sample (`sample_keys`): keys the live cluster has not changed since the snapshot's revision must have the same value. When the live cluster has compacted past the snapshot, this is the comparison that remains. If most sampled keys do not exist in the live cluster, the snapshot comes from another cluster.
+    6. `verdict` (`If`): on a pass, `kv.Set` remembers the last good drill and Slack gets the numbers. On a problem, `Fail` ends the execution FAILED with every problem found, and the `errors` block sends one alert that says which backup not to rely on and when the last good drill was.
+
+    ## What you get
+    - A Slack message per drill. These are from the test runs:
+      - "PASSED: `snapshots/etcd-b-rev2226.db` (0.0 h old, RPO 24 h) restored and serving in 1 s: 1775 keys, 0.2 MiB, revision 2226 (40 revisions behind the live cluster). HashKV at revision 2226 is identical on the restored member and the 3 live members that answered. Sample: 194 of 200 keys identical, 6 changed and 0 deleted since the snapshot."
+      - "FAILED at `drill_failed`: the sha256 etcd appended does not match the content (258080 bytes): bytes changed after etcd wrote the file, in storage or in transit"
+      - "FAILED at `drill_failed`: the file is 129040 bytes, not whole 512-byte pages plus etcd's 32-byte hash: it was cut short (an interrupted upload or copy, a full disk on the backup host)"
+      - "FAILED at `drill_failed`: 200 of 200 sampled keys do not exist in the live cluster: the snapshot is probably from another cluster, or most of the keyspace was deleted since"
+      - "FAILED at `drill_failed`: the restored database is 16.0 MiB, at or above the 8 MiB backend quota: a member restored from it starts in the NOSPACE alarm."
+    - `outputs.result`: `ok`, `key`, `age_hours`, `snapshot_revision`, `revisions_behind`, `restored_keys`, `restored_db_mb`, `restore_seconds`, `compare` (`hashkv` or `sample`), both hashes, the sample counts, `problems` and `warnings`.
+    - The KV entry `etcd_drill_last_good` with the time, key and revision of the last snapshot that passed.
+
+    ## Error handling
+    - Every finding is collected, so one run reports a stale *and* corrupt snapshot together, then the run ends FAILED.
+    - Infrastructure failures (no member answers, no leader, S3 unreachable, the scratch member cannot start) fail the task that hit them with the reason, and the `errors` block names that task.
+    - S3 calls retry with exponential backoff. The scratch member retries on a new random port if the first one is taken.
+    - The drill only reads from the live cluster (`endpoint status`, `alarm list`, `endpoint hashkv`, `get`). `snapshot save` runs only with `take_snapshot`, against the leader.
+    - `concurrency: limit 1` queues a webhook call that arrives while the nightly run is still restoring.
+
+    ## What this blueprint teaches about Kestra
+    - **S3-compatible storage with the AWS plugin**: `endpointOverride` and `forcePathStyle` point `s3.List`, `s3.Download` and `s3.Upload` at SeaweedFS, MinIO, Ceph or R2 as well as AWS.
+    - **`docker.Build` inside the flow**, to add a shell to a distroless tool image.
+    - **A script that reports instead of failing**: the drill emits a structured result whether it passes or not, and an `If` turns `ok: false` into a `Fail`. The outputs stay machine-readable for CI even when the drill fails, and the `errors` block sends the single alert.
+    - **The `jq` Pebble filter** to pick an object from a task's output list, and `trigger.body` with `??` so the webhook and manual runs share one flow.
+    - **Optional secrets**: `{{ inputs.tls ? secret('ETCD_CA_PEM') : '' }}` only reads the secret when TLS is on.
+
+    ## Prerequisites
+    - A Kestra worker that can run Docker containers and reach the etcd client URLs. The shell tasks use `networkMode: host`, so they reach whatever the worker host reaches, including the demo cluster on 127.0.0.1.
+    - Snapshots in an S3-compatible bucket, written by `etcdctl snapshot save` (RKE2, k3s, kubeadm backup jobs and most operators do this), or set `take_snapshot`.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: read access to the bucket (write too with `take_snapshot`).
+    - `SLACK_WEBHOOK_URL`.
+    - `ETCD_DRILL_WEBHOOK_KEY`: a long random string for the webhook.
+    - With `tls: true`: `ETCD_CA_PEM`, `ETCD_CERT_PEM`, `ETCD_KEY_PEM` (on kubeadm clusters: `/etc/kubernetes/pki/etcd/ca.crt` and the apiserver-etcd-client pair).
+
+    ### Inputs
+    - `endpoints` (every member's client URL), `bucket`, `prefix`, `snapshot_key`, `s3_endpoint`, `region`.
+    - `take_snapshot` (false), `rpo_hours` (24), `sample_keys` (200), `quota_backend_mb` (2048), `skip_hash_check` (false), `tls` (false).
+    - `etcd_version` (v3.5.17) and `build_image` (true).
+
+    ### Outputs
+    - `result` (JSON): the drill result described above, also when the drill fails.
+
+    ## Quick start
+    1. Start a three-member etcd and a local S3 (SeaweedFS) with one access key:
+       ```bash
+       for m in 1:2379 2:22379 3:32379; do n=${m%%:*}; c=${m#*:}; p=$((c + 1))
+         docker run -d --name etcd$n --network host quay.io/coreos/etcd:v3.5.17 etcd --name e$n --data-dir /data \
+           --listen-client-urls http://127.0.0.1:$c --advertise-client-urls http://127.0.0.1:$c \
+           --listen-peer-urls http://127.0.0.1:$p --initial-advertise-peer-urls http://127.0.0.1:$p \
+           --initial-cluster e1=http://127.0.0.1:2380,e2=http://127.0.0.1:22380,e3=http://127.0.0.1:32380
+       done
+       echo '{"identities":[{"name":"drill","credentials":[{"accessKey":"drill","secretKey":"drill-secret"}],"actions":["Admin","Read","Write","List"]}]}' > s3.json
+       docker run -d --name s3 --network host -v $PWD/s3.json:/s3.json chrislusf/seaweedfs server -s3 -s3.port=8333 -s3.config=/s3.json -volume.port=8088 -volume.max=5 -master.volumeSizeLimitMB=64 -dir=/data -ip=127.0.0.1
+       sleep 10; docker run --rm --network host -e AWS_ACCESS_KEY_ID=drill -e AWS_SECRET_ACCESS_KEY=drill-secret -e AWS_DEFAULT_REGION=us-east-1 \
+         amazon/aws-cli --endpoint-url http://127.0.0.1:8333 s3 mb s3://etcd-backups
+       ```
+    2. Add the secrets (`AWS_ACCESS_KEY_ID=drill`, `AWS_SECRET_ACCESS_KEY=drill-secret` for this demo), put a few keys in etcd (`etcdctl put /registry/pods/default/a 1`), then run once with `take_snapshot` checked. The next runs drill the newest snapshot in the bucket.
+    3. Real result from the test cluster (1,775 keys): PASSED, restored and serving in 1 s, HashKV identical on the restored member and the 3 live members.
+    4. Point `endpoints`, `bucket`, `prefix` and `s3_endpoint` at your cluster and backups, set `tls`, and call the webhook from your backup job.
+
+    ## How to read the result
+    - `revisions_behind` counts the writes the cluster accepted after the snapshot. They are what a restore loses; on Kubernetes, controllers recreate most of them, but not everything (leases, events, recently created objects).
+    - `compare: sample` is normal when the live cluster compacts often (kube-apiserver compacts every 5 minutes). Drill the snapshot right after the backup job writes it, through the webhook, to keep the exact HashKV comparison.
+    - "live members disagree" is about the cluster, not the backup: one member's data has diverged. Find it with `etcdctl endpoint hashkv --cluster`, remove and re-add it.
+
+    ## How to extend
+    - Restore with the same member layout as production (three scratch members) to also measure the time to a new quorum.
+    - Write the drill result to a table with the JDBC plugin to chart restore time and snapshot size over months.
+    - Chain the drill to your snapshot retention job, so old snapshots are only deleted after a newer one has passed.
+
+    ## Links
+    - [etcd disaster recovery](https://etcd.io/docs/v3.5/op-guide/recovery/)
+    - [etcdctl endpoint hashkv](https://github.com/etcd-io/etcd/tree/main/etcdctl#endpoint-hashkv)
+    - [Kubernetes: backing up an etcd cluster](https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/#backing-up-an-etcd-cluster)
+    - [Shell Commands](https://kestra.io/plugins/plugin-script-shell) with the [Docker task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.scripts.runner.docker.docker), and [Docker Build](https://kestra.io/plugins/plugin-docker/io.kestra.plugin.docker.build)
+    - [AWS S3 List, Download and Upload](https://kestra.io/plugins/plugin-aws/s3)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if), [Fail](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.fail), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule) and [Webhook](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.webhook) triggers
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+  subTags:
+    - Disaster Recovery
+    - Day 2 Operations
+  ee: false
+  demo: false
