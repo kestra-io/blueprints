@@ -1,0 +1,423 @@
+id: jaeger-slow-span-digest
+namespace: company.team
+description: |
+  Turn Jaeger trace data into a latency digest that escalates itself instead
+  of waiting for someone to notice a slow service in the UI. A keyed webhook
+  runs the digest on demand and a disabled hourly schedule holds the cadence
+  slot. The flow pulls recent traces from the Jaeger query API, falls back to
+  a bundled six span fixture when no collector answers, computes per service
+  p50 and p99 latency from the span durations, and compares each p99 against
+  a millisecond budget. Services over the budget are noted one by one,
+  tracked in a GitHub issue and announced on Slack, while a clean window is
+  only logged, and the verdict, slow services, worst p99 and trace count are
+  published as outputs.
+
+triggers:
+  - id: on_demand_digest
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: POST here to digest recent traces on demand, for example right after a deploy or an incident review.
+    key: "{{ secret('JAEGER_DIGEST_WEBHOOK_KEY') }}"
+  - id: hourly_digest
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly latency digest net, shipped disabled so nothing pages until an operator reviews the threshold and switches it on.
+    cron: "0 * * * *"
+    disabled: true
+
+inputs:
+  - id: jaeger_base_url
+    type: STRING
+    defaults: https://jaeger.example.test:16686
+    description: Base URL of the Jaeger query API, the fetch step appends /api/traces with the limit parameter.
+  - id: p99_threshold_ms
+    type: INT
+    defaults: 1000
+    description: Per service p99 latency budget in milliseconds, any service whose p99 exceeds this value counts as slow and is escalated.
+  - id: trace_limit
+    type: INT
+    defaults: 25
+    description: How many recent traces the Jaeger query API should return for the digest, the bundled fixture ignores this value.
+
+tasks:
+  # --- 1. trace workspace ---
+  - id: trace_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the trace fixture, the Jaeger response and the span parser all read the same files for the whole run.
+    tasks:
+      # --- 2. offline trace fixture ---
+      - id: write_traces_fixture
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Write a deterministic traces.json fixture with a heredoc, three traces and six spans where four spans stay fast and two spans blow past the one second budget, so the digest stays reproducible offline.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          entryPoint: []
+        containerImage: alpine:3.20
+        outputFiles:
+          - traces.json
+        commands:
+          - |
+            set -u
+            cat > traces.json <<'JSON'
+            {
+              "data": [
+                {
+                  "traceID": "aaa111bbb222",
+                  "spans": [
+                    {"spanID": "s1", "operationName": "GET /checkout", "process": {"serviceName": "checkout-api"}, "duration": 38000},
+                    {"spanID": "s2", "operationName": "GET /cart", "process": {"serviceName": "checkout-api"}, "duration": 42000},
+                    {"spanID": "s3", "operationName": "GET /search", "process": {"serviceName": "search-api"}, "duration": 29000}
+                  ]
+                },
+                {
+                  "traceID": "bbb222ccc333",
+                  "spans": [
+                    {"spanID": "s4", "operationName": "POST /checkout", "process": {"serviceName": "checkout-api"}, "duration": 55000}
+                  ]
+                },
+                {
+                  "traceID": "ccc333ddd444",
+                  "spans": [
+                    {"spanID": "s5", "operationName": "POST /payments/charge", "process": {"serviceName": "checkout-api"}, "duration": 3200000},
+                    {"spanID": "s6", "operationName": "GET /search/reindex", "process": {"serviceName": "search-api"}, "duration": 2100000}
+                  ]
+                }
+              ],
+              "total": 3,
+              "limit": 25,
+              "offset": 0,
+              "errors": null
+            }
+            JSON
+            echo "wrote $(wc -c < traces.json) bytes of trace fixture"
+
+      # --- 3. live trace fetch ---
+      - id: fetch_traces
+        type: io.kestra.plugin.core.http.Request
+        description: GET the Jaeger trace search endpoint with the configured limit and absorb a non 2xx answer, so an unreachable collector hands the digest to the fixture instead of failing the run.
+        method: GET
+        uri: "{{ inputs.jaeger_base_url }}/api/traces?service=&limit={{ inputs.trace_limit }}"
+        headers:
+          Accept: application/json
+        options:
+          allowFailed: true
+          followRedirects: true
+        timeout: PT30S
+
+      # --- 4. latency verdict ---
+      - id: analyze_traces
+        type: io.kestra.plugin.scripts.python.Script
+        description: Read the Jaeger response or the traces.json fixture, convert every span duration to milliseconds, compute per service p50 and p99, flag services whose p99 exceeds the budget, and emit the verdict through the outputs protocol.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        env:
+          JAEGER_BODY: "{{ (outputs.fetch_traces.body ?? '') | json }}"
+          P99_THRESHOLD_MS: "{{ inputs.p99_threshold_ms }}"
+        script: |
+          import json
+          import math
+          import os
+
+          FIXTURE = "traces.json"
+
+
+          def as_int(value, fallback):
+              try:
+                  return int(str(value).strip())
+              except (TypeError, ValueError):
+                  return fallback
+
+
+          def loads_payload(raw):
+              text = str(raw or "").strip()
+              if not text:
+                  return None
+              try:
+                  parsed = json.loads(text)
+              except ValueError:
+                  return None
+              if isinstance(parsed, str):
+                  try:
+                      parsed = json.loads(parsed)
+                  except ValueError:
+                      return None
+              return parsed if isinstance(parsed, (dict, list)) else None
+
+
+          def span_service(span):
+              process = span.get("process")
+              if isinstance(process, dict):
+                  name = str(process.get("serviceName") or "").strip()
+                  if name:
+                      return name
+              for key in ("serviceName", "service", "service_name"):
+                  name = str(span.get(key) or "").strip()
+                  if name:
+                      return name
+              return "unknown-service"
+
+
+          def span_duration_ms(span):
+              if "duration_ms" in span:
+                  try:
+                      return float(span["duration_ms"])
+                  except (TypeError, ValueError):
+                      return None
+              try:
+                  return float(span.get("duration")) / 1000.0
+              except (TypeError, ValueError):
+                  return None
+
+
+          def extract(document):
+              if isinstance(document, dict):
+                  traces = document.get("data")
+                  if not isinstance(traces, list):
+                      traces = [document] if document.get("spans") else []
+              elif isinstance(document, list):
+                  traces = document
+              else:
+                  return 0, []
+              spans = []
+              for trace in traces:
+                  if not isinstance(trace, dict):
+                      continue
+                  for span in trace.get("spans") or []:
+                      if not isinstance(span, dict):
+                          continue
+                      duration = span_duration_ms(span)
+                      if duration is None or duration < 0:
+                          continue
+                      spans.append((span_service(span), duration))
+              return len(traces), spans
+
+
+          def percentile(values, pct):
+              ordered = sorted(values)
+              if not ordered:
+                  return 0.0
+              rank = math.ceil(pct / 100.0 * len(ordered))
+              rank = max(1, min(rank, len(ordered)))
+              return float(ordered[rank - 1])
+
+
+          threshold = as_int(os.environ.get("P99_THRESHOLD_MS"), 1000)
+          if threshold < 1:
+              threshold = 1
+
+          document = loads_payload(os.environ.get("JAEGER_BODY"))
+          traces_scanned, spans = extract(document)
+          source = "jaeger_api" if spans else "fixture"
+
+          if not spans:
+              fixture_text = ""
+              try:
+                  with open(FIXTURE, "r", encoding="utf-8") as handle:
+                      fixture_text = handle.read()
+              except OSError:
+                  pass
+              traces_scanned, spans = extract(loads_payload(fixture_text))
+              source = "fixture" if spans else "none"
+
+          by_service = {}
+          for service, duration in spans:
+              by_service.setdefault(service, []).append(duration)
+
+          per_service = []
+          for service in sorted(by_service):
+              durations = by_service[service]
+              per_service.append({
+                  "service": service,
+                  "span_count": len(durations),
+                  "p50_ms": round(percentile(durations, 50), 2),
+                  "p99_ms": round(percentile(durations, 99), 2),
+              })
+
+          slow_services = sorted(
+              [row for row in per_service if row["p99_ms"] > threshold],
+              key=lambda row: -row["p99_ms"],
+          )
+
+          if not spans:
+              verdict = "NO_TRACE_DATA"
+              p99_ms = 0.0
+          elif slow_services:
+              verdict = "SLOW_SPANS"
+              p99_ms = float(max(row["p99_ms"] for row in per_service))
+          else:
+              verdict = "WITHIN_BUDGET"
+              p99_ms = float(max(row["p99_ms"] for row in per_service))
+
+          print("source=%s traces=%d spans=%d slow=%d p99=%.2fms threshold=%dms verdict=%s" % (
+              source, traces_scanned, len(spans), len(slow_services), p99_ms, threshold, verdict))
+          print("::" + json.dumps({"outputs": {
+              "verdict": verdict,
+              "slow_services": slow_services,
+              "p99_ms": round(p99_ms, 2),
+              "traces_scanned": int(traces_scanned),
+          }}) + "::")
+
+  # --- 5. slow span gate ---
+  - id: slow_span_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Branch on whether any service blew the p99 budget, so slow services escalate while a healthy trace window is only recorded.
+    condition: "{{ outputs.analyze_traces.vars.slow_services | length > 0 }}"
+    then:
+      # --- 6. per service notes ---
+      - id: note_slow_services
+        type: io.kestra.plugin.core.flow.Loop
+        description: Walk the slow services one at a time and write one execution log line per service with its p50, p99 and span count, so the digest leaves a readable trail before the escalation lands.
+        values: "{{ outputs.analyze_traces.vars.slow_services }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: note_slow_service
+            type: io.kestra.plugin.core.log.Log
+            description: Record the current slow service with its p50, p99 and span count against the configured budget.
+            message: "Slow service {{ item.value.service }} - p99 {{ item.value.p99_ms }}ms over the {{ inputs.p99_threshold_ms }}ms budget, p50 {{ item.value.p50_ms }}ms across {{ item.value.span_count }} span(s)."
+
+      # --- 7. track the slow services ---
+      - id: open_slow_span_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: Open a labeled issue on the sre runbooks repository listing every slow service with its p50 and p99, so the latency work lands in the backlog instead of a chat scrollback.
+        oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: your-org/sre-runbooks
+        title: "Slow services in Jaeger digest - {{ outputs.analyze_traces.vars.slow_services | length }} over {{ inputs.p99_threshold_ms }}ms p99"
+        body: |
+          ## Jaeger slow span digest
+
+          Verdict **{{ outputs.analyze_traces.vars.verdict }}** after scanning
+          **{{ outputs.analyze_traces.vars.traces_scanned }}** trace(s) against a
+          **{{ inputs.p99_threshold_ms }}ms** p99 budget. Worst service p99 is
+          **{{ outputs.analyze_traces.vars.p99_ms }}ms**.
+
+          ### Slow services
+
+          {% for row in outputs.analyze_traces.vars.slow_services %}
+          - `{{ row.service }}` - p99 {{ row.p99_ms }}ms, p50 {{ row.p50_ms }}ms, {{ row.span_count }} span(s)
+          {% endfor %}
+
+          Execution {{ execution.id }}
+
+          Profile the listed services in Jaeger, confirm whether the slow window lines up
+          with a deploy, then close this issue once a digest run reports WITHIN_BUDGET.
+        labels:
+          - jaeger
+          - latency
+
+      # --- 8. channel alert ---
+      - id: alert_slow_spans
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the ops channel how many services missed the p99 budget and which one is worst, right after the notes and the issue exist.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "Jaeger digest {{ outputs.analyze_traces.vars.verdict }} - {{ outputs.analyze_traces.vars.slow_services | length }} service(s) over the {{ inputs.p99_threshold_ms }}ms p99 budget across {{ outputs.analyze_traces.vars.traces_scanned }} trace(s). Worst p99 {{ outputs.analyze_traces.vars.p99_ms }}ms. Issue opened in your-org/sre-runbooks. Execution {{ execution.id }}."
+          }
+    else:
+      # --- 9. all clear ---
+      - id: log_within_budget
+        type: io.kestra.plugin.core.log.Log
+        description: Record the healthy trace window so the execution history still proves which digest ran and what the worst p99 was.
+        message: "Jaeger digest {{ outputs.analyze_traces.vars.verdict }} - worst p99 {{ outputs.analyze_traces.vars.p99_ms }}ms inside the {{ inputs.p99_threshold_ms }}ms budget across {{ outputs.analyze_traces.vars.traces_scanned }} trace(s), no service escalated."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    description: SLOW_SPANS when at least one service exceeded the p99 budget, WITHIN_BUDGET when every service stayed under it, otherwise NO_TRACE_DATA.
+    value: "{{ outputs.analyze_traces.vars.verdict }}"
+  - id: slow_services
+    type: ARRAY
+    description: 'Services whose p99 exceeded the budget as objects, for example [{"service": "checkout-api", "span_count": 4, "p50_ms": 42.0, "p99_ms": 3200.0}], sorted worst p99 first.'
+    value: "{{ outputs.analyze_traces.vars.slow_services | toJson }}"
+  - id: p99_ms
+    type: FLOAT
+    description: Worst per service p99 latency in milliseconds, 3200.0 against the bundled fixture and 0.0 when no spans could be read.
+    value: "{{ outputs.analyze_traces.vars.p99_ms }}"
+  - id: traces_scanned
+    type: INT
+    description: Number of Jaeger traces the digest read from the API response or the fixture, 3 for the bundled six span fixture.
+    value: "{{ outputs.analyze_traces.vars.traces_scanned }}"
+
+extend:
+  title: Find Slow Jaeger Services and Escalate the Latency Digest
+  metaTitle: Jaeger Slow Span Digest with P99 Escalation
+  shortDescription: Pull recent Jaeger traces, compute per service p50 and p99, and escalate services over the p99 budget through GitHub and Slack.
+  metaDescription: Pulls recent Jaeger traces, computes per service p50 and p99 latency, and escalates services over the p99 budget to GitHub and Slack.
+  description: |
+    A latency spike that only lives in the tracing UI is a latency spike nobody owns. This flow gives the trace window a verdict and an escalation path. A keyed webhook triggers an on-demand digest and a disabled hourly schedule holds the cadence. The flow queries the Jaeger trace search API, keeps a bundled six span fixture when no collector answers, and turns span durations into per service p50 and p99 figures. Services over the p99 budget are noted one per line, filed as a GitHub issue and posted to Slack, while a clean window is logged and the verdict, slow services, worst p99 and trace count ship as typed outputs.
+
+    ## How it works
+
+    1. `on_demand_digest` (`io.kestra.plugin.core.trigger.Webhook`) exposes a keyed URL for post-deploy or post-incident checks, and `hourly_digest` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 * * * *`) ships `disabled: true` so nothing runs until the cadence is switched on.
+    2. `trace_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) opens one shared filesystem so the fixture, the API response and the parser all see the same files.
+    3. `write_traces_fixture` (`io.kestra.plugin.scripts.shell.Commands` on the `io.kestra.plugin.scripts.runner.docker.Docker` runner, image `alpine:3.20`) writes `traces.json` with a heredoc in the Jaeger `/api/traces` shape. The fixture holds three traces and six spans across `checkout-api` and `search-api`, four spans stay between 29ms and 55ms while two spans land at 3200ms and 2100ms, so the offline p99 is 3200.0ms against the 1000ms default budget. `entryPoint: []` clears the image entrypoint so the shell script runs instead of a server command.
+    4. `fetch_traces` (`io.kestra.plugin.core.http.Request`) GETs `{{ inputs.jaeger_base_url }}/api/traces?service=&limit={{ inputs.trace_limit }}` with `Accept: application/json`, and `options.allowFailed` lets a 4xx, 5xx or timeout answer through so the digest continues on the fixture instead of dying.
+    5. `analyze_traces` (`io.kestra.plugin.scripts.python.Script` on `python:3.12-slim`) prefers the `data` array from the Jaeger response and falls back to `traces.json` when the body is missing or unparseable. Every span duration is converted from Jaeger microseconds to milliseconds, grouped by `process.serviceName`, and scored with nearest rank p50 and p99. A service is slow when `p99_ms > p99_threshold_ms`. The verdict, the slow service rows, the worst p99 and the trace count are printed as a single `::{"outputs": ...}::` line.
+    6. `slow_span_gate` (`io.kestra.plugin.core.flow.If`) branches on `slow_services | length > 0`. Above zero, `note_slow_services` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) writes one `core.log.Log` note per slow service, `open_slow_span_issue` (`io.kestra.plugin.github.issues.Create`) files a labeled issue listing every slow service with its p50 and p99, and `alert_slow_spans` posts the counts to Slack. At zero, `log_within_budget` records the quiet window.
+    7. The flow level `errors` handler (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) reports any failure with the execution id, because a digest that dies silently looks exactly like a healthy service.
+
+    ## What you get
+
+    - A latency verdict per run, `SLOW_SPANS`, `WITHIN_BUDGET` or `NO_TRACE_DATA`, with the worst service p99 as a float any downstream flow can gate on.
+    - Per service p50 and p99 math instead of a single average, so one slow endpoint is not averaged away by its fast siblings.
+    - Escalation where engineers already work, one log note per slow service, a labeled GitHub issue carrying the full slow list, and a Slack ping with the counts, plus a quiet log when everything is inside the budget.
+    - Offline determinism, the bundled fixture always reports checkout-api at a 3200.0ms p99, so the first run proves the escalation path before a real collector is wired up.
+
+    ## Who it's for
+
+    - SRE and platform teams who own latency objectives and want a p99 digest that escalates itself instead of relying on someone opening Jaeger.
+    - On-call engineers who need slow services to arrive as a channel message and a backlog issue with the numbers attached.
+    - Backend developers tracking whether a deploy pushed a service past its p99 budget.
+
+    ## Why orchestrate this with Kestra
+
+    A Jaeger bookmark and a dashboard do not create work when latency slips. Kestra wraps the check in the pieces a dashboard cannot provide, a keyed webhook for post-deploy runs, a disabled hourly schedule as the safety net, an HTTP step that degrades to a fixture instead of failing, a branch that separates slow from healthy, a loop that leaves one log line per offender, and routing into GitHub and Slack from one version controlled file. The same file carries the budget, the escalation policy and the execution history that proves the digest actually ran.
+
+    ## Prerequisites
+
+    - A worker with Docker access, the fixture is written in `alpine:3.20` and the analysis runs in `python:3.12-slim`.
+    - A Jaeger query API reachable at the `jaeger_base_url` input, or rely on the bundled fixture while you trial the flow.
+    - A GitHub token that can open issues in the repository named on `open_slow_span_issue` (classic PAT scope `repo`, or fine-grained **Issues: write**).
+    - A Slack incoming webhook for the slow span alert and for failure alerts.
+
+    ### Secrets
+
+    - `JAEGER_DIGEST_WEBHOOK_KEY`: key segment guarding the on demand webhook URL, anyone holding it can start a digest.
+    - `GITHUB_TOKEN`: token used to open the slow service issue.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL for the slow span alert and for failure alerts.
+
+    ## Quick start
+
+    1. Add the three secrets to your Kestra namespace.
+    2. Run the flow once with defaults and confirm `verdict` reads `SLOW_SPANS`, `slow_services` lists checkout-api at 3200.0ms and search-api at 2100.0ms, `p99_ms` reads 3200.0 and `traces_scanned` reads 3.
+    3. Raise `p99_threshold_ms` to 5000 and re-run to watch the gate flip to `log_within_budget` with `verdict` `WITHIN_BUDGET`.
+    4. Trigger `on_demand_digest` at `/api/v1/{tenant}/executions/webhook/{namespace}/jaeger-slow-span-digest/{JAEGER_DIGEST_WEBHOOK_KEY}`, then enable `hourly_digest` once the worker can reach Jaeger.
+    5. Point `open_slow_span_issue.repository` at your own runbooks repository before the first slow run.
+
+    ## How to extend
+
+    - Scope the query to one service by adding the service name to the `fetch_traces` uri when `service=` should not stay empty.
+    - Store every digest row with `io.kestra.plugin.jdbc.postgresql.Queries` so p99 drift is chartable over quarters.
+    - Fan the digest out per namespace with `io.kestra.plugin.core.flow.Subflow` when several Jaeger deployments must be checked each hour.
+    - Add a p50 guard beside the p99 guard inside `analyze_traces` when steady state creep matters as much as tail latency.
+
+    ## Links
+
+    - [Jaeger trace search API](https://www.jaegertracing.io/docs/latest/api/#operation-findtraces)
+    - [Kestra HTTP request task](https://kestra.io/plugins/core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Kestra GitHub plugin](https://kestra.io/plugins/plugin-github)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Reporting & Digests
+  ee: false
+  demo: false

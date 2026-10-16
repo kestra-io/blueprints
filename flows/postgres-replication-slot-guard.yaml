@@ -1,0 +1,370 @@
+id: postgres-replication-slot-guard
+namespace: company.team
+description: |
+  Catch replication slots that hold back WAL before they fill the disk.
+  A slot whose consumer stopped (a crashed CDC connector, a removed replica)
+  keeps every WAL segment from that point on. The flow tracks each slot,
+  alerts once per change of severity, and proposes dropping long-dead slots
+  to the on-call engineer, re-checking each one before it is dropped.
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: wal_retention
+    type: io.kestra.plugin.jdbc.postgresql.Trigger
+    description: Event-based check every minute. It starts a run only when a slot retains more WAL than the warning threshold (1 GiB here, keep it in sync with warn_mb) or has lost its reserved WAL. Shipped disabled; enable it after adding the secrets.
+    disabled: true
+    interval: PT1M
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT slot_name FROM pg_replication_slots
+      WHERE wal_status IN ('unreserved', 'lost')
+         OR pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 1024 * 1048576
+      LIMIT 1
+  - id: hourly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Regular check that also reports recoveries and re-asks about slots nobody has dealt with. Shipped disabled.
+    disabled: true
+    cron: "0 * * * *"
+
+inputs:
+  - id: warn_mb
+    type: INT
+    defaults: 1024
+    description: WAL retained by a slot, in MiB, that raises a warning.
+  - id: critical_mb
+    type: INT
+    defaults: 4096
+    description: WAL retained, in MiB, that is critical. A slot whose wal_status is unreserved or lost is always critical.
+  - id: drop_after_hours
+    type: INT
+    defaults: 24
+    description: A critical slot must have been inactive this long before the flow proposes dropping it.
+  - id: ask_again_hours
+    type: INT
+    defaults: 12
+    description: After a proposal is answered or ignored, wait this long before proposing the same slot again.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link in Slack.
+
+tasks:
+  - id: check_server
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Fail fast when the database is unreachable or too old, and find out whether this role may drop slots.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT CAST(current_setting('server_version_num') AS INT) AS version_num,
+             current_setting('server_version') AS version,
+             (SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = current_user) AS can_drop
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: version_guard
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_server.row.version_num < 130000 }}"
+    then:
+      - id: unsupported_version
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "PostgreSQL {{ outputs.check_server.row.version }} is not supported: the wal_status column this flow relies on needs PostgreSQL 13 or newer."
+
+  - id: ensure_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: State between runs, so each slot is reported once per change and inactivity can be measured.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS replication_slot_watch (
+        slot_name          TEXT PRIMARY KEY,
+        level              TEXT NOT NULL DEFAULT 'ok',
+        wal_status         TEXT,
+        restart_lsn        TEXT,
+        first_inactive_at  TIMESTAMPTZ,
+        asked_at           TIMESTAMPTZ,
+        updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+
+  - id: inspect_slots
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Measure the WAL each slot holds back, classify it, and update the watch table in one statement. Slots that disappeared are reported as removed.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      warn_mb: "{{ inputs.warn_mb }}"
+      critical_mb: "{{ inputs.critical_mb }}"
+      drop_after_hours: "{{ inputs.drop_after_hours }}"
+      ask_again_hours: "{{ inputs.ask_again_hours }}"
+    sql: |
+      WITH s AS (
+        SELECT slot_name, slot_type, coalesce(database, '') AS database, active, coalesce(wal_status, 'unknown') AS wal_status,
+               CAST(restart_lsn AS TEXT) AS restart_lsn,
+               coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) AS retained_bytes
+        FROM pg_replication_slots
+      ),
+      lvl AS (
+        SELECT s.*, CASE
+          WHEN s.wal_status IN ('unreserved', 'lost') OR s.retained_bytes >= CAST(:critical_mb AS NUMERIC) * 1048576 THEN 'critical'
+          WHEN s.retained_bytes >= CAST(:warn_mb AS NUMERIC) * 1048576 THEN 'warn'
+          ELSE 'ok' END AS level
+        FROM s
+      ),
+      prev AS (SELECT slot_name, level, wal_status FROM replication_slot_watch),
+      up AS (
+        INSERT INTO replication_slot_watch AS w (slot_name, level, wal_status, restart_lsn, first_inactive_at, updated_at)
+        SELECT slot_name, level, wal_status, restart_lsn, CASE WHEN active THEN NULL ELSE now() END, now() FROM lvl
+        ON CONFLICT (slot_name) DO UPDATE SET
+          level = EXCLUDED.level,
+          wal_status = EXCLUDED.wal_status,
+          restart_lsn = EXCLUDED.restart_lsn,
+          first_inactive_at = CASE WHEN EXCLUDED.first_inactive_at IS NULL THEN NULL
+                                   ELSE coalesce(w.first_inactive_at, EXCLUDED.first_inactive_at) END,
+          updated_at = now()
+        RETURNING w.slot_name, w.first_inactive_at, w.asked_at
+      ),
+      gone AS (
+        DELETE FROM replication_slot_watch WHERE slot_name NOT IN (SELECT slot_name FROM s)
+        RETURNING slot_name, level
+      )
+      SELECT l.slot_name, l.slot_type, l.database, l.active, l.wal_status, l.restart_lsn,
+             round(l.retained_bytes / 1048576.0, 1) AS retained_mb,
+             l.level, coalesce(p.level, 'ok') AS previous_level,
+             (l.level <> coalesce(p.level, 'ok')
+              OR (l.wal_status = 'lost' AND p.wal_status IS DISTINCT FROM 'lost')) AS changed,
+             coalesce(round(CAST(extract(epoch FROM now() - u.first_inactive_at) / 3600.0 AS NUMERIC), 1), 0) AS inactive_hours,
+             (l.level = 'critical' AND NOT l.active
+              AND u.first_inactive_at <= now() - make_interval(hours => CAST(:drop_after_hours AS INT))
+              AND (u.asked_at IS NULL OR u.asked_at <= now() - make_interval(hours => CAST(:ask_again_hours AS INT)))) AS drop_candidate
+      FROM lvl l JOIN up u USING (slot_name) LEFT JOIN prev p USING (slot_name)
+      UNION ALL
+      SELECT slot_name, '', '', false, 'removed', '', 0, 'ok', level, level <> 'ok', 0, false FROM gone
+      ORDER BY 7 DESC
+
+  - id: report_changes
+    type: io.kestra.plugin.core.flow.If
+    description: Post only what changed since the last run, so a slot that stays critical does not page every minute.
+    condition: "{{ outputs.inspect_slots.rows | jq('[.[] | select(.changed)] | length') | first > 0 }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Replication slots on {{ outputs.check_server.row.version | split(' ') | first }} changed:
+          {% for s in outputs.inspect_slots.rows %}{% if s.changed %}{% if s.wal_status == 'removed' %}- `{{ s.slot_name }}` was removed; it no longer holds WAL (was {{ s.previous_level }}).
+          {% elseif s.level == 'ok' %}- `{{ s.slot_name }}` recovered: {{ s.retained_mb }} MiB retained, {{ s.active ? 'active' : 'inactive' }}.
+          {% else %}- {{ s.level | upper }} `{{ s.slot_name }}` ({{ s.slot_type }}{% if s.database != '' %}, {{ s.database }}{% endif %}): retains {{ s.retained_mb }} MiB of WAL, {{ s.active ? 'active' : 'inactive for ' ~ s.inactive_hours ~ ' h' }}, wal_status {{ s.wal_status }}.{% if s.wal_status == 'lost' %} The WAL it needed is gone: its consumer can no longer resume and must re-sync.{% elseif not s.active %} Its consumer has stopped reading; restart it, or drop the slot if it is no longer needed.{% else %} Its consumer is connected but falling behind.{% endif %}
+          {% endif %}{% endif %}{% endfor %}
+
+  - id: propose_drops
+    type: io.kestra.plugin.core.flow.If
+    description: Ask the on-call engineer before dropping anything. Dropping a slot frees the WAL but forces its consumer to re-sync from scratch.
+    condition: "{{ outputs.inspect_slots.rows | jq('[.[] | select(.drop_candidate)] | length') | first > 0 }}"
+    then:
+      - id: mark_asked
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        parameters:
+          names: "{{ outputs.inspect_slots.rows | jq('[.[] | select(.drop_candidate) | .slot_name] | join(\",\")') | first }}"
+        sql: UPDATE replication_slot_watch SET asked_at = now() WHERE slot_name = ANY(string_to_array(:names, ','))
+
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          These inactive replication slots are critical and could be dropped to free WAL:
+          {% for s in outputs.inspect_slots.rows %}{% if s.drop_candidate %}- `{{ s.slot_name }}` ({{ s.slot_type }}{% if s.database != '' %}, {{ s.database }}{% endif %}): {{ s.retained_mb }} MiB retained, inactive for {{ s.inactive_hours }} h, wal_status {{ s.wal_status }}
+          {% endif %}{% endfor %}Dropping a slot cannot be undone: its consumer (CDC connector, replica) has to re-sync from a fresh snapshot.
+          {% if not outputs.check_server.row.can_drop %}This flow's database role cannot drop slots (it needs REPLICATION); drop them manually with pg_drop_replication_slot.{% else %}To drop, enter the slot names in the resume form within 4 hours: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}. Leave it empty to keep them; you will be asked again in {{ inputs.ask_again_hours }} h if they are still critical.{% endif %}
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.If
+        description: Only wait for an answer when this role is allowed to drop slots.
+        condition: "{{ outputs.check_server.row.can_drop }}"
+        then:
+          - id: wait_for_decision
+            type: io.kestra.plugin.core.flow.Pause
+            description: No answer within 4 hours means keep everything.
+            pauseDuration: PT4H
+            behavior: RESUME
+            onResume:
+              - id: drop_slots
+                type: STRING
+                required: false
+                description: Comma-separated names of the proposed slots to drop. Leave empty to keep them.
+              - id: note
+                type: STRING
+                required: false
+                description: Optional reason, included in the Slack confirmation.
+
+          - id: drop_requested
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.wait_for_decision.onResume.drop_slots ?? '') | trim != '' }}"
+            then:
+              - id: drop_slots
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Drop a slot only if it was proposed, is still inactive, and has not advanced since the proposal. Anything else is refused with the reason.
+                url: "{{ secret('POSTGRES_URL') }}"
+                username: "{{ secret('POSTGRES_USER') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH
+                parameters:
+                  names: "{{ outputs.wait_for_decision.onResume.drop_slots }}"
+                  proposed: "{{ outputs.inspect_slots.rows | jq('[.[] | select(.drop_candidate) | .slot_name] | join(\",\")') | first }}"
+                  proposed_lsns: "{{ outputs.inspect_slots.rows | jq('[.[] | select(.drop_candidate) | {(.slot_name): .restart_lsn}] | add') | first | toJson }}"
+                sql: |
+                  WITH req AS (
+                    SELECT DISTINCT trim(x) AS slot_name FROM unnest(string_to_array(:names, ',')) x WHERE trim(x) <> ''
+                  ),
+                  target AS (
+                    SELECT r.slot_name, s.active, CAST(s.restart_lsn AS TEXT) AS lsn,
+                           CAST(:proposed_lsns AS JSONB) ->> r.slot_name AS proposed_lsn,
+                           r.slot_name = ANY(string_to_array(:proposed, ',')) AS proposed,
+                           s.slot_name IS NOT NULL AS slot_exists
+                    FROM req r LEFT JOIN pg_replication_slots s USING (slot_name)
+                  ),
+                  checked AS (
+                    -- one eligibility flag decides both the drop and the reported result
+                    SELECT target.*, (proposed AND slot_exists AND NOT active
+                                      AND lsn IS NOT DISTINCT FROM proposed_lsn) AS eligible
+                    FROM target
+                  )
+                  SELECT slot_name,
+                    CASE
+                      WHEN eligible THEN 'dropped'
+                      WHEN NOT proposed THEN 'refused: it was not proposed for dropping'
+                      WHEN NOT slot_exists THEN 'already gone'
+                      WHEN active THEN 'refused: its consumer reconnected'
+                      ELSE 'refused: it advanced since the proposal (' || coalesce(proposed_lsn, 'none') || ' to ' || coalesce(lsn, 'none') || ')'
+                    END AS result,
+                    CASE WHEN eligible
+                      THEN (SELECT count(*) FROM (SELECT pg_drop_replication_slot(checked.slot_name)) d) ELSE 0 END AS dropped
+                  FROM checked
+                  ORDER BY slot_name
+              - id: notify_drop_result
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: |
+                  Replication slot clean-up{% if (outputs.wait_for_decision.onResume.note ?? '') != '' %} ({{ outputs.wait_for_decision.onResume.note }}){% endif %}:
+                  {% for r in outputs.drop_slots.rows %}- `{{ r.slot_name }}`: {{ r.result }}
+                  {% endfor %}
+            else:
+              - id: log_kept
+                type: io.kestra.plugin.core.log.Log
+                message: "No slot was selected for dropping. The proposal will be repeated in {{ inputs.ask_again_hours }} h if the slots are still critical."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Replication slot guard failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      Slots were not checked in this run; nothing was dropped unless a clean-up result was posted.
+
+outputs:
+  - id: slots
+    type: JSON
+    description: Every slot with its retained WAL, severity, and whether it was proposed for dropping.
+    value: "{{ outputs.inspect_slots.rows ?? [] }}"
+
+extend:
+  title: Stop Stale Replication Slots from Filling Your Postgres Disk
+  shortDescription: Track the WAL each replication slot holds back, alert once per change of severity, and drop long-dead slots only after on-call approval and a last safety check.
+  metaTitle: PostgreSQL Replication Slot WAL Guard with Kestra
+  metaDescription: Detect inactive PostgreSQL replication slots retaining WAL, alert without spam, and drop dead slots safely after on-call approval.
+  description: |
+    A replication slot makes PostgreSQL keep every WAL segment its consumer has not confirmed yet. When the consumer stops (a Debezium connector that crashed, a CDC job that was switched off, a replica that was deleted), the slot keeps holding WAL until the disk fills and the database stops accepting writes. This blueprint watches every slot, tells you early and only when something changes, and helps you clean up dead slots without ever dropping one whose consumer is still alive.
+
+    ## How it works
+
+    1. `wal_retention` (`io.kestra.plugin.jdbc.postgresql.Trigger`) polls every minute and starts a run only when a slot holds more WAL than the warning threshold or has lost its reserved WAL. `hourly_check` (`Schedule`) runs regardless, to report recoveries.
+    2. `check_server` fails fast if the database is unreachable, and records whether the role may drop slots. `version_guard` (`If`) requires PostgreSQL 13+.
+    3. `inspect_slots` measures the WAL each slot retains (`pg_wal_lsn_diff` from `restart_lsn`) and classifies it in one SQL statement:
+       - `ok`, `warn` (`warn_mb`), `critical` (`critical_mb`, or `wal_status` `unreserved`/`lost`)
+       - it updates the `replication_slot_watch` table with the level, position, and when the slot became inactive
+       - slots that disappeared are reported as removed
+    4. `report_changes` (`If`) posts only the slots whose level changed, or that just lost their WAL, with what to do about each.
+    5. `propose_drops` (`If`) lists critical slots inactive for `drop_after_hours`. If the role may drop slots, `wait_for_decision` (`Pause`) waits up to 4 hours for the on-call engineer to enter the names to drop.
+    6. `drop_slots` drops a slot only if it was proposed, is still inactive, and its position has not moved since the proposal. Every name gets a result line in Slack.
+
+    ## Error handling
+
+    - **No alert storms.** A slot is reported when its level changes, so a slot that stays critical does not page every minute. A proposal is not repeated for `ask_again_hours`.
+    - **No unsafe drops.** The drop is re-checked in the same statement that performs it. A slot whose consumer reconnected, or that advanced since the proposal, is refused with the reason, for example "refused: it advanced since the proposal (0/28E3B080 to 0/35C4FDF0)". Names that were never proposed (typos, healthy slots) are refused too.
+    - **No answer means keep.** The approval `Pause` resumes after 4 hours with nothing selected.
+    - **Least privilege.** Monitoring only needs to read `pg_replication_slots`. When the role lacks `REPLICATION`, the proposal says so and the flow does not wait for an approval it cannot carry out.
+    - **Clear failures.** `check_server` retries with backoff; if the database stays unreachable, the `errors` block names the task and cause and says that nothing was dropped.
+
+    ## What this blueprint teaches about Kestra
+
+    - An event-based JDBC `Trigger` whose query is the alert condition, so the flow runs only when there is something to look at.
+    - Keeping state between runs in a table to turn level-triggered checks into change notifications.
+    - An approval `Pause` with `behavior: RESUME` as a safe default, and a re-check at execution time, so human approval never acts on stale data.
+    - Bound SQL `parameters` for values typed by people.
+
+    ## Prerequisites
+
+    - PostgreSQL 13 or newer.
+    - A role that can read `pg_replication_slots` and create the `replication_slot_watch` table, for example `CREATE ROLE slot_guard LOGIN PASSWORD '...'; GRANT pg_monitor TO slot_guard; GRANT CREATE ON SCHEMA public TO slot_guard;`. Add `REPLICATION` (`ALTER ROLE slot_guard REPLICATION;`) if the flow should drop slots.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: JDBC URL of the database to watch (for example `jdbc:postgresql://db:5432/app`) and the role above.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `warn_mb` (INT, default 1024), `critical_mb` (INT, default 4096): WAL retained per slot, in MiB. Keep the trigger's threshold in sync with `warn_mb`.
+    - `drop_after_hours` (INT, default 24): how long a critical slot must be inactive before it is proposed for dropping.
+    - `ask_again_hours` (INT, default 12): how long to wait before proposing the same slot again.
+    - `kestra_url` (STRING): base URL for the approval link.
+
+    ### Outputs
+
+    - `slots` (JSON): every slot with its retained WAL in MiB, level, activity, and whether it was proposed for dropping.
+
+    ## Quick start
+
+    1. Create the role and add the secrets.
+    2. Run the flow manually once: it creates `replication_slot_watch` and reports any slot already above the thresholds.
+    3. Enable `wal_retention` and `hourly_check`.
+    4. Optionally set `max_slot_wal_keep_size` in PostgreSQL as a hard limit: slots that pass it become `lost` instead of filling the disk, and this flow reports them.
+
+    ## How to extend
+
+    - Page through PagerDuty or Opsgenie instead of Slack for `critical` changes.
+    - Watch several databases by turning `check_server` and `inspect_slots` into a subflow called once per database.
+    - Restart the consumer automatically, for example a Debezium connector through the Kafka Connect REST API, before proposing a drop.
+
+    ## Links
+
+    - [PostgreSQL replication slots](https://www.postgresql.org/docs/current/warm-standby.html#STREAMING-REPLICATION-SLOTS)
+    - [pg_replication_slots view](https://www.postgresql.org/docs/current/view-pg-replication-slots.html)
+    - [max_slot_wal_keep_size](https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false

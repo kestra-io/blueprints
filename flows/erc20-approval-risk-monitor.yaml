@@ -1,0 +1,685 @@
+id: erc20-approval-risk-monitor
+namespace: company.team
+description: |
+  Find risky ERC-20 token approvals granted by your wallets and revoke them.
+  Approval events are scanned incrementally, the current allowance of every
+  approval is read from the chain, and each one is classified: unlimited
+  approvals to unvetted contracts, approvals to plain wallets, and approvals
+  to denylisted addresses. Slack hears about changes only, and on-call can
+  revoke the risky ones from the approval form.
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: address_activity
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Point an address-activity webhook (Alchemy Notify, QuickNode Streams, Moralis Streams) for your wallets here, so a new approval is checked within seconds.
+    key: erc20-approvals-change-me
+  - id: periodic_scan
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Regular scan that also catches allowances changed by spending. Shipped disabled.
+    disabled: true
+    cron: "*/15 * * * *"
+
+inputs:
+  - id: owners
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "0x0000000000000000000000000000000000000000"
+    description: Wallets whose approvals are watched (treasury, hot wallets, deployers). Replace the placeholder with your addresses.
+  - id: allowlist
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+    description: Spender contracts you trust (the default is Uniswap's Permit2), for example your DEX router, bridge, or payment processor. Approvals to them are never flagged.
+  - id: denylist
+    type: ARRAY
+    itemType: STRING
+    defaults: []
+    description: Known malicious or exploited addresses, for example from your security provider's feed. Any approval to them is critical.
+  - id: start_block
+    type: INT
+    defaults: 0
+    description: First block to scan on the very first run. Use the block your wallets were created in.
+  - id: confirmations
+    type: INT
+    defaults: 12
+    description: Blocks to wait before scanning a block, so a reorg cannot hide or invent an approval.
+  - id: max_blocks_per_run
+    type: INT
+    defaults: 5000
+    description: Blocks scanned per run. Most RPC providers limit eth_getLogs ranges; later runs continue where this one stopped.
+  - id: revoke_enabled
+    type: BOOL
+    defaults: false
+    description: Send revocations through the EVM_SIGNER_URL signer. When false, risky approvals are reported with instructions to revoke them from the wallet.
+  - id: ask_again_hours
+    type: INT
+    defaults: 12
+    description: Wait this long before proposing the same approval for revocation again.
+  - id: explorer_url
+    type: STRING
+    defaults: https://etherscan.io
+    description: Block explorer for links in Slack.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link.
+
+tasks:
+  - id: validate_addresses
+    type: io.kestra.plugin.core.flow.If
+    description: A mistyped address would silently watch nothing, so reject anything that is not 0x followed by 40 hex characters.
+    condition: "{{ (inputs.owners + inputs.allowlist + inputs.denylist) | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | length') | first > 0 }}"
+    then:
+      - id: invalid_addresses
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "These entries in owners, allowlist, or denylist are not valid addresses: {{ (inputs.owners + inputs.allowlist + inputs.denylist) | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | join(\", \")') | first }}"
+
+  - id: node_check
+    type: io.kestra.plugin.core.http.Request
+    description: Read the chain id and head in one batch request; fails fast when the RPC endpoint is down or misconfigured.
+    uri: "{{ secret('EVM_RPC_URL') }}"
+    method: POST
+    contentType: application/json
+    body: '[{"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}, {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []}]'
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: ensure_tables
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS approval_scan_cursor (
+        chain_id    BIGINT NOT NULL,
+        owner       TEXT NOT NULL,
+        last_block  BIGINT NOT NULL,
+        PRIMARY KEY (chain_id, owner)
+      );
+      CREATE TABLE IF NOT EXISTS token_approvals (
+        id                   BIGSERIAL PRIMARY KEY,
+        chain_id             BIGINT NOT NULL,
+        owner                TEXT NOT NULL,
+        token                TEXT NOT NULL,
+        spender              TEXT NOT NULL,
+        symbol               TEXT,
+        decimals             INT,
+        allowance            NUMERIC(78, 0),
+        unlimited            BOOLEAN,
+        spender_is_contract  BOOLEAN,
+        risk                 TEXT,
+        reason               TEXT,
+        last_event_block     BIGINT,
+        proposed_at          TIMESTAMPTZ,
+        revoke_tx            TEXT,
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (chain_id, owner, token, spender)
+      );
+
+  - id: plan_scan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Work out the block range to scan, from the oldest owner cursor up to the head minus the confirmation depth. A newly added owner has no cursor and is scanned from start_block.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters:
+      chain_hex: "{{ outputs.node_check.body | jq('.[] | select(.id == 1) | .result') | first }}"
+      head_hex: "{{ outputs.node_check.body | jq('.[] | select(.id == 2) | .result') | first }}"
+      owners: "{{ inputs.owners | join(',') | lower }}"
+      start_block: "{{ inputs.start_block }}"
+      confirmations: "{{ inputs.confirmations }}"
+      max_blocks: "{{ inputs.max_blocks_per_run }}"
+    sql: |
+      WITH chain AS (
+        SELECT CAST(CAST('x' || lpad(substr(:chain_hex, 3), 16, '0') AS BIT(64)) AS BIGINT) AS chain_id,
+               CAST(CAST('x' || lpad(substr(:head_hex, 3), 16, '0') AS BIT(64)) AS BIGINT) AS head
+      ),
+      owners AS (SELECT DISTINCT trim(o) AS owner FROM unnest(string_to_array(:owners, ',')) o),
+      cur AS (
+        SELECT c.chain_id, c.head,
+               min(coalesce(k.last_block, CAST(:start_block AS BIGINT) - 1)) + 1 AS from_block
+        FROM chain c CROSS JOIN owners o
+        LEFT JOIN approval_scan_cursor k ON k.chain_id = c.chain_id AND k.owner = o.owner
+        GROUP BY c.chain_id, c.head
+      ),
+      r AS (
+        SELECT chain_id, head, from_block,
+               least(head - CAST(:confirmations AS BIGINT), from_block + CAST(:max_blocks AS BIGINT) - 1) AS to_block
+        FROM cur
+      )
+      SELECT chain_id, head, from_block, to_block, to_block >= from_block AS has_range,
+             '0x' || to_hex(from_block) AS from_hex, '0x' || to_hex(greatest(to_block, 0)) AS to_hex,
+             (SELECT CAST(json_agg('0x' || lpad(substr(trim(o), 3), 64, '0')) AS TEXT)
+              FROM unnest(string_to_array(:owners, ',')) o) AS owner_topics
+      FROM r
+
+  - id: scan_range
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan_scan.row.has_range }}"
+    then:
+      - id: get_logs
+        type: io.kestra.plugin.core.http.Request
+        description: All Approval(owner, spender, value) events emitted for the watched owners in the range, from any token contract.
+        uri: "{{ secret('EVM_RPC_URL') }}"
+        method: POST
+        contentType: application/json
+        body: >-
+          {{ {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getLogs', 'params': [{
+            'fromBlock': outputs.plan_scan.row.from_hex, 'toBlock': outputs.plan_scan.row.to_hex,
+            'topics': ['0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925', fromJson(outputs.plan_scan.row.owner_topics)]}]} | toJson }}
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+  - id: rpc_logs_ok
+    type: io.kestra.plugin.core.flow.If
+    description: JSON-RPC errors come back with HTTP 200, so check the body, for example when the provider rejects a too-large range.
+    condition: "{{ outputs.get_logs is defined and (outputs.get_logs.body | jq('.error.message // \"\"') | first) != '' }}"
+    then:
+      - id: logs_failed
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "eth_getLogs failed for blocks {{ outputs.plan_scan.row.from_block }}-{{ outputs.plan_scan.row.to_block }}: {{ outputs.get_logs.body | jq('.error.message') | first }}. Lower max_blocks_per_run if your provider limits the range."
+
+  - id: load_known
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Approvals of the watched owners already on file with a non-zero allowance. They are re-read every run, because spending lowers an allowance without a new Approval event.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      chain_id: "{{ outputs.plan_scan.row.chain_id }}"
+      owners: "{{ inputs.owners | join(',') | lower }}"
+    sql: |
+      SELECT token, owner, spender, last_event_block FROM token_approvals
+      WHERE chain_id = CAST(:chain_id AS BIGINT) AND allowance > 0
+        AND owner = ANY(string_to_array(:owners, ','))
+
+  - id: build_batch
+    type: io.kestra.plugin.scripts.python.Script
+    description: Turn events and known approvals into one JSON-RPC batch with allowance(), symbol(), decimals(), and eth_getCode calls.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      logs.json: "{{ outputs.get_logs.body ?? '{\"result\": []}' }}"
+      known.json: "{{ outputs.load_known.rows | toJson }}"
+    outputFiles:
+      - pairs.json
+      - batch.json
+    script: |
+      import json
+
+      logs = json.load(open("logs.json")).get("result") or []
+      known = json.load(open("known.json"))
+      pairs = {}
+
+      def topic_address(topic):
+          return "0x" + topic[-40:].lower()
+
+      for log in logs:
+          if len(log["topics"]) != 3:  # ERC-721 Approval has a fourth indexed topic (tokenId)
+              continue
+          key = (log["address"].lower(), topic_address(log["topics"][1]), topic_address(log["topics"][2]))
+          pairs[key] = max(pairs.get(key, 0), int(log["blockNumber"], 16))
+      for k in known:
+          pairs.setdefault((k["token"], k["owner"], k["spender"]), int(k["last_event_block"]))
+
+      pairs = [{"token": t, "owner": o, "spender": s, "last_event_block": b} for (t, o, s), b in sorted(pairs.items())]
+      calls = [{"jsonrpc": "2.0", "id": "head", "method": "eth_blockNumber", "params": []}]  # never send an empty batch
+
+      def eth_call(call_id, to, data):
+          calls.append({"jsonrpc": "2.0", "id": call_id, "method": "eth_call", "params": [{"to": to, "data": data}, "latest"]})
+
+      for i, p in enumerate(pairs):  # allowance(address,address)
+          eth_call(f"a{i}", p["token"], "0xdd62ed3e" + p["owner"][2:].rjust(64, "0") + p["spender"][2:].rjust(64, "0"))
+      for token in sorted({p["token"] for p in pairs}):
+          eth_call(f"s{token}", token, "0x95d89b41")  # symbol()
+          eth_call(f"d{token}", token, "0x313ce567")  # decimals()
+      for spender in sorted({p["spender"] for p in pairs}):
+          calls.append({"jsonrpc": "2.0", "id": f"c{spender}", "method": "eth_getCode", "params": [spender, "latest"]})
+
+      json.dump(pairs, open("pairs.json", "w"))
+      json.dump(calls, open("batch.json", "w"))
+      print(f"{len(logs)} Approval events, {len(pairs)} approvals to check")
+
+  - id: read_chain_state
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('EVM_RPC_URL') }}"
+    method: POST
+    contentType: application/json
+    body: "{{ read(outputs.build_batch.outputFiles['batch.json']) }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: decode_state
+    type: io.kestra.plugin.scripts.python.Script
+    description: Decode the batch results. Handles string and bytes32 symbols (MKR-style tokens) and skips contracts that answer allowance() with an error.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      pairs.json: "{{ read(outputs.build_batch.outputFiles['pairs.json']) }}"
+      response.json: "{{ outputs.read_chain_state.body }}"
+    outputFiles:
+      - state.json
+    script: |
+      import json
+
+      pairs = json.load(open("pairs.json"))
+      results = {r["id"]: r for r in json.load(open("response.json"))}
+
+      def value(call_id):
+          r = results.get(call_id, {})
+          return None if "error" in r else r.get("result")
+
+      def text(data):
+          if not data or data == "0x":
+              return None
+          raw = bytes.fromhex(data[2:])
+          if len(raw) == 32:  # bytes32 symbol
+              return raw.rstrip(b"\0").decode("utf-8", "replace")
+          try:
+              length = int.from_bytes(raw[32:64], "big")
+              return raw[64:64 + length].decode("utf-8", "replace")
+          except ValueError:
+              return None
+
+      state, skipped = [], 0
+      for i, p in enumerate(pairs):
+          raw = value(f"a{i}")
+          if raw is None or raw == "0x":
+              skipped += 1
+              print(f"skipped {p['token']}: allowance() did not answer like an ERC-20")
+              continue
+          allowance = int(raw, 16)
+          decimals = value(f"d{p['token']}")
+          state.append({
+              **p,
+              "allowance": str(allowance),
+              "unlimited": allowance >= 2 ** 128,
+              "symbol": text(value(f"s{p['token']}")) or p["token"][:10],
+              "decimals": int(decimals, 16) if decimals and decimals != "0x" else 18,
+              "spender_is_contract": (value(f"c{p['spender']}") or "0x") != "0x",
+          })
+      json.dump(state, open("state.json", "w"))
+      print(f"{len(state)} approvals decoded, {skipped} skipped")
+
+  - id: classify
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Classify every approval, store it, and return what changed since the last run in one statement.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      chain_id: "{{ outputs.plan_scan.row.chain_id }}"
+      state: "{{ read(outputs.decode_state.outputFiles['state.json']) }}"
+      allowlist: "{{ inputs.allowlist | join(',') | lower }}"
+      denylist: "{{ inputs.denylist | join(',') | lower }}"
+      ask_again_hours: "{{ inputs.ask_again_hours }}"
+    sql: |
+      WITH cur AS (
+        SELECT * FROM jsonb_to_recordset(CAST(:state AS JSONB)) AS x(
+          token TEXT, owner TEXT, spender TEXT, allowance NUMERIC, unlimited BOOLEAN,
+          symbol TEXT, decimals INT, spender_is_contract BOOLEAN, last_event_block BIGINT)
+      ),
+      cls AS (
+        SELECT cur.*,
+          CASE
+            WHEN allowance = 0 THEN 'revoked'
+            WHEN spender = ANY(string_to_array(:denylist, ',')) THEN 'critical'
+            WHEN NOT spender_is_contract THEN 'high'
+            WHEN spender = ANY(string_to_array(:allowlist, ',')) THEN 'ok'
+            WHEN unlimited THEN 'high'
+            ELSE 'review'
+          END AS risk,
+          CASE
+            WHEN allowance = 0 THEN 'allowance is zero'
+            WHEN spender = ANY(string_to_array(:denylist, ',')) THEN 'spender is on the denylist'
+            WHEN NOT spender_is_contract THEN 'spender is a wallet, not a contract: the usual sign of approval phishing'
+            WHEN spender = ANY(string_to_array(:allowlist, ',')) THEN 'spender is allowlisted'
+            WHEN unlimited THEN 'unlimited allowance to a contract that is not allowlisted'
+            ELSE 'limited allowance to a contract that is not allowlisted'
+          END AS reason
+        FROM cur
+      ),
+      prev AS (
+        SELECT owner, token, spender, risk FROM token_approvals WHERE chain_id = CAST(:chain_id AS BIGINT)
+      ),
+      up AS (
+        INSERT INTO token_approvals AS t (chain_id, owner, token, spender, symbol, decimals, allowance, unlimited,
+                                          spender_is_contract, risk, reason, last_event_block, updated_at)
+        SELECT CAST(:chain_id AS BIGINT), owner, token, spender, symbol, decimals, allowance, unlimited,
+               spender_is_contract, risk, reason, last_event_block, now()
+        FROM cls
+        ON CONFLICT (chain_id, owner, token, spender) DO UPDATE SET
+          symbol = EXCLUDED.symbol, decimals = EXCLUDED.decimals, allowance = EXCLUDED.allowance,
+          unlimited = EXCLUDED.unlimited, spender_is_contract = EXCLUDED.spender_is_contract,
+          risk = EXCLUDED.risk, reason = EXCLUDED.reason,
+          last_event_block = greatest(t.last_event_block, EXCLUDED.last_event_block), updated_at = now()
+        RETURNING t.id, t.owner, t.token, t.spender, t.proposed_at
+      )
+      SELECT up.id, c.owner, c.token, c.spender, c.symbol, c.risk, c.reason,
+             CASE WHEN c.unlimited THEN 'unlimited'
+                  ELSE trim(trailing '.' FROM trim(trailing '0' FROM CAST(round(c.allowance / power(CAST(10 AS NUMERIC), c.decimals), 6) AS TEXT))) END AS amount,
+             coalesce(p.risk, 'new') AS previous_risk,
+             (p.risk IS NULL AND c.risk IN ('critical', 'high', 'review'))
+               OR (p.risk IS NOT NULL AND p.risk <> c.risk) AS changed,
+             c.risk IN ('critical', 'high')
+               AND (up.proposed_at IS NULL OR up.proposed_at <= now() - make_interval(hours => CAST(:ask_again_hours AS INT))) AS revoke_candidate
+      FROM cls c JOIN up USING (owner, token, spender) LEFT JOIN prev p USING (owner, token, spender)
+      ORDER BY CASE c.risk WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'review' THEN 2 ELSE 3 END, up.id
+
+  - id: advance_cursor
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Move every owner's cursor only after the scanned range has been stored, so a failed run re-scans the same blocks.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    parameters:
+      chain_id: "{{ outputs.plan_scan.row.chain_id }}"
+      to_block: "{{ outputs.plan_scan.row.to_block }}"
+      has_range: "{{ outputs.plan_scan.row.has_range }}"
+      owners: "{{ inputs.owners | join(',') | lower }}"
+    sql: |
+      INSERT INTO approval_scan_cursor (chain_id, owner, last_block)
+      SELECT DISTINCT CAST(:chain_id AS BIGINT), trim(o), CAST(:to_block AS BIGINT)
+      FROM unnest(string_to_array(:owners, ',')) o WHERE CAST(:has_range AS BOOLEAN)
+      ON CONFLICT (chain_id, owner) DO UPDATE SET last_block = greatest(approval_scan_cursor.last_block, EXCLUDED.last_block)
+
+  - id: report_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.classify.rows | jq('[.[] | select(.changed)] | length') | first > 0 }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          ERC-20 approvals changed (chain {{ outputs.plan_scan.row.chain_id }}, scanned up to block {{ outputs.plan_scan.row.to_block }}):
+          {% for a in outputs.classify.rows %}{% if a.changed %}{% if a.risk == 'revoked' %}- #{{ a.id }} {{ a.symbol }} approval from {{ a.owner }} to {{ a.spender }}: allowance is now zero, spent or revoked (was {{ a.previous_risk }}).
+          {% elseif a.risk == 'ok' %}- #{{ a.id }} {{ a.symbol }} approval from {{ a.owner }} to {{ a.spender }} is no longer risky: {{ a.reason }}.
+          {% else %}- {{ a.risk | upper }} #{{ a.id }}: {{ a.owner }} lets {{ a.spender }} spend {{ a.amount }} {{ a.symbol }}. {{ a.reason | capitalize }}. {{ inputs.explorer_url }}/address/{{ a.spender }}
+          {% endif %}{% endif %}{% endfor %}
+
+  - id: propose_revocations
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.classify.rows | jq('[.[] | select(.revoke_candidate)] | length') | first > 0 }}"
+    then:
+      - id: mark_proposed
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        parameters:
+          ids: "{{ outputs.classify.rows | jq('[.[] | select(.revoke_candidate) | .id | tostring] | join(\",\")') | first }}"
+        sql: UPDATE token_approvals SET proposed_at = now() WHERE id = ANY(CAST(string_to_array(:ids, ',') AS BIGINT[]))
+
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          These approvals should be revoked:
+          {% for a in outputs.classify.rows %}{% if a.revoke_candidate %}- #{{ a.id }} {{ a.risk | upper }}: {{ a.owner }} → {{ a.spender }}, {{ a.amount }} {{ a.symbol }} ({{ a.reason }})
+          {% endif %}{% endfor %}{% if inputs.revoke_enabled %}Enter the ids to revoke (for example `{{ outputs.classify.rows | jq('[.[] | select(.revoke_candidate) | .id | tostring] | join(", ")') | first }}`) within 4 hours: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}. Each revocation sends approve(spender, 0) from the owner.{% else %}Automatic revocation is off (revoke_enabled is false). Revoke them from each owner wallet by calling approve(spender, 0) on the token, for example with revoke.cash.{% endif %}
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.revoke_enabled }}"
+        then:
+          - id: wait_for_decision
+            type: io.kestra.plugin.core.flow.Pause
+            description: No answer within 4 hours means nothing is revoked.
+            pauseDuration: PT4H
+            behavior: RESUME
+            onResume:
+              - id: revoke_ids
+                type: STRING
+                required: false
+                description: Comma-separated approval ids to revoke, as listed in Slack. Leave empty to revoke nothing.
+
+          - id: revoke_requested
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.wait_for_decision.onResume.revoke_ids ?? '') | trim != '' }}"
+            then:
+              - id: select_revocations
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Keep only ids that were proposed in this run and still have a non-zero allowance; report every other id with the reason.
+                url: "{{ secret('POSTGRES_URL') }}"
+                username: "{{ secret('POSTGRES_USER') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH
+                parameters:
+                  requested: "{{ outputs.wait_for_decision.onResume.revoke_ids ?? '' }}"
+                  proposed: "{{ outputs.classify.rows | jq('[.[] | select(.revoke_candidate) | .id | tostring] | join(\",\")') | first }}"
+                sql: |
+                  WITH req AS (
+                    SELECT DISTINCT trim(both ' #' FROM x) AS id FROM unnest(string_to_array(:requested, ',')) x
+                    WHERE trim(both ' #' FROM x) <> ''
+                  )
+                  SELECT r.id, t.owner, t.token, t.spender, t.symbol,
+                    CASE
+                      WHEN r.id !~ '^[0-9]+$' OR NOT (r.id = ANY(string_to_array(:proposed, ','))) THEN 'not proposed in this run'
+                      WHEN t.allowance = 0 THEN 'already revoked'
+                      ELSE 'revoke'
+                    END AS action
+                  FROM req r LEFT JOIN token_approvals t ON CAST(t.id AS TEXT) = r.id
+                  ORDER BY r.id
+
+              - id: revoke
+                type: io.kestra.plugin.core.flow.Loop
+                description: One revocation per approval. Each runs in its own block with allowFailure, so a refused or reverted revocation does not stop the others.
+                values: "{{ outputs.select_revocations.rows | jq('[.[] | select(.action == \"revoke\")]') | first | toJson }}"
+                outputs:
+                  - id: result
+                    type: STRING
+                    value: >-
+                      #{{ fromJson(item.value).id }} {{ fromJson(item.value).symbol }} {{ fromJson(item.value).owner }} → {{ fromJson(item.value).spender }}:
+                      {% if outputs.record_revocation is defined %}revoked in {{ outputs.send_revoke.body | jq('.result') | first }}{% elseif outputs.send_revoke is defined and (outputs.send_revoke.body | jq('.error.message // ""') | first) != '' %}NOT revoked, the signer refused: {{ outputs.send_revoke.body | jq('.error.message') | first }}{% elseif outputs.get_receipt is defined %}NOT revoked, the transaction reverted{% else %}NOT revoked, see the execution logs{% endif %}
+                tasks:
+                  - id: revocation
+                    type: io.kestra.plugin.core.flow.Sequential
+                    allowFailure: true
+                    tasks:
+                      - id: send_revoke
+                        type: io.kestra.plugin.core.http.Request
+                        description: approve(spender, 0) from the owner, signed by the signer behind EVM_SIGNER_URL.
+                        uri: "{{ secret('EVM_SIGNER_URL') }}"
+                        method: POST
+                        contentType: application/json
+                        options:
+                          allowFailed: true
+                        body: >-
+                          {{ {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_sendTransaction', 'params': [{
+                            'from': fromJson(item.value).owner, 'to': fromJson(item.value).token,
+                            'data': '0x095ea7b3000000000000000000000000' ~ (fromJson(item.value).spender | replace({'0x': ''})) ~ '0000000000000000000000000000000000000000000000000000000000000000'}]} | toJson }}
+
+                      - id: signer_ok
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ (outputs.send_revoke.body | jq('.error.message // \"\"') | first) != '' }}"
+                        then:
+                          - id: signer_refused
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: "The signer refused to revoke #{{ fromJson(item.value).id }}: {{ outputs.send_revoke.body | jq('.error.message') | first }}"
+
+                      - id: wait_for_receipt
+                        type: io.kestra.plugin.core.flow.LoopUntil
+                        condition: "{{ (outputs.get_receipt.body | jq('.result.status // \"\"') | first) != '' }}"
+                        checkFrequency:
+                          interval: PT3S
+                          maxIterations: 100
+                        failOnMaxReached: true
+                        tasks:
+                          - id: get_receipt
+                            type: io.kestra.plugin.core.http.Request
+                            uri: "{{ secret('EVM_RPC_URL') }}"
+                            method: POST
+                            contentType: application/json
+                            body: "{{ {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getTransactionReceipt', 'params': [outputs.send_revoke.body | jq('.result') | first]} | toJson }}"
+
+                      - id: receipt_ok
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ (outputs.get_receipt.body | jq('.result.status') | first) != '0x1' }}"
+                        then:
+                          - id: revoke_reverted
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: "Revocation of #{{ fromJson(item.value).id }} reverted on-chain in {{ outputs.send_revoke.body | jq('.result') | first }}."
+
+                      - id: record_revocation
+                        type: io.kestra.plugin.jdbc.postgresql.Query
+                        description: The next scan reads the allowance again from the chain and confirms it is zero.
+                        url: "{{ secret('POSTGRES_URL') }}"
+                        username: "{{ secret('POSTGRES_USER') }}"
+                        password: "{{ secret('POSTGRES_PASSWORD') }}"
+                        parameters:
+                          id: "{{ fromJson(item.value).id }}"
+                          tx: "{{ outputs.send_revoke.body | jq('.result') | first }}"
+                        sql: UPDATE token_approvals SET revoke_tx = :tx, updated_at = now() WHERE id = CAST(:id AS BIGINT)
+
+              - id: notify_revocations
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: |
+                  Approval revocations:
+                  {% for r in outputs.revoke.outputs ?? [] %}- {{ r.outputs.result }}
+                  {% endfor %}{% for r in outputs.select_revocations.rows %}{% if r.action != 'revoke' %}- #{{ r.id }}: skipped, {{ r.action }}
+                  {% endif %}{% endfor %}The next scan reads every allowance again from the chain.
+
+              - id: any_failed
+                type: io.kestra.plugin.core.flow.If
+                description: End the run as WARNING when a revocation did not go through, so dashboards and alerts on execution state see it.
+                condition: "{{ (outputs.revoke.outputs ?? []) | jq('[.[] | select(.outputs.result | contains(\"NOT revoked\"))] | length') | first > 0 }}"
+                then:
+                  - id: partial_revocation
+                    type: io.kestra.plugin.core.execution.Exit
+                    state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      ERC-20 approval monitor failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      The scan cursor did not move, so the next run checks the same blocks again.
+
+outputs:
+  - id: approvals
+    type: JSON
+    description: Every approval checked in this run with its risk, amount, and whether it was proposed for revocation.
+    value: "{{ outputs.classify.rows ?? [] }}"
+
+extend:
+  title: Find and Revoke Risky ERC-20 Token Approvals
+  shortDescription: Scan your wallets' Approval events, read every current allowance on-chain, flag unlimited, phishing-style, and denylisted approvals, and revoke the ones on-call approves.
+  metaTitle: ERC-20 Approval Risk Monitor and Revoker with Kestra
+  metaDescription: Monitor ERC-20 token approvals of your wallets, flag risky allowances, alert on changes, and revoke them after on-call approval.
+  description: |
+    Token approvals are how most wallet drains happen. A wallet that once approved a contract, or signed a phishing approval to an attacker's address, stays exposed until the allowance is set back to zero. Explorers show approvals one wallet at a time. This blueprint watches all of your organization's wallets on any EVM chain, keeps an inventory of every approval with its current on-chain allowance, and turns the risky ones into a short, reviewable list that on-call can revoke from the Kestra UI.
+
+    ## How it works
+
+    1. `address_activity` (`Webhook`) runs a scan when your RPC provider reports activity on your wallets; `periodic_scan` (`Schedule`) catches allowances lowered by spending.
+    2. `validate_addresses` rejects mistyped addresses; `node_check` reads the chain id and head.
+    3. `plan_scan` picks the block range from a per-owner cursor, leaving `confirmations` blocks for reorgs. A newly added owner is scanned from `start_block`.
+    4. `get_logs` fetches every `Approval(owner, spender, value)` event for your owners in one `eth_getLogs` call, from any token.
+    5. `build_batch` (Python) prepares one JSON-RPC batch, and `read_chain_state` reads, for every approval on file:
+       - the current `allowance()`
+       - the token's `symbol()` and `decimals()`
+       - whether the spender has contract code
+    6. `decode_state` (Python) decodes the results, including tokens with `bytes32` symbols. `classify` (Postgres) stores every approval and returns what changed:
+       - `critical`: spender on the denylist
+       - `high`: spender is a plain wallet (the usual phishing pattern), or an unlimited allowance to a contract that is not allowlisted
+       - `review`: limited allowance to a contract that is not allowlisted
+       - `ok`: allowlisted spender; `revoked`: allowance is zero
+    7. `report_changes` posts new risks and resolved ones to Slack. `propose_revocations` lists `critical` and `high` approvals.
+    8. With `revoke_enabled`, `wait_for_decision` (`Pause`) waits for on-call to enter the ids to revoke. `revoke` (`Loop`) then sends `approve(spender, 0)` from each owner through the signer, waits for the receipt, and reports each result.
+
+    ## Error handling
+
+    - **No alert storms:** an approval is reported when its risk changes, and a revocation is not proposed again for `ask_again_hours`.
+    - **Allowances, not events:** the flow reads the allowance from the chain every run, so spent and revoked approvals resolve themselves even without a new event.
+    - **Nothing is skipped after a failure:** cursors move only after a scan has been stored, so a failed run re-scans the same blocks. A reorg cannot invent or hide an approval inside the confirmation depth.
+    - **Revocations act only on what was proposed:**
+      - ids that were not proposed in this run, or whose allowance is already zero, are refused with the reason;
+      - each revocation runs in its own block with `allowFailure`, so a refused or reverted transaction does not stop the others;
+      - the summary states the outcome of every id, and the run ends as `WARNING` if any revocation did not go through.
+    - **JSON-RPC errors are surfaced:** they arrive with HTTP 200, so `rpc_logs_ok` and `signer_ok` read the error body and fail with the provider's message, for example a range limit or "No Signer available".
+    - **Clear failures:** mistyped addresses fail before any RPC call. RPC calls retry with backoff, and the `errors` alert names the task and cause.
+
+    ## What this blueprint teaches about Kestra
+
+    - JSON-RPC batching with the core `Request` task, with small Python steps only for ABI encoding and decoding.
+    - Incremental, restartable scanning with a cursor that moves only after the work is stored.
+    - Human-approved remediation: a `Pause` for the decision, then a `Loop` whose iterations each isolate their own failure with `allowFailure`.
+    - Loop `outputs` to collect one result line per iteration into a single summary.
+
+    ## Prerequisites
+
+    - An RPC endpoint for the chain (Alchemy, Infura, QuickNode, or your own node). Any EVM chain works.
+    - A Postgres database for the approval inventory and cursors.
+    - A Slack incoming webhook.
+    - For automatic revocation: a signer that accepts `eth_sendTransaction` for the owner addresses, such as Web3Signer, a KMS-backed relayer, or Clef. Keep it on a private network; never put private keys in Kestra.
+
+    ### Secrets
+
+    - `EVM_RPC_URL`: JSON-RPC endpoint, including your provider API key.
+    - `EVM_SIGNER_URL`: signer endpoint (only used when `revoke_enabled` is true).
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: state database.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `owners` (ARRAY): wallets to watch. Replace the placeholder.
+    - `allowlist`, `denylist` (ARRAY): trusted spenders (default: Permit2) and known-bad addresses.
+    - `start_block` (INT): where a new owner's scan starts; use the block the wallet was created in.
+    - `confirmations` (INT, default 12), `max_blocks_per_run` (INT, default 5000).
+    - `revoke_enabled` (BOOL, default false), `ask_again_hours` (INT, default 12).
+    - `explorer_url`, `kestra_url` (STRING): links in Slack.
+
+    ### Outputs
+
+    - `approvals` (JSON): every approval checked in the run with its risk, readable amount, and whether it was proposed for revocation.
+
+    ## Quick start
+
+    1. Add the secrets and set `owners`, `start_block`, and your `allowlist`.
+    2. Run the flow manually until the scan has caught up with the chain head; each run covers `max_blocks_per_run` blocks.
+    3. Enable `periodic_scan`, and point your provider's address-activity webhook at `address_activity`.
+    4. Once you trust the alerts, add a signer and set `revoke_enabled` to true.
+
+    ## How to extend
+
+    - Feed `denylist` from your security provider by reading it from the KV store or an API before `classify`.
+    - Watch NFT approvals too: ERC-721 `Approval` events have a fourth topic and are skipped today, and `ApprovalForAll` uses a different event signature.
+    - Propose revocations as a Safe transaction instead of sending them, for wallets controlled by a multisig.
+
+    ## Links
+
+    - [ERC-20 approve and allowance](https://eips.ethereum.org/EIPS/eip-20)
+    - [eth_getLogs](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getlogs)
+    - [Kestra Loop task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Python script task](https://kestra.io/plugins/plugin-script-python)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Business
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false

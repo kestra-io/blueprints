@@ -1,0 +1,440 @@
+id: rabbitmq-dlq-quarantine-and-replay
+namespace: company.team
+description: |
+  Drain dead-lettered messages from a RabbitMQ Dead-Letter Queue (DLQ),
+  classify failure root causes into transient vs unrecoverable poison pills,
+  quarantine poisoned payloads to Amazon S3 with an audit manifest, and
+  safely replay recoverable messages back to the primary exchange behind an
+  explicit dry-run gate.
+
+triggers:
+  - id: periodic_dlq_drain
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Drain and triage dead-lettered messages every 15 minutes. Shipped disabled; enable once queue names and secrets are configured.
+    cron: "*/15 * * * *"
+    disabled: true
+
+inputs:
+  - id: dlq_queue
+    type: STRING
+    displayName: "DLQ Queue Name"
+    defaults: "orders.dlq"
+    description: Name of the RabbitMQ Dead-Letter Queue to drain.
+
+  - id: target_exchange
+    type: STRING
+    displayName: "Target Exchange"
+    defaults: "orders.exchange"
+    description: The exchange to republish recoverable messages back into.
+
+  - id: target_routing_key
+    type: STRING
+    displayName: "Target Routing Key"
+    defaults: "orders.created"
+    description: The routing key applied to replayed messages.
+
+  - id: max_records
+    type: INT
+    displayName: "Max Records"
+    defaults: 50
+    description: Maximum dead-letter messages to drain and process in a single batch.
+
+  - id: max_retry_attempts
+    type: INT
+    displayName: "Max Retry Attempts"
+    defaults: 3
+    description: Maximum death count from RabbitMQ x-death headers before a message is classified as retry-exhausted and permanently quarantined.
+
+  - id: dry_run
+    type: SELECT
+    displayName: "Dry Run"
+    defaults: "true"
+    values:
+      - "true"
+      - "false"
+    description: When true, simulate triage and skip re-publishing to the exchange. Set to false to execute live replay.
+
+  - id: s3_quarantine_bucket
+    type: STRING
+    displayName: "S3 Quarantine Bucket"
+    defaults: "company-dlq-quarantine-archive"
+    description: Amazon S3 bucket used for cold-storage quarantine archives.
+
+  - id: s3_region
+    type: STRING
+    displayName: "AWS Region"
+    defaults: "us-east-1"
+    description: AWS region where the quarantine S3 bucket is hosted.
+
+tasks:
+  - id: drain_dlq
+    type: io.kestra.plugin.amqp.Consume
+    description: Consume up to max_records from the Dead-Letter Queue into Kestra internal storage.
+    host: "{{ secret('RABBITMQ_HOST') }}"
+    port: "{{ secret('RABBITMQ_PORT') }}"
+    username: "{{ secret('RABBITMQ_USERNAME') }}"
+    password: "{{ secret('RABBITMQ_PASSWORD') }}"
+    virtualHost: "{{ secret('RABBITMQ_VHOST') }}"
+    queue: "{{ inputs.dlq_queue }}"
+    serdeType: JSON
+    maxRecords: "{{ inputs.max_records }}"
+    maxDuration: PT30S
+    autoAck: false
+
+  - id: evaluate_drained_messages
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate whether any dead-letter messages were retrieved during the poll cycle.
+    condition: "{{ (outputs.drain_dlq.count ?? 0) > 0 }}"
+    then:
+      - id: classify_and_triage
+        type: io.kestra.plugin.scripts.python.Script
+        description: Classify error signatures, separate transient failures from toxic poison pills, and prepare quarantine and replay artifacts.
+        containerImage: python:3.11-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        inputFiles:
+          dlq_data.ion: "{{ outputs.drain_dlq.uri }}"
+        outputFiles:
+          - quarantine_manifest.json
+          - replay_batch.json
+          - triage_summary.json
+        script: |
+          import json
+          import os
+          from kestra import Kestra
+
+          max_retries = int("{{ inputs.max_retry_attempts }}")
+          raw_records = []
+
+          with open("dlq_data.ion", "r", encoding="utf-8", errors="ignore") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      if line.startswith("{") and line.endswith("}"):
+                          parsed = json.loads(line)
+                          raw_records.append(parsed)
+                      else:
+                          raw_records.append({"data": line, "raw": True})
+                  except Exception:
+                      raw_records.append({"data": line, "raw": True, "parse_error": True})
+
+          replay_candidates = []
+          quarantined_records = []
+          poison_count = 0
+          exhausted_count = 0
+          transient_count = 0
+
+          for item in raw_records:
+              payload = item.get("data", item)
+              headers = item.get("headers", {})
+
+              retry_count = 0
+              x_death = headers.get("x-death")
+              if isinstance(x_death, list) and len(x_death) > 0:
+                  retry_count = x_death[0].get("count", 0)
+              elif "retry_count" in headers:
+                  try:
+                      retry_count = int(headers["retry_count"])
+                  except Exception:
+                      retry_count = 0
+              elif isinstance(payload, dict) and "retry_count" in payload:
+                  try:
+                      retry_count = int(payload["retry_count"])
+                  except Exception:
+                      retry_count = 0
+
+              raw_str = json.dumps(item) if isinstance(item, (dict, list)) else str(item)
+              is_transient = any(kw in raw_str.upper() for kw in ["TIMEOUT", "503", "504", "429", "TEMPORARY", "CONNECTION_RESET", "LOCK_WAIT"])
+
+              if item.get("parse_error") or not isinstance(payload, dict):
+                  classification = "POISON_CORRUPT_PAYLOAD"
+                  poison_count += 1
+                  quarantined_records.append({
+                      "classification": classification,
+                      "retry_count": retry_count,
+                      "error_reason": "Payload unparseable or non-dictionary format",
+                      "record": item
+                  })
+              elif retry_count >= max_retries:
+                  classification = "RETRY_BUDGET_EXHAUSTED"
+                  exhausted_count += 1
+                  quarantined_records.append({
+                      "classification": classification,
+                      "retry_count": retry_count,
+                      "error_reason": f"Retry count {retry_count} reached threshold {max_retries}",
+                      "record": item
+                  })
+              elif is_transient:
+                  classification = "TRANSIENT_RECOVERABLE"
+                  transient_count += 1
+                  updated_headers = dict(headers) if isinstance(headers, dict) else {}
+                  updated_headers["x-replayed-by"] = "kestra-rabbitmq-dlq-pipeline"
+                  updated_headers["retry_count"] = retry_count + 1
+                  replay_candidates.append({
+                      "data": payload,
+                      "headers": updated_headers
+                  })
+              else:
+                  classification = "POISON_UNHANDLED_ERROR"
+                  poison_count += 1
+                  quarantined_records.append({
+                      "classification": classification,
+                      "retry_count": retry_count,
+                      "error_reason": "Business rejection or unhandled application exception",
+                      "record": item
+                  })
+
+          summary = {
+              "total_drained": len(raw_records),
+              "replay_count": len(replay_candidates),
+              "quarantine_count": len(quarantined_records),
+              "transient_count": transient_count,
+              "poison_count": poison_count,
+              "exhausted_count": exhausted_count
+          }
+
+          manifest = {
+              "execution_id": "{{ execution.id }}",
+              "dlq_queue": "{{ inputs.dlq_queue }}",
+              "target_exchange": "{{ inputs.target_exchange }}",
+              "target_routing_key": "{{ inputs.target_routing_key }}",
+              "summary": summary,
+              "quarantined_items": quarantined_records
+          }
+
+          with open("quarantine_manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+
+          with open("replay_batch.json", "w", encoding="utf-8") as f:
+              json.dump(replay_candidates, f, indent=2)
+
+          with open("triage_summary.json", "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2)
+
+          Kestra.outputs({
+              "total_drained": len(raw_records),
+              "replay_count": len(replay_candidates),
+              "quarantine_count": len(quarantined_records),
+              "transient_count": transient_count,
+              "poison_count": poison_count,
+              "exhausted_count": exhausted_count,
+              "replay_records": replay_candidates
+          })
+
+      - id: evaluate_replay
+        type: io.kestra.plugin.core.flow.If
+        description: Republish recoverable transient messages back to the primary exchange when dry run is disabled.
+        condition: "{{ outputs.classify_and_triage.vars.replay_count > 0 and inputs.dry_run == 'false' }}"
+        then:
+          - id: replay_to_exchange
+            type: io.kestra.plugin.amqp.Publish
+            description: Safely publish recoverable messages to the primary target exchange.
+            host: "{{ secret('RABBITMQ_HOST') }}"
+            port: "{{ secret('RABBITMQ_PORT') }}"
+            username: "{{ secret('RABBITMQ_USERNAME') }}"
+            password: "{{ secret('RABBITMQ_PASSWORD') }}"
+            virtualHost: "{{ secret('RABBITMQ_VHOST') }}"
+            exchange: "{{ inputs.target_exchange }}"
+            routingKey: "{{ inputs.target_routing_key }}"
+            serdeType: JSON
+            from: "{{ outputs.classify_and_triage.vars.replay_records }}"
+
+          - id: log_replay_executed
+            type: io.kestra.plugin.core.log.Log
+            message: "Replay executed: Published {{ outputs.classify_and_triage.vars.replay_count }} recoverable message(s) to exchange '{{ inputs.target_exchange }}' with routing key '{{ inputs.target_routing_key }}'."
+        else:
+          - id: log_replay_skipped
+            type: io.kestra.plugin.core.log.Log
+            message: "Replay skipped: dry_run={{ inputs.dry_run }}, replay_candidates={{ outputs.classify_and_triage.vars.replay_count }}."
+
+      - id: evaluate_quarantine
+        type: io.kestra.plugin.core.flow.If
+        description: Archive toxic or retry-exhausted messages to Amazon S3 cold storage and notify on-call engineers.
+        condition: "{{ outputs.classify_and_triage.vars.quarantine_count > 0 }}"
+        then:
+          - id: upload_quarantine_to_s3
+            type: io.kestra.plugin.aws.s3.Upload
+            description: Upload structured forensic quarantine manifest to Amazon S3.
+            accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+            secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+            region: "{{ inputs.s3_region }}"
+            bucket: "{{ inputs.s3_quarantine_bucket }}"
+            from: "{{ outputs.classify_and_triage.outputFiles['quarantine_manifest.json'] }}"
+            key: "quarantine/rabbitmq/{{ now() | date('yyyy/MM/dd') }}/quarantine-{{ execution.id }}.json"
+
+          - id: alert_quarantined_poison
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Dispatch Slack alert detailing quarantined poison pills and S3 storage location.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "RabbitMQ DLQ Quarantine Alert: {{ outputs.classify_and_triage.vars.quarantine_count }} poisoned or retry-exhausted message(s) quarantined from queue `{{ inputs.dlq_queue }}`. Forensic manifest archived at `s3://{{ inputs.s3_quarantine_bucket }}/quarantine/rabbitmq/{{ now() | date('yyyy/MM/dd') }}/quarantine-{{ execution.id }}.json`. Execution: {{ execution.id }}."
+              }
+
+      - id: notify_triage_summary
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Deliver end-of-batch summary report to the engineering operations Slack channel.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "RabbitMQ DLQ Triage Summary: Queue `{{ inputs.dlq_queue }}` drained {{ outputs.classify_and_triage.vars.total_drained }} message(s). Replayable: {{ outputs.classify_and_triage.vars.replay_count }} (dry_run: {{ inputs.dry_run }}). Quarantined: {{ outputs.classify_and_triage.vars.quarantine_count }} (Poison: {{ outputs.classify_and_triage.vars.poison_count }}, Exhausted: {{ outputs.classify_and_triage.vars.exhausted_count }}). Execution: {{ execution.id }}."
+          }
+    else:
+      - id: log_clean_dlq
+        type: io.kestra.plugin.core.log.Log
+        message: "DLQ '{{ inputs.dlq_queue }}' is clear. Drained 0 messages."
+
+errors:
+  - id: alert_pipeline_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert engineering team if the triage pipeline encounters an unhandled broker or storage error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "RabbitMQ DLQ Triage Pipeline FAILED in flow {{ flow.id }} (execution {{ execution.id }}) for queue {{ inputs.dlq_queue }}. Verify RabbitMQ broker connectivity, credentials, and S3 permissions."
+      }
+
+outputs:
+  - id: total_drained
+    type: INT
+    description: Total number of dead-lettered messages drained from the queue.
+    value: "{{ outputs.drain_dlq.count ?? 0 }}"
+
+  - id: replay_count
+    type: INT
+    description: Total number of recoverable transient messages identified for replay.
+    value: "{{ outputs.classify_and_triage.vars.replay_count ?? 0 }}"
+
+  - id: quarantine_count
+    type: INT
+    description: Total number of poison pills or exhausted messages quarantined to S3.
+    value: "{{ outputs.classify_and_triage.vars.quarantine_count ?? 0 }}"
+
+extend:
+  title: "RabbitMQ DLQ Poison-Pill Quarantine and Safe Replay Gate"
+  shortDescription: "Drain dead-lettered RabbitMQ messages, classify root causes into transient vs poison pills, safely replay recoverable messages, and isolate toxic payloads to S3."
+  metaTitle: "RabbitMQ DLQ Quarantine and Replay with Kestra"
+  metaDescription: "Drain RabbitMQ DLQs with Kestra, classify root causes, safely replay transient failures back to the exchange, and isolate poison pills into Amazon S3."
+  description: |
+    Dead-Letter Queues (DLQs) in RabbitMQ capture unprocessable messages rejected by downstream
+    consumers or expired by queue message TTLs. Left unattended, DLQs turn into unmonitored data
+    graveyards that consume broker memory and conceal upstream schema regressions. When operators
+    attempt manual replays without root-cause triage, unhandled poison pills immediately crash
+    restarted consumer workers again.
+
+    This blueprint implements an automated Dead-Letter Queue remediation and quarantine pipeline.
+    It periodically drains dead-lettered messages using `io.kestra.plugin.amqp.Consume`, analyzes
+    AMQP headers (`x-death`, delivery attempts, error stack traces), classifies events into
+    transient errors versus toxic poison pills, safely replays recoverable records back to the
+    primary exchange with updated metadata, and isolates unrecoverable records to Amazon S3 cold
+    storage with structured forensic manifests while alerting on-call engineers via Slack.
+
+    ## How it works
+
+    1. `periodic_dlq_drain` (`io.kestra.plugin.core.trigger.Schedule`) executes every 15 minutes. Shipped disabled so you can test in safe mode first.
+    2. `drain_dlq` (`io.kestra.plugin.amqp.Consume`) pulls up to `max_records` from `dlq_queue` into Kestra internal storage.
+    3. `evaluate_drained_messages` (`io.kestra.plugin.core.flow.If`) branches based on whether any messages were drained. If the queue is empty, `log_clean_dlq` records a healthy state and completes.
+    4. `classify_and_triage` (`io.kestra.plugin.scripts.python.Script`) inspects the downloaded batch:
+       - Extracts `x-death` array, custom retry headers, and payload structures.
+       - Identifies `TRANSIENT_RECOVERABLE` messages (network timeouts, HTTP 503/504, rate limits) where `retry_count < max_retry_attempts`.
+       - Identifies `POISON_CORRUPT_PAYLOAD` messages (invalid JSON, syntax errors, missing fields).
+       - Identifies `RETRY_BUDGET_EXHAUSTED` messages that have exceeded `max_retry_attempts`.
+       - Generates `quarantine_manifest.json`, `replay_batch.json`, and summary metrics.
+    5. `evaluate_replay` (`io.kestra.plugin.core.flow.If`) gates replay behind `inputs.dry_run == 'false'`. When live, `replay_to_exchange` (`io.kestra.plugin.amqp.Publish`) republishes recoverable messages back to `target_exchange` with routing key `target_routing_key`.
+    6. `evaluate_quarantine` (`io.kestra.plugin.core.flow.If`) uploads the forensic manifest to Amazon S3 via `io.kestra.plugin.aws.s3.Upload` and notifies Slack with direct S3 links.
+    7. `notify_triage_summary` posts an operational recap to Slack detailing total drained, replayed, and quarantined counts.
+    8. The flow-level `errors` block alerts Slack immediately if broker connectivity or storage operations fail.
+
+    ## What you get
+
+    - Automated DLQ drainage preventing broker memory bloat and silent message accumulation.
+    - Automated failure taxonomy separating transient network blips from unrecoverable poison pills.
+    - Safe, gated message replay protected by an explicit `dry_run` switch and maximum retry budget.
+    - Full audit compliance with forensic JSON manifests archived in partitioned S3 storage.
+    - Real-time Slack notifications for triage recaps and urgent poison-pill alerts.
+
+    ## Who it's for
+
+    - Platform and SRE teams running RabbitMQ in production microservices architectures.
+    - Data and backend engineers maintaining event-driven messaging pipelines and order processing queues.
+    - Anyone managing RabbitMQ who needs an automated DLQ consumer and replay mechanism instead of running manual CLI scripts.
+
+    ## Why orchestrate this with Kestra
+
+    RabbitMQ does not natively triage, inspect, or selectively replay messages from DLQs. A standalone Python script running on a cron lacks execution lineage, secret management, persistent audit artifacts, and native multi-cloud integrations. Kestra delivers declarative AMQP consumption and publication, Docker sandboxing for payload inspection, native S3 archiving, conditional flow control, and end-to-end execution history in a single observable YAML flow.
+
+    ## Prerequisites
+
+    - A running RabbitMQ broker with an existing Dead-Letter Queue (e.g. `orders.dlq`) and a target exchange (e.g. `orders.exchange`).
+    - An Amazon S3 bucket configured for cold-storage quarantine archives.
+    - An incoming Slack webhook for incident alerts and triage summaries.
+    - Docker available to the Kestra Worker for running Python payload inspection.
+
+    ### Secrets
+
+    - `RABBITMQ_HOST`: RabbitMQ broker hostname or IP address.
+    - `RABBITMQ_PORT`: AMQP port (typically 5672).
+    - `RABBITMQ_USERNAME`: Broker username.
+    - `RABBITMQ_PASSWORD`: Broker password.
+    - `RABBITMQ_VHOST`: RabbitMQ virtual host (default `/`).
+    - `AWS_ACCESS_KEY_ID`: IAM access key with `s3:PutObject` permissions.
+    - `AWS_SECRET_ACCESS_KEY`: IAM secret key matching the access key.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL.
+
+    ### Inputs
+
+    | Name | Type | Default | Description |
+    | :--- | :--- | :--- | :--- |
+    | `dlq_queue` | STRING | `orders.dlq` | Name of the RabbitMQ Dead-Letter Queue to drain |
+    | `target_exchange` | STRING | `orders.exchange` | Destination exchange for recoverable message replay |
+    | `target_routing_key` | STRING | `orders.created` | Routing key applied to replayed messages |
+    | `max_records` | INT | `50` | Maximum messages drained per execution cycle |
+    | `max_retry_attempts` | INT | `3` | Maximum retry budget before permanent quarantine |
+    | `dry_run` | SELECT | `"true"` | When true, simulate triage without publishing to exchange |
+    | `s3_quarantine_bucket` | STRING | `company-dlq-quarantine-archive` | Amazon S3 bucket for forensic quarantine archives |
+    | `s3_region` | STRING | `us-east-1` | AWS region where quarantine bucket resides |
+
+    ### Outputs
+
+    - `outputs.drain_dlq.count`: Total number of messages drained from the DLQ.
+    - `outputs.classify_and_triage.vars.replay_count`: Number of transient messages identified for replay.
+    - `outputs.classify_and_triage.vars.quarantine_count`: Number of toxic messages archived to S3.
+    - `outputs.classify_and_triage.outputFiles['quarantine_manifest.json']`: Forensic JSON manifest file URI.
+
+    ## Quick start
+
+    1. Add the RabbitMQ, AWS, and Slack secrets to your Kestra namespace.
+    2. Run the flow manually with `dry_run: "true"` to inspect your DLQ backlog safely.
+    3. Review the logs and generated `triage_summary.json` to confirm failure classifications.
+    4. Set `dry_run: "false"` on the next execution to replay verified transient messages to your target exchange.
+    5. Enable `periodic_dlq_drain` to automate scheduled queue maintenance.
+
+    ## How to extend
+
+    - Add custom regex patterns to the Python script to classify specific microservice error codes.
+    - Route quarantined messages to an Elasticsearch or OpenSearch index for full-text search across stack traces.
+    - Chain a downstream subflow using `io.kestra.plugin.core.flow.Subflow` to automatically open Jira tickets for unhandled poison pills.
+
+    ## Pitfalls
+
+    - **Replay Loops:** Replaying poison pills without incrementing retry headers or filtering out corrupt payloads causes endless consumer crash loops. This blueprint stops loops by enforcing `max_retry_attempts` and strict payload validation.
+    - **Live Replay in Production:** Always execute initial runs with `dry_run: "true"` to inspect payload classification before enabling live republishing.
+
+    ## Links
+
+    - [Kestra AMQP Plugin Documentation](https://kestra.io/plugins/plugin-amqp)
+    - [Kestra AWS S3 Plugin Documentation](https://kestra.io/plugins/plugin-aws)
+    - [RabbitMQ Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
+
+    - This blueprint has been created by [Vedant817](https://github.com/Vedant817)
+  tags:
+    - Infrastructure
+    - Data
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - Realtime Events
+  ee: false
+  demo: false

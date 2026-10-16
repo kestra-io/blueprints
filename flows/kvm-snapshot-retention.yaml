@@ -1,0 +1,350 @@
+id: kvm-snapshot-retention
+namespace: company.team
+description: |
+  Reclaim KVM host snapshots that rot past the retention window instead of
+  letting them eat cluster storage forever. A provisioning or maintenance
+  pipeline POSTs the snapshot inventory to a keyed webhook, Python ages every
+  snapshot against the retention policy while skipping referenced and exempt
+  hosts, a Loop walks the per host summaries and alerts on each host carrying
+  reclaimable space, and a final If escalates and fails the run once the
+  reclaimable gigabytes pass the threshold. Clean inventories are logged, and
+  the reclaimable snapshots, gigabytes, protected count and host table are
+  published as outputs.
+
+triggers:
+  - id: on_inventory_publish
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: The provisioning or maintenance pipeline POSTs the snapshot inventory per host here so retention is scored as soon as an inventory sync completes.
+    key: "{{ secret('KVM_SNAPSHOT_WEBHOOK_KEY') }}"
+  - id: nightly_retention_scan
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Nightly net at 04:00 UTC that re-scores the last inventory, shipped disabled until the webhook path is trusted in your environment.
+    cron: "0 4 * * *"
+    disabled: true
+
+inputs:
+  - id: retention_days
+    type: INT
+    defaults: 30
+    description: Age in days after which an unreferenced snapshot becomes reclaimable, snapshots exactly at the boundary stay protected.
+  - id: min_reclaimable_gb
+    type: FLOAT
+    defaults: 50.0
+    description: Fleet-wide reclaimable gigabytes that must be exceeded before the gate escalates and fails the run.
+  - id: exempt_hosts
+    type: STRING
+    defaults: "kvm-gpu-04"
+    description: Comma-separated KVM host names exempt from reclamation, for example hosts under a maintenance hold.
+
+tasks:
+  # --- 1. retention score ---
+  - id: apply_retention
+    type: io.kestra.plugin.scripts.python.Script
+    description: Read the posted snapshot inventory or the bundled example host set, age each snapshot against the retention window, protect referenced snapshots and exempt hosts, and emit the reclaimable verdict and per host rollup through the outputs protocol.
+    containerImage: python:3.12-slim
+    env:
+      KVM_SNAPSHOT_JSON: "{{ trigger.body ?? '' }}"
+      RETENTION_DAYS: "{{ inputs.retention_days }}"
+      MIN_RECLAIMABLE_GB: "{{ inputs.min_reclaimable_gb }}"
+      EXEMPT_HOSTS: "{{ inputs.exempt_hosts }}"
+    script: |
+      import datetime
+      import json
+      import os
+
+      DEFAULT_INVENTORY = """
+      {
+        "scan_date": "2026-10-15",
+        "snapshots": [
+          {"snapshot": "vm-web01-20260901", "host": "kvm-prod-01", "created_at": "2026-09-01T02:10:00Z", "size_gb": 42.5, "has_vm_ref": false},
+          {"snapshot": "vm-web01-quick", "host": "kvm-prod-01", "created_at": "2026-10-14T08:00:00Z", "size_gb": 12.0, "has_vm_ref": false},
+          {"snapshot": "vm-db02-cloning", "host": "kvm-prod-02", "created_at": "2026-08-20T11:30:00Z", "size_gb": 88.0, "has_vm_ref": true},
+          {"snapshot": "vm-edge-20260810", "host": "kvm-edge-03", "created_at": "2026-08-10T05:45:00Z", "size_gb": 30.0, "has_vm_ref": false},
+          {"snapshot": "vm-gpu01-maint", "host": "kvm-gpu-04", "created_at": "2026-07-30T22:00:00Z", "size_gb": 120.0, "has_vm_ref": false},
+          {"snapshot": "vm-lab9-old", "host": "kvm-lab-09", "created_at": "2026-06-15T09:00:00Z", "size_gb": 18.5, "has_vm_ref": false}
+        ]
+      }
+      """
+
+
+      def as_int(value, fallback=0):
+          try:
+              return int(value)
+          except (TypeError, ValueError):
+              try:
+                  return int(float(value))
+              except (TypeError, ValueError):
+                  return fallback
+
+
+      def as_float(value, fallback=0.0):
+          try:
+              return float(value)
+          except (TypeError, ValueError):
+              return fallback
+
+
+      def as_bool(value):
+          if isinstance(value, bool):
+              return value
+          return str(value).strip().lower() in ("true", "1", "yes")
+
+
+      raw = (os.environ.get("KVM_SNAPSHOT_JSON") or "").strip() or DEFAULT_INVENTORY.strip()
+      retention = max(0, as_int(os.environ.get("RETENTION_DAYS"), 30))
+      min_gb = as_float(os.environ.get("MIN_RECLAIMABLE_GB"), 50.0)
+      exempt_raw = os.environ.get("EXEMPT_HOSTS")
+      if exempt_raw is None:
+          exempt_raw = "kvm-gpu-04"
+      exempt_hosts = {
+          host.strip()
+          for host in exempt_raw.split(",")
+          if host.strip()
+      }
+
+      outputs = {
+          "scan_ok": False,
+          "snapshot_count": 0,
+          "reclaimable_count": 0,
+          "reclaimable_gb": 0.0,
+          "reclaimable_snapshots": [],
+          "protected_count": 0,
+          "oldest_reclaimable_age_days": 0,
+          "host_summary": [],
+      }
+
+      try:
+          payload = json.loads(raw)
+      except ValueError:
+          payload = None
+
+      if isinstance(payload, dict):
+          snapshots = payload.get("snapshots")
+          if not isinstance(snapshots, list):
+              snapshots = []
+          scan_date_raw = str(payload.get("scan_date") or "").strip()
+          try:
+              scan_date = datetime.date.fromisoformat(scan_date_raw[:10])
+          except ValueError:
+              scan_date = datetime.date.today()
+          hosts = {}
+          scanned = 0
+          reclaimable_names = []
+          reclaimable_gb = 0.0
+          reclaimable_count = 0
+          protected_count = 0
+          oldest_age = 0
+          for snap in snapshots:
+              if not isinstance(snap, dict):
+                  continue
+              scanned += 1
+              name = str(snap.get("snapshot") or "unknown-snapshot")
+              host = str(snap.get("host") or "unknown-host")
+              size_gb = max(0.0, as_float(snap.get("size_gb")))
+              has_ref = as_bool(snap.get("has_vm_ref"))
+              host_exempt = host in exempt_hosts
+              created_raw = str(snap.get("created_at") or "")
+              try:
+                  created = datetime.date.fromisoformat(created_raw[:10])
+                  age_days = (scan_date - created).days
+              except ValueError:
+                  age_days = -1
+              reclaimable = age_days > retention and not has_ref and not host_exempt
+              row = hosts.setdefault(host, {
+                  "host": host,
+                  "snapshots": 0,
+                  "reclaimable_count": 0,
+                  "reclaimable_gb": 0.0,
+                  "exempt": host_exempt,
+              })
+              row["snapshots"] += 1
+              if reclaimable:
+                  reclaimable_names.append(name)
+                  reclaimable_gb += size_gb
+                  reclaimable_count += 1
+                  oldest_age = max(oldest_age, age_days)
+                  row["reclaimable_count"] += 1
+                  row["reclaimable_gb"] = round(row["reclaimable_gb"] + size_gb, 2)
+              else:
+                  protected_count += 1
+          host_rows = sorted(hosts.values(), key=lambda r: r["reclaimable_gb"], reverse=True)
+          outputs.update({
+              "scan_ok": True,
+              "snapshot_count": scanned,
+              "reclaimable_count": reclaimable_count,
+              "reclaimable_gb": round(reclaimable_gb, 2),
+              "reclaimable_snapshots": reclaimable_names,
+              "protected_count": protected_count,
+              "oldest_reclaimable_age_days": oldest_age,
+              "host_summary": host_rows,
+          })
+
+      print("scan_ok=%s snapshots=%d reclaimable=%d gb=%.2f protected=%d oldest=%d" % (
+          outputs["scan_ok"], outputs["snapshot_count"], outputs["reclaimable_count"],
+          outputs["reclaimable_gb"], outputs["protected_count"],
+          outputs["oldest_reclaimable_age_days"]))
+      print("::" + json.dumps({"outputs": outputs}) + "::")
+
+  # --- 2. per host sweep ---
+  - id: review_hosts
+    type: io.kestra.plugin.core.flow.Loop
+    description: Walk the scored host rows one at a time so every host carrying reclaimable snapshots gets its own alert with the exact gigabyte figures instead of one blended fleet message.
+    concurrencyLimit: 1
+    values: "{{ outputs.apply_retention.vars.host_summary }}"
+    tasks:
+      - id: flag_host
+        type: io.kestra.plugin.core.flow.If
+        description: Branch on the per host reclaimable gigabytes the scorer already computed, keeping the age, reference and exemption policy in one place.
+        condition: "{{ item.value.reclaimable_gb > 0 }}"
+        then:
+          - id: alert_host
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Post the host name, its reclaimable snapshot count and gigabytes so the virtualization team can run virsh snapshot removal with evidence.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "text": "KVM snapshot reclaim for host {{ item.value.host }} - {{ item.value.reclaimable_count }} reclaimable snapshot(s) of {{ item.value.snapshots }} inventoried, {{ item.value.reclaimable_gb }} GB past the {{ inputs.retention_days }} day retention window and unreferenced. Execution {{ execution.id }}."
+              }
+        else:
+          - id: log_host_clean
+            type: io.kestra.plugin.core.log.Log
+            description: Record the clean host for the scan so the execution history still carries the full per host trail.
+            message: "Host {{ item.value.host }} clean - all {{ item.value.snapshots }} inventoried snapshot(s) protected by age, reference or exemption, nothing to reclaim."
+
+  # --- 3. reclaim gate ---
+  - id: gate_reclaim
+    type: io.kestra.plugin.core.flow.If
+    description: Branch on the fleet verdict so a scan whose reclaimable gigabytes meet the threshold escalates and fails the run, while a compliant estate is logged and passes.
+    condition: "{{ outputs.apply_retention.vars.scan_ok and outputs.apply_retention.vars.reclaimable_gb >= inputs.min_reclaimable_gb }}"
+    then:
+      - id: alert_reclaim
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the reclaimable snapshot count, the gigabytes, the oldest snapshot age and the named snapshots so storage pressure can be relieved immediately.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "KVM snapshot retention ESCALATION - {{ outputs.apply_retention.vars.reclaimable_count }} reclaimable snapshot(s) holding {{ outputs.apply_retention.vars.reclaimable_gb }} GB, oldest {{ outputs.apply_retention.vars.oldest_reclaimable_age_days }} days: {{ outputs.apply_retention.vars.reclaimable_snapshots }}. Threshold is {{ inputs.min_reclaimable_gb }} GB against a {{ inputs.retention_days }} day window. Execution {{ execution.id }}."
+          }
+      - id: fail_retention
+        type: io.kestra.plugin.core.execution.Fail
+        description: Turn the run red so the storage pipeline stops instead of signing off while stale snapshots keep consuming the KVM datastores.
+        errorMessage: "KVM snapshot retention found {{ outputs.apply_retention.vars.reclaimable_count }} reclaimable snapshot(s) holding {{ outputs.apply_retention.vars.reclaimable_gb }} GB, oldest {{ outputs.apply_retention.vars.oldest_reclaimable_age_days }} days."
+    else:
+      - id: log_retention_clean
+        type: io.kestra.plugin.core.log.Log
+        description: Record the clean retention verdict with the protected count so a quiet scan still leaves evidence the policy ran.
+        message: "KVM snapshot retention clean - {{ outputs.apply_retention.vars.snapshot_count }} snapshot(s) scanned, {{ outputs.apply_retention.vars.protected_count }} protected, reclaimable {{ outputs.apply_retention.vars.reclaimable_gb }} GB under the {{ inputs.min_reclaimable_gb }} GB threshold."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: scan_ok
+    type: BOOL
+    description: True when the posted inventory parsed and the retention policy was applied, false for a malformed payload.
+    value: "{{ outputs.apply_retention.vars.scan_ok }}"
+  - id: snapshot_count
+    type: INT
+    description: Number of snapshots scored in the inventory, referenced and exempt entries included.
+    value: "{{ outputs.apply_retention.vars.snapshot_count }}"
+  - id: reclaimable_count
+    type: INT
+    description: Snapshots past the retention window that are neither VM referenced nor on an exempt host.
+    value: "{{ outputs.apply_retention.vars.reclaimable_count }}"
+  - id: reclaimable_gb
+    type: FLOAT
+    description: Total gigabytes held by reclaimable snapshots, the number compared against the escalation threshold.
+    value: "{{ outputs.apply_retention.vars.reclaimable_gb }}"
+  - id: reclaimable_snapshots
+    type: ARRAY
+    description: Names of the reclaimable snapshots in inventory order, for example vm-lab9-old, ready to feed a virsh removal job.
+    value: "{{ outputs.apply_retention.vars.reclaimable_snapshots }}"
+  - id: protected_count
+    type: INT
+    description: Snapshots kept by policy, too new, VM referenced or sitting on an exempt host.
+    value: "{{ outputs.apply_retention.vars.protected_count }}"
+  - id: oldest_reclaimable_age_days
+    type: INT
+    description: Age in days of the oldest reclaimable snapshot, the loudest signal of how long storage has been leaking.
+    value: "{{ outputs.apply_retention.vars.oldest_reclaimable_age_days }}"
+  - id: host_summary
+    type: ARRAY
+    description: Per host rows with snapshot counts, reclaimable counts, reclaimable gigabytes and the exempt flag, sorted by reclaimable gigabytes descending.
+    value: "{{ outputs.apply_retention.vars.host_summary }}"
+
+extend:
+  title: Reclaim Stale KVM Snapshots Before They Eat the Datastore
+  metaTitle: KVM Snapshot Retention Scoring and Reclaim Gate
+  shortDescription: Age posted KVM snapshot inventories against retention policy, alert per host on Slack and gate the run on reclaimable gigabytes.
+  metaDescription: "Score KVM snapshot inventories against retention policy, skip referenced and exempt hosts, alert Slack per host and gate the run on reclaimable GB."
+  description: |
+    ## How it works
+
+    1. `on_inventory_publish` (`io.kestra.plugin.core.trigger.Webhook`, keyed with the `KVM_SNAPSHOT_WEBHOOK_KEY` secret) receives the snapshot inventory from your provisioning or maintenance pipeline. `nightly_retention_scan` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 4 * * *`) is the safety net and ships `disabled: true` until an operator turns it on.
+    2. `apply_retention` (`io.kestra.plugin.scripts.python.Script` on `python:3.12-slim`) prefers the posted inventory and falls back to a bundled six snapshot example so trial runs still produce a report. Each snapshot is aged against `scan_date`; it is reclaimable only when its age exceeds `retention_days` and it is neither VM referenced nor on a host listed in `exempt_hosts`. The reclaimable names, the gigabyte total, the protected count, the oldest age and the per host rollup are printed as a single `::{"outputs": ...}::` line.
+    3. `review_hosts` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) walks the scored host rows one at a time. `flag_host` (`io.kestra.plugin.core.flow.If`) branches on the per host reclaimable gigabytes, so a host carrying stale snapshots gets its own `alert_host` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) with the exact counts, while a clean host lands on `log_host_clean`.
+    4. `gate_reclaim` (`io.kestra.plugin.core.flow.If`) branches on the fleet verdict. Reclaimable gigabytes at or above `min_reclaimable_gb` reach `alert_reclaim` with the snapshot names and the oldest age, then `fail_retention` (`io.kestra.plugin.core.execution.Fail`) turns the run red. A compliant estate lands on `log_retention_clean`.
+    5. The flow level `errors` handler (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) reports any failure with the execution id, because a dead scorer looks exactly like a clean datastore.
+
+    ## What you get
+
+    - Per snapshot age, reference and exemption verdicts against a single retention policy that lives in version control.
+    - Reclaimable snapshot names in inventory order, ready to feed a `virsh snapshot-delete` job or a storage ticket.
+    - One focused Slack alert per host holding reclaimable space plus a fleet escalation when the gigabyte threshold is met.
+    - `reclaimable_count`, `reclaimable_gb`, `oldest_reclaimable_age_days` and the full `host_summary` table as typed outputs.
+    - A disabled nightly schedule as a second net once the webhook path is trusted.
+
+    ## Who it's for
+
+    - Virtualization admins responsible for KVM estates where provision and self-heal snapshots accumulate without garbage collection.
+    - Platform teams that need retention evidence before approving storage expansion.
+    - SREs who want stale snapshot pressure surfaced as a gate in the same pipeline as the rest of the platform checks.
+
+    ## Why orchestrate this with Kestra
+
+    Snapshot sprawl is invisible until a datastore fills and a live VM stalls. Kestra gives the provisioning pipeline a webhook to land on, a scorer whose age, reference and exemption rules are reviewable, a Loop that names every leaking host, a branch that separates escalation from the all clear, and outputs that a reclaim job or weekly storage report can consume. A cron script on the hypervisor can list snapshots, but it has no alert routing, no execution history and no gate.
+
+    ## Prerequisites
+
+    - A worker with Docker access, the scorer runs in `python:3.12-slim`.
+    - A provisioning or maintenance pipeline that POSTs snapshot inventory JSON with host, created_at, size_gb and has_vm_ref fields, or rely on the bundled example for trial runs.
+    - A Slack incoming webhook for the per host alerts and for failure alerts.
+
+    ### Secrets
+
+    - `KVM_SNAPSHOT_WEBHOOK_KEY`: key segment guarding the inventory webhook URL, anyone holding it can trigger a retention scan.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the per host alerts and failure alerts.
+
+    ## Quick start
+
+    1. Add the two secrets to your Kestra namespace.
+    2. Run the flow once with the default inputs and confirm `reclaimable_count` reads 3, `reclaimable_gb` reads 91.0, `oldest_reclaimable_age_days` reads 122 and `protected_count` reads 3, and that the host and escalation Slack alerts arrived.
+    3. Raise `min_reclaimable_gb` to 100 and re-run to watch the same inventory pass the gate while the reclaimable counters stay identical.
+    4. Point your pipeline at `/api/v1/{tenant}/executions/webhook/{namespace}/kvm-snapshot-retention/{KVM_SNAPSHOT_WEBHOOK_KEY}` and enable `nightly_retention_scan` once the path is trusted.
+
+    ## How to extend
+
+    - Drive reclamation directly with `io.kestra.plugin.scripts.shell.Commands` on a libvirt host after the gate passes, consuming the `reclaimable_snapshots` output as the removal list.
+    - Persist the `host_summary` rows to a warehouse with `io.kestra.plugin.jdbc.postgresql.Queries` to chart reclaimable gigabytes trending down week over week.
+    - Fan out per cluster with `io.kestra.plugin.core.flow.ForEachItem` over a subflow that scores one cluster inventory each.
+    - Add a second threshold for single snapshot size so one giant snapshot escalates even when the fleet total stays under the limit.
+
+    ## Links
+
+    - [libvirt snapshot management](https://libvirt.org/kbase/backing_storage.html)
+    - [Kestra Loop task](https://kestra.io/plugins/core/tasks/flow/io.kestra.plugin.core.flow.loop)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Kestra Webhook trigger](https://kestra.io/docs/workflow-components/triggers/webhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - VM Provisioning
+    - FinOps & Cost Management
+  ee: false
+  demo: false

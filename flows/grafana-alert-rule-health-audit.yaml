@@ -1,0 +1,368 @@
+id: grafana-alert-rule-health-audit
+namespace: company.team
+description: |
+  Audit Grafana-managed alert rules, notification routing and active silences.
+  Report only a changed set of delivery gaps or unhealthy evaluations. A human
+  may approve expiry of one long-lived silence after the flow rechecks it.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: grafana_change
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call POST /api/v1/main/executions/webhook/company.team/grafana-alert-rule-health-audit/grafana-audit-change-me after an alerting configuration change; replace the demo key before deployment.
+    key: grafana-audit-change-me
+  - id: daily_backstop
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Enable after configuring Grafana and Slack secrets to catch drift without a webhook.
+    cron: "0 8 * * *"
+    disabled: true
+
+inputs:
+  - id: grafana_url
+    type: STRING
+    defaults: http://grafana-audit:3000
+    description: Grafana base URL reachable from the Kestra worker; change it for your deployment.
+  - id: max_silence_hours
+    type: INT
+    defaults: 168
+    description: Flag active silences ending more than this many hours from now; seven days is the default review horizon.
+  - id: silence_id_to_expire
+    type: STRING
+    defaults: ""
+    description: Optional exact Grafana silence ID to propose for expiry if this audit finds it long-lived.
+  - id: allow_expiry
+    type: BOOL
+    defaults: false
+    description: Enable the human approval gate for the requested silence; the audit stays read-only by default.
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reject malformed URLs, thresholds and silence IDs before contacting Grafana.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      GRAFANA_URL: "{{ inputs.grafana_url }}"
+      MAX_HOURS: "{{ inputs.max_silence_hours }}"
+      SILENCE_ID: "{{ inputs.silence_id_to_expire }}"
+      ALLOW_EXPIRY: "{{ inputs.allow_expiry }}"
+    script: |
+      import os
+      import re
+      import hashlib
+      import json
+      from urllib.parse import urlparse
+
+      url = os.environ["GRAFANA_URL"].rstrip("/")
+      parsed = urlparse(url)
+      if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+          raise ValueError("Grafana URL must be an http(s) origin without credentials, path, query or fragment")
+      hours = int(os.environ["MAX_HOURS"])
+      if not 1 <= hours <= 8760:
+          raise ValueError("max_silence_hours must be from 1 to 8760")
+      silence_id = os.environ["SILENCE_ID"].strip()
+      if silence_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", silence_id):
+          raise ValueError("silence_id_to_expire contains invalid characters")
+      if os.environ["ALLOW_EXPIRY"].lower() == "true" and not silence_id:
+          raise ValueError("allow_expiry requires silence_id_to_expire")
+      print("Validated Grafana audit inputs")
+      key = "grafana_alert_health_" + hashlib.sha256(url.encode()).hexdigest()[:20]
+      print("::" + json.dumps({"outputs": {"kv_key": key}}) + "::")
+
+  - id: scan_grafana
+    type: io.kestra.plugin.scripts.python.Script
+    description: Read actual Grafana-managed rules, live evaluation health, the effective Alertmanager route tree and active silences; classify gaps without changing Grafana.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      GRAFANA_URL: "{{ inputs.grafana_url }}"
+      GRAFANA_TOKEN: "{{ secret('GRAFANA_API_TOKEN') }}"
+      MAX_HOURS: "{{ inputs.max_silence_hours }}"
+      SILENCE_ID: "{{ inputs.silence_id_to_expire }}"
+    script: |
+      import datetime as dt
+      import hashlib
+      import json
+      import os
+      import time
+      import urllib.error
+      import urllib.request
+
+      root = os.environ["GRAFANA_URL"].rstrip("/")
+      token = os.environ["GRAFANA_TOKEN"]
+      now = dt.datetime.now(dt.timezone.utc)
+      horizon = now + dt.timedelta(hours=int(os.environ["MAX_HOURS"]))
+
+      def get(path):
+          request = urllib.request.Request(root + path, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+          for attempt in range(3):
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      data = json.load(response)
+                  if isinstance(data, dict) and data.get("status") == "error":
+                      raise RuntimeError(path + ": Grafana returned status=error: " + str(data.get("error", "unknown")))
+                  return data
+              except urllib.error.HTTPError as error:
+                  if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                      raise RuntimeError(path + ": HTTP " + str(error.code)) from error
+              except (urllib.error.URLError, TimeoutError) as error:
+                  if attempt == 2:
+                      raise RuntimeError(path + ": " + str(error.reason if hasattr(error, "reason") else error)) from error
+              time.sleep(2 ** attempt)
+          raise RuntimeError(path + ": retry budget exhausted")
+
+      try:
+          rules = get("/api/v1/provisioning/alert-rules")
+          live = get("/api/prometheus/grafana/api/v1/rules")
+          config = get("/api/alertmanager/grafana/config/api/v1/alerts")
+          silences = get("/api/alertmanager/grafana/api/v2/silences")
+      except RuntimeError as error:
+          raise SystemExit("Grafana API error: " + str(error)) from None
+      if not isinstance(rules, list) or not isinstance(silences, list):
+          raise ValueError("Grafana returned an unexpected rules or silences response")
+      groups = live.get("data", {}).get("groups") if isinstance(live, dict) else None
+      am = config.get("alertmanager_config") if isinstance(config, dict) else None
+      if live.get("status") != "success" or not isinstance(groups, list) or not isinstance(am, dict):
+          raise ValueError("Grafana returned an unexpected live rule or Alertmanager response")
+
+      receivers = {r.get("name") for r in am.get("receivers", []) if isinstance(r, dict)}
+      issues = []
+      def issue(kind, key, detail):
+          issues.append({"kind": kind, "key": str(key), "detail": str(detail)})
+
+      def inspect_route(route, path):
+          if not isinstance(route, dict):
+              return
+          receiver = route.get("receiver")
+          if receiver and receiver not in receivers:
+              issue("missing_contact_point", path, "Route receiver " + str(receiver) + " has no configured contact point")
+          for index, child in enumerate(route.get("routes") or []):
+              inspect_route(child, path + "/" + str(index))
+
+      inspect_route(am.get("route"), "root")
+      rule_by_uid = {r.get("uid"): r for r in rules if isinstance(r, dict) and r.get("uid")}
+      for uid, rule in rule_by_uid.items():
+          direct = (rule.get("notification_settings") or {}).get("receiver")
+          if direct and direct not in receivers:
+              issue("missing_contact_point", uid, "Rule " + str(rule.get("title", uid)) + " selects missing receiver " + str(direct))
+
+      live_count = 0
+      for group in groups:
+          for rule in group.get("rules") or []:
+              live_count += 1
+              uid = rule.get("uid") or (rule.get("grafana_alert") or {}).get("uid") or rule.get("name", "unknown")
+              health = str(rule.get("health") or "").lower().replace(" ", "")
+              if health in ("error", "nodata") or health.startswith("error,") or health.startswith("nodata,"):
+                  title = rule_by_uid.get(uid, {}).get("title") or rule.get("name") or uid
+                  issue("unhealthy_rule", uid, str(title) + " has evaluation health " + str(rule.get("health")))
+
+      def parse_time(value):
+          return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+      candidates = {}
+      for silence in silences:
+          if not isinstance(silence, dict):
+              continue
+          sid = silence.get("id")
+          state = (silence.get("status") or {}).get("state")
+          if not sid or state != "active":
+              continue
+          try:
+              end = parse_time(silence["endsAt"])
+          except (KeyError, TypeError, ValueError):
+              issue("invalid_silence_expiry", sid, "Active silence has an unreadable endsAt")
+              continue
+          if end > horizon:
+              issue("long_silence", sid, "Active silence ends " + silence["endsAt"] + "; review matchers before expiry")
+              stable = {key: silence.get(key) for key in ("id", "matchers", "startsAt", "endsAt", "createdBy", "comment")}
+              candidates[sid] = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+
+      issues.sort(key=lambda row: (row["kind"], row["key"], row["detail"]))
+      digest = hashlib.sha256(json.dumps(issues, sort_keys=True).encode()).hexdigest()
+      target = os.environ["SILENCE_ID"].strip()
+      report = {"rule_count": len(rule_by_uid), "live_rule_count": live_count, "silence_count": len(silences), "issues": issues}
+      result = {"report": json.dumps(report, separators=(",", ":")), "digest": digest, "issue_count": len(issues), "target_eligible": target in candidates, "target_fingerprint": candidates.get(target, ""), "summary": "; ".join(i["kind"] + " " + i["key"] + ": " + i["detail"] for i in issues)[:1800] or "No alert health or routing gaps"}
+      print("Grafana audit: %d configured rules, %d live rules, %d silences, %d issues" % (len(rule_by_uid), live_count, len(silences), len(issues)))
+      print("::" + json.dumps({"outputs": result}) + "::")
+
+  - id: read_previous
+    type: io.kestra.plugin.core.kv.Get
+    description: Load the previous issue fingerprint so an unchanged audit does not page again.
+    key: "{{ outputs.validate_inputs.vars.kv_key }}"
+    errorOnMissing: false
+
+  - id: report_change
+    type: io.kestra.plugin.core.flow.If
+    description: Suppress an initial all-clear message, but report new issues and later recovery exactly once.
+    condition: "{{ (outputs.read_previous.value ?? '') != outputs.scan_grafana.vars.digest and (outputs.scan_grafana.vars.issue_count != 0 or (outputs.read_previous.value ?? '') != '') }}"
+    then:
+      - id: notify_change
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert once per changed issue set, including recovery to zero issues.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: >-
+          Grafana alert audit {{ execution.id }}: {{ outputs.scan_grafana.vars.issue_count }} issue(s).
+          {{ outputs.scan_grafana.vars.summary }}. Inspect the report output and fix the contact point, evaluation or silence.
+          Silence expiry requires separate approval.
+        retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+  - id: remember_digest
+    type: io.kestra.plugin.core.kv.Set
+    description: Record the current fingerprint after any required Slack alert succeeds.
+    key: "{{ outputs.validate_inputs.vars.kv_key }}"
+    value: "{{ outputs.scan_grafana.vars.digest }}"
+
+  - id: propose_expiry
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.allow_expiry and outputs.scan_grafana.vars.target_eligible }}"
+    then:
+      - id: wait_for_approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Review the exact silence ID and matchers in Grafana. If unanswered within four hours, expiry is cancelled.
+        pauseDuration: PT4H
+        behavior: CANCEL
+        onResume:
+          - id: action
+            type: SELECT
+            displayName: Expire the silence named in execution inputs?
+            description: Check the exact silence_id_to_expire in Grafana; choose keep unless it no longer protects an active incident.
+            values: [keep, expire]
+      - id: approved
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.wait_for_approval.onResume.action == 'expire' }}"
+        then:
+          - id: expire_if_unchanged
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-read the silence, require the same matchers and expiry the approver saw, then expire it and verify Grafana reports it expired.
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            env:
+              GRAFANA_URL: "{{ inputs.grafana_url }}"
+              GRAFANA_TOKEN: "{{ secret('GRAFANA_API_TOKEN') }}"
+              SILENCE_ID: "{{ inputs.silence_id_to_expire }}"
+              EXPECTED_FINGERPRINT: "{{ outputs.scan_grafana.vars.target_fingerprint }}"
+              MAX_HOURS: "{{ inputs.max_silence_hours }}"
+            script: |
+              import datetime as dt
+              import hashlib
+              import json
+              import os
+              import time
+              import urllib.error
+              import urllib.request
+
+              root = os.environ["GRAFANA_URL"].rstrip("/")
+              sid = os.environ["SILENCE_ID"]
+              path = "/api/alertmanager/grafana/api/v2/silence/" + sid
+              headers = {"Authorization": "Bearer " + os.environ["GRAFANA_TOKEN"], "Accept": "application/json"}
+
+              def get():
+                  with urllib.request.urlopen(urllib.request.Request(root + path, headers=headers), timeout=15) as response:
+                      return json.load(response)
+
+              silence = get()
+              stable = {key: silence.get(key) for key in ("id", "matchers", "startsAt", "endsAt", "createdBy", "comment")}
+              digest = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+              if digest != os.environ["EXPECTED_FINGERPRINT"]:
+                  raise RuntimeError("Silence changed since approval; no expiry sent. Re-run the audit")
+              horizon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=int(os.environ["MAX_HOURS"]))
+              end = dt.datetime.fromisoformat(silence["endsAt"].replace("Z", "+00:00"))
+              if (silence.get("status") or {}).get("state") != "active" or end <= horizon:
+                  raise RuntimeError("Silence is no longer an active long-lived candidate; no expiry sent")
+              request = urllib.request.Request(root + path, headers=headers, method="DELETE")
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      if response.status not in (200, 202, 204):
+                          raise RuntimeError("Grafana returned unexpected expiry status " + str(response.status))
+              except (urllib.error.URLError, TimeoutError) as error:
+                  raise RuntimeError("Expiry response is uncertain; inspect Grafana before retrying") from error
+              for _ in range(5):
+                  observed = get()
+                  if (observed.get("status") or {}).get("state") == "expired":
+                      print("Verified silence " + sid + " expired")
+                      print("::" + json.dumps({"outputs": {"expired": True, "silence_id": sid}}) + "::")
+                      break
+                  time.sleep(1)
+              else:
+                  raise RuntimeError("Grafana did not confirm the silence expired; inspect it before retrying")
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: A genuine API or task failure needs a human inspection before another expiry attempt.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Grafana alert audit {{ execution.id }} failed in {{ tasksWithState('FAILED')[0]['taskId'] }}.
+      Cause: {{ (errorLogs() | toJson | jq('[.[] | .message | select(contains("Error:"))] | first') | first) ?? errorLogs()[0]['message'] }}.
+      Inspect the execution and Grafana silence state before retrying; an expiry response may be uncertain.
+
+outputs:
+  - id: audit_report
+    type: STRING
+    description: JSON with configured/live rule counts, silence count and the exact issues; available on successful runs.
+    value: "{{ outputs.scan_grafana.vars.report ?? '{}' }}"
+  - id: expired_silence_id
+    type: STRING
+    description: The silence ID Grafana confirmed expired, or an empty string when no expiry was approved.
+    value: "{{ outputs.expire_if_unchanged.vars.silence_id ?? '' }}"
+
+extend:
+  title: Find Blind Spots in Grafana Alerting
+  shortDescription: Audit live alert health, notification receivers and long-lived silences; report changes once and require approval before expiring a silence.
+  metaTitle: Grafana Alert Rule Health Audit with Kestra
+  metaDescription: Audit Grafana alert health, receiver routing and long-lived silences with Kestra; alert on changes and approve guarded silence expiry.
+  description: |
+    An alert rule can exist yet never reach on-call: its evaluation is in Error or No Data, its route references a missing receiver, or a long-lived silence hides it. This blueprint reads Grafana's live evaluation and Alertmanager configuration APIs together. It reports only changes in the issue set and can expire one reviewed silence after approval and a fresh read.
+
+    ## How it works
+    1. `validate_inputs` checks the Grafana origin, horizon and requested silence ID before any API call.
+    2. `scan_grafana` reads configured rules, live rule health, Alertmanager receivers and routes, and active silences. It emits a JSON report and stable issue fingerprint.
+    3. `read_previous` and `report_change` compare the fingerprint with Kestra KV; a changed issue set produces one Slack message, then `remember_digest` updates KV. A first healthy audit is quiet.
+    4. If `allow_expiry` names a flagged silence, `wait_for_approval` asks a human to keep or expire it. `expire_if_unchanged` checks the exact silence fields again, sends one DELETE, and confirms the expired state. Timeout cancels the run without a write.
+
+    ## Error handling
+    API reads retry transient HTTP 429/5xx and network failures. HTTP 200 bodies with `status: error` fail loudly. A missing receiver, unhealthy evaluation and excessive silence remain separate issues. A changed or no-longer-long-lived silence is never expired. DELETE is not blindly retried because its response may be uncertain; the error alert tells an operator to inspect Grafana first.
+
+    ## What this blueprint teaches about Kestra
+    A Webhook and disabled Schedule share one audit, KV suppresses repeat notifications, `If` isolates a human-approved branch, and `Pause` makes the destructive step visible. The final output is machine-readable for downstream flows.
+
+    ## Prerequisites
+    Grafana 12 with Grafana-managed alerts; Python 3 on the Kestra worker; a Grafana service account allowed to read alert rules, receivers, routes and silences (and expire silences only when that option is used); a Slack incoming webhook. The default URL targets a Grafana container named `grafana-audit` on the same Docker network.
+
+    ### Secrets
+    - `GRAFANA_API_TOKEN`: service account bearer token; never embed it in the flow.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for changed issue sets and failures.
+
+    ### Inputs
+    - `grafana_url` (STRING, default `http://grafana-audit:3000`): Grafana origin reachable by Kestra.
+    - `max_silence_hours` (INT, default `168`): active silences past this future horizon need review.
+    - `silence_id_to_expire` (STRING, default empty): one exact silence to propose for expiry.
+    - `allow_expiry` (BOOL, default `false`): enable the approval step for that candidate.
+
+    ### Outputs
+    - `audit_report` (STRING containing JSON): configured/live rule counts and detailed issues on successful runs.
+    - `expired_silence_id` (STRING): ID only after Grafana confirms expiry; otherwise empty. Failed runs do not emit flow outputs.
+
+    ## Quick start
+    1. Add the two secrets and set `grafana_url` to your Grafana origin.
+    2. Run manually. Fix the reported receiver or evaluation gaps; activate the disabled schedule or POST to the webhook after configuration changes.
+    3. To expire a long-lived silence, copy its ID from `audit_report`, set `allow_expiry=true` and `silence_id_to_expire`, then review the Pause dialog. Re-running an unchanged audit does not repeat Slack.
+
+    ## Plugins used
+    - [Python Script](https://kestra.io/plugins/plugin-scripts-python/io.kestra.plugin.scripts.python.Script) with the Process runner and standard library.
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/io.kestra.plugin.slack.notifications.SlackIncomingWebhook).
+
+    ## Links
+    - [Grafana alerting provisioning API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/alerting_provisioning/)
+    - [Grafana alert rule health](https://grafana.com/docs/grafana/latest/alerting/fundamentals/alert-rule-evaluation/alert-rule-state-and-health/)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Core
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
