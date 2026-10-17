@@ -1,0 +1,414 @@
+id: mysql-binlog-point-in-time-restore-drill
+namespace: company.team
+description: |
+  Prove that your MySQL backups restore to the moment you choose. The drill takes the newest mysqldump and the archived
+  binlogs, checks the binlog chain for gaps and bad checksums, restores into a throwaway MySQL, replays the binlogs up
+  to a target time or right before a given statement (a DROP TABLE, a DELETE without WHERE), runs your checks and
+  measures the restore time. Demo mode needs only Docker.
+
+triggers:
+  - id: after_backup
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call it when the nightly mysqldump has been uploaded, so every new dump is proven restorable with the binlogs that follow it.
+    key: "{{ secret('MYSQL_PITR_DRILL_WEBHOOK_KEY') }}"
+  - id: weekly_drill
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Safety net when the backup job does not call the webhook. Shipped disabled.
+    cron: "20 5 * * 1"
+    disabled: true
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+sla:
+  - id: restore_deadline
+    type: MAX_DURATION
+    duration: PT1H
+    behavior: FAIL
+    labels:
+      drill: deadline_exceeded
+
+inputs:
+  - id: mode
+    type: SELECT
+    values: [demo, s3]
+    defaults: demo
+    description: demo builds a source database, dumps it, keeps writing, then drops a table by mistake, and recovers to the statement before the DROP. s3 drills your own dumps and binlogs.
+  - id: s3_bucket
+    type: STRING
+    required: false
+  - id: dump_prefix
+    type: STRING
+    defaults: mysql/dumps/
+    description: Where the mysqldump files are (*.sql.gz). The newest one is restored.
+  - id: binlog_prefix
+    type: STRING
+    defaults: mysql/binlogs/
+    description: Where the archived binlogs are, under their original names (binlog.000042), as written by mysqlbinlog --read-from-remote-server --raw.
+  - id: s3_endpoint
+    type: STRING
+    defaults: https://s3.us-east-1.amazonaws.com
+    description: For MinIO, Ceph, SeaweedFS or R2, their S3 URL.
+  - id: target_time
+    type: STRING
+    required: false
+    description: Recover to this moment, UTC, "2026-10-16 10:15:00". mysqlbinlog stops at the first event at or after this second, so nothing from the target second itself is replayed; binlog timestamps have one-second resolution. Use stop_before_statement to stop exactly before a mistake. Empty replays every archived binlog.
+  - id: stop_before_statement
+    type: STRING
+    required: false
+    description: A regular expression. The replay stops right before the first transaction whose statement matches it, for example "DROP TABLE `?shop`?.`?orders" or "DELETE FROM `shop`.`orders`" (row events are matched on mysqlbinlog -v pseudo-SQL). The demo uses "DROP TABLE".
+  - id: checks
+    type: ARRAY
+    itemType: STRING
+    required: false
+    description: SQL statements run on the restored server. Each returns one row with columns ok (1 or 0) and detail. The demo adds its own row count check.
+  - id: archive_lag_minutes
+    type: INT
+    defaults: 30
+    description: The newest archived binlog event must be younger than this. It is how much data you can lose if the server dies now.
+  - id: rto_minutes
+    type: INT
+    defaults: 30
+    description: The restore (dump load and binlog replay) must finish within this many minutes.
+  - id: mysql_image
+    type: STRING
+    defaults: percona/percona-server:8.0
+    description: Needs mysqld, mysqldump and mysqlbinlog of your server's major version. The official mysql image no longer ships mysqlbinlog; Percona Server is a drop-in MySQL build that does, and restores MySQL Community dumps and binlogs.
+
+variables:
+  last_good_key: mysql_pitr_drill_last_good
+
+tasks:
+  - id: s3_mode
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode == 's3' }}"
+    then:
+      - id: check_bucket
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (inputs.s3_bucket ?? '') == '' }}"
+        then:
+          - id: missing_bucket
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "DRILL FAILED: s3 mode needs s3_bucket."
+      - id: list_dumps
+        type: io.kestra.plugin.aws.s3.List
+        endpointOverride: "{{ inputs.s3_endpoint }}"
+        forcePathStyle: true
+        compatibilityMode: true
+        region: us-east-1
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        bucket: "{{ inputs.s3_bucket }}"
+        prefix: "{{ inputs.dump_prefix }}"
+        regexp: ".*\\.sql\\.gz$"
+        filter: FILES
+      - id: dump_found
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.list_dumps.objects ?? []) | length == 0 }}"
+        then:
+          - id: no_dump
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "DRILL FAILED: no *.sql.gz under s3://{{ inputs.s3_bucket }}/{{ inputs.dump_prefix }}. The dump job is not uploading where the drill looks, or not running."
+      - id: download_dump
+        type: io.kestra.plugin.aws.s3.Download
+        description: The newest dump by upload time.
+        endpointOverride: "{{ inputs.s3_endpoint }}"
+        forcePathStyle: true
+        compatibilityMode: true
+        region: us-east-1
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        bucket: "{{ inputs.s3_bucket }}"
+        key: "{{ outputs.list_dumps.objects | jq('sort_by(.lastModified) | last | .key') | first }}"
+      - id: download_binlogs
+        type: io.kestra.plugin.aws.s3.Downloads
+        endpointOverride: "{{ inputs.s3_endpoint }}"
+        forcePathStyle: true
+        compatibilityMode: true
+        region: us-east-1
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        bucket: "{{ inputs.s3_bucket }}"
+        prefix: "{{ inputs.binlog_prefix }}"
+        regexp: ".*\\.[0-9]{6}$"
+        action: NONE
+
+  - id: restore
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: |
+      One throwaway container: a scratch MySQL with the source's GTID mode, the dump, the binlog chain from the dump's
+      coordinates on, replayed in a single mysqlbinlog call, then the checks. Reports JSON whether it passes or not.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: IF_NOT_PRESENT
+      user: root
+    containerImage: "{{ inputs.mysql_image }}"
+    inputFiles: "{{ inputs.mode == 's3' ? (outputs.download_binlogs.outputFiles | merge({'dump.sql.gz': outputs.download_dump.uri})) : {} }}"
+    env:
+      MODE: "{{ inputs.mode }}"
+      DUMP_KEY: "{{ inputs.mode == 's3' ? (outputs.list_dumps.objects | jq('sort_by(.lastModified) | last | .key') | first) : 'demo' }}"
+      TARGET_TIME: "{{ inputs.target_time ?? '' }}"
+      STOP_RE: "{{ inputs.stop_before_statement ?? '' }}"
+      CHECKS: "{{ (inputs.checks ?? []) | join('\n') }}"
+      LAG_MIN: "{{ inputs.archive_lag_minutes }}"
+      TZ: UTC
+    commands:
+      - |
+        set -eu
+        W=/tmp/drill; rm -rf $W; mkdir -p $W/archive $W/srcbin; chown -R mysql $W
+        fail() { echo "DRILL FAILED: $*" >&2; exit 1; }
+        problems=""; problem() { problems="$problems$*|"; }
+        start_mysqld() { # <datadir> <socket> [options]
+          d=$1; s=$2; shift 2
+          mysqld --initialize-insecure --user=mysql --datadir=$d > $d.init.log 2>&1 || { tail -n 5 $d.init.log; fail "mysqld --initialize failed"; }
+          mysqld --user=mysql --datadir=$d --socket=$s --skip-networking --mysqlx=OFF --pid-file=$d.pid --log-error=$d.err "$@" &
+          for i in $(seq 1 120); do mysqladmin -S $s -uroot ping > /dev/null 2>&1 && return 0; sleep 0.5; done
+          tail -n 5 $d.err; fail "mysqld did not start: $(grep ERROR $d.err | grep -v Aborting | head -n 1 | sed 's/.*\] //')"
+        }
+
+        if [ "$MODE" = demo ]; then
+          # A source with GTIDs and binlogs, a dump, more writes over three binlog files, then the accident.
+          start_mysqld $W/src $W/src.sock --server-id=1 --log-bin=$W/srcbin/binlog --gtid-mode=ON --enforce-gtid-consistency=ON
+          SRC="mysql -S $W/src.sock -uroot"
+          $SRC -e "CREATE DATABASE shop; CREATE TABLE shop.orders (id INT PRIMARY KEY, total DECIMAL(10,2)); INSERT INTO shop.orders WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000) SELECT i, i * 1.5 FROM s"
+          mysqldump -S $W/src.sock -uroot --single-transaction --source-data=2 --set-gtid-purged=ON --databases shop 2> /dev/null | gzip > dump.sql.gz
+          for b in 1001 1501; do
+            $SRC -e "INSERT INTO shop.orders WITH RECURSIVE s(i) AS (SELECT $b UNION ALL SELECT i + 1 FROM s WHERE i < $b + 499) SELECT i, i * 1.5 FROM s; FLUSH BINARY LOGS"
+          done
+          $SRC -e "DROP TABLE shop.orders; FLUSH BINARY LOGS"
+          cp $W/srcbin/binlog.0* $W/archive/
+          mysqladmin -S $W/src.sock -uroot shutdown
+          [ -n "$STOP_RE" ] || STOP_RE="DROP TABLE"
+          CHECKS="SELECT count(*) = 2000 AS ok, CONCAT(count(*), ' orders recovered (2000 before the accidental DROP TABLE)') AS detail FROM shop.orders
+        $CHECKS"
+          echo "demo: 1000 orders dumped, 1000 more written across 3 binlogs, then DROP TABLE shop.orders in the same second"
+        else
+          find . -path ./dump.sql.gz -prune -o -type f -regex '.*\.[0-9][0-9][0-9][0-9][0-9][0-9]$' -exec cp {} $W/archive/ \;
+          [ -s dump.sql.gz ] || fail "the dump $DUMP_KEY is empty"
+        fi
+
+        # The dump's binlog coordinates: where the replay must start.
+        head=$(zcat dump.sql.gz 2> $W/zerr | head -n 60) || true
+        [ -n "$head" ] || fail "$DUMP_KEY is not a readable gzip file: $(cat $W/zerr)"
+        coord=$(echo "$head" | grep -oE "(SOURCE|MASTER)_LOG_FILE='[^']+', *(SOURCE|MASTER)_LOG_POS=[0-9]+" | head -n 1)
+        [ -n "$coord" ] || fail "$DUMP_KEY has no binlog coordinates: make the dump with --source-data=2 (or --master-data=2 before MySQL 8.0.26)"
+        first=$(echo "$coord" | cut -d"'" -f2); pos=$(echo "$coord" | grep -oE '[0-9]+$')
+        gtid=OFF; echo "$head" | grep -q 'GTID_PURGED' && gtid=ON
+        zcat dump.sql.gz | tail -n 1 | grep -q 'Dump completed' || fail "$DUMP_KEY ends without '-- Dump completed': the dump was cut short"
+
+        # The chain: every file from the dump's file on, no number missing, every checksum good.
+        base=${first%.*}; n0=$(echo "${first##*.}" | sed 's/^0*//')
+        last=$(ls $W/archive | grep -E "^$base\.[0-9]{6}$" | sort | tail -n 1)
+        [ -n "$last" ] || fail "no archived binlog named $base.* (the dump points at $first)"
+        n1=$(echo "${last##*.}" | sed 's/^0*//'); files=""; gap=""
+        for n in $(seq $n0 $n1); do
+          f=$(printf "%s.%06d" "$base" "$n")
+          if [ ! -f $W/archive/$f ]; then gap="$f"; break; fi
+          mysqlbinlog --verify-binlog-checksum $W/archive/$f > /dev/null 2> $W/crc || fail "$f is corrupt: $(head -n 1 $W/crc)"
+          files="$files $W/archive/$f"
+        done
+        [ -n "$files" ] || fail "$first, the binlog the dump starts from, is not in the archive"
+        lastfile=$(echo $files | awk '{print $NF}')
+        ts() { mysqlbinlog "$@" 2> /dev/null | grep -oE '^#[0-9]{6} +[0-9]{1,2}:[0-9]{2}:[0-9]{2}' | tail -n 1 | sed -E 's/^#([0-9]{2})([0-9]{2})([0-9]{2}) +/20\1-\2-\3 /'; }
+        end_time=$(ts $lastfile)
+        [ -z "$gap" ] || problem "$gap is missing from the archive: nothing after $(basename $lastfile) ($end_time) can be replayed"
+        if [ "$MODE" = s3 ]; then
+          lag=$(( ($(date +%s) - $(date -d "$end_time" +%s)) / 60 ))
+          [ "$lag" -le "$LAG_MIN" ] || problem "the newest archived binlog event is from $end_time UTC, $lag min ago, over the $LAG_MIN min limit: the binlog archiver has stopped"
+        fi
+        [ -z "$TARGET_TIME" ] || [ "$(date -d "$TARGET_TIME" +%s)" -le "$(date -d "$end_time" +%s)" ] || problem "the target $TARGET_TIME is after the last archived event ($end_time): whatever was written in between is not in the archive"
+
+        # An exact stop: the start of the first transaction whose statement matches STOP_RE.
+        stop_pos=""; stop_dt=""; stop_note=""
+        if [ -n "$STOP_RE" ]; then
+          for f in $files; do
+            sp=""; [ "$f" = "$W/archive/$first" ] && sp="--start-position=$pos"
+            at=$(mysqlbinlog -v --base64-output=DECODE-ROWS $sp $f 2> /dev/null | awk -v re="$STOP_RE" '
+              /^# at [0-9]+/ { at = $3 }
+              index($0, "SET @@SESSION.GTID_NEXT=") == 1 && !/AUTOMATIC/ { txn = at }
+              (!/^#/ || /^### /) && tolower($0) ~ tolower(re) { print (txn != "" ? txn : at); exit }')
+            if [ -n "$at" ]; then stopfile=$f; break; fi
+          done
+          [ -n "${at:-}" ] || fail "no statement matching /$STOP_RE/ in the binlogs after the dump"
+          files=$(echo $files | awk -v s="$stopfile" '{ for (i = 1; i <= NF; i++) { printf "%s ", $i; if ($i == s) exit } }')
+          stop_pos="$at"; stop_note="right before /$STOP_RE/ ($(basename $stopfile) position $at)"
+        elif [ -n "$TARGET_TIME" ]; then
+          stop_dt="$TARGET_TIME"; stop_note="to $TARGET_TIME UTC"
+        else
+          stop_note="to the end of the archive ($end_time UTC)"
+        fi
+
+        # Restore: the scratch server has no binlog of its own, and the source's GTID mode so GTID_PURGED and the
+        # binlogs' GTID_NEXT apply. All files go through one mysqlbinlog call, as temporary tables and
+        # multi-file transactions need.
+        started=$(date +%s)
+        start_mysqld $W/r $W/r.sock --server-id=2 --skip-log-bin --gtid-mode=$gtid --enforce-gtid-consistency=$gtid
+        R="mysql -S $W/r.sock -uroot"
+        zcat dump.sql.gz | $R 2> $W/load.err || fail "loading $DUMP_KEY failed: $(head -n 1 $W/load.err)"
+        dump_s=$(( $(date +%s) - started ))
+        set -- --start-position=$pos
+        [ -z "$stop_pos" ] || set -- "$@" --stop-position=$stop_pos
+        [ -z "$stop_dt" ] || set -- "$@" "--stop-datetime=$stop_dt"
+        mysqlbinlog "$@" $files 2> $W/mb.err | $R 2> $W/replay.err || fail "the binlog replay failed: $(head -n 1 $W/replay.err)"
+        ! grep -qiE 'error|could not' $W/mb.err || fail "mysqlbinlog could not read the binlogs: $(grep -m1 -iE 'error|could not' $W/mb.err)"
+        restore_s=$(( $(date +%s) - started ))
+        replayed_last=$(basename $(echo $files | awk '{print $NF}'))
+
+        results=""; failed_checks=0; total_checks=0
+        printf '%s\n' "$CHECKS" | grep -v '^ *$' > $W/checks.sql || true
+        while IFS= read -r q; do
+          total_checks=$((total_checks + 1))
+          row=$($R -N -B -e "$q" 2>&1 | head -n 1) || row="0	check could not run: $row"
+          case "$row" in ERROR*) row="0	check could not run: $row";; esac
+          ok=$(printf '%s' "$row" | cut -f1); detail=$(printf '%s' "$row" | cut -f2- | tr -d '"\\')
+          [ "$ok" = 1 ] || { failed_checks=$((failed_checks + 1)); problem "check failed: $detail"; }
+          results="$results$([ "$ok" = 1 ] && echo PASS || echo FAIL): $detail; "
+        done < $W/checks.sql
+        mysqladmin -S $W/r.sock -uroot shutdown > /dev/null 2>&1 || true
+
+        echo "::$(printf '{"outputs":{"ok":%s,"dump":"%s","binlogs":%s,"first_binlog":"%s","replayed_to":"%s","last_binlog":"%s","archive_end":"%s","gtid_mode":"%s","stopped":"%s","dump_seconds":%s,"restore_seconds":%s,"checks":"%s","problems":"%s"}}' \
+          "$([ -z "$problems" ] && echo true || echo false)" "$DUMP_KEY" "$(echo $files | wc -w)" "$first" "$replayed_last" "$(basename $lastfile)" "$end_time" "$gtid" \
+          "$stop_note" "$dump_s" "$restore_s" "${results%; }" "$(echo "${problems%|}" | tr -d '"\\')")::"
+
+  - id: verdict
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.restore.vars.ok and outputs.restore.vars.restore_seconds <= inputs.rto_minutes * 60 }}"
+    then:
+      - id: remember_good_restore
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ vars.last_good_key }}"
+        kvType: JSON
+        value: "{{ {'at': execution.startDate, 'dump': outputs.restore.vars.dump, 'archive_end': outputs.restore.vars.archive_end} | toJson }}"
+      - id: report_pass
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          MySQL point-in-time restore drill PASSED ({{ inputs.mode }}): `{{ outputs.restore.vars.dump }}` plus {{ outputs.restore.vars.binlogs }} binlog(s) {{ outputs.restore.vars.first_binlog }} to {{ outputs.restore.vars.replayed_to }} (GTID {{ outputs.restore.vars.gtid_mode }}; the archive ends at {{ outputs.restore.vars.last_binlog }}, {{ outputs.restore.vars.archive_end }} UTC), replayed {{ outputs.restore.vars.stopped }}, in {{ outputs.restore.vars.restore_seconds }} s (dump {{ outputs.restore.vars.dump_seconds }} s; RTO {{ inputs.rto_minutes }} min).
+          Checks: {{ outputs.restore.vars.checks }}
+    else:
+      - id: drill_failed
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "DRILL FAILED: {% if outputs.restore.vars.problems != '' %}{{ outputs.restore.vars.problems | replace({'|': '; '}) }}{% else %}the restore took {{ outputs.restore.vars.restore_seconds }} s, over the {{ inputs.rto_minutes }} min RTO{% endif %}"
+
+errors:
+  - id: unless_deadline
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (labels.drill ?? '') != 'deadline_exceeded' }}"
+    then:
+      - id: alert_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          MySQL point-in-time restore drill FAILED ({{ inputs.mode }}) in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at {{ errorLogs() | jq('([.[] | select(.message | test("DRILL FAILED"))] + .)[0] | "`" + .taskId + "`: " + (.message | sub("^.*DRILL FAILED: "; "") | split("\n")[0])') | first }}{% endif %}
+          Last good drill: {{ (kv(vars.last_good_key, errorOnMissing=false) ?? {}).at ?? 'never' }}
+
+afterExecution:
+  - id: deadline_alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (labels.drill ?? '') == 'deadline_exceeded' }}"
+    then:
+      - id: alert_deadline
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "MySQL point-in-time restore drill did not finish within 1 hour (execution {{ execution.id }}) and was stopped by its SLA. A download or the replay hung; the restore is not proven."
+
+outputs:
+  - id: result
+    type: JSON
+    value: "{{ outputs.restore.vars ?? {} }}"
+
+extend:
+  title: Prove Your MySQL Backups Restore to the Second, or to the Statement Before a Mistake
+  shortDescription: Restore the newest mysqldump plus the archived binlogs into a throwaway MySQL, stop at a time or right before a bad statement, run your checks and measure the restore time.
+  metaTitle: MySQL Point-in-Time Restore Drill with mysqldump and Binlogs | Kestra
+  metaDescription: Prove MySQL PITR works. Newest mysqldump plus archived binlogs, gap and checksum checks, stop before a DROP or DELETE, your SQL checks, and an RTO.
+  description: |
+    A MySQL point-in-time restore needs two backups that fail separately: a full dump, and every binlog written since. The dump job can succeed for months while the binlog archiver stopped, skipped a file, or uploaded one that is corrupt; the dump can be cut short or made without the binlog coordinates a replay needs. And when the day comes, the usual way to stop a replay, `--stop-datetime`, works to the second: a mistake made in the same second as the last good writes cannot be separated from them by time.
+
+    This blueprint is the MySQL counterpart of the Postgres point-in-time restore drill. It restores for real, in a throwaway container: the newest dump from S3, then the binlog chain from the dump's coordinates on, replayed up to a target time or right before the first transaction matching a statement you name (a `DROP TABLE`, a `DELETE` without `WHERE`). Your SQL checks run on the result, and the restore time is compared with your RTO. Demo mode needs only Docker: it builds a database, writes across three binlogs, drops a table by mistake in the same second as the last insert, and recovers to the statement before the `DROP`.
+
+    ## How it works
+    1. `after_backup` (`Webhook`, called by the dump job) or `weekly_drill` (`Schedule`, shipped disabled). `concurrency` limit 1, and a flow `sla` of one hour.
+    2. `s3_mode` (`If`): `list_dumps` (`aws.s3.List`), `dump_found` (`If` + `Fail`), `download_dump` (`aws.s3.Download`, the newest by upload time, picked with the `jq` Pebble filter), and `download_binlogs` (`aws.s3.Downloads` of every `*.NNNNNN` file under the binlog prefix).
+    3. `restore` (`shell.Commands`, Docker runner, one throwaway container). The downloaded files arrive as `inputFiles` (the binlog map merged with the dump):
+       - **The dump**: readable gzip, ends with `-- Dump completed`, and carries the binlog coordinates (`--source-data=2`) and `GTID_PURGED`.
+       - **The chain**: every binlog from the dump's file on, with no number missing and every event checksum good (`mysqlbinlog --verify-binlog-checksum`). The newest archived event must be younger than `archive_lag_minutes`.
+       - **The stop**: `stop_before_statement` scans the binlogs with `mysqlbinlog -v` (row events are matched on their pseudo-SQL) and stops at the start of the first matching transaction; `target_time` uses `--stop-datetime`; neither replays the whole archive.
+       - **The restore**: a scratch `mysqld` with no binlog of its own and the source's GTID mode, the dump, then every binlog in one `mysqlbinlog` call (temporary tables and transactions can span files), then your checks.
+       - It reports JSON whether it passes or not.
+    4. `verdict` (`If`): pass when every check passed and the restore beat `rto_minutes`; `kv.Set` remembers the last good drill. Otherwise `Fail` with every problem found.
+    5. `errors` → one Slack alert with the task, the reason and the last good drill. A run stopped by the `sla` is reported from `afterExecution`.
+
+    ## What you get
+    - Messages from the test runs:
+      - "PASSED (s3): `mysql/dumps/shop-….sql.gz` plus 2 binlog(s) binlog.000001 to binlog.000002 (GTID ON; …), replayed right before /DELETE FROM `shop`.`orders`/ (binlog.000002 position 33260), in 5 s. Checks: PASS: 10700 orders (10700 expected)"
+      - "FAILED: binlog.000002 is missing from the archive: nothing after binlog.000001 (2026-10-16 10:56:19) can be replayed"
+      - "FAILED: binlog.000002 is corrupt: ERROR: Could not read entry at offset 410: Error in log format or read error 1."
+      - "FAILED: the newest archived binlog event is from 2026-10-16 10:57:43 UTC, 2 min ago, over the 1 min limit: the binlog archiver has stopped"
+      - "FAILED: mysql/dumps/….sql.gz has no binlog coordinates: make the dump with --source-data=2"
+    - `outputs.result`: the dump, the binlogs replayed, where the archive ends, the GTID mode, where the replay stopped, dump and restore seconds, the check results and the problems.
+    - The KV entry `mysql_pitr_drill_last_good`.
+
+    ## Error handling
+    - **Every problem is collected** before the verdict (a gap and a failing check are reported together), and the run ends FAILED.
+    - **What cannot be restored stops the drill with its reason**: an unreadable or cut-short dump, a dump without coordinates, a corrupt binlog, a `stop_before_statement` that matches nothing, a scratch server that does not start (its first error is quoted), or a replay error from `mysql` or `mysqlbinlog`.
+    - **A check that cannot run** (wrong table, syntax error) counts as failed and quotes MySQL's error.
+    - **Slower than the RTO is a failure**, even when the data is right. A drill that hangs is stopped by the one-hour `sla` and reported.
+    - **Nothing touches production.** The drill only reads the bucket; the restored server lives and dies inside the container.
+
+    ## What this blueprint teaches about Kestra
+    - **`aws.s3.Downloads` into `inputFiles`**: `{{ outputs.download_binlogs.outputFiles | merge({'dump.sql.gz': outputs.download_dump.uri}) }}` hands a whole prefix of objects, plus one more file, to a script task.
+    - **A flow `sla` with `afterExecution`**, next to an RTO measured inside the task.
+    - **The Docker task runner as a disposable database**: two `mysqld` servers (the demo source and the restore) start and stop inside one task.
+    - **A script that reports instead of failing**, so `If` decides and the outputs stay readable when the drill fails.
+
+    ## Prerequisites
+    - A Kestra worker that can run Docker containers.
+    - For s3 mode:
+      - dumps made with `mysqldump --single-transaction --source-data=2 --set-gtid-purged=ON ... | gzip`, uploaded to `dump_prefix`;
+      - binlogs archived under their own names, for example with `mysqlbinlog --read-from-remote-server --raw --stop-never --result-file=/archive/ binlog.000001` and a sync of `/archive` to `binlog_prefix`.
+    - The image needs `mysqlbinlog`, which the official `mysql` image no longer ships; the default is Percona Server 8.0, a drop-in MySQL build.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`.
+    - `MYSQL_PITR_DRILL_WEBHOOK_KEY`: a long random string for the webhook.
+    - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: read access to the bucket (s3 mode).
+
+    ### Inputs
+    - `mode` (`demo` or `s3`), `s3_bucket`, `dump_prefix` (`mysql/dumps/`), `binlog_prefix` (`mysql/binlogs/`), `s3_endpoint`.
+    - `target_time` (UTC) or `stop_before_statement` (a regular expression); neither replays everything.
+    - `checks` (SQL returning `ok` and `detail`), `archive_lag_minutes` (30), `rto_minutes` (30), `mysql_image`.
+
+    ### Outputs
+    - `result` (JSON), described above.
+
+    ## Quick start
+    1. Add `SLACK_WEBHOOK_URL` and `MYSQL_PITR_DRILL_WEBHOOK_KEY`, and run with the defaults (demo mode).
+    2. Real result: "PASSED (demo): … 3 binlog(s) binlog.000001 to binlog.000003 (GTID ON …), replayed right before /DROP TABLE/ (binlog.000003 position 197), in 4 s. Checks: PASS: 2000 orders recovered (2000 before the accidental DROP TABLE)".
+    3. For your backups: set `mode: s3`, the bucket and prefixes, a check per table that matters, and call the webhook from the dump job.
+
+    ## How to read the result
+    - **`target_time` works to the second**: `mysqlbinlog --stop-datetime` stops at the first event at or after it, so nothing from the target second is replayed. In the tests, 700 inserts and an accidental `DELETE` ran in the same second. Stopping at that second lost the inserts (10000 orders), stopping one second later replayed the `DELETE` (100 orders), and `stop_before_statement` brought back exactly the 10700 orders that existed before it.
+    - `restore_seconds` includes the dump load; the replay is the rest. A long replay means the dump is too old for your RTO: dump more often.
+
+    ## How to extend
+    - Drill a dump from xtrabackup instead of mysqldump: read the coordinates from `xtrabackup_binlog_info`.
+    - Keep the recovered table: `mysqldump` it from the scratch server and upload it, to hand back an accidentally dropped table without a full restore.
+    - Run the drill against each replica's archive too, if they are archived separately.
+
+    ## Links
+    - [MySQL: point-in-time recovery using binary logs](https://dev.mysql.com/doc/refman/8.0/en/point-in-time-recovery-binlog.html)
+    - [mysqlbinlog: backing up binary log files](https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog-backup.html)
+    - [AWS S3 List, Download and Downloads](https://kestra.io/plugins/plugin-aws/s3) and [Shell Commands](https://kestra.io/plugins/plugin-script-shell) with the [Docker task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.scripts.runner.docker.docker)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if), [Fail](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.fail), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set), [SLA](https://kestra.io/docs/workflow-components/sla)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook), [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule) and [Webhook](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.webhook) triggers
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+  subTags:
+    - Disaster Recovery
+    - Day 2 Operations
+  ee: false
+  demo: false

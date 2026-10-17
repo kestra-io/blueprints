@@ -1,0 +1,412 @@
+id: mysql-online-schema-change-gh-ost
+namespace: company.team
+description: |
+  Run a MySQL ALTER TABLE online with gh-ost, with a person deciding the moment of the table swap. A dry run checks
+  the ALTER first. The real run copies the table while throttling on replica lag, then waits with the cut-over
+  postponed. The flow compares the ghost table with the original (row count and checksum), asks for approval, and
+  only then lets gh-ost swap the tables. A decline, a timeout or a failure removes the ghost tables and leaves the
+  original untouched.
+
+triggers:
+  - id: from_ci
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Let a migration pipeline start a schema change; the cut-over still waits for a person.
+    key: "{{ secret('GHOST_MIGRATION_WEBHOOK_KEY') }}"
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: host
+    type: STRING
+    defaults: mysql-primary
+    description: The primary. gh-ost runs with --allow-on-master and reads replica lag from throttle_replicas.
+  - id: port
+    type: INT
+    defaults: 3306
+  - id: database
+    type: STRING
+    defaults: shop
+    validator: ^[A-Za-z0-9_]+$
+  - id: table
+    type: STRING
+    defaults: orders
+    validator: ^[A-Za-z0-9_]+$
+  - id: alter
+    type: STRING
+    defaults: ADD COLUMN amount_cents BIGINT NULL, ADD INDEX idx_created_at (created_at)
+    description: The ALTER TABLE clause, without "ALTER TABLE <table>".
+  - id: throttle_replicas
+    type: STRING
+    required: false
+    description: Comma-separated host:port of replicas whose lag throttles the copy, e.g. replica-1:3306,replica-2:3306.
+  - id: max_lag_millis
+    type: INT
+    defaults: 1500
+    description: gh-ost pauses copying while a replica lags more than this.
+  - id: chunk_size
+    type: INT
+    defaults: 1000
+  - id: max_load
+    type: STRING
+    defaults: Threads_running=25
+    description: gh-ost throttles while a status variable is above this.
+  - id: critical_load
+    type: STRING
+    defaults: Threads_running=500
+    description: gh-ost aborts when a status variable reaches this.
+  - id: cut_over_lock_timeout_seconds
+    type: INT
+    defaults: 3
+    description: How long the cut-over may hold its table lock before it gives up and retries (the app is blocked for at most this long).
+  - id: cut_over_retries
+    type: INT
+    defaults: 60
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT24H
+    description: No decision within this time aborts the migration and removes the ghost tables.
+  - id: ghost_image
+    type: STRING
+    defaults: kestra-gh-ost:1.1.11
+  - id: build_image
+    type: BOOL
+    defaults: true
+    description: Build ghost_image locally with the Docker Build task (gh-ost from source, mysql client). Switch off when the image is in your registry.
+
+variables:
+  ctl: "`{{ inputs.database }}`.`_{{ inputs.table }}_kestra`"
+  ctl_sh: "{{ inputs.database }}._{{ inputs.table }}_kestra"
+  jdbc: "jdbc:mysql://{{ inputs.host }}:{{ inputs.port }}/{{ inputs.database }}"
+  ghost_args: >-
+    --host={{ inputs.host }} --port={{ inputs.port }} --user="$MYSQL_USER" --password="$MYSQL_PWD"
+    --database={{ inputs.database }} --table={{ inputs.table }} --alter="$ALTER"
+    --allow-on-master --max-lag-millis={{ inputs.max_lag_millis }}{% if (inputs.throttle_replicas ?? '') != '' %} --throttle-control-replicas={{ inputs.throttle_replicas }}{% endif %}
+    --chunk-size={{ inputs.chunk_size }} --max-load={{ inputs.max_load }} --critical-load={{ inputs.critical_load }}
+    --cut-over-lock-timeout-seconds={{ inputs.cut_over_lock_timeout_seconds }} --default-retries={{ inputs.cut_over_retries }}
+    --initially-drop-ghost-table --verbose
+
+tasks:
+  - id: build
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.build_image }}"
+    then:
+      - id: build_ghost_image
+        type: io.kestra.plugin.docker.Build
+        tags:
+          - "{{ inputs.ghost_image }}"
+        dockerfile: |
+          FROM golang:1.25-alpine AS build
+          RUN GOBIN=/out go install github.com/github/gh-ost/go/cmd/gh-ost@v1.1.11
+          FROM alpine:3.20
+          RUN apk add --no-cache mysql-client bash coreutils
+          COPY --from=build /out/gh-ost /usr/local/bin/gh-ost
+
+  - id: dry_run
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: gh-ost without --execute connects, checks binlog settings and applies the ALTER to an empty ghost table. Nothing is copied or swapped.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: IF_NOT_PRESENT
+    containerImage: "{{ inputs.ghost_image }}"
+    env:
+      MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+      MYSQL_PWD: "{{ secret('MYSQL_PASSWORD') }}"
+      ALTER: "{{ inputs.alter }}"
+    commands:
+      - |
+        gh-ost {{ render(vars.ghost_args) }} > noop.log 2>&1 || {
+          tail -n 20 noop.log
+          why=$(grep -oE 'Error [0-9]{4}.*' noop.log | head -1); [ -n "$why" ] || why=$(grep -E 'FATAL|ERROR' noop.log | sed -E 's/^[0-9/ :-]+(FATAL|ERROR) //' | head -1)
+          echo "DRY RUN REJECTED: $why" >&2; exit 1; }
+        rows=$(grep -oE 'Estimated number of rows via EXPLAIN: [0-9]+' noop.log | grep -oE '[0-9]+$' || echo 0)
+        echo "::{\"outputs\":{\"estimated_rows\":${rows:-0}}}::"
+        sed -n '/^CREATE TABLE/,/^) ENGINE/p' noop.log
+
+  - id: open_control_row
+    type: io.kestra.plugin.jdbc.mysql.Queries
+    description: A one-row table the two branches below use to talk. gh-ost writes its state; the approval branch writes the decision.
+    url: "{{ render(vars.jdbc) }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS {{ render(vars.ctl) }} (execution_id VARCHAR(64) PRIMARY KEY, state VARCHAR(32) NOT NULL, decision VARCHAR(16), detail VARCHAR(2000), throttled_seconds INT NOT NULL DEFAULT 0, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP);
+      REPLACE INTO {{ render(vars.ctl) }} (execution_id, state) VALUES ('{{ execution.id }}', 'starting');
+
+  - id: migrate
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: run_ghost
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: gh-ost copies the table and holds the cut-over until the control row says cutover (or abort).
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: IF_NOT_PRESENT
+        containerImage: "{{ inputs.ghost_image }}"
+        env:
+          MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+          MYSQL_PWD: "{{ secret('MYSQL_PASSWORD') }}"
+          ALTER: "{{ inputs.alter }}"
+        commands:
+          - |
+            sql() { mysql -h {{ inputs.host }} -P {{ inputs.port }} -u "$MYSQL_USER" -N -B -e "$1" {{ inputs.database }}; }
+            state() { sql "UPDATE {{ render(vars.ctl_sh) }} SET state='$1', detail=LEFT('$(echo "$2" | tr -d "'\\\\")', 2000), throttled_seconds=$throttled WHERE execution_id='{{ execution.id }}'"; }
+            touch postpone; throttled=0; aborted=""
+            gh-ost {{ render(vars.ghost_args) }} --postpone-cut-over-flag-file="$PWD/postpone" --serve-tcp-port=10001 --execute > ghost.log 2>&1 &
+            pid=$!
+            while kill -0 $pid 2>/dev/null; do
+              line=$(echo status | nc -w 2 127.0.0.1 10001 2>/dev/null | grep '^Copy:' | tail -1)
+              case "$line" in
+                *"State: postponing cut-over"*) [ -e postpone ] && [ -z "$aborted" ] && state postponed "$line" ;;
+                *"State: throttled"*) throttled=$((throttled + 5)); state copying "$line" ;;
+                ?*) state copying "$line" ;;
+              esac
+              case "$(sql "SELECT decision FROM {{ render(vars.ctl_sh) }} WHERE execution_id='{{ execution.id }}'")" in
+                cutover) [ ! -e postpone ] || { rm -f postpone; echo "cut-over approved, unpostponed"; } ;;
+                abort) [ -n "$aborted" ] || { echo panic | nc -w 2 127.0.0.1 10001 >/dev/null 2>&1; aborted=yes; } ;;
+              esac
+              sleep 5
+            done
+            rc=0; wait $pid || rc=$?
+            grep -E 'Copy:|throttled|cut-over|Cut-over|ERROR|FATAL' ghost.log | tail -n 15
+            timeouts=$(grep -c 'Lock wait timeout' ghost.log || true)
+            if [ $rc -eq 0 ] && [ -z "$aborted" ]; then
+              state done "$(grep '^Copy:' ghost.log | tail -1)"
+            elif [ -n "$aborted" ]; then
+              state aborted "aborted on request before the cut-over"
+            else
+              err=$(grep -E 'FATAL|ERROR' ghost.log | tail -1 | sed -E 's/^[0-9/ :-]+(FATAL|ERROR) //')
+              state failed "${err:-gh-ost exited with code $rc}"
+              echo "GH-OST FAILED after $(grep -c 'Lock wait timeout' ghost.log || true) cut-over lock timeouts: ${err:-exit code $rc}" >&2; exit 1
+            fi
+            echo "::{\"outputs\":{\"throttled_seconds\":$throttled,\"cut_over_lock_timeouts\":${timeouts:-0}}}::"
+
+      - id: gate
+        type: io.kestra.plugin.core.flow.Sequential
+        errors:
+          - id: abort_on_gate_failure
+            type: io.kestra.plugin.jdbc.mysql.Query
+            description: If the gate fails (for example the verification never matches), tell gh-ost to stop instead of leaving it postponed.
+            url: "{{ render(vars.jdbc) }}"
+            username: "{{ secret('MYSQL_USERNAME') }}"
+            password: "{{ secret('MYSQL_PASSWORD') }}"
+            sql: UPDATE {{ render(vars.ctl) }} SET decision = 'abort' WHERE execution_id = '{{ execution.id }}'
+        tasks:
+          - id: wait_for_copy
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: Polls the control row until the copy is complete and the cut-over is postponed (or gh-ost stopped).
+            condition: "{{ ['postponed', 'failed', 'aborted', 'done'] contains outputs.read_state.row.state }}"
+            failOnMaxReached: true
+            checkFrequency:
+              interval: PT5S
+              maxDuration: PT24H
+            tasks:
+              - id: read_state
+                type: io.kestra.plugin.jdbc.mysql.Query
+                url: "{{ render(vars.jdbc) }}"
+                username: "{{ secret('MYSQL_USERNAME') }}"
+                password: "{{ secret('MYSQL_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: SELECT state, detail, throttled_seconds FROM {{ render(vars.ctl) }} WHERE execution_id = '{{ execution.id }}'
+
+          - id: copy_finished
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.read_state.row.state == 'postponed' }}"
+            then:
+              - id: common_columns
+                type: io.kestra.plugin.jdbc.mysql.Query
+                description: Columns present in both tables; added and dropped columns are not compared.
+                url: "{{ render(vars.jdbc) }}"
+                username: "{{ secret('MYSQL_USERNAME') }}"
+                password: "{{ secret('MYSQL_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT GROUP_CONCAT(CONCAT('COALESCE(CAST(`', o.COLUMN_NAME, '` AS CHAR), ''<null>'')') ORDER BY o.ORDINAL_POSITION SEPARATOR ', ') AS expr,
+                         GROUP_CONCAT(o.COLUMN_NAME ORDER BY o.ORDINAL_POSITION) AS names
+                  FROM information_schema.COLUMNS o JOIN information_schema.COLUMNS g
+                    ON g.TABLE_SCHEMA = o.TABLE_SCHEMA AND g.TABLE_NAME = '_{{ inputs.table }}_gho' AND g.COLUMN_NAME = o.COLUMN_NAME
+                  WHERE o.TABLE_SCHEMA = '{{ inputs.database }}' AND o.TABLE_NAME = '{{ inputs.table }}'
+              - id: verify
+                type: io.kestra.plugin.core.flow.LoopUntil
+                description: One statement reads both tables from the same snapshot. gh-ost applies binlog events with a small delay, so a busy table can need a few tries.
+                condition: "{{ outputs.compare.row.original_rows == outputs.compare.row.ghost_rows and outputs.compare.row.original_sum == outputs.compare.row.ghost_sum }}"
+                failOnMaxReached: false
+                checkFrequency:
+                  interval: PT3S
+                  maxIterations: 10
+                tasks:
+                  - id: compare
+                    type: io.kestra.plugin.jdbc.mysql.Query
+                    url: "{{ render(vars.jdbc) }}"
+                    username: "{{ secret('MYSQL_USERNAME') }}"
+                    password: "{{ secret('MYSQL_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    sql: |
+                      SELECT (SELECT COUNT(*) FROM `{{ inputs.table }}`) AS original_rows,
+                             (SELECT COUNT(*) FROM `_{{ inputs.table }}_gho`) AS ghost_rows,
+                             (SELECT CAST(COALESCE(BIT_XOR(CRC32(CONCAT_WS('#', {{ outputs.common_columns.row.expr }}))), 0) AS CHAR) FROM `{{ inputs.table }}`) AS original_sum,
+                             (SELECT CAST(COALESCE(BIT_XOR(CRC32(CONCAT_WS('#', {{ outputs.common_columns.row.expr }}))), 0) AS CHAR) FROM `_{{ inputs.table }}_gho`) AS ghost_sum
+              - id: verification_gate
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.compare.row.original_rows != outputs.compare.row.ghost_rows or outputs.compare.row.original_sum != outputs.compare.row.ghost_sum }}"
+                then:
+                  - id: verification_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "VERIFICATION FAILED after {{ outputs.verify.iterationCount }} tries: original {{ outputs.compare.row.original_rows }} rows, checksum {{ outputs.compare.row.original_sum }}; ghost {{ outputs.compare.row.ghost_rows }} rows, checksum {{ outputs.compare.row.ghost_sum }}. No approval was requested; gh-ost is told to abort."
+              - id: request_approval
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: |
+                  gh-ost on {{ inputs.database }}.{{ inputs.table }} is ready to cut over: `{{ inputs.alter }}`.
+                  Ghost table matches the original: {{ outputs.compare.row.ghost_rows }} rows, checksum {{ outputs.compare.row.ghost_sum }} over {{ outputs.common_columns.row.names }}. Throttled for about {{ outputs.read_state.row.throttled_seconds }} s on load or replica lag.
+                  The swap blocks writes to the table for at most {{ inputs.cut_over_lock_timeout_seconds }} s per attempt. Resume execution {{ execution.id }} in Kestra to decide.
+              - id: approve_cut_over
+                type: io.kestra.plugin.core.flow.Pause
+                pauseDuration: "{{ inputs.approval_timeout }}"
+                behavior: RESUME
+                onResume:
+                  - id: cut_over
+                    type: BOOL
+                    displayName: Swap the tables now?
+                    defaults: false
+                  - id: note
+                    type: STRING
+                    required: false
+              - id: send_decision
+                type: io.kestra.plugin.jdbc.mysql.Query
+                url: "{{ render(vars.jdbc) }}"
+                username: "{{ secret('MYSQL_USERNAME') }}"
+                password: "{{ secret('MYSQL_PASSWORD') }}"
+                sql: |
+                  UPDATE {{ render(vars.ctl) }} SET decision = '{{ (outputs.approve_cut_over.onResume.cut_over ?? false) ? 'cutover' : 'abort' }}' WHERE execution_id = '{{ execution.id }}'
+            else:
+              - id: copy_stopped
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "gh-ost stopped before the cut-over ({{ outputs.read_state.row.state }}): {{ outputs.read_state.row.detail ?? 'see run_ghost logs' }}"
+
+  - id: final_state
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ render(vars.jdbc) }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT c.state, c.detail,
+             (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{{ inputs.database }}' AND TABLE_NAME = '_{{ inputs.table }}_del') AS old_table_kept
+      FROM {{ render(vars.ctl) }} c WHERE c.execution_id = '{{ execution.id }}'
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.final_state.row.state == 'done' }}"
+    then:
+      - id: report_done
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "gh-ost on {{ inputs.database }}.{{ inputs.table }} DONE: `{{ inputs.alter }}` is live{% if outputs.run_ghost.vars.cut_over_lock_timeouts > 0 %} (the cut-over hit the lock timeout {{ outputs.run_ghost.vars.cut_over_lock_timeouts }} time(s) and retried){% endif %}{% if outputs.final_state.row.old_table_kept > 0 %}; the previous table is kept as _{{ inputs.table }}_del until you drop it{% endif %}. Approved{% if (outputs.approve_cut_over.onResume.note ?? '') != '' %}: {{ outputs.approve_cut_over.onResume.note }}{% endif %}."
+    else:
+      - id: report_aborted
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "gh-ost on {{ inputs.database }}.{{ inputs.table }} ABORTED before the cut-over ({% if outputs.approve_cut_over.onResume.cut_over is defined %}declined{% else %}no decision within the approval window{% endif %}{% if (outputs.approve_cut_over.onResume.note ?? '') != '' %}: {{ outputs.approve_cut_over.onResume.note }}{% endif %}). {{ inputs.table }} was never changed; the ghost tables are removed."
+
+finally:
+  - id: cleanup
+    type: io.kestra.plugin.jdbc.mysql.Queries
+    description: Removes the ghost and changelog tables (already gone after a cut-over), the empty sentry table a failed cut-over can leave, and the control table. Never touches the original, or a _del table that holds the previous data.
+    url: "{{ render(vars.jdbc) }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    sql: |
+      DROP TABLE IF EXISTS `_{{ inputs.table }}_gho`;
+      DROP TABLE IF EXISTS `_{{ inputs.table }}_ghc`;
+      SET @sentry = (SELECT IF(COUNT(*) > 0, 'DROP TABLE `_{{ inputs.table }}_del`', 'DO 0') FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{{ inputs.database }}' AND TABLE_NAME = '_{{ inputs.table }}_del' AND TABLE_COMMENT = 'ghost-cut-over-sentry');
+      PREPARE drop_sentry FROM @sentry;
+      EXECUTE drop_sentry;
+      DEALLOCATE PREPARE drop_sentry;
+      DROP TABLE IF EXISTS {{ render(vars.ctl) }};
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      gh-ost on {{ inputs.database }}.{{ inputs.table }} FAILED in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs() | jq('([.[] | select(.message | test("DRY RUN REJECTED|GH-OST FAILED|VERIFICATION FAILED|stopped before"))] + .)[0].message | split("\n")[0]') | first }}{% endif %}
+      `{{ inputs.alter }}` was not applied and {{ inputs.table }} is unchanged; the cleanup task drops gh-ost's leftover _gho/_ghc tables.
+
+extend:
+  title: Online MySQL Schema Change with gh-ost and an Approved Cut-Over
+  shortDescription: Dry-run the ALTER, copy the table with gh-ost while throttling on replica lag, verify the ghost table, and swap the tables only after a person approves. Declines and failures clean up after themselves.
+  metaTitle: MySQL Online Schema Change with gh-ost, Verification and Approval | Kestra
+  metaDescription: Run gh-ost from Kestra with a dry run, replica-lag throttling, a row-count and checksum check, and a postponed cut-over that waits for approval.
+  description: |
+    `ALTER TABLE` on a large, busy MySQL table locks or stalls writes and floods the replicas. [gh-ost](https://github.com/github/gh-ost) avoids that: it builds a "ghost" copy with the new schema, keeps it in sync from the binlog, then swaps the two tables in a short atomic cut-over. Most teams want a person to choose the moment of the swap, and proof that the copy is complete before anything is renamed.
+
+    This blueprint adds that around gh-ost.
+
+    ## How it works
+    1. `dry_run` runs gh-ost without `--execute`. It connects, checks binlog settings, and applies the ALTER to an empty ghost table. A typo, a missing column or a rename without approval stops here, before any copy starts.
+    2. `migrate` is a `Parallel` task with two branches that talk through a one-row control table (`_<table>_kestra`):
+       - `run_ghost` starts gh-ost with `--postpone-cut-over-flag-file`, `--max-lag-millis` and `--throttle-control-replicas`, and every 5 s writes gh-ost's status line to the control row (copying, throttled or postponed);
+       - `gate` waits until the copy is done and the cut-over is postponed. It then compares the original and ghost tables in one consistent read: row count and a `BIT_XOR(CRC32(...))` checksum over the columns both tables have. Only then does it ask for approval (`Pause`) and write the decision.
+    3. On approval, `run_ghost` removes the flag file and gh-ost swaps the tables. The previous table is kept as `_<table>_del` for you to drop later. On a decline or a timeout it sends gh-ost `panic`, and `orders` is never touched.
+    4. `finally` drops `_gho`/`_ghc`, the empty sentry table a failed cut-over can leave, and the control table. It never drops the original or a `_del` table that holds data.
+
+    ## Error handling
+    - **Replica lag throttles the copy.** In a test, stopping the replica's SQL thread for 20 s paused the copy, and the approval message reported "Throttled for about 20 s".
+    - **The cut-over never blocks writers for long.** Each attempt holds its lock for at most `cut_over_lock_timeout_seconds` (3 s) and is retried `cut_over_retries` times. With a transaction holding the table for 20 s, the cut-over retried and then succeeded. When the lock was held through every retry, gh-ost gave up, `orders` was unchanged, and the alert quoted MySQL ("Lock wait timeout exceeded").
+    - **The swap needs proof first.** If the ghost table does not match the original after 10 tries, no approval is requested, gh-ost is told to abort, and the ghost tables are removed.
+    - **Concurrent writes are expected.** gh-ost applies binlog events with a small delay, so the comparison retries until the two tables agree. With 1500 inserts, updates and deletes during the copy and the wait, the tables matched and no row differed after the swap.
+    - Every alert names the failing task and gh-ost's or MySQL's own error.
+    - **One run at a time.** `concurrency` (limit 1, `QUEUE`) makes a new run wait while another one waits for approval; answer or kill the waiting run first.
+
+    ## What this blueprint teaches about Kestra
+    - **`Parallel` with two cooperating branches.** A long-running worker task and a human gate (`LoopUntil`, `Pause`, JDBC writes) talk through a database row, without exposing gh-ost's socket.
+    - **`Sequential` with its own `errors` block**, so a failed gate tells the other branch to stop instead of leaving gh-ost waiting forever.
+    - **Flow-level `finally`** for cleanup that must run after success, a decline and a failure alike.
+    - **`io.kestra.plugin.docker.Build`**, to build the tool image (gh-ost from source, mysql client) inside the flow.
+
+    ## Prerequisites
+    - MySQL 5.7 or 8.x with `binlog_format=ROW` and `binlog_row_image=FULL`. A user with ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE, plus REPLICATION SLAVE, REPLICATION CLIENT and SUPER (or the cloud equivalent). See the [gh-ost requirements](https://github.com/github/gh-ost/blob/master/doc/requirements-and-limitations.md).
+    - A Kestra worker that can run Docker containers and reach MySQL.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `MYSQL_USERNAME`, `MYSQL_PASSWORD`: the migration user, used by gh-ost and the JDBC tasks.
+    - `SLACK_WEBHOOK_URL`.
+    - `GHOST_MIGRATION_WEBHOOK_KEY`: a long random string for the pipeline webhook.
+
+    ### Inputs
+    - `host`, `port`, `database`, `table`, and `alter` (the clause after `ALTER TABLE <table>`).
+    - `throttle_replicas` (`host:port,...`), `max_lag_millis` (1500), `chunk_size` (1000), `max_load` (`Threads_running=25`), `critical_load` (`Threads_running=500`).
+    - `cut_over_lock_timeout_seconds` (3), `cut_over_retries` (60), `approval_timeout` (PT24H).
+    - `ghost_image`, and `build_image` (true builds it with the Docker Build task; set false when the image is in your registry).
+
+    ### Outputs
+    - `outputs.run_ghost.vars.throttled_seconds` and `cut_over_lock_timeouts`; `outputs.compare.row` (row counts and checksums); `outputs.final_state.row.state` (`done` or `aborted`).
+
+    ## Quick start
+    1. Add the secrets, set `host`, `database`, `table`, `alter` and `throttle_replicas`, and run.
+    2. When Slack says "ready to cut over", check the numbers and resume with **Swap the tables now?** checked.
+    3. Drop `_<table>_del` once you are sure you do not need to swap back.
+
+    ## How to extend
+    - Run the cut-over in a maintenance window: put a `Schedule` in front, or call the webhook from your change pipeline.
+    - Point `host` at a replica and remove `--allow-on-master` to have gh-ost inspect a replica, as gh-ost recommends.
+    - Add `--hooks-path` scripts to gh-ost for your own notifications on throttling or cut-over.
+
+    ## Plugins used
+    - [Shell Commands](https://kestra.io/plugins/plugin-script-shell) with the [Docker task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.scripts.runner.docker.docker)
+    - [Docker Build](https://kestra.io/plugins/plugin-docker/io.kestra.plugin.docker.build)
+    - [MySQL Query](https://kestra.io/plugins/plugin-jdbc-mysql/io.kestra.plugin.jdbc.mysql.query) and [Queries](https://kestra.io/plugins/plugin-jdbc-mysql/io.kestra.plugin.jdbc.mysql.queries)
+    - [Parallel](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.parallel), [Sequential](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.sequential), [LoopUntil](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Database Migration
+    - Day 2 Operations
+  ee: false
+  demo: false

@@ -1,0 +1,426 @@
+id: postgres-expand-contract-column-migration
+namespace: company.team
+description: |
+  Change a PostgreSQL column without downtime, using expand and contract. Expand adds the new column and a trigger
+  that keeps it in sync with every write. A batched backfill fills the existing rows and saves a checkpoint in the
+  KV store after every batch, so a killed run resumes where it stopped. Every row is then verified, and the old
+  column is dropped only after a person approves. Demo mode migrates `demo_orders.amount` (dollars, numeric) to
+  `amount_cents` (bigint).
+
+triggers:
+  - id: from_ci
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Let a deploy pipeline start the migration once the app version that writes both columns is live.
+    key: "{{ secret('EXPAND_CONTRACT_WEBHOOK_KEY') }}"
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: action
+    type: SELECT
+    values: [migrate, rollback]
+    defaults: migrate
+    description: migrate runs expand, backfill, verify, approval and contract, and is safe to re-run. rollback removes the trigger and the new column and keeps the old one.
+  - id: schema
+    type: STRING
+    defaults: public
+    validator: ^[a-z_][a-z0-9_]*$
+  - id: table
+    type: STRING
+    defaults: demo_orders
+    validator: ^[a-z_][a-z0-9_]*$
+  - id: key_column
+    type: STRING
+    defaults: id
+    validator: ^[a-z_][a-z0-9_]*$
+    description: An integer primary key. Batches walk it in order, and the checkpoint is the last key done.
+  - id: old_column
+    type: STRING
+    defaults: amount
+    validator: ^[a-z_][a-z0-9_]*$
+  - id: new_column
+    type: STRING
+    defaults: amount_cents
+    validator: ^[a-z_][a-z0-9_]*$
+  - id: new_type
+    type: STRING
+    defaults: bigint
+    description: SQL type of the new column, e.g. bigint, text, timestamptz.
+  - id: transform
+    type: STRING
+    defaults: CAST(round(amount * 100) AS bigint)
+    description: SQL expression that computes the new value from the row's columns. The trigger, the backfill and the verification all use it.
+  - id: batch_size
+    type: INT
+    defaults: 5000
+    min: 1
+  - id: batch_interval
+    type: DURATION
+    defaults: PT0.2S
+    description: Pause between batches, to leave room for production writes and replication.
+  - id: lock_timeout
+    type: STRING
+    defaults: 5s
+    description: DDL waits at most this long for its lock instead of queueing behind a long transaction and blocking every query behind it. It tries 5 times, 10 s apart.
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT24H
+    description: No decision within this time keeps the expanded state (nothing is dropped).
+  - id: seed_demo
+    type: BOOL
+    defaults: true
+    description: Create demo_orders with 100,000 rows if it does not exist. Switch off for your own tables.
+
+variables:
+  kv_key: "expand_contract_{{ inputs.schema }}_{{ inputs.table }}_{{ inputs.new_column }}"
+  target: "\"{{ inputs.schema }}\".\"{{ inputs.table }}\""
+  cfg: "{{ {'schema': inputs.schema, 'table': inputs.table, 'key': inputs.key_column, 'old': inputs.old_column, 'new': inputs.new_column, 'new_type': inputs.new_type, 'transform': inputs.transform} | toJson }}"
+  approval_window: "{{ inputs.approval_timeout >= 3600 ? ((inputs.approval_timeout / 3600) | numberFormat('0.#')) ~ ' h' : ((inputs.approval_timeout / 60) | numberFormat('0.#')) ~ ' min' }}"
+  mismatch: "\"{{ inputs.new_column }}\" IS DISTINCT FROM ({{ inputs.transform }})"
+
+tasks:
+  - id: seed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.seed_demo and inputs.action == 'migrate' }}"
+    then:
+      - id: create_demo_table
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        sql: |
+          CREATE TABLE IF NOT EXISTS public.demo_orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, customer text NOT NULL, amount numeric(10,2), created_at timestamptz NOT NULL DEFAULT now());
+          INSERT INTO public.demo_orders (customer, amount)
+          SELECT 'customer-' || (g % 997), round(CAST(random() * 500 AS numeric), 2)
+          FROM generate_series(1, 100000) AS g
+          WHERE NOT EXISTS (SELECT 1 FROM public.demo_orders);
+
+  - id: action_switch
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ inputs.action }}"
+    cases:
+      migrate:
+        - id: expand
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: Idempotent. Adds the column and (re)creates the sync trigger. Only a lock timeout is retried; any other error fails at once.
+          url: "{{ secret('POSTGRES_URL') }}"
+          username: "{{ secret('POSTGRES_USER') }}"
+          password: "{{ secret('POSTGRES_PASSWORD') }}"
+          sql: |
+            SELECT set_config('lock_timeout', '{{ inputs.lock_timeout }}', false), set_config('expand_contract.cfg', $cfg${{ render(vars.cfg) }}$cfg$, false);
+            DO $do$
+            DECLARE
+              c json := CAST(current_setting('expand_contract.cfg') AS json);
+              t regclass := to_regclass(format('%I.%I', c->>'schema', c->>'table'));
+              key_type text;
+              attempt int;
+              fn text := (c->>'table') || '_' || (c->>'new') || '_sync';
+            BEGIN
+              IF t IS NULL THEN RAISE EXCEPTION 'table %.% does not exist', c->>'schema', c->>'table'; END IF;
+              SELECT format_type(atttypid, NULL) INTO key_type FROM pg_attribute WHERE attrelid = t AND attname = c->>'key' AND NOT attisdropped;
+              IF key_type IS NULL OR key_type NOT IN ('smallint', 'integer', 'bigint') THEN
+                RAISE EXCEPTION 'key column % must be an integer column (found %)', c->>'key', coalesce(key_type, 'no such column');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = t AND attname = c->>'old' AND NOT attisdropped) THEN
+                RAISE EXCEPTION 'old column % does not exist on % (already contracted?)', c->>'old', t;
+              END IF;
+              -- A transform that does not parse or cast would break every write once it is in the trigger, so try it on 1000 rows first.
+              EXECUTE format('SELECT count(CAST((%s) AS %s)) FROM (SELECT * FROM %s LIMIT 1000) AS sample', c->>'transform', c->>'new_type', t);
+              FOR attempt IN 1..5 LOOP
+                BEGIN
+                  EXECUTE format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s', t, c->>'new', c->>'new_type');
+                  EXECUTE format($f$
+                    CREATE OR REPLACE FUNCTION %I.%I() RETURNS trigger LANGUAGE plpgsql AS $body$
+                    BEGIN
+                      IF TG_OP = 'INSERT' THEN
+                        IF NEW.%I IS NULL THEN SELECT (%s) INTO NEW.%I FROM (SELECT NEW.*) AS src; END IF;
+                      ELSIF NEW.%I IS DISTINCT FROM OLD.%I THEN
+                        SELECT (%s) INTO NEW.%I FROM (SELECT NEW.*) AS src;
+                      END IF;
+                      RETURN NEW;
+                    END $body$
+                  $f$, c->>'schema', fn, c->>'new', c->>'transform', c->>'new', c->>'old', c->>'old', c->>'transform', c->>'new');
+                  EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', fn, t);
+                  EXECUTE format('CREATE TRIGGER %I BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION %I.%I()', fn, t, c->>'schema', fn);
+                  EXIT;
+                EXCEPTION WHEN lock_not_available THEN
+                  IF attempt = 5 THEN RAISE EXCEPTION 'no lock on % after 5 tries of lock_timeout %; a long transaction holds it (see pg_stat_activity)', t, current_setting('lock_timeout'); END IF;
+                  RAISE WARNING 'lock_timeout on %, try % of 5, waiting 10 s', t, attempt;
+                  PERFORM pg_sleep(10);
+                END;
+              END LOOP;
+            END $do$;
+
+        - id: start_point
+          type: io.kestra.plugin.core.output.OutputValues
+          description: Where this run starts. Anything above 0 means an earlier run was stopped and this one resumes.
+          values:
+            resume_from: "{{ kv(render(vars.kv_key), errorOnMissing=false) ?? 0 }}"
+
+        - id: backfill
+          type: io.kestra.plugin.core.flow.LoopUntil
+          description: One batch per iteration, until a batch comes back short. The checkpoint survives a killed run.
+          condition: "{{ outputs.batch.row.batch_rows < inputs.batch_size }}"
+          failOnMaxReached: true
+          checkFrequency:
+            interval: "{{ inputs.batch_interval }}"
+            maxDuration: PT12H
+          tasks:
+            - id: batch
+              type: io.kestra.plugin.jdbc.postgresql.Query
+              url: "{{ secret('POSTGRES_URL') }}"
+              username: "{{ secret('POSTGRES_USER') }}"
+              password: "{{ secret('POSTGRES_PASSWORD') }}"
+              fetchType: FETCH_ONE
+              sql: |
+                WITH b AS (
+                  SELECT "{{ inputs.key_column }}" AS k FROM {{ render(vars.target) }}
+                  WHERE "{{ inputs.key_column }}" > {{ kv(render(vars.kv_key), errorOnMissing=false) ?? 0 }}
+                  ORDER BY "{{ inputs.key_column }}" LIMIT {{ inputs.batch_size }}
+                ), u AS (
+                  UPDATE {{ render(vars.target) }} SET "{{ inputs.new_column }}" = ({{ inputs.transform }})
+                  WHERE "{{ inputs.key_column }}" IN (SELECT k FROM b)
+                  RETURNING 1
+                )
+                SELECT (SELECT count(*) FROM b) AS batch_rows, (SELECT count(*) FROM u) AS updated,
+                       COALESCE((SELECT max(k) FROM b), {{ kv(render(vars.kv_key), errorOnMissing=false) ?? 0 }}) AS last_key
+            - id: checkpoint
+              type: io.kestra.plugin.core.kv.Set
+              key: "{{ render(vars.kv_key) }}"
+              value: "{{ outputs.batch.row.last_key }}"
+              kvType: NUMBER
+
+        - id: verify
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Every row, old against new, through the same transform the trigger uses.
+          url: "{{ secret('POSTGRES_URL') }}"
+          username: "{{ secret('POSTGRES_USER') }}"
+          password: "{{ secret('POSTGRES_PASSWORD') }}"
+          fetchType: FETCH_ONE
+          sql: |
+            SELECT count(*) AS total_rows,
+                   count(*) FILTER (WHERE {{ render(vars.mismatch) }}) AS mismatched,
+                   (SELECT string_agg(CAST(k AS text), ', ') FROM (
+                      SELECT "{{ inputs.key_column }}" AS k FROM {{ render(vars.target) }} WHERE {{ render(vars.mismatch) }}
+                      ORDER BY 1 LIMIT 5) AS s) AS sample_keys
+            FROM {{ render(vars.target) }}
+
+        - id: verification_gate
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.verify.row.mismatched > 0 }}"
+          then:
+            - id: verification_failed
+              type: io.kestra.plugin.core.execution.Fail
+              errorMessage: "MIGRATION BLOCKED: {{ outputs.verify.row.mismatched }} of {{ outputs.verify.row.total_rows }} rows have {{ inputs.new_column }} different from {{ inputs.transform }} (keys {{ outputs.verify.row.sample_keys }}). Nothing was dropped; fix the rows or the transform and re-run."
+
+        - id: request_approval
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            Column migration {{ inputs.schema }}.{{ inputs.table }}: {{ inputs.old_column }} -> {{ inputs.new_column }} is backfilled and verified ({{ outputs.verify.row.total_rows }} rows, 0 mismatches; this run started at {{ inputs.key_column }} > {{ outputs.start_point.values.resume_from }} and ran {{ outputs.backfill.iterationCount }} batches).
+            Contract drops the trigger and the column {{ inputs.old_column }}. Approve only once every app reads {{ inputs.new_column }}: resume execution {{ execution.id }} in Kestra within {{ render(vars.approval_window) }}.
+
+        - id: approve_contract
+          type: io.kestra.plugin.core.flow.Pause
+          description: The old column is dropped only on an explicit yes. A timeout keeps the expanded state.
+          pauseDuration: "{{ inputs.approval_timeout }}"
+          behavior: RESUME
+          onResume:
+            - id: drop_old_column
+              type: BOOL
+              displayName: Drop the old column now?
+              defaults: false
+            - id: note
+              type: STRING
+              required: false
+
+        - id: decision
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.approve_contract.onResume.drop_old_column ?? false }}"
+          then:
+            - id: reverify
+              type: io.kestra.plugin.jdbc.postgresql.Query
+              description: Rows changed while the run waited; check again right before dropping anything.
+              url: "{{ secret('POSTGRES_URL') }}"
+              username: "{{ secret('POSTGRES_USER') }}"
+              password: "{{ secret('POSTGRES_PASSWORD') }}"
+              fetchType: FETCH_ONE
+              sql: SELECT count(*) AS total_rows, count(*) FILTER (WHERE {{ render(vars.mismatch) }}) AS mismatched FROM {{ render(vars.target) }}
+            - id: reverification_gate
+              type: io.kestra.plugin.core.flow.If
+              condition: "{{ outputs.reverify.row.mismatched > 0 }}"
+              then:
+                - id: reverification_failed
+                  type: io.kestra.plugin.core.execution.Fail
+                  errorMessage: "MIGRATION BLOCKED: while the run waited for approval, {{ outputs.reverify.row.mismatched }} of {{ outputs.reverify.row.total_rows }} rows stopped matching. Nothing was dropped; re-run migrate."
+            - id: contract
+              type: io.kestra.plugin.jdbc.postgresql.Queries
+              url: "{{ secret('POSTGRES_URL') }}"
+              username: "{{ secret('POSTGRES_USER') }}"
+              password: "{{ secret('POSTGRES_PASSWORD') }}"
+              sql: |
+                SELECT set_config('lock_timeout', '{{ inputs.lock_timeout }}', false), set_config('expand_contract.cfg', $cfg${{ render(vars.cfg) }}$cfg$, false);
+                DO $do$
+                DECLARE
+                  c json := CAST(current_setting('expand_contract.cfg') AS json);
+                  t regclass := to_regclass(format('%I.%I', c->>'schema', c->>'table'));
+                  fn text := (c->>'table') || '_' || (c->>'new') || '_sync';
+                  attempt int;
+                BEGIN
+                  FOR attempt IN 1..5 LOOP
+                    BEGIN
+                      EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', fn, t);
+                      EXECUTE format('DROP FUNCTION IF EXISTS %I.%I()', c->>'schema', fn);
+                      EXECUTE format('ALTER TABLE %s DROP COLUMN %I', t, c->>'old');
+                      EXIT;
+                    EXCEPTION WHEN lock_not_available THEN
+                      IF attempt = 5 THEN RAISE EXCEPTION 'no lock on % after 5 tries of lock_timeout %; a long transaction holds it (see pg_stat_activity)', t, current_setting('lock_timeout'); END IF;
+                      RAISE WARNING 'lock_timeout on %, try % of 5, waiting 10 s', t, attempt;
+                      PERFORM pg_sleep(10);
+                    END;
+                  END LOOP;
+                END $do$;
+            - id: forget_checkpoint
+              type: io.kestra.plugin.core.kv.Delete
+              key: "{{ render(vars.kv_key) }}"
+              errorOnMissing: false
+            - id: report_done
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              messageText: "Column migration {{ inputs.schema }}.{{ inputs.table }} DONE: {{ inputs.old_column }} dropped, {{ inputs.new_column }} verified on {{ outputs.reverify.row.total_rows }} rows. Approved{% if (outputs.approve_contract.onResume.note ?? '') != '' %}: {{ outputs.approve_contract.onResume.note }}{% endif %}."
+          else:
+            - id: report_kept
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              messageText: "Column migration {{ inputs.schema }}.{{ inputs.table }} paused in the expanded state: {{ inputs.new_column }} is backfilled and kept in sync by the trigger, {{ inputs.old_column }} was not dropped ({% if outputs.approve_contract.onResume.drop_old_column is defined %}declined{% else %}no decision within {{ render(vars.approval_window) }}{% endif %}{% if (outputs.approve_contract.onResume.note ?? '') != '' %}: {{ outputs.approve_contract.onResume.note }}{% endif %}). Re-run migrate to contract later, or rollback."
+
+      rollback:
+        - id: undo_expand
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          url: "{{ secret('POSTGRES_URL') }}"
+          username: "{{ secret('POSTGRES_USER') }}"
+          password: "{{ secret('POSTGRES_PASSWORD') }}"
+          sql: |
+            SELECT set_config('lock_timeout', '{{ inputs.lock_timeout }}', false), set_config('expand_contract.cfg', $cfg${{ render(vars.cfg) }}$cfg$, false);
+            DO $do$
+            DECLARE
+              c json := CAST(current_setting('expand_contract.cfg') AS json);
+              t regclass := to_regclass(format('%I.%I', c->>'schema', c->>'table'));
+              fn text := (c->>'table') || '_' || (c->>'new') || '_sync';
+              attempt int;
+            BEGIN
+              IF t IS NULL THEN RAISE EXCEPTION 'table %.% does not exist', c->>'schema', c->>'table'; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = t AND attname = c->>'old' AND NOT attisdropped) THEN
+                RAISE EXCEPTION 'refusing to roll back: old column % is already dropped, % holds the only copy of the data', c->>'old', c->>'new';
+              END IF;
+              FOR attempt IN 1..5 LOOP
+                BEGIN
+                  EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', fn, t);
+                  EXECUTE format('DROP FUNCTION IF EXISTS %I.%I()', c->>'schema', fn);
+                  EXECUTE format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', t, c->>'new');
+                  EXIT;
+                EXCEPTION WHEN lock_not_available THEN
+                  IF attempt = 5 THEN RAISE EXCEPTION 'no lock on % after 5 tries of lock_timeout %; a long transaction holds it (see pg_stat_activity)', t, current_setting('lock_timeout'); END IF;
+                  RAISE WARNING 'lock_timeout on %, try % of 5, waiting 10 s', t, attempt;
+                  PERFORM pg_sleep(10);
+                END;
+              END LOOP;
+            END $do$;
+        - id: forget_checkpoint_after_rollback
+          type: io.kestra.plugin.core.kv.Delete
+          key: "{{ render(vars.kv_key) }}"
+          errorOnMissing: false
+        - id: report_rollback
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: "Column migration {{ inputs.schema }}.{{ inputs.table }} ROLLED BACK: trigger and {{ inputs.new_column }} removed, {{ inputs.old_column }} untouched, checkpoint cleared."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      Column migration {{ inputs.schema }}.{{ inputs.table }} ({{ inputs.action }}) FAILED in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs() | jq('([.[] | select(.message | test("MIGRATION BLOCKED"))] + [.[] | select(.message | test("ERROR:"))] + .)[0].message | sub("^.*?ERROR: "; "") | split("\n")[0]') | first }}{% endif %}
+      {% if inputs.action == 'migrate' %}{% if kv(render(vars.kv_key), errorOnMissing=false) is not null %}Backfill checkpoint: {{ inputs.key_column }} {{ kv(render(vars.kv_key), errorOnMissing=false) }}; a re-run resumes from there. {% endif %}The old column {{ inputs.old_column }} is only dropped after an approval.{% endif %}
+
+outputs:
+  - id: verification
+    type: JSON
+    value: "{{ outputs.verify.row ?? {} }}"
+
+extend:
+  title: Change a Postgres Column Without Downtime (Expand and Contract)
+  shortDescription: Add the new column with a sync trigger, backfill in batches with a KV checkpoint that survives a killed run, verify every row, and drop the old column only after a person approves.
+  metaTitle: Zero-Downtime PostgreSQL Column Migration (Expand/Contract) with Kestra
+  metaDescription: Expand and contract a Postgres column with a sync trigger, a resumable batched backfill, full verification and approval before the old column is dropped.
+  description: |
+    Changing a column in a busy table, such as dollars to cents, `int` to `bigint`, or a renamed field, cannot be done with one `ALTER TABLE` without locking writers or breaking the app that still reads the old column. The safe way is **expand and contract**: add the new column next to the old one, keep both in sync while the backfill runs and the app moves over, prove they agree, and only then drop the old one.
+
+    This blueprint runs the whole sequence, and is safe to stop and run again at any point.
+
+    ## How it works
+    1. `expand` adds the new column and a `BEFORE INSERT OR UPDATE` trigger that fills it from the old one with your `transform` expression. The trigger only writes the new column when the old one changed (or on an insert without a value), so an app that already writes the new column directly is not overwritten. Before installing the trigger, the transform is tried on 1000 rows: one that does not parse or cast would otherwise break every write.
+    2. `backfill` (`LoopUntil`) updates one batch per iteration in key order and saves the last key in the KV store after each batch. A killed or failed run resumes from the checkpoint; `batch_interval` leaves room for production traffic and replication between batches.
+    3. `verify` compares every row with the same transform and fails with the first differing keys. A write that bypassed the trigger (for example a bulk load with `session_replication_role = replica`) blocks the contract.
+    4. `approve_contract` (`Pause`) waits for a person to confirm that every app reads the new column. A decline or a timeout keeps the expanded state, and the trigger keeps syncing.
+    5. After approval the rows are checked again, then `contract` drops the trigger, its function and the old column, and the checkpoint is removed.
+    6. `action: rollback` removes the trigger and the new column. It refuses after a contract, when the new column holds the only copy of the data.
+
+    ## Error handling
+    - **DDL never queues behind a long transaction.** Every DDL statement runs with `lock_timeout` (5 s by default) and is retried 5 times, 10 s apart, inside the database. Only a lock timeout is retried; any other error fails at once. In a test, a 25 s transaction held a lock on the table: the app's queries waited at most 5 s, and the expand completed after the transaction ended.
+    - **Kill-safe backfill.** The checkpoint is written after each batch, so a re-run redoes at most one batch, and an `UPDATE` with the same transform is harmless.
+    - **Concurrent writes stay consistent.** Rows written during the backfill go through the trigger. The backfill's `UPDATE` re-evaluates a row changed under it, so it uses the newest value.
+    - **Nothing is dropped without two verifications and an approval**, and every failure message names the task, the cause, the keys involved and where a re-run resumes.
+    - **One run at a time.** `concurrency` (limit 1, `QUEUE`) makes a new run wait while another one waits for approval; answer or kill the waiting run first.
+
+    ## What this blueprint teaches about Kestra
+    - **`LoopUntil` with a KV checkpoint** as a resumable batch job: one task does a batch, `kv.Set` records progress, and the loop exits when a batch comes back short.
+    - **`Pause` with typed `onResume` inputs** (a BOOL and a note) as a human gate in the middle of a long operation, with `behavior: RESUME` and a duration so an unanswered request never drops anything.
+    - **`Switch`** to run the same flow forward (`migrate`) or backward (`rollback`), and input `validator`s that keep table and column names to safe identifiers.
+    - `errorLogs()` and `jq` in the `errors` handler, so the Slack alert quotes the reason rather than "task failed".
+
+    ## Prerequisites
+    - PostgreSQL 11 or later, a table with an integer primary key, and a role that can `ALTER` it and create a function in its schema.
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `POSTGRES_URL` (JDBC URL, e.g. `jdbc:postgresql://db:5432/app`), `POSTGRES_USER`, `POSTGRES_PASSWORD`.
+    - `SLACK_WEBHOOK_URL`.
+    - `EXPAND_CONTRACT_WEBHOOK_KEY`: a long random string for the deploy pipeline's webhook.
+
+    ### Inputs
+    - `action`: `migrate` (default) or `rollback`.
+    - `schema`, `table`, `key_column`, `old_column`, `new_column`, `new_type`.
+    - `transform`: SQL that computes the new value from the row, e.g. `CAST(round(amount * 100) AS bigint)`, `lower(email)` or `CAST(legacy_id AS bigint)`.
+    - `batch_size` (5000), `batch_interval` (PT0.2S), `lock_timeout` (5s), `approval_timeout` (PT24H), `seed_demo`.
+
+    ### Outputs
+    - `verification` (JSON): `total_rows`, `mismatched` and `sample_keys` from the full comparison, e.g. `{{ outputs.verify.row.mismatched }}`. The checkpoint is the KV entry `expand_contract_<schema>_<table>_<new_column>`.
+
+    ## Quick start
+    1. Add the Postgres and Slack secrets and run the flow with the defaults. It creates `demo_orders` with 100,000 rows and migrates `amount` (numeric dollars) to `amount_cents` (bigint).
+    2. While the run waits for approval, write through the "old app" (`UPDATE demo_orders SET amount = 7.25 WHERE id = 10`) and see `amount_cents` follow.
+    3. Resume with **Drop the old column now?** checked: the trigger and `amount` are gone, and every row was verified twice.
+    4. For your table, set `seed_demo: false` and the column inputs, deploy the app version that writes both columns, then run `migrate`.
+
+    ## How to extend
+    - Add an index on the new column with `CREATE INDEX CONCURRENTLY` in its own `Queries` task between verify and approval (it cannot run in a transaction).
+    - Poll replication lag (`pg_stat_replication.replay_lag`) inside the loop and pause the backfill while a replica is behind.
+    - Trigger the flow from your deploy pipeline through the webhook, so the migration starts once the dual-write release is live.
+
+    ## Plugins used
+    - [PostgreSQL Queries](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.queries) and [Query](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.query)
+    - [LoopUntil](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause), [Switch](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch), [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set) / [KV Delete](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.delete)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Database Migration
+    - Day 2 Operations
+  ee: false
+  demo: false
