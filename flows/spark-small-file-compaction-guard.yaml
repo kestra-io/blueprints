@@ -1,0 +1,919 @@
+id: spark-small-file-compaction-guard
+namespace: company.team
+description: Compact small-file Hive partitions with Spark through a staged swap that proves every row survived before the live path changes.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: spark_master
+    type: STRING
+    defaults: "{{ secret('SPARK_MASTER_URL') }}"
+    description: Spark master URL, for example spark://master:7077 or yarn.
+  - id: table_path
+    type: STRING
+    defaults: "{{ secret('LAKE_TABLE_PATH') }}"
+    description: Root of one Hive-partitioned Parquet table, for example hdfs://nn:8020/lake/events.
+  - id: partition_column
+    type: STRING
+    defaults: dt
+    description: Name of the single partition column. Only directories named <column>=<value> are considered.
+  - id: target_file_mb
+    type: INT
+    defaults: 128
+    min: 1
+    max: 2048
+    description: Wanted size of one data file. It sets both the fragmentation threshold and the output file count.
+  - id: max_avg_file_pct
+    type: INT
+    defaults: 25
+    min: 1
+    max: 99
+    description: A partition counts as fragmented only when its average data file is smaller than this percentage of target_file_mb.
+  - id: min_data_files
+    type: INT
+    defaults: 50
+    min: 2
+    max: 100000
+    description: Minimum number of data files in a partition before compaction is worth a rewrite.
+  - id: max_partition_mb
+    type: INT
+    defaults: 2048
+    min: 1
+    max: 1048576
+    description: Bounded change. A partition larger than this is reported and never rewritten.
+  - id: quiet_minutes
+    type: INT
+    defaults: 60
+    min: 0
+    max: 10080
+    description: A partition whose newest file is younger than this is treated as still receiving writes and is spared.
+  - id: max_partitions
+    type: INT
+    defaults: 5
+    min: 1
+    max: 100
+    description: Largest number of partitions one approved run may rewrite. The rest are deferred to the next run.
+  - id: protected_partitions
+    type: ARRAY
+    itemType: STRING
+    defaults: []
+    description: Partition directory names that must never be rewritten, for example dt=2026-10-15.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+  - id: slack_webhook_url
+    type: STRING
+    defaults: "{{ secret('SLACK_WEBHOOK_URL') }}"
+
+variables:
+  spark_conf:
+    spark.executor.memory: 900m
+    spark.executor.cores: "1"
+    spark.cores.max: "1"
+    spark.driver.memory: 900m
+    spark.sql.shuffle.partitions: "4"
+    spark.sql.sources.partitionOverwriteMode: static
+    spark.hadoop.dfs.replication: "1"
+  params: |
+    {{ {
+      'table': inputs.table_path,
+      'partition_column': inputs.partition_column,
+      'target_file_mb': inputs.target_file_mb,
+      'max_avg_file_pct': inputs.max_avg_file_pct,
+      'min_data_files': inputs.min_data_files,
+      'max_partition_mb': inputs.max_partition_mb,
+      'quiet_minutes': inputs.quiet_minutes,
+      'max_partitions': inputs.max_partitions,
+      'protected': inputs.protected_partitions,
+      'dry_run': inputs.dry_run
+    } | toJson }}
+  lib: |
+    import hashlib
+    import json
+    import math
+    import time
+
+    from pyspark.sql import SparkSession, functions as F
+
+    MOD_A = 1000003
+    MOD_B = 1000033
+    STAGING = "_compaction/staging"
+    BACKUP = "_compaction/backup"
+
+
+    def session(app):
+        spark = SparkSession.builder.appName(app).getOrCreate()
+        spark.sparkContext.setLogLevel("WARN")
+        return spark
+
+
+    def emit(payload):
+        print("::" + json.dumps({"outputs": payload}) + "::", flush=True)
+
+
+    def stop(message):
+        raise SystemExit("GUARD_REFUSED " + message)
+
+
+    def hpath(spark, path):
+        return spark.sparkContext._jvm.org.apache.hadoop.fs.Path(path)
+
+
+    def filesystem(spark, path):
+        hconf = spark.sparkContext._jsc.hadoopConfiguration()
+        return hpath(spark, path).getFileSystem(hconf)
+
+
+    def listing(spark, fs, path):
+        p = hpath(spark, path)
+        if not fs.exists(p):
+            return None
+        out = []
+        for st in fs.listStatus(p):
+            if st.isFile():
+                out.append({
+                    "name": st.getPath().getName(),
+                    "len": int(st.getLen()),
+                    "mtime": int(st.getModificationTime()),
+                })
+        return out
+
+
+    def subdirs(spark, fs, path):
+        p = hpath(spark, path)
+        if not fs.exists(p):
+            return []
+        return sorted(st.getPath().getName() for st in fs.listStatus(p) if st.isDirectory())
+
+
+    def files_digest(files):
+        items = sorted("{0}:{1}:{2}".format(f["name"], f["len"], f["mtime"]) for f in files)
+        return hashlib.sha256("|".join(items).encode("utf-8")).hexdigest()
+
+
+    def metrics(df):
+        """Row count plus two order independent checksums over every column as text."""
+        cols = sorted(df.columns)
+        key = F.xxhash64(*[F.coalesce(F.col(c).cast("string"), F.lit("@null@")) for c in cols])
+        row = df.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.coalesce(F.sum(F.pmod(key, F.lit(MOD_A))), F.lit(0)).alias("ck_a"),
+            F.coalesce(F.sum(F.pmod(key, F.lit(MOD_B))), F.lit(0)).alias("ck_b"),
+        ).first()
+        return {"rows": int(row["rows"]), "ck_a": int(row["ck_a"]), "ck_b": int(row["ck_b"])}
+
+
+    def facts(spark, fs, path, with_metrics=True):
+        """Layout and content facts of one partition directory. None when it is absent."""
+        found = listing(spark, fs, path)
+        if found is None:
+            return None
+        data = [f for f in found if f["name"].endswith(".parquet")]
+        hidden = [f for f in found if f["name"].startswith("_") or f["name"].startswith(".")]
+        unknown = [f["name"] for f in found if f not in data and f not in hidden]
+        total = sum(f["len"] for f in data)
+        newest = max([f["mtime"] for f in found], default=0)
+        out = {
+            "data_files": len(data),
+            "other_files": len(found) - len(data),
+            "total_bytes": total,
+            "avg_bytes": total // max(1, len(data)),
+            "newest_mtime": newest,
+            "age_minutes": int((time.time() * 1000 - newest) // 60000) if newest else -1,
+            "unknown_files": unknown,
+            "files_digest": files_digest(found),
+        }
+        if with_metrics and data:
+            out.update(metrics(spark.read.parquet(path)))
+        else:
+            out.update({"rows": 0, "ck_a": 0, "ck_b": 0})
+        out["fingerprint"] = "{0}:{1}:{2}:{3}:{4}:{5}".format(
+            out["data_files"], out["total_bytes"], out["newest_mtime"],
+            out["rows"], out["ck_a"], out["ck_b"])
+        return out
+
+
+    def reconcile(spark, fs, table, apply_restore, apply_cleanup):
+        """Finish or undo whatever an interrupted or refused earlier pass left behind."""
+        actions = []
+        backups = subdirs(spark, fs, table + "/" + BACKUP)
+        staged = subdirs(spark, fs, table + "/" + STAGING)
+        for name in backups:
+            bpath = "{0}/{1}/{2}".format(table, BACKUP, name)
+            live = "{0}/{1}".format(table, name)
+            spath = "{0}/{1}/{2}".format(table, STAGING, name)
+            back = facts(spark, fs, bpath)
+            if back is None:
+                continue
+            current = facts(spark, fs, live)
+            if current is None or current["data_files"] == 0:
+                action = "restore_live_from_backup"
+                if apply_restore:
+                    if current is not None:
+                        fs.delete(hpath(spark, live), True)
+                    if not fs.rename(hpath(spark, bpath), hpath(spark, live)):
+                        stop("could not restore " + name + " from its backup copy")
+                    if fs.exists(hpath(spark, spath)):
+                        fs.delete(hpath(spark, spath), True)
+                    action = "restored_live_from_backup"
+            elif (current["rows"], current["ck_a"], current["ck_b"]) == (
+                    back["rows"], back["ck_a"], back["ck_b"]):
+                action = "swap_committed_backup_removable"
+                if apply_cleanup:
+                    fs.delete(hpath(spark, bpath), True)
+                    if fs.exists(hpath(spark, spath)):
+                        fs.delete(hpath(spark, spath), True)
+                    action = "swap_committed_backup_removed"
+            else:
+                action = "conflict"
+            actions.append({
+                "partition": name,
+                "action": action,
+                "live_rows": None if current is None else current["rows"],
+                "backup_rows": back["rows"],
+                "live_data_files": None if current is None else current["data_files"],
+                "backup_data_files": back["data_files"],
+            })
+        for name in staged:
+            if name in backups:
+                continue
+            live = "{0}/{1}".format(table, name)
+            current = facts(spark, fs, live, with_metrics=False)
+            if current is None or current["data_files"] == 0:
+                actions.append({"partition": name, "action": "conflict",
+                                "live_rows": None, "backup_rows": None,
+                                "live_data_files": None, "backup_data_files": None})
+                continue
+            action = "orphan_staging_removable"
+            if apply_cleanup:
+                fs.delete(hpath(spark, "{0}/{1}/{2}".format(table, STAGING, name)), True)
+                action = "orphan_staging_removed"
+            actions.append({"partition": name, "action": action,
+                            "live_rows": current["rows"], "backup_rows": None,
+                            "live_data_files": current["data_files"], "backup_data_files": None})
+        return actions
+
+
+    def scan(spark, params, apply_restore, apply_cleanup):
+        """One detector, used before and after the approval. It also classifies every spared partition."""
+        table = params["table"].rstrip("/")
+        fs = filesystem(spark, table)
+        if not fs.exists(hpath(spark, table)):
+            stop("table root " + table + " does not exist")
+        target_bytes = int(params["target_file_mb"]) * 1024 * 1024
+        max_avg = target_bytes * int(params["max_avg_file_pct"]) // 100
+        quiet_ms = int(params["quiet_minutes"]) * 60000
+        max_part_bytes = int(params["max_partition_mb"]) * 1024 * 1024
+        protected = set(params["protected"] or [])
+        prefix = params["partition_column"] + "="
+
+        actions = reconcile(spark, fs, table, apply_restore, apply_cleanup)
+        now_ms = time.time() * 1000
+
+        candidates = []
+        spared = []
+        for name in subdirs(spark, fs, table):
+            if not name.startswith(prefix):
+                continue
+            part = facts(spark, fs, "{0}/{1}".format(table, name))
+            part["partition"] = name
+            reasons = []
+            if name in protected:
+                reasons.append("protected")
+            if part["unknown_files"]:
+                reasons.append("unknown_files")
+            if part["total_bytes"] == 0:
+                reasons.append("empty")
+            if part["data_files"] < int(params["min_data_files"]):
+                reasons.append("few_data_files")
+            if part["avg_bytes"] >= max_avg:
+                reasons.append("average_file_size_ok")
+            if part["total_bytes"] > max_part_bytes:
+                reasons.append("partition_too_large")
+            if quiet_ms > 0 and (now_ms - part["newest_mtime"]) < quiet_ms:
+                reasons.append("active_writes")
+            if reasons:
+                part["reason"] = reasons[0]
+                part["reasons"] = reasons
+                spared.append(part)
+            else:
+                part["target_files"] = max(1, int(math.ceil(part["total_bytes"] / float(target_bytes))))
+                candidates.append(part)
+
+        candidates.sort(key=lambda r: (-r["data_files"], r["partition"]))
+        limit = int(params["max_partitions"])
+        plan = candidates[:limit]
+        deferred = [r["partition"] for r in candidates[limit:]]
+        quiet = [p for p in spared if p["reason"] != "active_writes"] + plan
+        conflicts = [a for a in actions if a["action"] == "conflict"]
+        return {
+            "table": table,
+            "plan": plan,
+            "spared": spared,
+            "deferred": deferred,
+            "actions": actions,
+            "vars": {
+                "table": table,
+                "partitions_seen": len(plan) + len(spared) + len(deferred),
+                "plan_count": len(plan),
+                "spared_count": len(spared),
+                "deferred_count": len(deferred),
+                "has_plan": "yes" if plan else "no",
+                "plan_partitions_json": json.dumps([p["partition"] for p in plan]),
+                "plan_json": json.dumps(plan),
+                "spared_json": json.dumps([
+                    {k: p[k] for k in ("partition", "reason", "reasons", "data_files", "total_bytes",
+                                       "avg_bytes", "newest_mtime", "age_minutes", "rows", "ck_a",
+                                       "ck_b", "files_digest")}
+                    for p in spared]),
+                "plan_fingerprint": "|".join(
+                    "{0}={1}".format(p["partition"], p["fingerprint"]) for p in plan),
+                "planned_data_files": sum(p["data_files"] for p in plan),
+                "planned_bytes": sum(p["total_bytes"] for p in plan),
+                "planned_rows": sum(p["rows"] for p in plan),
+                "planned_target_files": sum(p["target_files"] for p in plan),
+                "quiet_rows": sum(p["rows"] for p in quiet),
+                "quiet_ck_a": sum(p["ck_a"] for p in quiet),
+                "quiet_ck_b": sum(p["ck_b"] for p in quiet),
+                "table_rows": sum(p["rows"] for p in plan + spared),
+                "table_data_files": sum(p["data_files"] for p in plan + spared),
+                "table_bytes": sum(p["total_bytes"] for p in plan + spared),
+                "residue_actions": len(actions),
+                "residue_json": json.dumps(actions),
+                "residue_conflict": "yes" if conflicts else "no",
+                "spark_version": spark.version,
+                "report": " ".join(
+                    ["PLAN " + (",".join("{0}[{1} files avg {2}B -> {3} files]".format(
+                        p["partition"], p["data_files"], p["avg_bytes"], p["target_files"])
+                        for p in plan) or "none")]
+                    + ["SPARED " + (",".join("{0}[{1}]".format(p["partition"], p["reason"])
+                                             for p in spared) or "none")]
+                    + (["DEFERRED " + ",".join(deferred)] if deferred else [])
+                    + (["RESIDUE " + ",".join("{0}[{1}]".format(a["partition"], a["action"])
+                                              for a in actions)] if actions else [])),
+            },
+        }
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: scan_table
+        type: io.kestra.plugin.spark.PythonSubmit
+        master: "{{ inputs.spark_master }}"
+        configurations: "{{ vars.spark_conf }}"
+        timeout: PT15M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: kw7
+          user: root
+        mainScript: |
+          {{ render(vars.lib) }}
+
+          PARAMS = json.loads(r'''{{ render(vars.params) }}''')
+
+          spark = session("kestra-compaction-guard-detect")
+          # A restore is pure recovery of a partition that is missing or empty, so it runs in every
+          # mode. Removing a superseded backup is housekeeping and waits for a non dry run.
+          found = scan(spark, PARAMS, apply_restore=True, apply_cleanup=not PARAMS["dry_run"])
+          spark.stop()
+          emit(found["vars"])
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Table {{ outputs.scan_table.vars.table }} on Spark {{ outputs.scan_table.vars.spark_version }}:
+      {{ outputs.scan_table.vars.partitions_seen }} partitions, {{ outputs.scan_table.vars.table_data_files }}
+      data files, {{ outputs.scan_table.vars.table_rows }} rows. {{ outputs.scan_table.vars.report }}
+
+  - id: residue_conflict
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.scan_table.vars.residue_conflict == 'yes' }}"
+    then:
+      - id: conflicting_residue
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          A leftover backup copy disagrees with the live partition, so an earlier pass cannot be
+          reconciled automatically. Compare the live partition with its copy under _compaction/backup
+          and resolve it by hand before running this flow again.
+
+  - id: incident
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.scan_table.vars.has_plan == 'yes' }}"
+    then:
+      - id: finding
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.slack_webhook_url }}"
+        method: POST
+        contentType: application/json
+        body: >-
+          {{ {'text': 'Small-file partitions found in ' ~ outputs.scan_table.vars.table ~ '. '
+              ~ outputs.scan_table.vars.report ~ ' dry_run=' ~ inputs.dry_run ~ ' auto_remediate='
+              ~ inputs.auto_remediate ~ '. Execution ' ~ execution.id} | toJson }}
+      - id: change_enabled
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: PT30M
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Approve rewriting the planned partitions of this table only.
+          - id: approved_change
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval.onResume.approved ?? false }}"
+            then:
+              - id: recheck
+                type: io.kestra.plugin.core.flow.WorkingDirectory
+                tasks:
+                  - id: rescan_table
+                    type: io.kestra.plugin.spark.PythonSubmit
+                    master: "{{ inputs.spark_master }}"
+                    configurations: "{{ vars.spark_conf }}"
+                    timeout: PT15M
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: kw7
+                      user: root
+                    mainScript: |
+                      {{ render(vars.lib) }}
+
+                      PARAMS = json.loads(r'''{{ render(vars.params) }}''')
+                      APPROVED = r'''{{ outputs.scan_table.vars.plan_fingerprint }}'''
+
+                      spark = session("kestra-compaction-guard-recheck")
+                      found = scan(spark, PARAMS, apply_restore=False, apply_cleanup=False)
+                      spark.stop()
+                      out = found["vars"]
+                      out["stale"] = "no" if out["plan_fingerprint"] == APPROVED else "yes"
+                      out["approved_fingerprint"] = APPROVED
+                      emit(out)
+              - id: unchanged_plan
+                type: io.kestra.plugin.core.flow.If
+                condition: >-
+                  {{ outputs.rescan_table.vars.stale == 'no'
+                     and outputs.rescan_table.vars.residue_conflict == 'no'
+                     and outputs.rescan_table.vars.plan_count == outputs.scan_table.vars.plan_count
+                     and outputs.rescan_table.vars.planned_rows == outputs.scan_table.vars.planned_rows
+                     and outputs.rescan_table.vars.table == outputs.scan_table.vars.table }}
+                then:
+                  - id: compact_partitions
+                    type: io.kestra.plugin.core.flow.Loop
+                    values: "{{ fromJson(outputs.rescan_table.vars.plan_partitions_json) }}"
+                    concurrencyLimit: 1
+                    tasks:
+                      - id: rewrite
+                        type: io.kestra.plugin.core.flow.WorkingDirectory
+                        tasks:
+                          - id: stage_and_swap
+                            type: io.kestra.plugin.spark.PythonSubmit
+                            master: "{{ inputs.spark_master }}"
+                            configurations: "{{ vars.spark_conf }}"
+                            timeout: PT20M
+                            taskRunner:
+                              type: io.kestra.plugin.scripts.runner.docker.Docker
+                              networkMode: kw7
+                              user: root
+                            mainScript: |
+                              {{ render(vars.lib) }}
+
+                              PARAMS = json.loads(r'''{{ render(vars.params) }}''')
+                              PLAN = json.loads(r'''{{ outputs.rescan_table.vars.plan_json }}''')
+                              PARTITION = r'''{{ item.value }}'''
+
+                              table = PARAMS["table"].rstrip("/")
+                              entry = None
+                              for candidate in PLAN:
+                                  if candidate["partition"] == PARTITION:
+                                      entry = candidate
+                              if entry is None:
+                                  stop(PARTITION + " is not part of the approved plan")
+
+                              live = "{0}/{1}".format(table, PARTITION)
+                              stage = "{0}/{1}/{2}".format(table, STAGING, PARTITION)
+                              backup = "{0}/{1}/{2}".format(table, BACKUP, PARTITION)
+
+                              spark = session("kestra-compaction-guard-rewrite")
+                              fs = filesystem(spark, table)
+
+                              # Eligibility is read again here, immediately before the write, because
+                              # the approval and the rescan are both older than this moment.
+                              before = facts(spark, fs, live)
+                              if before is None:
+                                  stop(PARTITION + " disappeared after the plan was approved")
+                              if before["fingerprint"] != entry["fingerprint"]:
+                                  stop("{0} changed after the plan was approved: {1} is not {2}".format(
+                                      PARTITION, before["fingerprint"], entry["fingerprint"]))
+                              for path in (stage, backup):
+                                  if fs.exists(hpath(spark, path)):
+                                      fs.delete(hpath(spark, path), True)
+                              fs.mkdirs(hpath(spark, "{0}/{1}".format(table, BACKUP)))
+
+                              # Step 1: build the compacted copy beside the table. Nothing live moves yet,
+                              # and _compaction is hidden from Spark's own partition discovery.
+                              target = int(entry["target_files"])
+                              try:
+                                  spark.read.parquet(live).repartition(target) \
+                                      .write.mode("overwrite").parquet(stage)
+                              except Exception as exc:
+                                  if fs.exists(hpath(spark, stage)):
+                                      fs.delete(hpath(spark, stage), True)
+                                  stop("the staged write for {0} was refused: {1}".format(
+                                      PARTITION, str(exc)[:400]))
+
+                              staged = facts(spark, fs, stage)
+                              if staged is None or (staged["rows"], staged["ck_a"], staged["ck_b"]) != (
+                                      before["rows"], before["ck_a"], before["ck_b"]):
+                                  fs.delete(hpath(spark, stage), True)
+                                  stop("the staged copy of {0} does not conserve the data".format(PARTITION))
+                              if staged["data_files"] > target or staged["data_files"] >= before["data_files"]:
+                                  fs.delete(hpath(spark, stage), True)
+                                  stop("the staged copy of {0} is not less fragmented".format(PARTITION))
+
+                              # Step 2: last read before the swap. A writer that touched the partition
+                              # while the copy was built invalidates the copy.
+                              again = facts(spark, fs, live, with_metrics=False)
+                              if again["files_digest"] != before["files_digest"]:
+                                  fs.delete(hpath(spark, stage), True)
+                                  stop(PARTITION + " was written to while the compacted copy was built")
+
+                              # Step 3: two directory renames. HDFS renames are atomic, so the live path
+                              # always points at a complete partition.
+                              if not fs.rename(hpath(spark, live), hpath(spark, backup)):
+                                  fs.delete(hpath(spark, stage), True)
+                                  stop("could not move the live copy of " + PARTITION + " aside")
+                              if not fs.rename(hpath(spark, stage), hpath(spark, live)):
+                                  fs.rename(hpath(spark, backup), hpath(spark, live))
+                                  stop("could not publish " + PARTITION + ", the original is back in place")
+
+                              after = facts(spark, fs, live)
+                              conserved = (after["rows"], after["ck_a"], after["ck_b"]) == (
+                                  before["rows"], before["ck_a"], before["ck_b"])
+                              if not conserved or after["data_files"] > target:
+                                  fs.delete(hpath(spark, live), True)
+                                  fs.rename(hpath(spark, backup), hpath(spark, live))
+                                  stop("the published copy of {0} failed verification, the original is back in place".format(PARTITION))
+                              fs.delete(hpath(spark, backup), True)
+                              spark.stop()
+                              emit({
+                                  "partition": PARTITION,
+                                  "files_before": before["data_files"],
+                                  "files_after": after["data_files"],
+                                  "avg_before": before["avg_bytes"],
+                                  "avg_after": after["avg_bytes"],
+                                  "rows": after["rows"],
+                                  "ck_a": after["ck_a"],
+                                  "bytes_before": before["total_bytes"],
+                                  "bytes_after": after["total_bytes"],
+                                  "target_files": target,
+                              })
+                  - id: verify
+                    type: io.kestra.plugin.core.flow.WorkingDirectory
+                    tasks:
+                      - id: audit_table
+                        type: io.kestra.plugin.spark.PythonSubmit
+                        master: "{{ inputs.spark_master }}"
+                        configurations: "{{ vars.spark_conf }}"
+                        timeout: PT15M
+                        taskRunner:
+                          type: io.kestra.plugin.scripts.runner.docker.Docker
+                          networkMode: kw7
+                          user: root
+                        mainScript: |
+                          {{ render(vars.lib) }}
+
+                          PARAMS = json.loads(r'''{{ render(vars.params) }}''')
+                          PLAN = json.loads(r'''{{ outputs.rescan_table.vars.plan_json }}''')
+                          SPARED = json.loads(r'''{{ outputs.scan_table.vars.spared_json }}''')
+
+                          table = PARAMS["table"].rstrip("/")
+                          spark = session("kestra-compaction-guard-verify")
+                          fs = filesystem(spark, table)
+                          problems = []
+                          lines = []
+
+                          for entry in PLAN:
+                              name = entry["partition"]
+                              now = facts(spark, fs, "{0}/{1}".format(table, name))
+                              if now is None:
+                                  problems.append(name + " is gone")
+                                  continue
+                              if (now["rows"], now["ck_a"], now["ck_b"]) != (
+                                      entry["rows"], entry["ck_a"], entry["ck_b"]):
+                                  problems.append("{0} lost or changed data: {1}/{2} rows".format(
+                                      name, now["rows"], entry["rows"]))
+                              if now["data_files"] > int(entry["target_files"]):
+                                  problems.append("{0} still holds {1} data files".format(
+                                      name, now["data_files"]))
+                              if now["data_files"] >= entry["data_files"]:
+                                  problems.append(name + " was not compacted")
+                              lines.append("{0}: {1} files -> {2} files, avg {3}B -> {4}B, {5} rows kept".format(
+                                  name, entry["data_files"], now["data_files"],
+                                  entry["avg_bytes"], now["avg_bytes"], now["rows"]))
+
+                          for entry in SPARED:
+                              name = entry["partition"]
+                              now = facts(spark, fs, "{0}/{1}".format(table, name))
+                              if now is None:
+                                  problems.append("spared partition " + name + " is gone")
+                                  continue
+                              if entry["reason"] == "active_writes":
+                                  # This partition was still receiving writes, so new files are allowed
+                                  # while losing rows or files is not.
+                                  if now["rows"] < entry["rows"] or now["data_files"] < entry["data_files"]:
+                                      problems.append("spared partition " + name + " lost data")
+                                  lines.append("{0}: spared ({1}), {2} rows now, {3} rows before".format(
+                                      name, entry["reason"], now["rows"], entry["rows"]))
+                              else:
+                                  if now["files_digest"] != entry["files_digest"]:
+                                      problems.append("spared partition " + name + " was modified")
+                                  lines.append("{0}: spared ({1}), byte identical".format(name, entry["reason"]))
+
+                          left = subdirs(spark, fs, table + "/" + BACKUP) + subdirs(spark, fs, table + "/" + STAGING)
+                          if left:
+                              problems.append("working directories left behind: " + ",".join(left))
+
+                          current = scan(spark, PARAMS, apply_restore=False, apply_cleanup=False)
+                          spark.stop()
+                          out = current["vars"]
+                          out["all_ok"] = "no" if problems else "yes"
+                          out["problems_json"] = json.dumps(problems)
+                          out["residue_dirs"] = len(left)
+                          out["summary"] = " | ".join(lines)
+                          emit(out)
+                  - id: outcome
+                    type: io.kestra.plugin.core.flow.If
+                    condition: >-
+                      {{ outputs.audit_table.vars.all_ok == 'yes'
+                         and outputs.audit_table.vars.residue_dirs == 0
+                         and outputs.audit_table.vars.quiet_rows == outputs.scan_table.vars.quiet_rows
+                         and outputs.audit_table.vars.quiet_ck_a == outputs.scan_table.vars.quiet_ck_a
+                         and outputs.audit_table.vars.quiet_ck_b == outputs.scan_table.vars.quiet_ck_b
+                         and outputs.audit_table.vars.table_rows >= outputs.scan_table.vars.table_rows
+                         and outputs.audit_table.vars.table_data_files < outputs.scan_table.vars.table_data_files }}
+                    then:
+                      - id: recovered
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          Compaction verified. Table {{ outputs.audit_table.vars.table }} went from
+                          {{ outputs.scan_table.vars.table_data_files }} to {{ outputs.audit_table.vars.table_data_files }}
+                          data files with {{ outputs.audit_table.vars.table_rows }} rows and checksum
+                          {{ outputs.audit_table.vars.quiet_ck_a }} unchanged on every quiet partition.
+                          {{ outputs.audit_table.vars.summary }}
+                    else:
+                      - id: unresolved
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          Verification failed after the swap: {{ outputs.audit_table.vars.problems_json }}.
+                          Rows or checksums moved, a partition is still fragmented, a spared partition was
+                          touched or a working directory was left behind. Inspect the table before retrying.
+                else:
+                  - id: stale_approval
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      The approval is stale. The partitions changed between the plan and the approval,
+                      so nothing was written. Approved plan
+                      {{ outputs.rescan_table.vars.approved_fingerprint }}, current plan
+                      {{ outputs.rescan_table.vars.plan_fingerprint }}. Run the flow again to read the
+                      table and approve a fresh plan.
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: Approval was not granted. Every partition was left exactly as it was found.
+        else:
+          - id: report_only
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Read-only mode. {{ outputs.scan_table.vars.plan_count }} partitions holding
+              {{ outputs.scan_table.vars.planned_data_files }} data files would be rewritten into
+              {{ outputs.scan_table.vars.planned_target_files }} files after approval. Nothing was written.
+
+triggers:
+  - id: nightly_layout_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "20 3 * * *"
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.slack_webhook_url }}"
+    method: POST
+    contentType: application/json
+    body: >-
+      {{ {'text': 'Spark small-file compaction guard failed on ' ~ inputs.table_path ~ '. A refused
+          write, a stale approval, a conflicting backup copy or a failed verification needs
+          investigation. No partition is left half written. Execution ' ~ execution.id} | toJson }}
+
+extend:
+  title: Spark Small File Compaction Guard
+  shortDescription: Compact small-file Hive partitions with Spark behind an approval, a staged swap and a row-level conservation proof.
+  metaTitle: Spark Small File Compaction Guard with Kestra
+  metaDescription: Detect fragmented Hive partitions, compact them with Spark through a staged atomic swap and prove every row survived.
+  tags: [Data, Infrastructure]
+  subTags: [Spark & Big Data, Day 2 Operations]
+  ee: false
+  demo: false
+  description: |
+    ## Safety
+
+    A streaming or micro-batch writer leaves a Hive-partitioned Parquet table with hundreds of tiny
+    files per partition. Every later query pays for opening them. The usual fix is one line:
+    `df.repartition(n).write.mode("overwrite").parquet(partition_path)`. On a plain directory table
+    that line is the most dangerous statement in the data platform. There is no transaction log and
+    no snapshot. Spark deletes the partition directory first, then writes the new files, so the
+    partition does not exist for the length of the job. If the job is killed, the cluster loses a
+    node or the source DataFrame is still lazily pointing at the path being deleted, the partition is
+    gone and no rollback exists. This flow never overwrites a live path. It builds the compacted copy
+    somewhere else, proves it holds the same rows, then swaps it in with two atomic renames.
+
+    | Guard | What it stops |
+    | --- | --- |
+    | Staged write into `_compaction/staging`, never onto the live path | the delete-then-write window that loses a partition when a job dies |
+    | Row count plus two order-independent checksums compared before the swap | publishing a copy that silently dropped or changed rows |
+    | Two atomic `rename` calls instead of a copy | a reader ever seeing a partially written partition |
+    | The old files kept under `_compaction/backup` until verification passes | having nothing to roll back to |
+    | `quiet_minutes` on the newest file mtime | rewriting a partition that is still being appended to |
+    | `protected_partitions` | touching a partition another team owns |
+    | `min_data_files`, `max_avg_file_pct` and `max_partition_mb` | rewriting partitions that are already fine or too big to rewrite safely |
+    | Any unexpected file in a partition makes it ineligible | rewriting a layout the flow does not understand |
+    | `auto_remediate` false, `dry_run` true, `Pause` | three separate gates before one write |
+    | Fingerprint recheck after the approval plus a third read immediately before the swap | acting on a plan that went stale while the approval waited |
+    | `Loop` with `concurrencyLimit: 1` | two partitions racing for the same staging area |
+    | Residue reconciliation at the start of every run | leaving a half-finished pass to rot |
+
+    ## How it works
+
+    1. `detect` (`WorkingDirectory`) runs `scan_table` (`io.kestra.plugin.spark.PythonSubmit`). It
+       lists the table root through the Hadoop `FileSystem` API. For every `<partition_column>=`
+       directory it reads the data file count, total bytes, average file size, newest mtime, a
+       SHA-256 digest of the file listing, the row count and two checksums.
+    2. The same task first reconciles leftovers. A partition that is missing or empty while a copy
+       sits under `_compaction/backup` is restored from that copy in any mode. A backup whose rows and
+       checksums match the live partition belongs to a swap that already committed, so it is removed
+       outside dry run. A backup that disagrees with the live partition is a conflict: `residue_conflict`
+       fails the run through `conflicting_residue` rather than guessing.
+    3. `report` logs the plan and, for every spared partition, the first reason it was spared.
+       `incident` (`If`) continues only when the plan is not empty and posts it to Slack (`finding`).
+    4. `change_enabled` (`If`) requires `auto_remediate: true` and `dry_run: false`. Otherwise
+       `report_only` prints the file counts that would be rewritten and the run ends.
+    5. `approval` (`Pause`) waits for a person. `approved_change` reads `onResume.approved ?? false`,
+       so a resume with no answer is a refusal.
+    6. `recheck` runs the identical detector again (`rescan_table`) and compares its plan fingerprint,
+       which carries file counts, bytes, mtimes, rows and checksums, with the approved one.
+       `unchanged_plan` (`If`) also compares the partition count, the planned row total and the table
+       path. Anything else fails the run at `stale_approval` before a single byte is written.
+    7. `compact_partitions` (`Loop`, `concurrencyLimit: 1`) rewrites one partition at a time in
+       `stage_and_swap`: read the live partition a third time and compare the fingerprint, write
+       `repartition(target_files)` into `_compaction/staging/<partition>`, compare rows and both
+       checksums against the live partition, confirm the copy really is less fragmented, compare the
+       file listing digest once more, then `rename` live to `_compaction/backup/<partition>` and
+       `rename` the staged copy onto the live path. The published partition is read back. On any
+       mismatch the backup is renamed straight back and the task fails. The backup is deleted only
+       after the read-back passes.
+    8. `verify` (`audit_table`) re-reads the table from scratch. Planned partitions must hold their
+       exact rows and checksums with fewer files, partitions spared for any reason other than active
+       writes must be byte identical, partitions spared as active may only grow and `_compaction` must
+       be empty. `outcome` (`If`) additionally compares the row count and both checksums summed over
+       every quiet partition against the values read before the change. It also requires the table-wide
+       data file count to have dropped. Otherwise `unresolved` fails the run.
+
+    The `nightly_layout_check` schedule ships `disabled: true` with `dry_run: true` and
+    `auto_remediate: false`, so enabling it can only produce a report.
+
+    ## What you get
+
+    - A per-partition fragmentation report from the file system itself, with the reason every spared
+      partition was spared.
+    - Compaction that is approved per plan and applied one partition at a time.
+    - A conservation proof: identical row count and two checksums before and after, per partition and
+      summed over the table.
+    - A failed run, not a silent one, when a write is refused, a copy does not match or a partition is
+      still fragmented afterwards.
+    - A table that an interrupted or refused run leaves intact, plus a next run that reconciles it.
+
+    ## Who it's for
+
+    Data platform and lakehouse teams running Spark over partitioned Parquet directories without a
+    table format, where compaction is a hand-written overwrite nobody wants to be on call for.
+
+    ## Why orchestrate this with Kestra
+
+    Compaction is not one job: it is a measurement, a decision, an approval, a bounded write and a
+    proof. The dangerous part is the gap between them. Kestra holds the measured plan across a
+    `Pause`, reads the table again on the other side, serialises the rewrites then fails the execution
+    when the proof does not hold. The guard and the evidence live in the same file as the Spark code,
+    so the next operator can read why a partition was spared instead of reconstructing it from logs.
+
+    ## Tested end to end
+
+    Kestra 2.0.5, Spark plugin 1.2.9, Spark 4.0.1 standalone with one worker, Apache Hadoop 3.4.1 HDFS
+    with replication 1. Validate was clean: no constraints, warnings or deprecations. Every number
+    below was read back with `hdfs dfs` plus a separate `spark-submit` that never goes through Kestra.
+    The fixture table held 7 partitions, 324,495 rows and 961 data files: two fragmented partitions
+    (320 and 180 files averaging 2,304 bytes), a healthy one (2 files of 2.8 MB), a lookalike with
+    many files but a healthy average (60 files of 305 KB), a boundary partition one file below
+    `min_data_files`, a protected one and one still being written to. All eight cases below ran on the
+    final revision 2 with `target_file_mb: 1`, `min_data_files: 50` and `quiet_minutes: 60`.
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy | `67ZznzUpaTAKdm5M2JhvwI` | SUCCESS. A second table of 2 partitions and 3 data files produced `PLAN none` |
+    | Dry run | `2KMdymYCzKlES5gZbOxlpS` | SUCCESS. Planned `dt=2026-10-10` and `dt=2026-10-11` only, spared the other five with one reason each, wrote nothing. 961 data files afterwards |
+    | Remediation | `3uPrXH5xVr5RjMV7omGA44` | SUCCESS. **961 to 463 data files**, 500 tiny files became 2. `hdfs dfs -count` went from 968 to 470 files. Average file in `dt=2026-10-10` grew from 2,304 to 128,049 bytes. All 324,495 rows, checksum 162,334,318,880 and `amount` total 8,099,402.65 unchanged |
+    | Repeat | `1cJX14kpztoMpW56pIB1xE` | SUCCESS. `PLAN none`, the two compacted partitions now spare themselves on `few_data_files`, no second rewrite |
+    | Declined approval | `6vyk2ojmQegFLuOjqmJl8D` | SUCCESS. With the protection removed `dt=2026-10-15` was the plan. Resumed `approved=false`, so the partition kept its 200 files and 460,932 bytes |
+    | Change during the Pause | `2vKYLPrEI7EWtZmSYQmYs2` | FAILED as intended. A writer landed a 201st file in the planned partition while the approval waited. `rescan_table` saw a different fingerprint and `stale_approval` refused before any write |
+    | Refused write | `1BSr0bcfBh92Kre76Zj0nH` | FAILED as intended. A 200,000 byte HDFS space quota on the staging directory made the staged copy raise `DSQuotaExceededException`. The guard failed the run, left the live partition at 200 files and cleaned the staging directory |
+    | Interrupted pass | `eruQgAGncFeDI6UmgJ4sv` | SUCCESS. A swap was crashed by hand between the two renames, leaving `dt=2026-10-14` only under `_compaction/backup`. The next run restored it in read-only mode: 49 files, 112,900 bytes, 245 rows, checksum 125,922,802 |
+
+    Protected and lookalike partitions were spared in every run: the 2-file healthy partition, the
+    60-file partition with a 305 KB average, the 49-file boundary against `min_data_files: 50`, the
+    partition named in `protected_partitions` and the partition still inside the quiet window. The
+    independent `spark-submit` audit after the whole sweep matched the seeded fixture per partition,
+    byte for byte on the five spared ones and row for row on the two rewritten ones. Slack was a local
+    HTTP sink and the errors block fired on both failing runs.
+
+    A second, freshly seeded HDFS namenode repeated the three cases that matter, with its own
+    `hdfs dfs` and `spark-submit` reads: healthy `SSUPjLuatXKyueDd05kgp`, remediation
+    `6LjP2Hv9OOThfbqWeNU48B` (the same 961 to 463 data files, 320 and 180 files became 1 each, the same
+    324,495 rows and checksum 162,334,318,880) and a pause race `3B7oEIg7CMqEbVfD3kbvgB` where a
+    201st file landed in `dt=2026-10-15` and `stale_approval` refused before any write.
+
+    ## Prerequisites
+
+    - A Hive-partitioned Parquet table on a Hadoop compatible file system that supports atomic
+      directory rename. Tested on HDFS 3.4.1. Object stores without atomic rename are out of scope.
+    - Spark 4.0.1 reachable from Kestra plus the Kestra Spark plugin.
+    - Minimum permissions: read on the table root, plus write, rename and delete inside it. Nothing
+      outside the table root is touched.
+
+    ### Secrets
+
+    - `SPARK_MASTER_URL`: Spark master, for example `spark://master:7077`.
+    - `LAKE_TABLE_PATH`: root of the table, for example `hdfs://nn:8020/lake/events`.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for findings and failures.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    | --- | --- | --- |
+    | `partition_column` | `dt` | Only `<column>=<value>` directories are considered |
+    | `target_file_mb` | `128` | Wanted file size. Sets the threshold and the output file count |
+    | `max_avg_file_pct` | `25` | Fragmented means the average file is under this share of the target |
+    | `min_data_files` | `50` | Fewest files worth a rewrite |
+    | `max_partition_mb` | `2048` | Bounded change. Larger partitions are reported only |
+    | `quiet_minutes` | `60` | Partitions written to more recently are spared |
+    | `max_partitions` | `5` | Most partitions one approved run may rewrite |
+    | `protected_partitions` | `[]` | Partition directories that are never rewritten |
+    | `dry_run` | `true` | Report only |
+    | `auto_remediate` | `false` | Ask for approval to compact |
+
+    ## Quick start
+
+    1. Add the three secrets. The Spark account needs read, write, rename and delete inside the table
+       root only.
+    2. Execute with the defaults. Read the report: the plan plus the reason beside every spared
+       partition.
+    3. Tune `target_file_mb` and `min_data_files` to the table, then list partitions other teams own in
+       `protected_partitions`.
+    4. Execute with `dry_run: false` and `auto_remediate: true`, then approve the Pause.
+    5. Read the verification line: file counts before and after, rows kept and the checksum that did
+       not move.
+    6. Enable `nightly_layout_check` for a daily report.
+
+    ## How to extend
+
+    - Point the flow at several tables from a parent flow, so each table keeps its own plan, approval
+      and proof.
+    - Add a Z-order or sort inside the staged write by sorting the DataFrame before `repartition` then
+      compare query times across the swap.
+    - Send the plan to a ticket instead of Slack then resume the Pause from the ticket's approval.
+    - Keep the backup copy for a retention window instead of deleting it, by skipping the final delete
+      and letting a later run reconcile it.
+
+    Limits: the flow handles one partition column and one table per execution. It needs a file system
+    with atomic directory rename, so plain object stores are out of scope. The staged copy doubles the
+    partition's space for the length of the rewrite. Row order inside a partition is not preserved and
+    the checksums are order independent by design. A compaction changes file mtimes, so a downstream
+    job that keys on mtime sees the partition as new. Table formats such as Delta, Iceberg and Hudi
+    have their own transactional compaction and do not need this.
+
+    ## Links
+
+    - [Spark: generic file source options](https://spark.apache.org/docs/latest/sql-data-sources-generic-options.html)
+    - [HDFS: rename semantics in the file system specification](https://hadoop.apache.org/docs/r3.4.1/hadoop-project-dist/hadoop-common/filesystem/filesystem.html)
+    - [Kestra Spark PythonSubmit](https://kestra.io/plugins/plugin-spark/io.kestra.plugin.spark.pythonsubmit)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
