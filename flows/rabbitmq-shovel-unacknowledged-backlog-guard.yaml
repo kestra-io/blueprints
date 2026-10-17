@@ -1,0 +1,475 @@
+id: rabbitmq-shovel-unacknowledged-backlog-guard
+namespace: company.messaging
+
+description: |
+  Audits RabbitMQ dynamic shovel links via the Management HTTP API, correlates source queue
+  unacknowledged message accumulation and message delivery rates, detects stalled consumers,
+  records health metrics in the Kestra KV store, alerts Slack, and optionally restarts stalled shovels.
+
+inputs:
+  - id: rabbitmq_api_url
+    type: STRING
+    displayName: RabbitMQ Management API URL
+    defaults: "http://localhost:15672"
+    description: Base URL for the RabbitMQ HTTP Management API.
+
+  - id: target_vhost
+    type: STRING
+    displayName: Target Virtual Host
+    defaults: "*"
+    description: Virtual host name to inspect, or * to monitor dynamic shovels across all virtual hosts.
+
+  - id: unacked_threshold
+    type: INT
+    displayName: Unacknowledged Message Threshold
+    defaults: 100
+    description: Maximum acceptable unacknowledged messages on a shovel source queue before flagging a consumer acknowledgment stall.
+
+  - id: backlog_threshold
+    type: INT
+    displayName: Ready Backlog Threshold
+    defaults: 500
+    description: Source queue ready message count threshold that, when combined with a near-zero delivery rate, flags a stalled shovel link.
+
+  - id: min_delivery_rate
+    type: FLOAT
+    displayName: Minimum Delivery Rate (msg/s)
+    defaults: 0.01
+    description: Minimum message delivery rate in messages per second. Delivery rates at or below this value during message accumulation indicate a stalled worker.
+
+  - id: auto_restart
+    type: BOOL
+    displayName: Auto Restart Stalled Shovels
+    defaults: false
+    description: When true and dry_run is false, automatically restarts stalled dynamic shovels by deleting and re-creating their runtime parameters.
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    defaults: true
+    description: When true, audits link status and backlog, dispatches notifications, and updates KV telemetry without modifying shovel parameters.
+
+variables:
+  kv_key: "rabbitmq_shovel_health_{{ inputs.rabbitmq_api_url | slugify }}"
+
+triggers:
+  - id: periodic_shovel_health_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scans dynamic shovel link health and unacknowledged queue backlog every 5 minutes.
+    cron: "*/5 * * * *"
+    disabled: true
+
+tasks:
+  - id: fetch_shovel_parameters
+    type: io.kestra.plugin.core.http.Request
+    description: Fetches dynamic shovel runtime parameters from the RabbitMQ Management API to inspect configuration and prepare restart definitions.
+    uri: "{{ inputs.rabbitmq_api_url }}/api/parameters/shovel"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (secret('RABBITMQ_MANAGEMENT_USERNAME') ~ ':' ~ secret('RABBITMQ_MANAGEMENT_PASSWORD')) | base64Encode }}"
+      Accept: "application/json"
+    options:
+      allowFailed: true
+
+  - id: fetch_shovel_statuses
+    type: io.kestra.plugin.core.http.Request
+    description: Queries active dynamic shovel link runtime states from /api/shovels across cluster nodes.
+    uri: "{{ inputs.rabbitmq_api_url }}/api/shovels"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (secret('RABBITMQ_MANAGEMENT_USERNAME') ~ ':' ~ secret('RABBITMQ_MANAGEMENT_PASSWORD')) | base64Encode }}"
+      Accept: "application/json"
+    options:
+      allowFailed: true
+
+  - id: fetch_queue_statistics
+    type: io.kestra.plugin.core.http.Request
+    description: Retrieves queue message depth, unacknowledged message counts, and consumer delivery rates from /api/queues.
+    uri: "{{ inputs.rabbitmq_api_url }}/api/queues"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (secret('RABBITMQ_MANAGEMENT_USERNAME') ~ ':' ~ secret('RABBITMQ_MANAGEMENT_PASSWORD')) | base64Encode }}"
+      Accept: "application/json"
+    options:
+      allowFailed: true
+
+  - id: evaluate_shovel_health
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fuses shovel statuses, queue depths, unacknowledged backlogs, and delivery rates in Python to identify stalled or degraded shovel links.
+    containerImage: python:3.11-slim
+    inputFiles:
+      shovel_parameters.json: "{{ outputs.fetch_shovel_parameters.body ?? '[]' }}"
+      shovel_statuses.json: "{{ outputs.fetch_shovel_statuses.body ?? '[]' }}"
+      queue_statistics.json: "{{ outputs.fetch_queue_statistics.body ?? '[]' }}"
+    outputFiles:
+      - metrics_summary.json
+    env:
+      UNACKED_THRESHOLD: "{{ inputs.unacked_threshold }}"
+      BACKLOG_THRESHOLD: "{{ inputs.backlog_threshold }}"
+      MIN_DELIVERY_RATE: "{{ inputs.min_delivery_rate }}"
+      TARGET_VHOST: "{{ inputs.target_vhost }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import json
+      import os
+      import sys
+      import urllib.parse
+      from datetime import datetime, timezone
+
+      def read_json_data(file_path):
+          try:
+              with open(file_path, "r", encoding="utf-8") as f:
+                  content = f.read().strip()
+                  if not content:
+                      return []
+                  parsed = json.loads(content)
+                  return parsed if isinstance(parsed, list) else []
+          except Exception as exc:
+              print(f"Warning: could not parse {file_path}: {exc}", file=sys.stderr)
+              return []
+
+      shovel_params = read_json_data("shovel_parameters.json")
+      shovel_statuses = read_json_data("shovel_statuses.json")
+      queue_stats = read_json_data("queue_statistics.json")
+
+      unacked_thresh = int(os.environ.get("UNACKED_THRESHOLD", 100))
+      backlog_thresh = int(os.environ.get("BACKLOG_THRESHOLD", 500))
+      min_delivery_rate = float(os.environ.get("MIN_DELIVERY_RATE", 0.01))
+      target_vhost = os.environ.get("TARGET_VHOST", "*")
+      execution_id = os.environ.get("EXECUTION_ID", "unknown")
+
+      queue_map = {
+          (q.get("vhost", "/"), q.get("name", "")): q
+          for q in queue_stats if isinstance(q, dict)
+      }
+
+      status_map = {
+          (s.get("vhost", "/"), s.get("name", "")): s
+          for s in shovel_statuses if isinstance(s, dict)
+      }
+
+      all_shovels = []
+      stalled_shovels = []
+      healthy_shovels = []
+
+      for param in shovel_params:
+          if not isinstance(param, dict):
+              continue
+
+          vhost = param.get("vhost", "/")
+          if target_vhost and target_vhost != "*" and vhost != target_vhost:
+              continue
+
+          name = param.get("name", "")
+          config = param.get("value", {})
+          src_queue = config.get("src-queue")
+          dest_queue = config.get("dest-queue")
+
+          status_info = status_map.get((vhost, name), {})
+          state = status_info.get("state", "unknown")
+          reason = status_info.get("reason")
+          timestamp = status_info.get("timestamp")
+
+          q_info = queue_map.get((vhost, src_queue), {}) if src_queue else {}
+          unacked = q_info.get("messages_unacknowledged", 0)
+          ready = q_info.get("messages_ready", 0)
+          total_msgs = q_info.get("messages", 0)
+
+          msg_stats = q_info.get("message_stats") or {}
+          deliver_rate = (
+              msg_stats.get("deliver_get_details", {}).get("rate")
+              or msg_stats.get("deliver_details", {}).get("rate")
+              or msg_stats.get("ack_details", {}).get("rate")
+              or 0.0
+          )
+
+          stall_reasons = []
+          if state not in ["running"]:
+              stall_reasons.append(f"Link status is '{state}' (expected 'running'); reason: {reason or 'none reported'}")
+          elif unacked >= unacked_thresh and deliver_rate <= min_delivery_rate:
+              stall_reasons.append(f"Unacknowledged backlog stall: {unacked} unacked messages (>= {unacked_thresh}) with delivery rate {deliver_rate:.2f} msg/s (<= {min_delivery_rate})")
+          elif ready >= backlog_thresh and deliver_rate <= min_delivery_rate:
+              stall_reasons.append(f"Source queue backlog stall: {ready} ready messages (>= {backlog_thresh}) with delivery rate {deliver_rate:.2f} msg/s (<= {min_delivery_rate})")
+
+          encoded_vhost = urllib.parse.quote(vhost, safe="")
+          shovel_record = {
+              "name": name,
+              "vhost": vhost,
+              "vhost_encoded": encoded_vhost,
+              "state": state,
+              "reason": reason,
+              "src_queue": src_queue or "unspecified",
+              "dest_queue": dest_queue or "unspecified",
+              "unacknowledged_messages": unacked,
+              "ready_messages": ready,
+              "total_messages": total_msgs,
+              "delivery_rate": round(deliver_rate, 2),
+              "stall_reason": "; ".join(stall_reasons) if stall_reasons else None,
+              "config": config
+          }
+
+          all_shovels.append(shovel_record)
+          if stall_reasons:
+              stalled_shovels.append(shovel_record)
+          else:
+              healthy_shovels.append(shovel_record)
+
+      stalled_count = len(stalled_shovels)
+      healthy_count = len(healthy_shovels)
+      total_shovels_count = len(all_shovels)
+
+      if stalled_count > 0:
+          summary_report = f"Detected {stalled_count} stalled or degraded shovel(s) out of {total_shovels_count} total dynamic shovels scanned."
+      else:
+          summary_report = f"All {total_shovels_count} dynamic shovels are healthy and running with active delivery rates."
+
+      kv_metrics = {
+          "timestamp": datetime.now(timezone.utc).isoformat(),
+          "execution_id": execution_id,
+          "target_vhost": target_vhost,
+          "total_shovels": total_shovels_count,
+          "healthy_shovels": healthy_count,
+          "stalled_shovels": stalled_count,
+          "stalled_shovel_names": [s["name"] for s in stalled_shovels],
+          "unacked_backlog_total": sum(s["unacknowledged_messages"] for s in all_shovels),
+          "status": "UNHEALTHY" if stalled_count > 0 else "HEALTHY",
+          "stalled_details": [
+              {
+                  "name": s["name"],
+                  "vhost": s["vhost"],
+                  "state": s["state"],
+                  "unacked": s["unacknowledged_messages"],
+                  "ready": s["ready_messages"],
+                  "rate": s["delivery_rate"],
+                  "stall_reason": s["stall_reason"]
+              }
+              for s in stalled_shovels
+          ]
+      }
+
+      with open("metrics_summary.json", "w", encoding="utf-8") as f:
+          json.dump(kv_metrics, f, indent=2)
+
+      outputs = {
+          "total_shovels": total_shovels_count,
+          "healthy_count": healthy_count,
+          "stalled_count": stalled_count,
+          "has_stalled_shovels": stalled_count > 0,
+          "stalled_shovels": stalled_shovels,
+          "summary_report": summary_report,
+          "kv_metrics": kv_metrics
+      }
+
+      print("::" + json.dumps({"outputs": outputs}) + "::")
+
+  - id: record_shovel_health_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Records dynamic shovel health status, unacknowledged backlogs, and stalled shovel metrics into Kestra KV store.
+    key: "{{ render(vars.kv_key) }}"
+    kvType: JSON
+    value: "{{ outputs.evaluate_shovel_health.vars.kv_metrics }}"
+
+  - id: branch_on_stalled_shovels
+    type: io.kestra.plugin.core.flow.If
+    description: Routes based on whether any dynamic shovels were detected in a stalled, terminated, or degraded state.
+    condition: "{{ outputs.evaluate_shovel_health.vars.has_stalled_shovels == true }}"
+    then:
+      - id: alert_stalled_shovels_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-priority incident notification to Slack with shovel diagnostic findings.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {
+            "text": ":warning: *RabbitMQ Dynamic Shovel Health Alert*\n" ~
+                    "*Host:* `" ~ inputs.rabbitmq_api_url ~ "`\n" ~
+                    "*Target VHost:* `" ~ inputs.target_vhost ~ "`\n" ~
+                    "*Total Shovels:* `" ~ outputs.evaluate_shovel_health.vars.total_shovels ~ "` | *Stalled Links:* *" ~ outputs.evaluate_shovel_health.vars.stalled_count ~ "*\n" ~
+                    "*Diagnostics:* " ~ outputs.evaluate_shovel_health.vars.summary_report ~ "\n" ~
+                    "*Action Taken:* " ~ (inputs.auto_restart and not inputs.dry_run ? "Initiating automated dynamic shovel parameter restart." : "Preserved without restart (auto_restart=" ~ inputs.auto_restart ~ ", dry_run=" ~ inputs.dry_run ~ ").")
+          } | toJson }}
+
+      - id: branch_remediation
+        type: io.kestra.plugin.core.flow.If
+        description: Checks if automated restart remediation should be executed.
+        condition: "{{ inputs.auto_restart == true and inputs.dry_run == false }}"
+        then:
+          - id: restart_stalled_shovels
+            type: io.kestra.plugin.core.flow.Loop
+            description: Restarts each stalled dynamic shovel by deleting and re-creating its parameter definition.
+            values: "{{ outputs.evaluate_shovel_health.vars.stalled_shovels | toJson }}"
+            tasks:
+              - id: delete_stalled_shovel_parameter
+                type: io.kestra.plugin.core.http.Request
+                description: Deletes runtime shovel parameter via HTTP DELETE to terminate the frozen worker link.
+                uri: "{{ inputs.rabbitmq_api_url }}/api/parameters/shovel/{{ fromJson(item.value).vhost_encoded }}/{{ fromJson(item.value).name }}"
+                method: DELETE
+                headers:
+                  Authorization: "Basic {{ (secret('RABBITMQ_MANAGEMENT_USERNAME') ~ ':' ~ secret('RABBITMQ_MANAGEMENT_PASSWORD')) | base64Encode }}"
+                options:
+                  allowFailed: true
+
+              - id: recreate_shovel_parameter
+                type: io.kestra.plugin.core.http.Request
+                description: Re-applies dynamic shovel configuration via HTTP PUT to trigger fresh connection handshake.
+                uri: "{{ inputs.rabbitmq_api_url }}/api/parameters/shovel/{{ fromJson(item.value).vhost_encoded }}/{{ fromJson(item.value).name }}"
+                method: PUT
+                headers:
+                  Authorization: "Basic {{ (secret('RABBITMQ_MANAGEMENT_USERNAME') ~ ':' ~ secret('RABBITMQ_MANAGEMENT_PASSWORD')) | base64Encode }}"
+                  Content-Type: application/json
+                body: "{{ {'value': fromJson(item.value).config} | toJson }}"
+                options:
+                  allowFailed: false
+
+              - id: log_shovel_restarted
+                type: io.kestra.plugin.core.log.Log
+                message: "Restarted stalled dynamic shovel '{{ fromJson(item.value).name }}' in vhost '{{ fromJson(item.value).vhost }}'."
+
+          - id: notify_slack_remediation_completed
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Confirms completed automatic shovel restarts in Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {{ {
+                "text": ":recycle: *RabbitMQ Dynamic Shovels Auto-Remediated*\n" ~
+                        "Successfully deleted and recreated parameters for " ~ outputs.evaluate_shovel_health.vars.stalled_count ~ " stalled dynamic shovel(s) on `" ~ inputs.rabbitmq_api_url ~ "`. Fresh worker links initialized."
+              } | toJson }}
+
+        else:
+          - id: log_dry_run_or_manual_mode
+            type: io.kestra.plugin.core.log.Log
+            message: "Stalled dynamic shovels detected ({{ outputs.evaluate_shovel_health.vars.stalled_count }}), but auto_restart is disabled or dry_run is active. No modifications made to RabbitMQ shovel parameters."
+
+    else:
+      - id: log_all_shovels_healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "RabbitMQ shovel health check complete: All {{ outputs.evaluate_shovel_health.vars.total_shovels }} dynamic shovels are healthy and actively processing messages. 0 stalled links."
+
+outputs:
+  - id: total_shovels
+    type: INT
+    value: "{{ outputs.evaluate_shovel_health.vars.total_shovels }}"
+  - id: healthy_count
+    type: INT
+    value: "{{ outputs.evaluate_shovel_health.vars.healthy_count }}"
+  - id: stalled_count
+    type: INT
+    value: "{{ outputs.evaluate_shovel_health.vars.stalled_count }}"
+  - id: has_stalled_shovels
+    type: BOOLEAN
+    value: "{{ outputs.evaluate_shovel_health.vars.has_stalled_shovels }}"
+  - id: kv_store_key
+    type: STRING
+    value: "{{ render(vars.kv_key) }}"
+  - id: metrics_report_uri
+    type: STRING
+    value: "{{ outputs.evaluate_shovel_health.outputFiles['metrics_summary.json'] }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notifies Slack if probing the RabbitMQ management API fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {
+        "text": ":x: *RabbitMQ Shovel Guard Execution Failed*\n" ~
+                "*Flow:* `" ~ flow.id ~ "` | *Execution:* `" ~ execution.id ~ "`\n" ~
+                "Failed to inspect RabbitMQ Management API at `" ~ inputs.rabbitmq_api_url ~ "`. Check network reachability and basic authentication credentials."
+      } | toJson }}
+
+extend:
+  title: RabbitMQ Dynamic Shovel Unacknowledged Backlog and Link Health Guard
+  metaTitle: RabbitMQ Shovel Unacknowledged Backlog & Link Health Guard | Kestra
+  shortDescription: Audit RabbitMQ dynamic shovel statuses, detect unacknowledged message accumulation and zero-rate stalled links, auto-restart workers, and store KV metrics.
+  metaDescription: Monitor RabbitMQ dynamic shovels for unacknowledged backlog and stalled link rates, auto-restart frozen workers, and persist telemetry in Kestra KV.
+  description: |
+    RabbitMQ Dynamic Shovels move messages reliably across queues, exchanges, and clusters.
+    However, dynamic shovel worker threads can quietly stall when TCP half-open states occur,
+    downstream prefetch buffers fill up with unacknowledged messages without acknowledgments,
+    or transient network disconnects leave links in terminated or starting states. Because the
+    source queue continues to accept upstream publishes while the shovel consumer is frozen,
+    unacknowledged messages and backlogs accumulate, leading to consumer starvation and broker
+    memory pressure.
+
+    This blueprint implements an automated health guard for RabbitMQ Dynamic Shovels. It polls
+    the RabbitMQ Management HTTP API (`/api/shovels`, `/api/parameters/shovel`, and `/api/queues`),
+    correlates live link states with source queue unacknowledged message depths and delivery rates,
+    flags stalled or dead links, dispatches Slack incident alerts, persists health telemetry in
+    Kestra's KV store, and safely restarts stalled shovels via HTTP parameter deletion and recreation.
+
+    ## How it works
+
+    1. `periodic_shovel_health_audit` (`io.kestra.plugin.core.trigger.Schedule`) triggers the flow every 5 minutes. It is initialized in `disabled: true` mode for safe manual validation.
+    2. `fetch_shovel_parameters`, `fetch_shovel_statuses`, and `fetch_queue_statistics` query the RabbitMQ Management HTTP API using `io.kestra.plugin.core.http.Request` with HTTP Basic Authentication over TLS or plaintext.
+    3. `evaluate_shovel_health` (`io.kestra.plugin.scripts.python.Script`) runs in a Python 3.11 sandbox to:
+       - Cross-reference dynamic shovel parameter definitions with live link statuses.
+       - Locate source queues and inspect `messages_unacknowledged`, `messages_ready`, and delivery rates (`deliver_get_details.rate`).
+       - Flag any shovel whose state is not `running` (such as `terminated` or `starting`).
+       - Flag stalled shovels where unacknowledged messages exceed `unacked_threshold` or ready messages exceed `backlog_threshold` while delivery rate is 0.
+       - Structure comprehensive telemetry metrics for KV persistence and remediation.
+    4. `record_shovel_health_kv` (`io.kestra.plugin.core.kv.Set`) stores the telemetry object under a namespaced KV key for historical reporting and external dashboards.
+    5. `branch_on_stalled_shovels` (`io.kestra.plugin.core.flow.If`) evaluates whether any stalled shovels were detected:
+       - When detected, `alert_stalled_shovels_slack` sends a detailed operational alert with affected shovel names, vhosts, backlog counts, and delivery rates.
+       - If `auto_restart` is enabled and `dry_run` is false, `restart_stalled_shovels` (`io.kestra.plugin.core.flow.Loop`) executes an atomic restart sequence: deleting the shovel parameter (`DELETE /api/parameters/shovel/{vhost}/{name}`) to terminate the hung erlang worker, followed by recreating it (`PUT /api/parameters/shovel/{vhost}/{name}`) with the original parameter payload.
+       - Otherwise, a dry-run log message records the findings without altering cluster state.
+    6. When all shovels are running normally and message throughput is healthy, `log_all_shovels_healthy` logs the healthy audit summary.
+    7. The flow-level `errors` block dispatches an alert to Slack if connectivity to the RabbitMQ API fails.
+
+    ## What you get
+
+    - Early detection of silent shovel consumer stalls before queues exhaust broker memory limits.
+    - Visibility into unacknowledged message accumulation and delivery rate starvation.
+    - Automated self-healing through parameter recreation that unblocks frozen shovel connections without broker restarts.
+    - Continuous operational telemetry persisted into Kestra's KV store.
+    - Actionable Slack notifications with source and destination queue details, error reasons, and remediation status.
+
+    ## Who it's for
+
+    - Site Reliability Engineers (SREs) and DevOps teams maintaining cross-region or hybrid-cloud RabbitMQ topologies.
+    - Messaging and Event Platform teams operating RabbitMQ Dynamic Shovels for event replication.
+    - Backend engineers troubleshooting unexplained queue backlog growth and consumer starvation.
+
+    ## Why orchestrate this with Kestra
+
+    RabbitMQ Management provides status dashboards but lacks native automated remediation for stalled dynamic shovel links. A bash cron script running curl lacks centralized audit lineage, secret masking, structured KV telemetry, and flexible dry-run control. Kestra combines declarative API polling, containerized python data correlation, Slack alerting, and automated REST parameter remediation into an observable, version-controlled blueprint.
+
+    ## Prerequisites
+
+    - A running RabbitMQ cluster with the `rabbitmq_management` and `rabbitmq_shovel_management` plugins enabled.
+    - A RabbitMQ user with `monitoring` or `administrator` tags to access management endpoints and manage runtime parameters.
+    - An incoming Slack webhook URL for operational notifications.
+
+    ### Secrets
+
+    - `RABBITMQ_MANAGEMENT_USERNAME`: RabbitMQ user with access to `/api/shovels`, `/api/parameters/shovel`, and `/api/queues`.
+    - `RABBITMQ_MANAGEMENT_PASSWORD`: Password matching the management user.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL used to dispatch alerts and remediation summaries.
+
+    ## Quick start
+
+    1. Configure the `RABBITMQ_MANAGEMENT_USERNAME`, `RABBITMQ_MANAGEMENT_PASSWORD`, and `SLACK_WEBHOOK_URL` secrets in your Kestra namespace.
+    2. Import this blueprint into Kestra.
+    3. Execute the flow with default inputs (`dry_run: true`) to safely inspect active shovels and observe KV store metrics.
+    4. Confirm that your dynamic shovels and queues appear in the execution logs and KV store.
+    5. Set `auto_restart: true` and `dry_run: false` to enable automated self-healing remediation.
+    6. Enable `periodic_shovel_health_audit` to schedule continuous 5-minute health monitoring.
+
+    ## How to extend
+
+    - Route incident alerts to PagerDuty or Opsgenie using Kestra notification plugins for P1 alerts.
+    - Combine with Kestra's Dead-Letter Queue (DLQ) blueprints to inspect and quarantine poison pills rejected by the destination cluster.
+    - Add custom Prometheus metrics emission to record shovel latency and delivery throughput over time.
+
+    ## Links
+
+    - [RabbitMQ Shovel Plugin Documentation](https://www.rabbitmq.com/docs/shovel)
+    - [RabbitMQ Management HTTP API](https://rawcdn.githack.com/rabbitmq/rabbitmq-server/v3.13.0/deps/rabbitmq_management/priv/www/api/index.html)
+    - [Kestra HTTP Request Plugin Documentation](https://kestra.io/plugins/plugin-core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Kestra KV Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Realtime & Streaming
+  ee: false
+  demo: false
