@@ -593,3 +593,22 @@ Extra templated copies on tools that have no stronger blueprint yet. The best-sc
 - `victoriametrics-vmagent-scrape-target-drop-sentinel`
 - `vpa-recommender-cgroup-oom-event-sentinel`
 - `yugabytedb-under-replicated-tablets-and-raft-sentinel`
+
+## Archived 2026-10-17: more flows that hard-code their results
+
+The probe step returns fixed or "simulated" values instead of calling the system.
+
+- `aws-secrets-manager-rotation-compliance-sentinel`
+- `azure-application-gateway-unhealthy-backend-sentinel`
+- `azure-container-apps-replica-scaling-ceiling-guard`
+- `bentoml-inference-latency-sentinel`
+- `chromadb-collection-health-sentinel`
+- `docling-multimodal-pdf-to-structured-rag-chunks`
+- `feast-feature-store-offline-to-online-materialization-gate`
+- `instructor-structured-extraction-with-pydantic-validation-gate`
+- `kubernetes-cilium-bgp-peering-session-state-sentinel`
+- `kubernetes-flagger-canary-deployment-rollback-notifier`
+- `lancedb-fragment-compaction-sentinel`
+- `langchain-adversarial-jailbreak-guardrail`
+- `litellm-proxy-budget-and-model-fallback-gate`
+- `modal-gpu-idle-leak-and-timeout-sentinel`
