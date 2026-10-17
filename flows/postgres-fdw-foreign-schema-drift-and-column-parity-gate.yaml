@@ -1,0 +1,424 @@
+id: postgres-fdw-foreign-schema-drift-and-column-parity-gate
+namespace: company.data
+
+description: |
+  Audits PostgreSQL postgres_fdw foreign tables against remote physical relations
+  to detect breaking schema mutations, dropped columns, and data type drift before
+  queries fail. Generates remediation DDL and gates downstream data pipelines.
+
+inputs:
+  - id: foreign_server_name
+    type: STRING
+    displayName: Foreign Server Name
+    defaults: "remote_orders_srv"
+    description: Name of the foreign server registered via CREATE SERVER using postgres_fdw.
+
+  - id: local_foreign_schema
+    type: STRING
+    displayName: Local Foreign Schema
+    defaults: "foreign_orders"
+    description: Local PostgreSQL schema containing the postgres_fdw foreign tables.
+
+  - id: remote_source_schema
+    type: STRING
+    displayName: Remote Source Schema
+    defaults: "public"
+    description: Schema in the remote source database where the original physical tables reside.
+
+  - id: auto_reconcile_additive
+    type: BOOL
+    displayName: Auto-Reconcile Additive Columns
+    defaults: false
+    description: When true, automatically executes ALTER FOREIGN TABLE ADD COLUMN on the local database for newly introduced remote columns. Breaking changes always halt the gate.
+
+  - id: slack_channel
+    type: STRING
+    displayName: Slack Notification Channel
+    defaults: "#data-ops-alerts"
+    description: Destination Slack channel for schema drift notifications and parity alerts.
+
+triggers:
+  - id: post_migration_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Receives webhook notifications from upstream CI/CD deployment pipelines immediately after remote schema migrations complete.
+    key: "{{ secret('FDW_GATE_WEBHOOK_KEY') }}"
+    disabled: true
+
+  - id: scheduled_drift_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scheduled daily schema parity audit executed at 05:00 UTC before business hours to detect unannounced remote schema mutations.
+    cron: "0 5 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: fetch_local_foreign_columns
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Query local PostgreSQL system catalogs to inventory all foreign tables and columns mapped to the foreign server.
+    url: "{{ secret('LOCAL_POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('LOCAL_POSTGRES_USER') }}"
+    password: "{{ secret('LOCAL_POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        ft.foreign_table_schema AS local_schema,
+        ft.foreign_table_name AS local_table,
+        COALESCE(
+          (SELECT fto.option_value
+           FROM information_schema.foreign_table_options fto
+           WHERE fto.foreign_table_schema = ft.foreign_table_schema
+             AND fto.foreign_table_name = ft.foreign_table_name
+             AND fto.option_name = 'table_name'),
+          ft.foreign_table_name
+        ) AS remote_table,
+        c.column_name,
+        c.data_type,
+        c.udt_name,
+        c.is_nullable,
+        c.ordinal_position
+      FROM information_schema.foreign_tables ft
+      JOIN information_schema.foreign_servers fs
+        ON ft.foreign_server_name = fs.foreign_server_name
+      JOIN information_schema.columns c
+        ON c.table_schema = ft.foreign_table_schema
+       AND c.table_name = ft.foreign_table_name
+      WHERE fs.foreign_server_name = '{{ inputs.foreign_server_name }}'
+        AND ('{{ inputs.local_foreign_schema }}' = '' OR ft.foreign_table_schema = '{{ inputs.local_foreign_schema }}')
+      ORDER BY ft.foreign_table_name, c.ordinal_position;
+
+  - id: fetch_remote_source_columns
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Query information_schema.columns on the remote source database to retrieve the active physical schema definitions.
+    url: "{{ secret('REMOTE_POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('REMOTE_POSTGRES_USER') }}"
+    password: "{{ secret('REMOTE_POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        table_schema AS remote_schema,
+        table_name AS remote_table,
+        column_name,
+        data_type,
+        udt_name,
+        is_nullable,
+        ordinal_position
+      FROM information_schema.columns
+      WHERE table_schema = '{{ inputs.remote_source_schema }}'
+      ORDER BY table_name, ordinal_position;
+
+  - id: analyze_schema_parity
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compare local foreign table definitions against remote physical catalog definitions to detect dropped columns, type mutations, and new attributes.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    inputFiles:
+      local_columns.json: "{{ outputs.fetch_local_foreign_columns.rows | toJson }}"
+      remote_columns.json: "{{ outputs.fetch_remote_source_columns.rows | toJson }}"
+    outputFiles:
+      - "drift_summary.json"
+      - "remediation.sql"
+    script: |
+      import json
+      import sys
+
+      with open("local_columns.json", "r") as f:
+          local_data = json.load(f) or []
+
+      with open("remote_columns.json", "r") as f:
+          remote_data = json.load(f) or []
+
+      # Index local foreign table columns: (local_schema, local_table, remote_table) -> {col_name: col_info}
+      local_tables = {}
+      for row in local_data:
+          key = (row.get("local_schema"), row.get("local_table"), row.get("remote_table"))
+          local_tables.setdefault(key, {})[row.get("column_name")] = row
+
+      # Index remote source columns: remote_table -> {col_name: col_info}
+      remote_tables = {}
+      for row in remote_data:
+          remote_tables.setdefault(row.get("remote_table"), {})[row.get("column_name")] = row
+
+      breaking_issues = []
+      additive_issues = []
+      remediation_sqls = []
+      in_sync_count = 0
+
+      for (loc_schema, loc_table, rem_table), loc_cols in local_tables.items():
+          if rem_table not in remote_tables:
+              breaking_issues.append({
+                  "type": "MISSING_REMOTE_RELATION",
+                  "local_table": f"{loc_schema}.{loc_table}",
+                  "remote_table": rem_table,
+                  "message": f"Remote source relation '{rem_table}' does not exist in remote schema."
+              })
+              continue
+
+          rem_cols = remote_tables[rem_table]
+          table_has_drift = False
+
+          # Check for dropped remote columns or data type mutations (Breaking Drift)
+          for col_name, loc_col in loc_cols.items():
+              if col_name not in rem_cols:
+                  table_has_drift = True
+                  breaking_issues.append({
+                      "type": "DROPPED_REMOTE_COLUMN",
+                      "local_table": f"{loc_schema}.{loc_table}",
+                      "column": col_name,
+                      "message": f"Column '{col_name}' dropped or renamed remotely, but still defined in foreign table."
+                  })
+                  remediation_sqls.append(f"ALTER FOREIGN TABLE {loc_schema}.{loc_table} DROP COLUMN IF EXISTS {col_name};")
+              else:
+                  rem_col = rem_cols[col_name]
+                  loc_type = (loc_col.get("udt_name") or loc_col.get("data_type", "")).lower()
+                  rem_type = (rem_col.get("udt_name") or rem_col.get("data_type", "")).lower()
+                  if loc_type != rem_type:
+                      table_has_drift = True
+                      breaking_issues.append({
+                          "type": "DATA_TYPE_MUTATION",
+                          "local_table": f"{loc_schema}.{loc_table}",
+                          "column": col_name,
+                          "local_type": loc_col.get("data_type"),
+                          "remote_type": rem_col.get("data_type"),
+                          "message": f"Type mismatch on '{col_name}': foreign table has '{loc_col.get('data_type')}', remote table has '{rem_col.get('data_type')}'."
+                      })
+                      remediation_sqls.append(f"ALTER FOREIGN TABLE {loc_schema}.{loc_table} ALTER COLUMN {col_name} TYPE {rem_col.get('data_type')};")
+
+          # Check for new remote columns not yet mapped locally (Additive Drift)
+          for col_name, rem_col in rem_cols.items():
+              if col_name not in loc_cols:
+                  table_has_drift = True
+                  additive_issues.append({
+                      "type": "NEW_REMOTE_COLUMN",
+                      "local_table": f"{loc_schema}.{loc_table}",
+                      "remote_table": rem_table,
+                      "column": col_name,
+                      "data_type": rem_col.get("data_type"),
+                      "message": f"New remote column '{col_name}' ({rem_col.get('data_type')}) available for import."
+                  })
+                  remediation_sqls.append(f"ALTER FOREIGN TABLE {loc_schema}.{loc_table} ADD COLUMN IF NOT EXISTS {col_name} {rem_col.get('data_type')};")
+
+          if not table_has_drift:
+              in_sync_count += 1
+
+      if breaking_issues:
+          status = "BREAKING_DRIFT"
+      elif additive_issues:
+          status = "ADDITIVE_DRIFT"
+      else:
+          status = "IN_SYNC"
+
+      summary = {
+          "status": status,
+          "breaking_count": len(breaking_issues),
+          "additive_count": len(additive_issues),
+          "in_sync_tables_count": in_sync_count,
+          "total_foreign_tables": len(local_tables),
+          "breaking_issues": breaking_issues,
+          "additive_issues": additive_issues,
+          "remediation_sql": "\n".join(remediation_sqls)
+      }
+
+      with open("drift_summary.json", "w") as f:
+          json.dump(summary, f, indent=2)
+
+      with open("remediation.sql", "w") as f:
+          f.write("\n".join(remediation_sqls) + ("\n" if remediation_sqls else ""))
+
+      print(f"Schema Parity Analysis Completed: {status}")
+      print(f"Foreign tables examined: {len(local_tables)}, Breaking: {len(breaking_issues)}, Additive: {len(additive_issues)}, In-Sync: {in_sync_count}")
+
+  - id: route_parity_verdict
+    type: io.kestra.plugin.core.flow.Switch
+    description: Route execution based on classified schema drift status.
+    value: "{{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).status }}"
+    cases:
+      "BREAKING_DRIFT":
+        - id: alert_breaking_drift
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          description: Alert on-call data engineers and DBAs when breaking schema drift is detected in foreign tables.
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: |
+            {
+              "channel": "{{ inputs.slack_channel }}",
+              "text": ":rotating_light: *PostgreSQL postgres_fdw Schema Drift Alert*",
+              "attachments": [
+                {
+                  "color": "#D32F2F",
+                  "title": "Breaking Foreign Table Drift Detected",
+                  "fields": [
+                    {
+                      "title": "Foreign Server",
+                      "value": "`{{ inputs.foreign_server_name }}`",
+                      "short": true
+                    },
+                    {
+                      "title": "Breaking Issues Count",
+                      "value": "{{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).breaking_count }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Affected Relations",
+                      "value": "{{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).breaking_issues | jq('[.[].local_table] | unique | join(\", \")') }}",
+                      "short": false
+                    },
+                    {
+                      "title": "Action Required",
+                      "value": "Downstream ETL pipelines halted. Review remediation SQL artifact to reconcile foreign table definitions.",
+                      "short": false
+                    }
+                  ],
+                  "footer": "Kestra postgres_fdw Parity Gate"
+                }
+              ]
+            }
+
+        - id: fail_deployment_gate
+          type: io.kestra.plugin.core.execution.Fail
+          description: Halt execution and block downstream pipelines due to breaking postgres_fdw schema drift.
+          errorMessage: "Fatal schema drift detected in PostgreSQL postgres_fdw foreign tables: {{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).breaking_count }} breaking discrepancies found."
+
+      "ADDITIVE_DRIFT":
+        - id: check_auto_reconcile
+          type: io.kestra.plugin.core.flow.If
+          description: Evaluate whether automatic additive column reconciliation is enabled.
+          condition: "{{ inputs.auto_reconcile_additive }}"
+          then:
+            - id: apply_additive_ddl
+              type: io.kestra.plugin.jdbc.postgresql.Queries
+              description: Execute ALTER FOREIGN TABLE ADD COLUMN statements on local database to synchronize new remote columns.
+              url: "{{ secret('LOCAL_POSTGRES_JDBC_URL') }}"
+              username: "{{ secret('LOCAL_POSTGRES_USER') }}"
+              password: "{{ secret('LOCAL_POSTGRES_PASSWORD') }}"
+              sql: "{{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).remediation_sql }}"
+
+            - id: log_reconciliation_applied
+              type: io.kestra.plugin.core.log.Log
+              description: Log successful automatic application of additive foreign table column updates.
+              message: "Successfully applied additive foreign table column updates: {{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).additive_count }} columns added to foreign tables."
+          else:
+            - id: notify_additive_drift
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              description: Notify data engineering channel that new remote columns are available to import into foreign tables.
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              payload: |
+                {
+                  "channel": "{{ inputs.slack_channel }}",
+                  "text": ":information_source: *PostgreSQL postgres_fdw Additive Schema Drift*",
+                  "attachments": [
+                    {
+                      "color": "#1976D2",
+                      "title": "New Remote Columns Available",
+                      "fields": [
+                        {
+                          "title": "Foreign Server",
+                          "value": "`{{ inputs.foreign_server_name }}`",
+                          "short": true
+                        },
+                        {
+                          "title": "New Columns Count",
+                          "value": "{{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).additive_count }}",
+                          "short": true
+                        },
+                        {
+                          "title": "Remediation Script",
+                          "value": "Review `remediation.sql` execution artifact or re-run flow with `auto_reconcile_additive: true`.",
+                          "short": false
+                        }
+                      ],
+                      "footer": "Kestra postgres_fdw Parity Gate"
+                    }
+                  ]
+                }
+
+      "IN_SYNC":
+        - id: log_clean_audit
+          type: io.kestra.plugin.core.log.Log
+          description: Log verification confirmation when all foreign tables are in complete column parity with remote source schemas.
+          message: "PostgreSQL postgres_fdw parity check completed successfully. All {{ fromJson(read(outputs.analyze_schema_parity.outputFiles['drift_summary.json'])).in_sync_tables_count }} foreign tables are in complete schema parity with remote physical tables."
+
+extend:
+  title: PostgreSQL postgres_fdw Foreign Schema Drift & Column Parity Audit Gate
+  metaTitle: PostgreSQL postgres_fdw Schema Drift & Column Parity Gate | Kestra
+  shortDescription: Audit PostgreSQL postgres_fdw foreign tables against remote relations, detect breaking schema drift or dropped columns, and gate pipeline deployments.
+  metaDescription: Audit PostgreSQL postgres_fdw foreign tables against remote schemas, detect breaking column drift and dropped attributes, and gate deployments with Kestra.
+  description: |
+    Automate PostgreSQL Foreign Data Wrapper (`postgres_fdw`) schema drift detection, column parity auditing, and conditional DDL reconciliation with Kestra orchestration. In distributed PostgreSQL architectures and microservice database setups, `postgres_fdw` is commonly deployed to query remote transactional databases directly from analytics environments or federated reporting schemas.
+
+    Because `postgres_fdw` stores static column definitions when foreign tables are created (`CREATE FOREIGN TABLE` or `IMPORT FOREIGN SCHEMA`), foreign tables do not automatically update when upstream database migrations alter remote physical tables. If upstream engineers drop a column or mutate a data type, downstream queries on foreign tables fail with fatal runtime errors (`ERROR: relation does not have attribute`). Conversely, newly added columns remain invisible to analytics teams until explicitly added.
+
+    This blueprint queries both local and remote PostgreSQL `information_schema` catalogs, computes exact column-level schema differences, categorizes findings into breaking drift (dropped columns, type mismatches) versus additive changes (new columns), posts targeted Slack alerts, and gates downstream ETL execution.
+
+    ## How it works
+
+    1. `post_migration_webhook` or `scheduled_drift_audit` initiates the workflow after an upstream schema migration or on a scheduled daily cadence.
+    2. `fetch_local_foreign_columns` (`io.kestra.plugin.jdbc.postgresql.Query`) queries local PostgreSQL catalogs (`information_schema.foreign_tables`, `foreign_table_options`, and `columns`) to inventory all foreign tables mapped to the target foreign server, recording column names, data types, and nullability.
+    3. `fetch_remote_source_columns` (`io.kestra.plugin.jdbc.postgresql.Query`) connects to the upstream source database to fetch the true physical column definitions from `information_schema.columns`.
+    4. `analyze_schema_parity` (`io.kestra.plugin.scripts.python.Script`) executes in a container to compare local and remote catalogs. Discrepancies are categorized into `BREAKING_DRIFT` (dropped columns on remote, missing remote tables, or type mismatches) and `ADDITIVE_DRIFT` (new columns on remote). The task produces `drift_summary.json` and a ready-to-run `remediation.sql` artifact.
+    5. `route_parity_verdict` (`io.kestra.plugin.core.flow.Switch`) routes the flow based on the parity status:
+       - **`BREAKING_DRIFT`**: `alert_breaking_drift` dispatches an urgent Slack alert with the affected table names, and `fail_deployment_gate` halts execution to prevent corrupted analytics queries.
+       - **`ADDITIVE_DRIFT`**: `check_auto_reconcile` inspects the `auto_reconcile_additive` input. If enabled, `apply_additive_ddl` executes the generated `ALTER FOREIGN TABLE ADD COLUMN` statements on the local database; otherwise, `notify_additive_drift` posts an informational Slack notification.
+       - **`IN_SYNC`**: `log_clean_audit` logs an audit confirmation that all foreign relations match remote definitions.
+
+    ## What you get
+
+    - Automated prevention of downstream query failures caused by silent upstream column deletions or renames.
+    - Identification of data type mutations before deserialization errors corrupt analytics pipelines.
+    - Automated generation of safe DDL remediation scripts (`ALTER FOREIGN TABLE ADD/DROP COLUMN`).
+    - Optional zero-touch reconciliation for non-breaking additive column changes.
+    - Auditable execution history tracking foreign table schema parity over time.
+
+    ## Who it's for
+
+    - Data Engineers maintaining federated data models and cross-database reporting pipelines.
+    - Database Administrators managing multi-database PostgreSQL clusters and microservice boundaries.
+    - Platform and SRE teams enforcing schema contract testing in continuous deployment workflows.
+
+    ## Why orchestrate this with Kestra
+
+    Detecting foreign schema drift with custom cron scripts requires managing credential distribution across multiple hosts, handling database connection timeouts, and building bespoke alert formatters.
+
+    Orchestrating this process with Kestra centralizes database connection secrets, executes parallel catalog queries with built-in retries, generates downloadable DDL remediation artifacts in execution storage, and gates downstream workflows via declarative YAML flow control.
+
+    ## Prerequisites
+
+    - A local PostgreSQL database with the `postgres_fdw` extension and an existing foreign server configured.
+    - Network connectivity and read access from Kestra workers to both local and remote PostgreSQL instances.
+    - A Slack Incoming Webhook URL for alerting on schema drift.
+
+    ### Secrets
+
+    - `LOCAL_POSTGRES_JDBC_URL`: JDBC connection URL for the local database hosting foreign tables (e.g., `jdbc:postgresql://local-db:5432/analytics`).
+    - `LOCAL_POSTGRES_USER`: Database username with read permissions on local catalogs and DDL permissions if auto-reconciliation is enabled.
+    - `LOCAL_POSTGRES_PASSWORD`: Database password for the local PostgreSQL user.
+    - `REMOTE_POSTGRES_JDBC_URL`: JDBC connection URL for the remote upstream physical database (e.g., `jdbc:postgresql://remote-db:5432/orders`).
+    - `REMOTE_POSTGRES_USER`: Database username with read permissions on `information_schema.columns` in the remote database.
+    - `REMOTE_POSTGRES_PASSWORD`: Database password for the remote PostgreSQL user.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL used to dispatch drift alerts and notifications.
+    - `FDW_GATE_WEBHOOK_KEY`: Secret authentication token securing the post-migration webhook trigger endpoint.
+
+    ## Quick start
+
+    1. Configure the eight required secrets in your Kestra namespace (`LOCAL_POSTGRES_JDBC_URL`, `LOCAL_POSTGRES_USER`, `LOCAL_POSTGRES_PASSWORD`, `REMOTE_POSTGRES_JDBC_URL`, `REMOTE_POSTGRES_USER`, `REMOTE_POSTGRES_PASSWORD`, `SLACK_WEBHOOK_URL`, and `FDW_GATE_WEBHOOK_KEY`).
+    2. Import this blueprint into Kestra and adjust inputs (`foreign_server_name`, `local_foreign_schema`, `remote_source_schema`) to match your PostgreSQL server configuration.
+    3. Click **Execute** to run an initial schema parity audit across your foreign tables.
+    4. Enable `scheduled_drift_audit` or configure your CI/CD deployment tool to call `post_migration_webhook` after database migrations.
+
+    ## How to extend
+
+    - **Automated DDL Rollback**: Pair with a Git repository task to commit the generated `remediation.sql` artifact directly to a database migration branch.
+    - **PagerDuty Escalation**: Replace or augment the Slack task with `io.kestra.plugin.notifications.pagerduty.PagerDutyAlert` for immediate on-call incident paging when critical production tables experience breaking drift.
+    - **Multi-Server Fanout**: Wrap the flow in a `ForEach` loop across an array of registered foreign servers to audit an entire fleet of remote database connections in parallel.
+
+    ## Links
+
+    - [PostgreSQL postgres_fdw Documentation](https://www.postgresql.org/docs/current/postgres-fdw.html)
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [Kestra Python Script Documentation](https://kestra.io/plugins/plugin-scripts)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+    - Day 2 Operations
+  ee: false
+  demo: false
