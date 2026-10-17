@@ -1,0 +1,475 @@
+id: redpanda-cluster-health-and-partition-leader-sentinel
+namespace: company.streaming
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    defaults: "redpanda-prod-01"
+    description: "Unique identifier for the Redpanda cluster used in KV tracking and incident alerting."
+
+  - id: redpanda_admin_url
+    type: STRING
+    defaults: "http://redpanda.internal.company.com:9644"
+    description: "Base HTTP URL for the Redpanda Admin API (default port 9644)."
+
+  - id: max_leader_imbalance
+    type: INT
+    defaults: 5
+    description: "Maximum acceptable delta between maximum and minimum broker partition leaders before flagging an imbalance."
+
+  - id: max_disk_usage_pct
+    type: INT
+    defaults: 85
+    description: "Maximum disk space utilization percentage on any broker storage drive before raising a capacity alert."
+
+  - id: enable_auto_rebalance
+    type: BOOL
+    defaults: false
+    description: "Whether to automatically trigger the Redpanda cluster maintenance rebalance API when leader imbalance is detected."
+
+  - id: slack_channel
+    type: STRING
+    defaults: "#streaming-alerts"
+    description: "Target Slack channel for cluster health warnings and leader rebalance notifications."
+
+triggers:
+  - id: scheduled_cluster_health_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+    disabled: true
+
+tasks:
+  - id: probe_cluster_health
+    type: io.kestra.plugin.core.http.Request
+    description: "Queries Redpanda Admin API cluster health overview to detect leaderless and under-replicated partitions."
+    uri: "{{ inputs.redpanda_admin_url }}/v1/cluster/health_overview"
+    method: GET
+    headers:
+      Accept: "application/json"
+      Authorization: "Bearer {{ secret('REDPANDA_ADMIN_TOKEN') }}"
+    options:
+      timeout:
+        readIdleTimeout: PT15S
+
+  - id: probe_nodes_telemetry
+    type: io.kestra.plugin.core.http.Request
+    description: "Queries Redpanda Admin API node inventory for broker leadership counts and storage drive utilization."
+    uri: "{{ inputs.redpanda_admin_url }}/v1/nodes"
+    method: GET
+    headers:
+      Accept: "application/json"
+      Authorization: "Bearer {{ secret('REDPANDA_ADMIN_TOKEN') }}"
+    options:
+      timeout:
+        readIdleTimeout: PT15S
+
+  - id: evaluate_sentinel_metrics
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Calculates broker partition leader imbalance, identifies degraded and under-replicated partitions, and inspects storage drive headroom."
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra
+    env:
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      MAX_LEADER_IMBALANCE: "{{ inputs.max_leader_imbalance }}"
+      MAX_DISK_USAGE_PCT: "{{ inputs.max_disk_usage_pct }}"
+      ENABLE_AUTO_REBALANCE: "{{ inputs.enable_auto_rebalance }}"
+      HEALTH_OVERVIEW_RAW: "{{ outputs.probe_cluster_health.body | toJson }}"
+      NODES_TELEMETRY_RAW: "{{ outputs.probe_nodes_telemetry.body | toJson }}"
+    script: |
+      import json
+      import os
+      import sys
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          class Kestra:
+              @staticmethod
+              def outputs(values):
+                  print(f"::{{'outputs': {json.dumps(values)}}}::")
+
+      cluster_id = os.environ.get("CLUSTER_ID", "redpanda-prod-01")
+      max_leader_imbalance = int(os.environ.get("MAX_LEADER_IMBALANCE", "5"))
+      max_disk_usage_pct = float(os.environ.get("MAX_DISK_USAGE_PCT", "85.0"))
+      enable_auto_rebalance = os.environ.get("ENABLE_AUTO_REBALANCE", "false").lower() in ("true", "1", "yes")
+
+      def parse_payload(raw):
+          if not raw:
+              return {}
+          if isinstance(raw, (dict, list)):
+              return raw
+          try:
+              data = json.loads(raw)
+              if isinstance(data, str):
+                  return json.loads(data)
+              return data
+          except Exception:
+              return {}
+
+      health_data = parse_payload(os.environ.get("HEALTH_OVERVIEW_RAW", "{}"))
+      nodes_data = parse_payload(os.environ.get("NODES_TELEMETRY_RAW", "[]"))
+
+      if isinstance(nodes_data, dict) and "nodes" in nodes_data:
+          nodes_list = nodes_data["nodes"]
+      elif isinstance(nodes_data, list):
+          nodes_list = nodes_data
+      else:
+          nodes_list = []
+
+      # 1. Cluster health and degraded partitions
+      is_healthy = bool(health_data.get("is_healthy", True))
+      controller_id = health_data.get("controller_id", -1)
+      all_nodes = health_data.get("all_nodes", [])
+      nodes_down = health_data.get("nodes_down", [])
+
+      leaderless_raw = health_data.get("leaderless_partitions", [])
+      if isinstance(leaderless_raw, int):
+          leaderless_count = leaderless_raw
+          leaderless_partitions = []
+      else:
+          leaderless_partitions = leaderless_raw or []
+          leaderless_count = len(leaderless_partitions)
+
+      under_replicated_raw = health_data.get("under_replicated_partitions", [])
+      if isinstance(under_replicated_raw, int):
+          under_replicated_count = under_replicated_raw
+          under_replicated_partitions = []
+      else:
+          under_replicated_partitions = under_replicated_raw or []
+          under_replicated_count = len(under_replicated_partitions)
+
+      under_replicated_replicas = int(health_data.get("under_replicated_replicas", under_replicated_count))
+
+      # Extract affected topic names
+      affected_topics = set()
+      for part in (leaderless_partitions + under_replicated_partitions):
+          part_str = str(part)
+          if "/" in part_str:
+              topic = part_str.split("/")[0]
+          elif "-" in part_str:
+              topic = part_str.rsplit("-", 1)[0]
+          else:
+              topic = part_str
+          if topic:
+              affected_topics.add(topic)
+      affected_topics_list = sorted(list(affected_topics))
+
+      # 2. Broker leader imbalance and disk headroom
+      broker_leaders = {}
+      broker_partitions = {}
+      saturated_drives = []
+
+      for node in nodes_list:
+          node_id = str(node.get("node_id", node.get("id", "unknown")))
+          leaders = int(node.get("leader_count", node.get("leaders", 0)))
+          parts = int(node.get("partition_count", node.get("partitions", 0)))
+          broker_leaders[node_id] = leaders
+          broker_partitions[node_id] = parts
+
+          # Check storage drive headroom
+          disk = node.get("disk", {})
+          if isinstance(disk, list):
+              disks = disk
+          elif isinstance(disk, dict) and disk:
+              disks = [disk]
+          else:
+              disks = []
+
+          for d in disks:
+              path = d.get("path", "/var/lib/redpanda/data")
+              total = float(d.get("total_bytes", 0))
+              free = float(d.get("free_bytes", 0))
+              if "used_percent" in d:
+                  used_pct = round(float(d["used_percent"]), 2)
+              elif total > 0:
+                  used_pct = round(((total - free) / total) * 100.0, 2)
+              else:
+                  used_pct = 0.0
+
+              if used_pct >= max_disk_usage_pct:
+                  saturated_drives.append({
+                      "node_id": node_id,
+                      "path": path,
+                      "used_percent": used_pct,
+                      "free_gb": round(free / (1024**3), 2),
+                      "total_gb": round(total / (1024**3), 2)
+                  })
+
+      if broker_leaders:
+          max_leaders = max(broker_leaders.values())
+          min_leaders = min(broker_leaders.values())
+          total_leaders = sum(broker_leaders.values())
+          leader_imbalance_delta = max_leaders - min_leaders
+          leader_imbalance_pct = round((leader_imbalance_delta / max(1, total_leaders)) * 100.0, 2)
+      else:
+          max_leaders = 0
+          min_leaders = 0
+          total_leaders = 0
+          leader_imbalance_delta = 0
+          leader_imbalance_pct = 0.0
+
+      leader_imbalance_breached = leader_imbalance_delta > max_leader_imbalance
+      degraded_partitions_breached = (under_replicated_replicas > 0) or (leaderless_count > 0) or (len(nodes_down) > 0)
+      disk_headroom_breached = len(saturated_drives) > 0
+
+      if degraded_partitions_breached:
+          status = "CRITICAL_DEGRADED_PARTITIONS"
+      elif leader_imbalance_breached:
+          status = "WARNING_LEADER_IMBALANCE"
+      elif disk_headroom_breached:
+          status = "WARNING_DISK_SATURATION"
+      else:
+          status = "HEALTHY"
+
+      alert_required = (status != "HEALTHY")
+      rebalance_triggered = leader_imbalance_breached and enable_auto_rebalance
+
+      broker_distribution_summary = ", ".join([f"Node {nid}: {cnt} leaders" for nid, cnt in sorted(broker_leaders.items())])
+
+      Kestra.outputs({
+          "cluster_id": cluster_id,
+          "status": status,
+          "is_healthy": is_healthy and (status == "HEALTHY"),
+          "alert_required": alert_required,
+          "rebalance_triggered": rebalance_triggered,
+          "leader_imbalance_delta": leader_imbalance_delta,
+          "leader_imbalance_pct": leader_imbalance_pct,
+          "max_leaders": max_leaders,
+          "min_leaders": min_leaders,
+          "total_leaders": total_leaders,
+          "broker_leaders": broker_leaders,
+          "broker_partitions": broker_partitions,
+          "broker_distribution_summary": broker_distribution_summary,
+          "under_replicated_replicas": under_replicated_replicas,
+          "leaderless_count": leaderless_count,
+          "nodes_down": nodes_down,
+          "affected_topics": affected_topics_list,
+          "affected_topics_summary": ", ".join(affected_topics_list) if affected_topics_list else "None",
+          "saturated_drives": saturated_drives,
+          "total_nodes": len(nodes_list) if nodes_list else len(all_nodes)
+      })
+
+  - id: evaluate_cluster_status
+    type: io.kestra.plugin.core.flow.If
+    description: "Evaluates whether partition imbalance, degraded replicas, or disk saturation exceeded thresholds."
+    condition: "{{ outputs.evaluate_sentinel_metrics.vars.alert_required == true }}"
+    then:
+      - id: record_health_state_kv
+        type: io.kestra.plugin.core.kv.Set
+        description: "Stores cluster degradation state and partition metrics in Kestra KV store for historical tracking."
+        key: "redpanda_health_{{ inputs.cluster_id }}"
+        kvType: JSON
+        overwrite: true
+        value: |
+          {{
+            {
+              "cluster_id": inputs.cluster_id,
+              "status": outputs.evaluate_sentinel_metrics.vars.status,
+              "leader_imbalance_delta": outputs.evaluate_sentinel_metrics.vars.leader_imbalance_delta,
+              "leader_imbalance_pct": outputs.evaluate_sentinel_metrics.vars.leader_imbalance_pct,
+              "max_leaders": outputs.evaluate_sentinel_metrics.vars.max_leaders,
+              "min_leaders": outputs.evaluate_sentinel_metrics.vars.min_leaders,
+              "under_replicated_replicas": outputs.evaluate_sentinel_metrics.vars.under_replicated_replicas,
+              "leaderless_count": outputs.evaluate_sentinel_metrics.vars.leaderless_count,
+              "nodes_down": outputs.evaluate_sentinel_metrics.vars.nodes_down,
+              "affected_topics": outputs.evaluate_sentinel_metrics.vars.affected_topics,
+              "saturated_drives": outputs.evaluate_sentinel_metrics.vars.saturated_drives,
+              "recorded_at": now()
+            } | toJson
+          }}
+
+      - id: evaluate_rebalance_trigger
+        type: io.kestra.plugin.core.flow.If
+        description: "Triggers automated partition leader rebalancing when enabled and imbalance threshold is breached."
+        condition: "{{ outputs.evaluate_sentinel_metrics.vars.rebalance_triggered == true }}"
+        then:
+          - id: trigger_cluster_rebalance
+            type: io.kestra.plugin.core.http.Request
+            description: "Dispatches leader rebalance request to Redpanda cluster maintenance API."
+            uri: "{{ inputs.redpanda_admin_url }}/v1/cluster_maintenance/rebalance"
+            method: POST
+            headers:
+              Accept: "application/json"
+              Content-Type: "application/json"
+              Authorization: "Bearer {{ secret('REDPANDA_ADMIN_TOKEN') }}"
+            body: |
+              {
+                "mode": "continuous",
+                "reason": "Automated partition leader rebalance triggered by Kestra Redpanda sentinel"
+              }
+            options:
+              timeout:
+                readIdleTimeout: PT30S
+
+          - id: log_rebalance_invoked
+            type: io.kestra.plugin.core.log.Log
+            message: "Dispatched automated leader rebalance to Redpanda Admin API for cluster '{{ inputs.cluster_id }}'. HTTP Status: {{ outputs.trigger_cluster_rebalance.code }}."
+
+      - id: notify_slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: "Dispatches structured degradation alert to Slack with broker node distribution and affected topics."
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ inputs.slack_channel }}",
+            "text": "⚠️ *REDPANDA CLUSTER ALERT: {{ outputs.evaluate_sentinel_metrics.vars.status }}*",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "⚠️ Redpanda Cluster Health Warning"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Cluster ID:*\n`{{ inputs.cluster_id }}`"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Status:*\n`{{ outputs.evaluate_sentinel_metrics.vars.status }}`"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Leader Imbalance Delta:*\n{{ outputs.evaluate_sentinel_metrics.vars.leader_imbalance_delta }} ({{ outputs.evaluate_sentinel_metrics.vars.leader_imbalance_pct }}%)"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Under-Replicated Replicas:*\n{{ outputs.evaluate_sentinel_metrics.vars.under_replicated_replicas }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Leaderless Partitions:*\n{{ outputs.evaluate_sentinel_metrics.vars.leaderless_count }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Nodes Offline:*\n{{ outputs.evaluate_sentinel_metrics.vars.nodes_down }}"
+                  }
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Broker Leadership Distribution:*\n`{{ outputs.evaluate_sentinel_metrics.vars.broker_distribution_summary }}`\n*Affected Topics:*\n`{{ outputs.evaluate_sentinel_metrics.vars.affected_topics_summary }}`\n*Rebalance Action:*\n`{% if outputs.evaluate_sentinel_metrics.vars.rebalance_triggered %}AUTOMATIC_REBALANCE_TRIGGERED{% else %}MANUAL_ATTENTION_REQUIRED{% endif %}`"
+                }
+              }
+            ]
+          }
+
+    else:
+      - id: log_cluster_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: "Logs nominal health confirmation when partition leaders are balanced and replication is healthy."
+        message: "Redpanda cluster '{{ inputs.cluster_id }}' is healthy. All {{ outputs.evaluate_sentinel_metrics.vars.total_nodes }} brokers balanced (delta: {{ outputs.evaluate_sentinel_metrics.vars.leader_imbalance_delta }}), 0 under-replicated partitions, all drives within headroom."
+
+  - id: finalize_telemetry_outputs
+    type: io.kestra.plugin.core.output.OutputValues
+    description: "Emits structured cluster sentinel metrics for observability and downstream audit pipelines."
+    values:
+      cluster_id: "{{ inputs.cluster_id }}"
+      status: "{{ outputs.evaluate_sentinel_metrics.vars.status }}"
+      is_healthy: "{{ outputs.evaluate_sentinel_metrics.vars.is_healthy }}"
+      leader_imbalance_delta: "{{ outputs.evaluate_sentinel_metrics.vars.leader_imbalance_delta }}"
+      leader_imbalance_pct: "{{ outputs.evaluate_sentinel_metrics.vars.leader_imbalance_pct }}"
+      under_replicated_replicas: "{{ outputs.evaluate_sentinel_metrics.vars.under_replicated_replicas }}"
+      affected_topics_count: "{{ outputs.evaluate_sentinel_metrics.vars.affected_topics | length }}"
+      rebalance_triggered: "{{ outputs.evaluate_sentinel_metrics.vars.rebalance_triggered }}"
+
+errors:
+  - id: alert_probe_exception
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: "Alerts streaming infrastructure team when the Redpanda Admin API is unreachable or returns a fatal HTTP error."
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "{{ inputs.slack_channel }}",
+        "text": "🚨 *REDPANDA SENTINEL PROBE FAILED*\n*Target:* `{{ inputs.redpanda_admin_url }}`\n*Cluster ID:* `{{ inputs.cluster_id }}`\n*Execution:* `{{ execution.id }}`\n*Details:* Failed to query Admin API endpoints or evaluate cluster telemetry."
+      }
+
+extend:
+  title: Redpanda Partition Leader Imbalance and Under-Replicated Partitions Sentinel
+  metaTitle: Redpanda Cluster Health & Partition Leader Sentinel | Kestra
+  shortDescription: Audit Redpanda partition leader distribution, track under-replicated partitions and storage headroom, persist health in KV, and trigger rebalancing.
+  metaDescription: Audit Redpanda broker partition leader distribution, detect under-replicated partitions, alert Slack, and trigger automated rebalancing.
+  description: |
+    Redpanda delivers a mission-critical, low-latency streaming platform powered by Raft consensus. When broker nodes fail, network partitions occur, or rolling cluster updates shift traffic, partition leadership can concentrate heavily on a subset of brokers. This imbalance introduces CPU saturation, uneven network utilization, and severe producer latency degradation.
+
+    In parallel, under-replicated partitions and disk storage exhaustion directly threaten cluster quorum and data availability. This blueprint connects directly to the Redpanda Admin HTTP API, audits partition leadership balance across all registered brokers, verifies replica synchronization, inspects disk storage headroom, records state transitions in Kestra's key-value store, optionally executes automated rebalancing, and routes operational alerts to Slack.
+
+    ## How it works
+
+    1. **Admin API Ingestion**: Two `io.kestra.plugin.core.http.Request` tasks query the Redpanda Admin API: `probe_cluster_health` calls `GET /v1/cluster/health_overview` and `probe_nodes_telemetry` calls `GET /v1/nodes` using secured bearer authentication.
+    2. **Telemetry Evaluation**: The `evaluate_sentinel_metrics` task (`io.kestra.plugin.scripts.python.Script`) calculates the partition leader delta (`max_leaders - min_leaders`), evaluates relative imbalance percentages, audits under-replicated and leaderless partitions, extracts affected topic names, and checks disk utilization across broker storage drives against configured headroom thresholds.
+    3. **State Persistence**: When any degradation threshold is exceeded, the `record_health_state_kv` task (`io.kestra.plugin.core.kv.Set`) stores the structured cluster health state in Kestra KV store under `redpanda_health_{cluster}` for downstream tracking and SLA reporting.
+    4. **Automated Rebalancing**: If leader imbalance exceeds the threshold and `enable_auto_rebalance` is active, `trigger_cluster_rebalance` (`io.kestra.plugin.core.http.Request`) invokes Redpanda's `POST /v1/cluster_maintenance/rebalance` endpoint to redistribute partition leadership.
+    5. **Incident Notification**: The `notify_slack_alert` task (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) delivers rich Slack message blocks displaying broker leadership distribution, affected topics, imbalance deltas, and rebalance actions. If the cluster is healthy, nominal health is logged via `log_cluster_healthy`.
+    6. **Failure Recovery**: An `errors` block catches network partitions or Admin API authentication failures and dispatches immediate high-priority alerts to Slack.
+
+    ## What you get
+
+    - Automated calculation of broker partition leadership skew (`max_leaders - min_leaders`) and percentage skew.
+    - Real-time detection of under-replicated partitions, leaderless partitions, and offline broker nodes.
+    - Proactive storage drive capacity monitoring across all cluster nodes before disk exhaustion trips read-only locks.
+    - Persistent cluster health baselines saved directly into Kestra's KV store.
+    - Optional zero-touch remediation triggering automated continuous leader rebalancing.
+    - Formatted Slack alert cards identifying affected topics and broker distribution.
+
+    ## Who it's for
+
+    - Streaming Platform Engineers operating production Redpanda clusters.
+    - Site Reliability Engineers (SREs) monitoring Raft consensus health and broker resource distribution.
+    - Data Engineers responsible for mission-critical Kafka-compatible event pipelines.
+
+    ## Why orchestrate this with Kestra
+
+    Monitoring high-throughput streaming systems requires fast, decoupled, and dependable automation. Kestra integrates native HTTP probes, containerized Python analysis, key-value storage, and Slack notifications into a declarative workflow. If a network disruption occurs, Kestra handles retry semantics and error cascades cleanly without requiring custom cron scripts or external monitoring agents.
+
+    ## Prerequisites
+
+    - A running Redpanda cluster (v22.3+) with the HTTP Admin API reachable (default port 9644).
+    - Network ingress from Kestra workers to the Redpanda Admin API port.
+    - A Slack Incoming Webhook URL configured for the target incident channel.
+    - Docker enabled on the Kestra worker environment to run Python scripts.
+
+    ### Secrets
+
+    - `REDPANDA_ADMIN_TOKEN`: Bearer token for authenticating against the Redpanda HTTP Admin API.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for posting operational health and rebalance alerts.
+
+    ## Quick start
+
+    1. Configure the `REDPANDA_ADMIN_TOKEN` and `SLACK_WEBHOOK_URL` secrets in your Kestra namespace.
+    2. Import this flow under your streaming namespace (e.g., `company.streaming`).
+    3. Run a manual execution with your cluster Admin API URL (e.g., `http://redpanda.internal.company.com:9644`) to verify connectivity.
+    4. Enable the `scheduled_cluster_health_audit` schedule trigger for continuous 15-minute cluster surveillance.
+    5. Set `enable_auto_rebalance: true` if you want Kestra to automatically trigger leader rebalancing upon detected skew.
+
+    ## How to extend
+
+    - Add PagerDuty escalation: attach an `io.kestra.plugin.pagerduty.PagerDutyAlert` task when `under_replicated_replicas > 0` or brokers drop offline.
+    - Monitor consumer group lag: pair this flow with Kafka consumer offset monitoring blueprints for end-to-end streaming health.
+    - Integrate maintenance window schedules: silence auto-rebalancing during planned node upgrade windows.
+
+    ## Links
+
+    - [Redpanda Admin API Reference](https://docs.redpanda.com/current/reference/admin-api/)
+    - [Redpanda Partition Balancer](https://docs.redpanda.com/current/manage/cluster-maintenance/disk-architecture/)
+    - [Kestra HTTP Request Plugin](https://kestra.io/plugins/plugin-core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Kestra Python Script Plugin](https://kestra.io/plugins/plugin-scripts-python/io.kestra.plugin.scripts.python.script)
+    - [Kestra Slack Plugin](https://kestra.io/plugins/plugin-slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Kestra KV Store](https://kestra.io/docs/concepts/kv-store)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Realtime & Streaming
+  ee: false
+  demo: false
