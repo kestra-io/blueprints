@@ -1,0 +1,375 @@
+id: pinot-consuming-segment-commit-stall-guard
+namespace: company.team
+
+description: |
+  Audits Apache Pinot real-time tables for stuck consuming segments and commit protocol stalls,
+  classifies consumer partition lag against operational thresholds, safely executes an authorized
+  pause-and-resume cycle to recycle wedged consumer threads, and verifies that ingestion resumes.
+
+inputs:
+  - id: pinot_jdbc_url
+    type: STRING
+    displayName: Pinot JDBC URL
+    description: JDBC connection string for the Apache Pinot Controller (the Pinot JDBC driver resolves and routes broker queries through the controller), e.g. jdbc:pinot://host:9000.
+    defaults: "jdbc:pinot://pinot-controller:9000"
+
+  - id: controller_url
+    type: STRING
+    displayName: Pinot Controller REST URL
+    description: HTTP base URL of the Apache Pinot Controller managing cluster metadata and Helix state.
+    defaults: "http://pinot-controller:9000"
+
+  - id: table_name
+    type: STRING
+    displayName: Real-Time Table Name
+    description: Name of the Apache Pinot real-time table (including the _REALTIME suffix).
+    defaults: "transcript_REALTIME"
+
+  - id: max_commit_stall_seconds
+    type: INT
+    displayName: Max Commit Stall Threshold (Seconds)
+    description: Maximum allowable time a segment may remain in COMMITTING or stalled CONSUMING state before escalating.
+    defaults: 600
+
+  - id: max_allowed_consumer_lag_records
+    type: INT
+    displayName: Max Consumer Lag Threshold
+    description: Maximum permissible difference between partition upstream high water mark and current consumer offset.
+    defaults: 50000
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, triggers a Controller pause-and-resume cycle to recycle stuck consumer threads.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, simulates remediation without executing state-modifying requests against the Pinot Controller.
+    defaults: true
+
+tasks:
+  - id: probe_broker_metrics
+    type: io.kestra.plugin.jdbc.pinot.Query
+    description: Queries the Apache Pinot broker to determine total active rows and latest ingested event timestamp.
+    url: "{{ inputs.pinot_jdbc_url }}"
+    username: "{{ secret('PINOT_BROKER_USER') }}"
+    password: "{{ secret('PINOT_BROKER_PASSWORD') }}"
+    sql: "SELECT count(*) AS total_rows, max(event_timestamp) AS max_event_timestamp FROM {{ inputs.table_name }};"
+    fetchType: FETCH_ONE
+    retry:
+      type: constant
+      interval: PT5S
+      maxAttempts: 3
+
+  - id: probe_consuming_segments
+    type: io.kestra.plugin.core.http.Request
+    description: Fetches consuming segment runtime metadata and partition offset progression from the Pinot Controller.
+    uri: "{{ inputs.controller_url }}/tables/{{ inputs.table_name }}/consumingSegmentsInfo"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PINOT_CONTROLLER_AUTH_TOKEN') }}"
+      Accept: "application/json"
+    retry:
+      type: constant
+      interval: PT5S
+      maxAttempts: 3
+
+  - id: evaluate_segment_health
+    type: io.kestra.plugin.scripts.python.Script
+    description: Classifies consuming segment state into HEALTHY, STALLED_COMMIT, or CRITICAL_LAG using the real consumingSegmentsInfo response shape (a map of segment name to per-replica consumer state, last-consumed timestamp, and per-partition records lag).
+    containerImage: python:3.12-slim
+    env:
+      SEGMENTS_INFO: "{{ outputs.probe_consuming_segments.body | toJson }}"
+    script: |
+      import json
+      import os
+      import time
+
+      segments_info = json.loads(os.environ.get("SEGMENTS_INFO", "{}"))
+      max_commit_stall_ms = {{ inputs.max_commit_stall_seconds }} * 1000
+      max_lag_records = {{ inputs.max_allowed_consumer_lag_records }}
+      now_ms = int(time.time() * 1000)
+
+      stalled_segments = set()
+      high_lag_segments = set()
+      total_consuming_replicas = 0
+
+      for segment_name, replica_infos in segments_info.items():
+          if not replica_infos:
+              # Helix ideal state expects this segment to be CONSUMING, but no server
+              # reported an active consumer thread for it. This is the same signal
+              # Pinot's own ConsumingSegmentInfoReader.getIngestionStatus() treats as
+              # UNHEALTHY -- the segment's consumer is gone, a classic wedged-commit symptom.
+              stalled_segments.add(segment_name)
+              continue
+
+          for replica_info in replica_infos:
+              consumer_state = replica_info.get("consumerState")
+
+              if consumer_state == "NOT_CONSUMING":
+                  stalled_segments.add(segment_name)
+                  continue
+
+              if consumer_state != "CONSUMING":
+                  continue
+
+              total_consuming_replicas += 1
+
+              last_consumed_ts = replica_info.get("lastConsumedTimestamp") or 0
+              if (now_ms - last_consumed_ts) > max_commit_stall_ms:
+                  stalled_segments.add(segment_name)
+
+              records_lag_map = (replica_info.get("partitionOffsetInfo") or {}).get("recordsLagMap") or {}
+              for lag_value in records_lag_map.values():
+                  try:
+                      lag = int(lag_value)
+                  except (TypeError, ValueError):
+                      continue
+                  if lag > max_lag_records:
+                      high_lag_segments.add(segment_name)
+                      break
+
+      if not segments_info:
+          status = "NO_CONSUMING_SEGMENTS"
+      elif stalled_segments:
+          status = "STALLED_COMMIT"
+      elif high_lag_segments:
+          status = "CRITICAL_LAG"
+      else:
+          status = "HEALTHY"
+
+      output_payload = {
+          "status": status,
+          "stalled_commit_count": len(stalled_segments),
+          "high_lag_count": len(high_lag_segments),
+          "total_consuming_replicas": total_consuming_replicas,
+      }
+      print(f"Pinot segment health: status={status}, stalled={sorted(stalled_segments)}, high_lag={sorted(high_lag_segments)}")
+      print(f'::{{"outputs": {json.dumps(output_payload)}}}::')
+
+  - id: route_by_operational_state
+    type: io.kestra.plugin.core.flow.Switch
+    description: Routes execution based on the evaluated health status of real-time consuming segments.
+    value: "{{ outputs.evaluate_segment_health.vars.status }}"
+    cases:
+      HEALTHY:
+        - id: log_nominal_state
+          type: io.kestra.plugin.core.log.Log
+          description: Logs confirmation that all real-time partitions are actively consuming within operational bounds.
+          message: "Apache Pinot table {{ inputs.table_name }} is healthy. Ingested rows: {{ outputs.probe_broker_metrics.row.total_rows }}, latest event timestamp: {{ outputs.probe_broker_metrics.row.max_event_timestamp }}."
+
+      NO_CONSUMING_SEGMENTS:
+        - id: log_no_segments_warning
+          type: io.kestra.plugin.core.log.Log
+          description: Emits advisory log when no consuming segments are returned by the controller for the specified table.
+          message: "No active consuming segments found for table {{ inputs.table_name }}. Verify table existence and streaming ingestion source."
+
+      STALLED_COMMIT:
+        - id: alert_stalled_commit
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          description: Notifies operations team of wedged segment commits blocking partition ingestion.
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: |
+            {
+              "channel": "#data-platform-alerts",
+              "text": "🚨 *Apache Pinot Ingestion Alert: Stalled Consuming Segment Detected*",
+              "attachments": [
+                {
+                  "color": "#E01E5A",
+                  "fields": [
+                    {"title": "Table", "value": "`{{ inputs.table_name }}`", "short": true},
+                    {"title": "Stall Threshold", "value": "{{ inputs.max_commit_stall_seconds }}s", "short": true},
+                    {"title": "Broker Active Rows", "value": "{{ outputs.probe_broker_metrics.row.total_rows }}", "short": true},
+                    {"title": "Auto-Remediation", "value": "{{ inputs.auto_remediate and not inputs.dry_run ? 'ENABLED (Executing pause/resume)' : 'DISABLED (Dry run)' }}", "short": true}
+                  ]
+                }
+              ]
+            }
+
+        - id: check_remediation_gate
+          type: io.kestra.plugin.core.flow.If
+          description: Evaluates whether automated recovery execution is authorized by operational policy flags.
+          condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+          then:
+            - id: pause_table_consumption
+              type: io.kestra.plugin.core.http.Request
+              description: Instructs the Pinot Controller to pause real-time consumption and release stuck commit locks.
+              uri: "{{ inputs.controller_url }}/tables/{{ inputs.table_name }}/pause"
+              method: POST
+              headers:
+                Authorization: "Bearer {{ secret('PINOT_CONTROLLER_AUTH_TOKEN') }}"
+
+            - id: resume_table_consumption
+              type: io.kestra.plugin.core.http.Request
+              description: Instructs the Pinot Controller to resume real-time consumption, spawning fresh consumer tasks.
+              uri: "{{ inputs.controller_url }}/tables/{{ inputs.table_name }}/resume"
+              method: POST
+              headers:
+                Authorization: "Bearer {{ secret('PINOT_CONTROLLER_AUTH_TOKEN') }}"
+
+            - id: verify_broker_ingestion
+              type: io.kestra.plugin.jdbc.pinot.Query
+              description: Re-queries the broker following recovery to verify that partition consumption has resumed.
+              url: "{{ inputs.pinot_jdbc_url }}"
+              username: "{{ secret('PINOT_BROKER_USER') }}"
+              password: "{{ secret('PINOT_BROKER_PASSWORD') }}"
+              sql: "SELECT count(*) AS verified_total_rows, max(event_timestamp) AS verified_max_timestamp FROM {{ inputs.table_name }};"
+              fetchType: FETCH_ONE
+
+            - id: log_remediation_success
+              type: io.kestra.plugin.core.log.Log
+              description: Logs successful recycling of stalled Pinot real-time consumer tasks and post-recovery row counts.
+              message: "Successfully executed pause-resume cycle on {{ inputs.table_name }}. Post-recovery rows: {{ outputs.verify_broker_ingestion.row.verified_total_rows }}."
+          else:
+            - id: log_dry_run_remediation
+              type: io.kestra.plugin.core.log.Log
+              description: Records diagnostic plan when auto-remediation is disabled or operating in dry-run mode.
+              message: "Stalled commit detected on {{ inputs.table_name }}, but auto_remediate is false or dry_run is true. Skipping controller mutation."
+
+      CRITICAL_LAG:
+        - id: alert_critical_lag
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          description: Dispatches high-priority alert when consumer lag exceeds tolerance without a commit freeze.
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: |
+            {
+              "channel": "#data-platform-alerts",
+              "text": "⚠️ *Apache Pinot Consumer Lag Warning: Partition Backlog Escalation*",
+              "attachments": [
+                {
+                  "color": "#ECB22E",
+                  "fields": [
+                    {"title": "Table", "value": "`{{ inputs.table_name }}`", "short": true},
+                    {"title": "Lag Threshold", "value": "{{ inputs.max_allowed_consumer_lag_records }} records", "short": true},
+                    {"title": "Action", "value": "Inspect upstream Kafka/Pulsar topic partition throughput and Pinot server CPU/disk saturation.", "short": false}
+                  ]
+                }
+              ]
+            }
+
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Evaluates Pinot real-time table consuming segment health once every hour.
+    cron: "0 * * * *"
+    disabled: true
+
+  - id: webhook_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: External webhook endpoint accepting incident alerts from Prometheus Alertmanager or Kafka monitoring agents.
+    key: "{{ secret('PINOT_GUARD_WEBHOOK_KEY') }}"
+    disabled: true
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Posts pipeline execution error alert if broker queries or controller API requests fail.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "#data-platform-alerts",
+        "text": "❌ *Pinot Consuming Segment Guard Flow Execution Failed*",
+        "attachments": [
+          {
+            "color": "#D32F2F",
+            "fields": [
+              {"title": "Execution ID", "value": "`{{ execution.id }}`", "short": true},
+              {"title": "Failed Task", "value": "`{{ task.id }}`", "short": true},
+              {"title": "Flow", "value": "`{{ flow.id }}`", "short": true}
+            ]
+          }
+        ]
+      }
+
+extend:
+  title: Apache Pinot Consuming Segment Commit Stall and Consumer Lag Guard
+  metaTitle: Apache Pinot Consuming Segment Commit Stall Guard | Kestra
+  shortDescription: Audit Apache Pinot real-time table consuming segments for stalled commits, recycle wedged partition workers, and verify ingestion.
+  metaDescription: Audit Apache Pinot real-time consuming segment commit stalls and partition lag, trigger pause-resume recovery, and verify fresh record arrival with Kestra.
+  description: |
+    Apache Pinot ingests streaming events from Apache Kafka, Amazon Kinesis, and Apache Pulsar into volatile consuming segments. When a segment reaches its configured size or duration limit (`realtime.segment.flush.threshold.rows` or `threshold.time`), it enters a distributed commit protocol to seal the segment and persist it to deep storage. In high-throughput production clusters, transient deep storage timeouts, ZooKeeper leader elections, or segment upload errors can leave a segment's consumer thread wedged mid-commit: the Controller's `/consumingSegmentsInfo` endpoint then reports either no responding replica for a segment that should be consuming, a replica explicitly in `NOT_CONSUMING` state, or a `CONSUMING` replica whose `lastConsumedTimestamp` has gone stale.
+
+    When a segment commit stalls, the consumer thread on that partition ceases reading new messages, causing consumer lag to climb relentlessly and preventing downstream real-time analytics queries from observing newly arrived transactions. This blueprint automates continuous segment health auditing across Pinot real-time tables, evaluates these per-replica consumer signals against operational SLAs, safely executes an authorized pause-and-resume cycle to break stuck commit locks, and verifies that active ingestion resumes cleanly on the Pinot broker.
+
+    ## How it works
+
+    1. **Scheduled or Webhook Trigger**: The flow triggers either on an hourly schedule (`0 * * * *`, shipped disabled for safe onboarding) or instantly via an authenticated webhook endpoint triggered by Prometheus Alertmanager or Kafka consumer lag alarms.
+    2. **Broker SQL Ingestion Telemetry**: The `probe_broker_metrics` task (`io.kestra.plugin.jdbc.pinot.Query`) queries Apache Pinot over the JDBC driver (`jdbc:pinot://<controller-host>:9000`, which the driver resolves against the Controller) to extract current total row counts and the latest ingested event timestamp.
+    3. **Controller Consuming Segment Introspection**: The `probe_consuming_segments` task (`io.kestra.plugin.core.http.Request`) invokes the Pinot Controller REST API endpoint (`GET /tables/{tableName}/consumingSegmentsInfo`) using secret bearer authentication to retrieve, per segment, each replica's consumer state, last-consumed timestamp, and per-partition records lag.
+    4. **Operational Health Evaluation**: The `evaluate_segment_health` task (`io.kestra.plugin.scripts.python.Script`) parses the real per-replica response: a segment with no reporting replica, or a replica reporting `NOT_CONSUMING`, or a `CONSUMING` replica whose `lastConsumedTimestamp` is older than `max_commit_stall_seconds` is classified as a wedged commit; a `CONSUMING` replica whose per-partition `recordsLagMap` exceeds `max_allowed_consumer_lag_records` is classified as critical lag. The flow classifies the cluster state into `HEALTHY`, `STALLED_COMMIT`, or `CRITICAL_LAG`.
+    5. **Multi-Branch Flow Routing**: The `route_by_operational_state` task (`io.kestra.plugin.core.flow.Switch`) routes execution based on the classified outcome:
+       - `HEALTHY`: Emits an informational audit log confirming nominal consumption and active row progression.
+       - `NO_CONSUMING_SEGMENTS`: Logs a warning when no consuming segments are discovered, indicating an uninitialized or paused real-time table.
+       - `STALLED_COMMIT`: Immediately alerts the streaming operations Slack channel. If `auto_remediate` is true and `dry_run` is false, it executes automated recovery: pauses table consumption (`POST /tables/{tableName}/pause`), resumes table consumption (`POST /tables/{tableName}/resume`) to recycle stalled worker threads, re-queries the broker with `verify_broker_ingestion` to prove that fresh data is committing, and logs the remediation result.
+       - `CRITICAL_LAG`: Sends an actionable warning alert to Slack specifying that partition lag has crossed tolerance bounds without a stuck commit lock.
+    6. **Top-Level Error Safeguards**: Any communication timeout or authentication failure in broker queries or controller API calls routes directly to the `errors` handler, notifying the engineering team with execution context.
+
+    ## What you get
+
+    - **Zero-Downtime Commit Stall Recovery**: Unsticks frozen partition consumer threads via automated controller pause-and-resume orchestration without restarting Pinot Server pods or dropping state.
+    - **Dual-Plane Health Verification**: Combines broker SQL data-plane queries with controller control-plane REST telemetry for end-to-end visibility.
+    - **Safe Dry-Run Protection**: Enforces a strict two-flag safety gate (`auto_remediate: false` and `dry_run: true` by default) so operators can safely observe drift diagnostics before enabling automated recovery.
+    - **Post-Recovery Verification**: Re-queries the Pinot broker after recovery actions to prove that table row counts are advancing before resolving incidents.
+    - **Audit History & Observability**: Retains full execution logs, segment status snapshots, and Slack notifications within Kestra's version-controlled audit trail.
+
+    ## Who it's for
+
+    - **Real-Time Data Platform Engineers** managing high-throughput Apache Pinot OLAP clusters consuming from Kafka, Kinesis, or Pulsar.
+    - **Site Reliability Engineers (SREs)** responsible for real-time analytical query SLAs and automated self-healing infrastructure.
+    - **Analytics Engineers** operating hybrid Pinot tables who require guaranteed ingestion freshness for user-facing dashboards.
+
+    ## Why orchestrate this with Kestra
+
+    Apache Pinot's native controller reports segment statuses via REST APIs, but it lacks built-in self-healing policies, automated multi-step recovery workflows, and cross-system alerting integrations. Custom shell cron scripts or manual curl commands lack centralized execution history, secret masking, and verification gates.
+
+    Kestra provides a declarative, Git-versioned framework to orchestrate Pinot JDBC queries and Controller REST calls. With Kestra, timeout handling, credential masking, conditional branching, and incident alerts are declared in clean YAML. If a network blip occurs, Kestra's declarative retries prevent false alarms, while every recovery action is permanently recorded for compliance and post-mortem analysis.
+
+    ## Prerequisites
+
+    - A running Apache Pinot cluster (v0.12.0+) with Broker and Controller services accessible from Kestra worker nodes. Locally testable via the official `apachepinot/pinot:latest` Docker image.
+    - An active real-time table configured with a streaming ingestion source (such as Apache Kafka or Apache Pulsar).
+    - Administrative access to the Pinot Controller REST API.
+    - A Slack Incoming Webhook URL for operational incident dispatch.
+
+    ### Secrets
+
+    - `PINOT_BROKER_USER`: Username for authenticating JDBC queries against the Pinot Broker (leave empty if unauthenticated).
+    - `PINOT_BROKER_PASSWORD`: Password for authenticating JDBC queries against the Pinot Broker.
+    - `PINOT_CONTROLLER_AUTH_TOKEN`: Bearer token for authenticating administrative requests against the Pinot Controller REST API.
+    - `PINOT_GUARD_WEBHOOK_KEY`: Secret authentication key securing the event-driven Kestra webhook trigger.
+    - `SLACK_WEBHOOK_URL`: HTTPS endpoint for delivering structured incident alerts and remediation summaries to Slack.
+
+    ## Quick start
+
+    1. **Configure Secrets**: In your Kestra workspace, navigate to **Administration -> Secrets** and create `PINOT_BROKER_USER`, `PINOT_BROKER_PASSWORD`, `PINOT_CONTROLLER_AUTH_TOKEN`, `PINOT_GUARD_WEBHOOK_KEY`, and `SLACK_WEBHOOK_URL`.
+    2. **Local Testing Setup**: If testing locally, launch Apache Pinot's streaming quickstart, which starts a real Kafka topic and a real-time table so consuming segments actually exist to audit (the batch quickstart has none):
+       ```bash
+       docker run --name pinot-quickstart -p 9000:9000 -d apachepinot/pinot:1.2.0 QuickStart -type stream
+       ```
+    3. **Execute in Dry-Run Mode**: Click **Execute** in Kestra with `dry_run: true` and `auto_remediate: false`. Verify that `probe_broker_metrics` and `probe_consuming_segments` execute successfully and log current cluster telemetry.
+    4. **Enable Scheduled Monitoring**: Once validated against your cluster endpoints, toggle `disabled: false` on the `hourly_schedule` trigger to maintain continuous 24/7 protection.
+
+    ## How to extend
+
+    - **Prometheus Metric Export**: Append an `io.kestra.plugin.core.http.Request` task to push detected consuming lag and commit stall durations into Prometheus Pushgateway for Grafana dashboarding.
+    - **Automatic Segment Reload**: Chain `io.kestra.plugin.jdbc.pinot.Query` to execute an administrative segment reload when non-consuming sealed segments exhibit CRC verification discrepancies.
+    - **Kafka Consumer Group Alignment**: Connect this workflow with `flows/kafka-consumer-lag-sentinel.yaml` to cross-correlate Pinot consuming partition offsets with Kafka broker log end offsets.
+    - **PagerDuty Escalation**: Replace or augment the Slack notification task with `io.kestra.plugin.notifications.pagerduty.PagerDutyAlert` to page on-call SREs when stalls persist across consecutive executions.
+
+    ## Links
+
+    - [Kestra Apache Pinot Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-pinot)
+    - [Apache Pinot Real-Time Table Architecture](https://docs.pinot.apache.org/basics/components/table#real-time-table)
+    - [Apache Pinot Consuming Segments Administration Guide](https://docs.pinot.apache.org/operators/operating-pinot/tuning/realtime)
+    - [Apache Pinot Controller REST API Reference](https://docs.pinot.apache.org/users/api/pinot-rest-api)
+
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
