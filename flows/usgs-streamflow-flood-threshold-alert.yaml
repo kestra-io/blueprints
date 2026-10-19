@@ -1,0 +1,547 @@
+id: usgs-streamflow-flood-threshold-alert
+namespace: company.team
+
+description: |
+  Watch a list of USGS stream gauges against the NWS action and flood stages you care about.
+  Every 15 minutes the flow pulls the last six hours of gage height and discharge for all
+  gauges in one request to the USGS Water Data OGC API, computes the latest reading, the rate of rise
+  and the 6-hour change in DuckDB, classifies each gauge as normal, action, flood or stale,
+  and alerts in Slack only when a gauge changes state. State lives in the KV store and every
+  evaluation is appended to a rolling history CSV.
+
+inputs:
+  - id: sites
+    type: JSON
+    displayName: Gauges and thresholds
+    description: >-
+      One object per gauge: `site` (USGS site number, 8 to 15 digits, a `USGS-` prefix is
+      accepted), `name`, `action_ft` and `flood_ft` (gage height in feet, from the NWS gauge
+      page; either may be null) and an optional `nws_lid` for the link in the alert. The
+      defaults are the NWS action and minor flood stages of four gauges: two that were above
+      action stage in October 2026 and two that were normal.
+    defaults: |
+      [
+        {"site": "02228000", "name": "Satilla River at Atkinson, GA", "action_ft": 11, "flood_ft": 13, "nws_lid": "ATKG1"},
+        {"site": "05484900", "name": "Raccoon River at Des Moines (Fleur Dr), IA", "action_ft": 8, "flood_ft": 12, "nws_lid": "DEMI4"},
+        {"site": "01646500", "name": "Potomac River near Washington DC (Little Falls)", "action_ft": 5, "flood_ft": 10, "nws_lid": "BRKM2"},
+        {"site": "07010000", "name": "Mississippi River at St. Louis, MO", "action_ft": 28, "flood_ft": 30, "nws_lid": "EADM7"}
+      ]
+
+  - id: stale_minutes
+    type: INT
+    displayName: Stale after (minutes)
+    description: A gauge whose newest valid gage height is older than this is classified `stale`. Most USGS gauges record every 15 minutes and transmit every 15 to 60 minutes, so keep this at 90 or more.
+    defaults: 120
+
+  - id: hysteresis_ft
+    type: FLOAT
+    displayName: Hysteresis (ft)
+    description: A gauge in action or flood stays there until it drops this far below the threshold, so a river hovering at the line does not alert every 15 minutes.
+    defaults: 0.2
+
+  - id: trend_ft_per_hr
+    type: FLOAT
+    displayName: Rising/falling threshold (ft/h)
+    description: The last-hour rate of change above which a gauge is reported as rising (or below minus this value, falling).
+    defaults: 0.05
+
+  - id: history_days
+    type: INT
+    displayName: History retention (days)
+    description: Rows older than this are dropped from the rolling history CSV.
+    defaults: 14
+
+  - id: use_api_key
+    type: BOOL
+    displayName: Send USGS API key
+    description: Send the `USGS_API_KEY` secret (a free api.data.gov key) in the `X-Api-Key` header for higher rate limits. Two requests every 15 minutes fit the anonymous limit, so this is only needed for very large gauge lists or many copies of the flow.
+    defaults: false
+
+  - id: state_key
+    type: STRING
+    displayName: KV state key
+    description: KV key holding the last severity per gauge. The history CSV URI is stored under the same key with a `_history` suffix. Use one key per gauge list.
+    defaults: usgs_flood_state
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+    recoverMissedSchedules: LAST
+    description: Matches the 15-minute recording interval of most USGS gauges. After downtime only the latest missed run is replayed; older ones would evaluate the same data.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: prepare_sites
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Normalises the gauge list (trims, strips a `USGS-` prefix, keeps the first entry of a duplicated site) and
+      separates malformed site numbers. The API silently returns nothing for an id it cannot parse, so a typo
+      would otherwise look like a gauge that stopped reporting.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      sites.json: "{{ inputs.sites | toJson }}"
+    outputFiles:
+      - config_parquet
+    sql: |
+      CREATE TABLE raw AS
+      SELECT row_number() OVER () AS ord,
+             regexp_replace(trim(s->>'$.site'), '^USGS-', '') AS site,
+             coalesce(s->>'$.name', s->>'$.site') AS name,
+             TRY_CAST(s->>'$.action_ft' AS DOUBLE) AS action_ft,
+             TRY_CAST(s->>'$.flood_ft' AS DOUBLE) AS flood_ft,
+             s->>'$.nws_lid' AS nws_lid
+      FROM (SELECT unnest(from_json(content, '["JSON"]')) AS s FROM read_text('sites.json'));
+
+      CREATE TABLE config AS
+      SELECT site, arg_min(name, ord) AS name, arg_min(action_ft, ord) AS action_ft, arg_min(flood_ft, ord) AS flood_ft,
+             arg_min(nws_lid, ord) AS nws_lid, min(ord) AS ord,
+             regexp_full_match(coalesce(site, ''), '[0-9]{8,15}') AS valid_id
+      FROM raw GROUP BY site;
+
+      COPY (SELECT * FROM config WHERE valid_id ORDER BY ord) TO '{{ outputFiles.config_parquet }}' (FORMAT PARQUET);
+
+      SELECT
+        (SELECT count(*) FROM raw) AS listed,
+        count(*) FILTER (WHERE valid_id) AS valid_count,
+        count(*) FILTER (WHERE NOT valid_id) AS invalid_count,
+        coalesce(string_agg('USGS-' || site, ',' ORDER BY ord) FILTER (WHERE valid_id), '') AS location_ids,
+        coalesce(string_agg(coalesce(site, '<missing>') || ' (' || name || ')', '; ' ORDER BY ord) FILTER (WHERE NOT valid_id), '') AS invalid_sites
+      FROM config;
+
+  - id: require_sites
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ outputs.prepare_sites.outputs[0].row.valid_count == 0 }}"
+    errorMessage: "No valid USGS site numbers in the input (invalid: {{ outputs.prepare_sites.outputs[0].row.invalid_sites }})."
+
+  - id: fetch_readings
+    type: io.kestra.plugin.core.http.Download
+    description: |
+      One request for all gauges to the `continuous` collection (instantaneous values) of the USGS Water Data
+      OGC API: gage height `00065` (ft) and discharge `00060` (ft³/s) for the last six hours (`time=PT6H`),
+      only the properties used and no geometry. A 6-hour window of 15-minute data is about 50 rows per gauge,
+      so `limit=50000` covers several hundred gauges in a single page.
+    uri: "https://api.waterdata.usgs.gov/ogcapi/v1/collections/continuous/items?f=json&monitoring_location_id={{ outputs.prepare_sites.outputs[0].row.location_ids }}&parameter_code=00065,00060&time=PT6H&limit=50000&properties=monitoring_location_id,parameter_code,time_series_id,time,value,qualifier,approval_status&skipGeometry=true"
+    headers:
+      User-Agent: kestra-usgs-streamflow-flood-threshold-alert/1.0 (https://kestra.io)
+      Accept: application/geo+json
+      X-Api-Key: "{{ inputs.use_api_key ? secret('USGS_API_KEY') : '' }}"
+    options:
+      timeout:
+        readIdleTimeout: PT2M
+    retry:
+      type: exponential
+      interval: PT20S
+      maxInterval: PT2M
+      maxAttempts: 4
+
+  - id: fetch_locations
+    type: io.kestra.plugin.core.http.Download
+    description: Official USGS names of the same gauges, also one request. A site missing here does not exist, which tells a wrong site number apart from a gauge that stopped reporting.
+    uri: "https://api.waterdata.usgs.gov/ogcapi/v1/collections/monitoring-locations/items?f=json&id={{ outputs.prepare_sites.outputs[0].row.location_ids }}&properties=monitoring_location_name,state_name,site_type&skipGeometry=true&limit=10000"
+    headers:
+      User-Agent: kestra-usgs-streamflow-flood-threshold-alert/1.0 (https://kestra.io)
+      Accept: application/geo+json
+      X-Api-Key: "{{ inputs.use_api_key ? secret('USGS_API_KEY') : '' }}"
+    retry:
+      type: exponential
+      interval: PT20S
+      maxInterval: PT2M
+      maxAttempts: 4
+
+  - id: previous_state
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+    description: JSON array of the last severity per gauge. Missing on the first run, which is the BASELINE run.
+
+  - id: previous_history
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.state_key }}_history"
+    errorOnMissing: false
+    description: URI of the rolling history CSV written by the last run.
+
+  - id: evaluate
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Flattens the GeoJSON features to one row per reading, drops readings without a numeric value (ice,
+      equipment malfunction), and when a gauge has several time series for the same parameter (a second sensor
+      or a retired record) keeps the one with the newest valid reading. Per gauge it computes the latest gage height
+      and discharge, the age of the reading, the last-hour and 6-hour rates of change (least-squares slope in
+      ft/h), the 6-hour change and peak, then the severity with hysteresis against the previous state, the state
+      transition, the new state JSON and the appended history.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      readings.json: "{{ outputs.fetch_readings.uri }}"
+      locations.json: "{{ outputs.fetch_locations.uri }}"
+      config.parquet: "{{ outputs.prepare_sites.outputFiles.config_parquet }}"
+      state.json: "{{ outputs.previous_state.value ?? '[]' }}"
+      history.csv: "{{ outputs.previous_history.value ?? 'run_at,site,name,observed_at,age_min,stage_ft,discharge_cfs,rate_1h_ft_per_hr,change_6h_ft,trend,severity,previous_severity,changed' }}"
+    outputFiles:
+      - sites_csv
+      - history_csv
+    parameters:
+      stale_minutes: "{{ inputs.stale_minutes }}"
+      hysteresis_ft: "{{ inputs.hysteresis_ft }}"
+      trend_ft_per_hr: "{{ inputs.trend_ft_per_hr }}"
+      history_days: "{{ inputs.history_days }}"
+    sql: |
+      CREATE TABLE config AS SELECT * FROM read_parquet('config.parquet');
+
+      CREATE TABLE locations AS
+      SELECT regexp_replace(f->>'$.id', '^USGS-', '') AS site,
+             f->>'$.properties.monitoring_location_name' AS usgs_name,
+             f->>'$.properties.state_name' AS state_name
+      FROM (SELECT unnest(from_json(json_extract(content, '$.features'), '["JSON"]')) AS f FROM read_text('locations.json'));
+
+      CREATE TABLE response AS
+      SELECT from_json(json_extract(content, '$.features'), '["JSON"]') AS features,
+             coalesce(list_contains(from_json(json_extract(content, '$.links[*].rel'), '["VARCHAR"]'), 'next'), false) AS has_next_page
+      FROM read_text('readings.json');
+
+      CREATE TABLE points AS
+      SELECT regexp_replace(f->>'$.properties.monitoring_location_id', '^USGS-', '') AS site,
+             f->>'$.properties.parameter_code' AS param,
+             f->>'$.properties.time_series_id' AS series_id,
+             CAST(f->>'$.properties.time' AS TIMESTAMPTZ) AS observed_at,
+             CASE WHEN TRY_CAST(f->>'$.properties.value' AS DOUBLE) > -999999 THEN TRY_CAST(f->>'$.properties.value' AS DOUBLE) END AS value,
+             coalesce(f->>'$.properties.qualifier', '') AS qualifiers,
+             f->>'$.properties.approval_status' AS approval_status
+      FROM (SELECT unnest(features) AS f FROM response);
+
+      CREATE TABLE best_method AS
+      SELECT site, param, arg_max(series_id, observed_at) AS series_id
+      FROM points WHERE value IS NOT NULL GROUP BY site, param;
+
+      CREATE TABLE good AS
+      SELECT p.* FROM points p JOIN best_method m USING (site, param, series_id) WHERE p.value IS NOT NULL;
+
+      CREATE TABLE stage AS
+      SELECT site, max(observed_at) AS latest_at, arg_max(value, observed_at) AS stage_ft,
+             round(arg_max(value, observed_at) - arg_min(value, observed_at), 2) AS change_6h_ft,
+             max(value) AS peak_6h_ft, count(*) AS readings,
+             regr_slope(value, epoch(observed_at)) * 3600 AS rate_6h
+      FROM good WHERE param = '00065' GROUP BY site;
+
+      CREATE TABLE rate_1h AS
+      SELECT g.site, regr_slope(g.value, epoch(g.observed_at)) * 3600 AS rate_1h, count(*) AS n
+      FROM good g JOIN stage s USING (site)
+      WHERE g.param = '00065' AND g.observed_at >= s.latest_at - INTERVAL 60 MINUTE
+      GROUP BY g.site;
+
+      CREATE TABLE flow AS
+      SELECT site, arg_max(value, observed_at) AS discharge_cfs FROM good WHERE param = '00060' GROUP BY site;
+
+      CREATE TABLE last_raw AS
+      SELECT site, arg_max(qualifiers, observed_at) AS latest_qualifiers, bool_or(value IS NULL) AS had_no_data
+      FROM points WHERE param = '00065' GROUP BY site;
+
+      CREATE TABLE prev AS
+      SELECT s->>'$.site' AS site, s->>'$.severity' AS severity, s->>'$.since' AS since
+      FROM (SELECT unnest(from_json(content, '["JSON"]')) AS s FROM read_text('state.json'));
+
+      CREATE TABLE base AS
+      SELECT c.ord, c.site, c.name, c.action_ft, c.flood_ft, c.nws_lid,
+             l.usgs_name, l.state_name,
+             s.latest_at, s.stage_ft, s.change_6h_ft, s.peak_6h_ft, s.readings,
+             round(coalesce(CASE WHEN r.n >= 2 THEN r.rate_1h END, s.rate_6h), 3) AS rate_1h_ft_per_hr,
+             round(s.rate_6h, 3) AS rate_6h_ft_per_hr,
+             f.discharge_cfs, lr.latest_qualifiers, coalesce(lr.had_no_data, false) AS had_no_data,
+             date_diff('minute', s.latest_at, now()) AS age_min,
+             p.severity AS previous_severity, p.since AS previous_since,
+             CASE WHEN c.flood_ft IS NOT NULL AND s.stage_ft >= c.flood_ft THEN 2
+                  WHEN c.action_ft IS NOT NULL AND s.stage_ft >= c.action_ft THEN 1 ELSE 0 END AS raw_rank,
+             CASE p.severity WHEN 'flood' THEN 2 WHEN 'action' THEN 1 ELSE 0 END AS prev_rank
+      FROM config c
+      LEFT JOIN stage s USING (site)
+      LEFT JOIN rate_1h r USING (site)
+      LEFT JOIN flow f USING (site)
+      LEFT JOIN last_raw lr USING (site)
+      LEFT JOIN prev p USING (site)
+      LEFT JOIN locations l USING (site);
+
+      CREATE TABLE eval AS
+      SELECT *,
+             severity <> coalesce(previous_severity, 'normal') AS changed,
+             CASE WHEN severity <> coalesce(previous_severity, 'normal') OR previous_since IS NULL
+                  THEN strftime(now() AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') ELSE previous_since END AS since
+      FROM (
+        SELECT *,
+               CASE WHEN latest_at IS NULL THEN 'stale'
+                    WHEN age_min > CAST(:stale_minutes AS INTEGER) THEN 'stale'
+                    ELSE ['normal', 'action', 'flood'][greatest(raw_rank, held_rank) + 1] END AS severity,
+               CASE WHEN latest_at IS NULL AND usgs_name IS NULL THEN 'no such USGS site (check the site number)'
+                    WHEN latest_at IS NULL THEN 'no valid gage height in the last 6 hours' || CASE WHEN coalesce(latest_qualifiers, '') <> '' THEN ' (qualifier ' || latest_qualifiers || ')' ELSE '' END
+                    WHEN age_min > CAST(:stale_minutes AS INTEGER) THEN 'latest reading is ' || age_min || ' minutes old'
+                    END AS stale_reason,
+               held_rank > raw_rank AND latest_at IS NOT NULL AND age_min <= CAST(:stale_minutes AS INTEGER) AS held_by_hysteresis,
+               CASE WHEN rate_1h_ft_per_hr >= CAST(:trend_ft_per_hr AS DOUBLE) THEN 'rising'
+                    WHEN rate_1h_ft_per_hr <= -CAST(:trend_ft_per_hr AS DOUBLE) THEN 'falling'
+                    WHEN rate_1h_ft_per_hr IS NULL THEN 'unknown' ELSE 'steady' END AS trend,
+               CASE WHEN rate_1h_ft_per_hr >= CAST(:trend_ft_per_hr AS DOUBLE) AND flood_ft IS NOT NULL AND stage_ft < flood_ft
+                    THEN round((flood_ft - stage_ft) / rate_1h_ft_per_hr, 1) END AS hours_to_flood_at_current_rate
+        FROM (
+          SELECT *,
+                 greatest(raw_rank,
+                   CASE WHEN prev_rank >= 2 AND stage_ft >= flood_ft - CAST(:hysteresis_ft AS DOUBLE) THEN 2
+                        WHEN prev_rank >= 1 AND stage_ft >= action_ft - CAST(:hysteresis_ft AS DOUBLE) THEN 1 ELSE 0 END) AS held_rank
+          FROM base
+        )
+      );
+
+      COPY (
+        SELECT site, name, usgs_name, severity, previous_severity, changed, since, stale_reason, held_by_hysteresis,
+               strftime(latest_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') AS observed_at_utc, age_min,
+               stage_ft, action_ft, flood_ft, discharge_cfs, trend, rate_1h_ft_per_hr, rate_6h_ft_per_hr,
+               change_6h_ft, peak_6h_ft, hours_to_flood_at_current_rate, readings, latest_qualifiers
+        FROM eval ORDER BY ord
+      ) TO '{{ outputFiles.sites_csv }}' (HEADER, DELIMITER ',');
+
+      CREATE TABLE history AS
+      SELECT * FROM read_csv('history.csv', header = true, auto_detect = false,
+        columns = {'run_at': 'VARCHAR', 'site': 'VARCHAR', 'name': 'VARCHAR', 'observed_at': 'VARCHAR', 'age_min': 'BIGINT',
+                   'stage_ft': 'DOUBLE', 'discharge_cfs': 'DOUBLE', 'rate_1h_ft_per_hr': 'DOUBLE', 'change_6h_ft': 'DOUBLE',
+                   'trend': 'VARCHAR', 'severity': 'VARCHAR', 'previous_severity': 'VARCHAR', 'changed': 'BOOLEAN'})
+      WHERE CAST(run_at AS TIMESTAMPTZ) >= now() - to_days(CAST(:history_days AS INTEGER))
+      UNION ALL
+      SELECT strftime(now() AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ'), site, name,
+             strftime(latest_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ'), age_min, stage_ft, discharge_cfs,
+             rate_1h_ft_per_hr, change_6h_ft, trend, severity, previous_severity, changed
+      FROM eval;
+
+      COPY (SELECT * FROM history ORDER BY run_at, site) TO '{{ outputFiles.history_csv }}' (HEADER, DELIMITER ',');
+
+      SELECT
+        count(*) AS gauges,
+        (SELECT count(*) FROM prev) = 0 AS is_baseline,
+        count(*) FILTER (WHERE severity = 'flood') AS flood,
+        count(*) FILTER (WHERE severity = 'action') AS action,
+        count(*) FILTER (WHERE severity = 'normal') AS normal,
+        count(*) FILTER (WHERE severity = 'stale') AS stale,
+        count(*) FILTER (WHERE trend = 'rising') AS rising,
+        count(*) FILTER (WHERE held_by_hysteresis) AS held_by_hysteresis,
+        count(*) FILTER (WHERE changed) AS transitions,
+        (SELECT count(*) FROM points) AS readings_returned,
+        (SELECT any_value(has_next_page) FROM response) AS truncated,
+        (SELECT count(*) FROM history) AS history_rows,
+        coalesce(string_agg(site || ' ' || severity || CASE WHEN stage_ft IS NOT NULL THEN ' ' || stage_ft || ' ft' ELSE '' END, ', ' ORDER BY ord), '') AS status_line,
+        coalesce(CAST(to_json(list(json_object(
+          'site', site, 'name', name, 'usgs_name', usgs_name, 'nws_lid', nws_lid,
+          'severity', severity, 'previous_severity', coalesce(previous_severity, 'normal'), 'stale_reason', stale_reason,
+          'stage_ft', stage_ft, 'action_ft', action_ft, 'flood_ft', flood_ft, 'discharge_cfs', discharge_cfs,
+          'observed_at', strftime(latest_at AT TIME ZONE 'UTC', '%Y-%m-%d %H:%M UTC'), 'age_min', age_min,
+          'trend', trend, 'rate_1h', rate_1h_ft_per_hr, 'change_6h', round(change_6h_ft, 2), 'peak_6h', peak_6h_ft,
+          'hours_to_flood', hours_to_flood_at_current_rate) ORDER BY ord) FILTER (WHERE changed)) AS VARCHAR), '[]') AS transition_list,
+        CAST(to_json(list(json_object('site', site, 'severity', severity, 'since', since) ORDER BY ord)) AS VARCHAR) AS new_state
+      FROM eval;
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Severity and `since` timestamp per gauge, so the next run alerts only on changes.
+    key: "{{ inputs.state_key }}"
+    value: "{{ outputs.evaluate.outputs[0].row.new_state }}"
+
+  - id: save_history
+    type: io.kestra.plugin.core.kv.Set
+    description: Points the history key at the new rolling CSV. Older copies stay with their executions until purged.
+    key: "{{ inputs.state_key }}_history"
+    value: "{{ outputs.evaluate.outputFiles.history_csv }}"
+
+  - id: alert_transitions
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.outputs[0].row.transitions > 0 }}"
+    then:
+      - id: each_transition
+        type: io.kestra.plugin.core.flow.Loop
+        description: One message per gauge that changed state, routed by its new severity. Each iteration exposes its message as a loop output so the alerts are also logged in the parent execution.
+        values: "{{ outputs.evaluate.outputs[0].row.transition_list }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: route_by_severity
+            type: io.kestra.plugin.core.flow.Switch
+            value: "{{ fromJson(item.value).severity }}"
+            cases:
+              flood:
+                - id: flood_text
+                  type: io.kestra.plugin.core.debug.Return
+                  format: |-
+                    :rotating_light: *FLOOD STAGE* {{ fromJson(item.value).name }} (USGS {{ fromJson(item.value).site }}): *{{ fromJson(item.value).stage_ft }} ft*, flood stage {{ fromJson(item.value).flood_ft }} ft (was {{ fromJson(item.value).previous_severity }}).
+                    {{ fromJson(item.value).trend | capitalize }} {{ fromJson(item.value).rate_1h }} ft/h, {{ fromJson(item.value).change_6h }} ft in 6 h, 6 h peak {{ fromJson(item.value).peak_6h }} ft, discharge {{ fromJson(item.value).discharge_cfs ?? 'n/a' }} ft³/s, observed {{ fromJson(item.value).observed_at }}.
+                    https://waterdata.usgs.gov/monitoring-location/USGS-{{ fromJson(item.value).site }}/{% if fromJson(item.value).nws_lid is not empty %} | https://water.noaa.gov/gauges/{{ fromJson(item.value).nws_lid }}{% endif %}
+                - id: slack_flood
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  allowFailure: true
+                  description: allowFailure keeps the check running when `SLACK_WEBHOOK_URL` is not set; the alert is still logged and in the CSV.
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  messageText: "{{ outputs.flood_text.value }}"
+              action:
+                - id: action_text
+                  type: io.kestra.plugin.core.debug.Return
+                  format: |-
+                    :warning: *Action stage* {{ fromJson(item.value).name }} (USGS {{ fromJson(item.value).site }}): *{{ fromJson(item.value).stage_ft }} ft*, action {{ fromJson(item.value).action_ft }} ft, flood {{ fromJson(item.value).flood_ft ?? 'n/a' }} ft (was {{ fromJson(item.value).previous_severity }}).
+                    {{ fromJson(item.value).trend | capitalize }} {{ fromJson(item.value).rate_1h }} ft/h, {{ fromJson(item.value).change_6h }} ft in 6 h{% if (fromJson(item.value).hours_to_flood ?? 'none') != 'none' %}, flood stage in about {{ fromJson(item.value).hours_to_flood }} h at this rate{% endif %}. Discharge {{ fromJson(item.value).discharge_cfs ?? 'n/a' }} ft³/s, observed {{ fromJson(item.value).observed_at }}.
+                    https://waterdata.usgs.gov/monitoring-location/USGS-{{ fromJson(item.value).site }}/{% if fromJson(item.value).nws_lid is not empty %} | https://water.noaa.gov/gauges/{{ fromJson(item.value).nws_lid }}{% endif %}
+                - id: slack_action
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  allowFailure: true
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  messageText: "{{ outputs.action_text.value }}"
+              stale:
+                - id: stale_text
+                  type: io.kestra.plugin.core.debug.Return
+                  format: |-
+                    :satellite_antenna: *Gauge data stale* {{ fromJson(item.value).name }} (USGS {{ fromJson(item.value).site }}): {{ fromJson(item.value).stale_reason }} (was {{ fromJson(item.value).previous_severity }}).{% if (fromJson(item.value).stage_ft ?? 'none') != 'none' %} Last valid reading {{ fromJson(item.value).stage_ft }} ft at {{ fromJson(item.value).observed_at }}.{% endif %} Flood status cannot be confirmed until data resumes.
+                    https://waterdata.usgs.gov/monitoring-location/USGS-{{ fromJson(item.value).site }}/
+                - id: slack_stale
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  allowFailure: true
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  messageText: "{{ outputs.stale_text.value }}"
+              normal:
+                - id: normal_text
+                  type: io.kestra.plugin.core.debug.Return
+                  format: |-
+                    :white_check_mark: *{{ fromJson(item.value).previous_severity == 'stale' ? 'Data restored' : 'Back below action stage' }}* {{ fromJson(item.value).name }} (USGS {{ fromJson(item.value).site }}): {{ fromJson(item.value).stage_ft }} ft, {{ fromJson(item.value).trend }} {{ fromJson(item.value).rate_1h }} ft/h, observed {{ fromJson(item.value).observed_at }} (was {{ fromJson(item.value).previous_severity }}).
+                - id: slack_normal
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  allowFailure: true
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  messageText: "{{ outputs.normal_text.value }}"
+        outputs:
+          - id: severity
+            type: STRING
+            value: "{{ fromJson(item.value).severity }}"
+          - id: message
+            type: STRING
+            value: "{{ outputs.flood_text.value ?? outputs.action_text.value ?? outputs.stale_text.value ?? outputs.normal_text.value ?? '' }}"
+
+      - id: log_alerts
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{% for it in outputs.each_transition.outputs %}[{{ it.outputs.severity | upper }}] {{ it.outputs.message }}\n{% endfor %}"
+    else:
+      - id: no_transitions
+        type: io.kestra.plugin.core.log.Log
+        message: "No state changes across {{ outputs.evaluate.outputs[0].row.gauges }} gauges: {{ outputs.evaluate.outputs[0].row.status_line }}."
+
+  - id: warn_invalid_sites
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.prepare_sites.outputs[0].row.invalid_count > 0 }}"
+    level: WARN
+    message: "Skipped malformed USGS site numbers (must be 8 to 15 digits): {{ outputs.prepare_sites.outputs[0].row.invalid_sites }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.evaluate.outputs[0].row.gauges }} gauges checked{{ outputs.evaluate.outputs[0].row.is_baseline ? ' (BASELINE run, every non-normal gauge alerts once)' : '' }}: flood {{ outputs.evaluate.outputs[0].row.flood }}, action {{ outputs.evaluate.outputs[0].row.action }}, normal {{ outputs.evaluate.outputs[0].row.normal }}, stale {{ outputs.evaluate.outputs[0].row.stale }}; rising {{ outputs.evaluate.outputs[0].row.rising }}, held by hysteresis {{ outputs.evaluate.outputs[0].row.held_by_hysteresis }}.
+      Transitions alerted: {{ outputs.evaluate.outputs[0].row.transitions }}. Status: {{ outputs.evaluate.outputs[0].row.status_line }}.
+      USGS readings parsed: {{ outputs.evaluate.outputs[0].row.readings_returned }}{{ outputs.evaluate.outputs[0].row.truncated ? ' (TRUNCATED: the API returned a next page, split the gauge list)' : '' }}. History rows kept: {{ outputs.evaluate.outputs[0].row.history_rows }}. Per-gauge CSV: {{ outputs.evaluate.outputFiles.sites_csv }}
+
+errors:
+  - id: slack_check_failed
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    allowFailure: true
+    description: The gauges are unwatched while this flow fails (USGS outage, network), so say so.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":x: USGS flood threshold check failed in {{ flow.namespace }}.{{ flow.id }} (execution {{ execution.id }}); gauges are not being watched until it recovers."
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.evaluate.outputs[0].row | toJson }}"
+  - id: sites_csv
+    type: FILE
+    value: "{{ outputs.evaluate.outputFiles.sites_csv }}"
+  - id: history_csv
+    type: FILE
+    value: "{{ outputs.evaluate.outputFiles.history_csv }}"
+
+extend:
+  title: Alert on USGS Stream Gauges Crossing NWS Action and Flood Stage, with Rate of Rise and Stale-Data Detection
+  metaTitle: USGS Streamflow Flood Threshold Alert with DuckDB and Slack | Kestra
+  shortDescription: Every 15 minutes, pull six hours of gage height and discharge for a list of USGS gauges in one OGC API request, compute the latest stage, rate of rise and 6-hour change in DuckDB, classify each gauge as normal, action, flood or stale with hysteresis, and post to Slack only when a gauge changes state.
+  metaDescription: Watch USGS gauges every 15 minutes against NWS action and flood stage, with rate of rise, stale-data detection, KV state and Slack alerts on change only.
+  description: |
+    A river crossing its action or flood stage is the moment someone has to move equipment, close a road or call a levee crew, and the USGS publishes the gage height of thousands of stream gauges within minutes of the reading. The NWS publishes the stage at which each gauge becomes a concern. This flow joins the two: it reads the last six hours of gage height and discharge for your gauges in a single request to the USGS Water Data OGC API, computes the latest stage, how fast it is moving and how much it changed, compares it with the thresholds you give per gauge, and alerts in Slack when a gauge enters or leaves action stage, flood stage or a data gap. Severity is kept in the KV store so a river sitting above flood stage for two days alerts once, not two hundred times, and every evaluation is appended to a rolling history CSV.
+
+    ## How it works
+
+    1. A `Schedule` trigger runs every 15 minutes (`recoverMissedSchedules: LAST`, so a restart replays only the latest missed run), and `concurrency.limit: 1` keeps two runs from racing on the KV state.
+    2. `prepare_sites` (DuckDB) normalises the `sites` JSON input: trims ids, accepts `USGS-02228000` or `02228000`, keeps the first entry of a duplicated site and separates malformed ids (not 8 to 15 digits), which the API would silently answer with nothing. `require_sites` (Fail) stops the run if no valid id is left.
+    3. `fetch_readings` (HTTP Download) makes one request to the `continuous` collection for all gauges: `monitoring_location_id` as a comma list, `parameter_code=00065,00060` (gage height in ft, discharge in ft³/s), `time=PT6H`, `properties` limited to the fields used and `skipGeometry=true`. `fetch_locations` makes one request to `monitoring-locations` for the official names; a site missing there does not exist. Both retry with exponential backoff and can send an API key.
+    4. `previous_state` and `previous_history` (KV Get, `errorOnMissing: false`) read the last severity per gauge and the URI of the history CSV. Both are missing on the first run, the BASELINE run.
+    5. `evaluate` (DuckDB) flattens the GeoJSON to one row per reading, drops readings without a numeric value (ice, equipment problems) and, when a gauge has more than one time series for a parameter, keeps the one with the newest reading. Per gauge it computes the latest stage and discharge, the age of the reading, the last-hour and 6-hour rates of change (least-squares slope in ft/h), the 6-hour change and peak, and the hours to flood stage at the current rate when rising. Severity is `stale` if there is no reading in six hours, the site does not exist or the reading is older than `stale_minutes`; otherwise `flood`, `action` or `normal`. A gauge in action or flood stays there until it drops `hysteresis_ft` below the threshold. A transition is a severity different from the stored one; on the baseline run every gauge that is not `normal` alerts once. The summary also flags a truncated response (a `next` page link).
+    6. `save_state` and `save_history` (KV Set) store the new severities and point the history key at the new CSV, which keeps `history_days` of rows.
+    7. `alert_transitions` (If) runs `each_transition` (Loop) over the gauges that changed. `route_by_severity` (Switch) writes a different message for each new severity: flood (stage over flood stage, trend, peak, discharge), action (adds the hours to flood stage at the current rate), stale (the reason and the last good reading), normal (back below action stage, or data restored after a gap). Each case posts to Slack with `allowFailure`, so a missing webhook warns instead of failing. `log_alerts` prints every message in the parent execution. With no transition, `no_transitions` logs one status line.
+    8. `warn_invalid_sites` names the malformed ids, `summary` logs the counts, and `errors` posts to Slack if the run itself fails, because the gauges are unwatched until it recovers.
+
+    ## What you get
+
+    - Slack alerts on state changes only, with stage, threshold, rate of rise, 6-hour change and peak, discharge, observation time and links to the USGS and NWS gauge pages.
+    - A per-gauge CSV per run (severity, previous severity, `since`, stale reason, hysteresis flag, stage, discharge, rates, peak, hours to flood, number of readings) and a rolling history CSV for charts or post-event review, both as flow outputs.
+    - Stale-data alerts for gauges that stop reporting, and an explicit "no such USGS site" for a wrong site number, so a silent gauge is never read as a calm river.
+    - Hysteresis so a river hovering at the line does not flap.
+
+    ## Who it's for
+
+    - Emergency management, public works and utility operations teams who act at specific river stages.
+    - Facility, construction and agriculture operators with assets in a floodplain.
+    - Hydrologists and data teams who want a reproducible stage-threshold feed without running a database.
+
+    ## Why orchestrate this with Kestra
+
+    - Two HTTP calls and SQL replace a polling script: the classification, rates and hysteresis are readable in the flow.
+    - The KV store keeps the severity per gauge and the history pointer, so alerting on change needs no database.
+    - `Loop` plus `Switch` gives each severity its own message; paging on-call for `flood` only is one more task in one case.
+    - Retries, `concurrency` and `recoverMissedSchedules` handle API hiccups and restarts; `errors` reports a broken check.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB plugin and the Slack plugin (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
+    - Outbound HTTPS to `api.waterdata.usgs.gov`. No key is needed for two requests every 15 minutes; a free api.data.gov key raises the rate limit.
+    - The thresholds for each gauge from its NWS gauge page (`water.noaa.gov/gauges/<LID>`, "Flood Categories"): action stage and minor flood stage, in feet of gage height at the USGS gauge.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for transition alerts and failure notices (optional; without it the Slack tasks warn and the check still runs).
+    - `USGS_API_KEY`: api.data.gov key sent as `X-Api-Key` when `use_api_key` is true (optional).
+
+    ## Quick start
+
+    1. Import the flow and click **Execute** with the defaults: Satilla River at Atkinson, GA (action 11 ft, flood 13 ft), Raccoon River at Des Moines (8 / 12 ft), Potomac at Little Falls (5 / 10 ft) and Mississippi at St. Louis (28 / 30 ft). On 19 October 2026 the baseline run found the Satilla in flood at 14.18 ft, the Raccoon at action stage at 8.32 ft and the other two normal, and alerted twice. Your result depends on the rivers today.
+    2. Execute again: `No state changes across 4 gauges`.
+    3. Add a site number that does not exist: it alerts once as stale with "no such USGS site". Add a malformed one such as `0222-800`: `warn_invalid_sites` names it and it is not sent.
+    4. Set `stale_minutes` to 10 to see the stale alerts, then run with the default to see the recovery messages.
+    5. Replace the gauges with yours, add `SLACK_WEBHOOK_URL` and enable the schedule.
+
+    ## How to extend
+
+    - Add `moderate_ft` and `major_ft` to the input and two more `Switch` cases, or page on-call for `flood` only.
+    - Pull the thresholds from the NWS National Water Prediction Service API (`api.water.noaa.gov/nwps/v1/gauges/<LID>`) instead of typing them, and add its stage forecast to alert before the crossing.
+    - Alert on rate of rise alone (`rate_1h_ft_per_hr` above a limit) for flashy creeks that go from normal to flood within an hour.
+    - Load the history CSV into Postgres, BigQuery or a DuckDB file for dashboards.
+    - The legacy USGS Water Services endpoint (`waterservices.usgs.gov/nwis/iv/?format=json&sites=...&parameterCd=00065,00060&period=PT6H`) answers the same question, but it is scheduled for shutdown on 22 February 2027 and in our tests it returned the latest readings about an hour later than the OGC API, so this flow uses the OGC API.
+
+    ## Links
+
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop), [Switch](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch) and [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Schedule trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - [USGS Water Data OGC APIs](https://api.waterdata.usgs.gov/docs/ogcapi/), [continuous collection](https://api.waterdata.usgs.gov/ogcapi/v1/collections/continuous) and [API keys](https://api.waterdata.usgs.gov/docs/ogcapi/keys/)
+    - [Legacy USGS Water Services (shutdown 22 February 2027)](https://waterservices.usgs.gov/)
+    - [NWS National Water Prediction Service](https://water.noaa.gov/) for action and flood stages
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Realtime & Streaming
+  ee: false
+  demo: false
