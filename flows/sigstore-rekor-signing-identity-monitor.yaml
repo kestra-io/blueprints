@@ -1,0 +1,598 @@
+id: sigstore-rekor-signing-identity-monitor
+namespace: company.team
+
+description: |
+  Watch the public Sigstore Rekor transparency log for signatures made with your identities or
+  over your release artifacts, and flag anything you did not expect: another identity, another
+  OIDC issuer, a branch instead of a tag, a reusable workflow called from a foreign repository,
+  an unknown signing key, or a signature logged outside the release window. Rekor's index only
+  searches by email or artifact digest, so workflow identities are watched through the digests
+  of your GitHub release assets. Every new entry is decoded, its Fulcio certificate parsed, and
+  its Merkle inclusion proof and signed checkpoint verified. Keyless, no API key.
+
+inputs:
+  - id: identities
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - https://github.com/goreleaser/goreleaser/.github/workflows/release.yml@refs/tags/*
+      - keyless@projectsigstore.iam.gserviceaccount.com
+    description: Signer identities you expect (the certificate SAN), glob patterns allowed. Plain email addresses are also searched in the Rekor index; workflow URIs cannot be searched and are only checked on entries found by digest.
+
+  - id: allowed_issuers
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - https://token.actions.githubusercontent.com
+      - https://accounts.google.com
+    description: OIDC issuers allowed to vouch for your identities (Fulcio extension 1.3.6.1.4.1.57264.1.8, or .1 on older certificates).
+
+  - id: allowed_refs
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - refs/tags/*
+    description: Git refs a GitHub Actions signature may come from (source repository ref extension). Empty list disables the check.
+
+  - id: allowed_key_fingerprints
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - sha256:adb808ab071482427b7a135b99f640580553757c46454b49d6daf227c19aef8f
+    description: SHA-256 fingerprints of the public keys (SubjectPublicKeyInfo) allowed for non-keyless signatures. The default is the KMS key cosign uses next to keyless signing.
+
+  - id: github_repos
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - goreleaser/goreleaser
+      - sigstore/cosign
+    description: GitHub repositories (owner/name) whose release assets are watched. Their `digest` (sha256) is searched in Rekor and the release times define the signing windows.
+
+  - id: asset_name_regex
+    type: STRING
+    defaults: "^(checksums\\.txt|cosign-linux-amd64)$"
+    description: Release assets to watch, matched on the asset name. Keep it to the files you sign; every asset is one index request.
+
+  - id: releases_per_repo
+    type: INT
+    defaults: 5
+    min: 1
+    max: 30
+    description: Most recent releases per repository to watch.
+
+  - id: include_prereleases
+    type: BOOL
+    defaults: false
+    description: Also watch prereleases (nightlies are often signed by a different workflow).
+
+  - id: artifact_digests
+    type: ARRAY
+    itemType: STRING
+    required: false
+    description: Extra sha256 digests to watch (container image digests, files not on GitHub). These have no release window.
+
+  - id: search_emails
+    type: BOOL
+    defaults: true
+    description: Search the Rekor index for every plain email in `identities`, so certificates issued for your email by any issuer are found.
+
+  - id: window_hours_before
+    type: INT
+    defaults: 2
+    description: Hours before a release's creation time a signature of its assets is still expected.
+
+  - id: window_hours_after
+    type: INT
+    defaults: 24
+    description: Hours after a release's publication time a signature of its assets is still expected.
+
+  - id: max_entries_per_run
+    type: INT
+    defaults: 50
+    min: 10
+    max: 500
+    description: Cap on entries fetched per run (10 per request, about one second per entry). New UUIDs beyond the cap are fetched on the next run.
+
+  - id: state_key
+    type: STRING
+    defaults: sigstore_rekor_monitor
+    description: KV key holding the seen UUIDs, their logIndex and the last verified checkpoint. One key per watchlist.
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"
+
+tasks:
+  - id: previous_state
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+    description: JSON with every UUID seen so far (and its logIndex) plus the last verified tree head. Missing on the first run.
+
+  - id: scan_rekor
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Collects facts from the log, no policy: verifies the signed tree head and its consistency with the last run, reads
+      release asset digests from GitHub, searches the Rekor index by hash and email, fetches new entries 10 per request,
+      parses the signer (Fulcio certificate or public key) and verifies each inclusion proof against its signed checkpoint.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install --quiet --disable-pip-version-check --root-user-action=ignore cryptography
+    timeout: PT30M
+    inputFiles:
+      config.json: "{{ inputs | toJson }}"
+      state.json: "{{ outputs.previous_state.value ?? '' }}"
+    outputFiles:
+      - entries.json
+      - releases.json
+      - state.json
+    script: |
+      import base64, hashlib, json, re, time, urllib.error, urllib.request
+      from cryptography import x509
+      from cryptography.hazmat.primitives import hashes, serialization
+      from cryptography.hazmat.primitives.asymmetric import ec
+
+      REKOR = "https://rekor.sigstore.dev"
+      UA = {"User-Agent": "kestra-sigstore-rekor-signing-identity-monitor/1.0", "Accept": "application/json"}
+      cfg = json.load(open("config.json"))
+      state = json.loads(open("state.json").read() or "{}") or {}
+      seen = state.get("entries", {})
+      baseline = not seen
+      problems = []
+
+      def call(url, body=None, raw=False):
+          data = json.dumps(body).encode() if body is not None else None
+          headers = dict(UA, **({"Content-Type": "application/json"} if data else {}))
+          for attempt in range(5):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=60) as r:
+                      time.sleep(0.2)
+                      payload = r.read()
+                      return payload.decode() if raw else json.loads(payload)
+              except urllib.error.HTTPError as e:
+                  if e.code in (429, 500, 502, 503, 504) and attempt < 4:
+                      time.sleep(2 ** attempt * 2)
+                      continue
+                  raise
+
+      H = lambda *parts: hashlib.sha256(b"".join(parts)).digest()
+
+      def inclusion_ok(leaf, index, size, proof, root):
+          fn, sn, r = index, size - 1, leaf
+          for p in proof:
+              if sn == 0:
+                  return False
+              if fn & 1 or fn == sn:
+                  r = H(b"\x01", p, r)
+                  while not fn & 1 and fn != 0:
+                      fn, sn = fn >> 1, sn >> 1
+              else:
+                  r = H(b"\x01", r, p)
+              fn, sn = fn >> 1, sn >> 1
+          return sn == 0 and r == root
+
+      def consistency_ok(size1, size2, root1, root2, proof):
+          if size1 == size2:
+              return root1 == root2 and not proof
+          if size1 & (size1 - 1) == 0:
+              proof = [root1] + proof
+          fn, sn = size1 - 1, size2 - 1
+          while fn & 1:
+              fn, sn = fn >> 1, sn >> 1
+          fr = sr = proof[0]
+          for c in proof[1:]:
+              if sn == 0:
+                  return False
+              if fn & 1 or fn == sn:
+                  fr, sr = H(b"\x01", c, fr), H(b"\x01", c, sr)
+                  while not fn & 1 and fn != 0:
+                      fn, sn = fn >> 1, sn >> 1
+              else:
+                  sr = H(b"\x01", sr, c)
+              fn, sn = fn >> 1, sn >> 1
+          return sn == 0 and fr == root1 and sr == root2
+
+      keys = {}
+      def log_key(tree_id):
+          if tree_id not in keys:
+              pem = call(f"{REKOR}/api/v1/log/publicKey?treeID={tree_id}", raw=True)
+              pem = json.loads(pem) if pem.startswith('"') else pem  # served JSON-quoted when Accept is application/json
+              keys[tree_id] = serialization.load_pem_public_key(pem.encode())
+          return keys[tree_id]
+
+      def parse_checkpoint(note):
+          body, _, sigs = note.partition("\n\n")
+          origin, size, root = body.split("\n")[:3]
+          return {"text": body + "\n", "tree_id": origin.rsplit(" ", 1)[-1], "size": int(size),
+                  "root": base64.b64decode(root), "sig": base64.b64decode(sigs.strip().split(" ")[-1])[4:]}
+
+      def checkpoint_signed(cp):
+          key = log_key(cp["tree_id"])
+          try:
+              key.verify(cp["sig"], cp["text"].encode(), ec.ECDSA(hashes.SHA256()))
+              return True
+          except Exception:
+              return False
+
+      # 1. Current signed tree head of every shard, and a consistency proof against the head stored by the last run.
+      head = call(f"{REKOR}/api/v1/log")
+      shards = {str(s["treeID"]): s for s in head.get("inactiveShards", [])}
+      shards[str(head["treeID"])] = head
+      cur = parse_checkpoint(head["signedTreeHead"])
+      head_signed = checkpoint_signed(cur)
+      prev = state.get("checkpoint") or {}
+      consistency = "BASELINE"
+      if prev and prev.get("tree_id") != cur["tree_id"]:
+          consistency = "SHARD_ROTATED"
+      elif prev and prev["size"] > cur["size"]:
+          consistency = "FAILED"
+      elif prev:
+          proof = call(f"{REKOR}/api/v1/log/proof?firstSize={prev['size']}&lastSize={cur['size']}&treeID={cur['tree_id']}")
+          ok = consistency_ok(prev["size"], cur["size"], bytes.fromhex(prev["root"]), cur["root"], [bytes.fromhex(h) for h in proof.get("hashes", [])])
+          consistency = "VERIFIED" if ok else "FAILED"
+
+      # 2. Release assets (digest + timing) from GitHub, and the explicit digest list.
+      releases, queries = [], {}
+      asset_rx = re.compile(cfg["asset_name_regex"])
+      for repo in [r.strip() for r in cfg["github_repos"] if r.strip()]:
+          try:
+              rels = call(f"https://api.github.com/repos/{repo}/releases?per_page=30")
+          except urllib.error.HTTPError as e:
+              problems.append(f"GitHub repo {repo}: HTTP {e.code}")
+              continue
+          rels = [r for r in rels if not r["draft"] and (cfg["include_prereleases"] or not r["prerelease"])][: cfg["releases_per_repo"]]
+          if not rels:
+              problems.append(f"GitHub repo {repo}: no published releases")
+          for rel in rels:
+              for a in rel["assets"]:
+                  if asset_rx.search(a["name"]) and (a.get("digest") or "").startswith("sha256:"):
+                      releases.append({"repo": repo, "tag": rel["tag_name"], "asset": a["name"], "digest": a["digest"],
+                                       "created_at": rel["created_at"], "published_at": rel["published_at"]})
+                      queries[a["digest"]] = {"hash": a["digest"]}
+      for d in cfg.get("artifact_digests") or []:
+          hexd = d.strip().lower().removeprefix("sha256:")
+          if re.fullmatch(r"[0-9a-f]{64}", hexd):
+              queries["sha256:" + hexd] = {"hash": "sha256:" + hexd}
+              releases.append({"repo": "", "tag": "", "asset": "listed digest", "digest": "sha256:" + hexd, "created_at": None, "published_at": None})
+          elif d.strip():
+              problems.append(f"Not a sha256 digest, skipped: {d.strip()}")
+      emails = [i for i in cfg["identities"] if re.fullmatch(r"[^@\s*?/]+@[^@\s*?/]+\.[a-z]{2,}", i.strip(), re.I)]
+      if cfg["search_emails"]:
+          for e in emails:
+              queries["email:" + e.strip().lower()] = {"email": e.strip().lower()}
+
+      labels = {r["digest"]: (f"{r['repo']}@{r['tag']} {r['asset']}" if r["repo"] else r["digest"]) for r in releases}
+      # 3. Index search. UUIDs are unordered, so the seen set decides what is new.
+      found, hits = {}, {}
+      for key, q in queries.items():
+          try:
+              uuids = call(f"{REKOR}/api/v1/index/retrieve", q)
+          except urllib.error.HTTPError as e:
+              problems.append(f"Rekor index search {key}: HTTP {e.code} {e.read()[:200].decode(errors='replace')}")
+              continue
+          hits[key] = len(set(uuids))
+          if not uuids and "email" in q:
+              problems.append(f"No Rekor entry at all for {q['email']} (typo, or never used to sign)")
+          for u in set(uuids):
+              found.setdefault(u, []).append(key)
+      new = [u for u in found if u not in seen]
+      # Digest hits first, then the active shard, so the per-run cap spends requests on what matters most.
+      new.sort(key=lambda u: (not any(k.startswith("sha256:") for k in found[u]), not u.startswith(f"{int(cur['tree_id']):016x}")))
+      to_fetch, deferred = new[: cfg["max_entries_per_run"]], new[cfg["max_entries_per_run"]:]
+
+      # 4. Fetch, decode, extract the signer and verify inclusion.
+      def der_text(v):
+          if v and v[0] in (0x0C, 0x13, 0x16) and len(v) > 1:
+              n, i = v[1], 2
+              if n & 0x80:
+                  k = n & 0x7F
+                  n, i = int.from_bytes(v[2:2 + k], "big"), 2 + k
+              return v[i:i + n].decode(errors="replace")
+          return v.decode(errors="replace")
+
+      def signers(body):
+          spec, kind = body.get("spec", {}), body.get("kind")
+          if kind in ("hashedrekord", "rekord"):
+              return [spec.get("signature", {}).get("publicKey", {}).get("content")]
+          if kind == "dsse":
+              return [s.get("verifier") for s in spec.get("signatures", [])]
+          if kind == "intoto":
+              env = spec.get("content", {}).get("envelope", {})
+              return [s.get("publicKey") for s in env.get("signatures", [])] or [spec.get("publicKey")]
+          return [spec.get("publicKey", {}).get("content") if isinstance(spec.get("publicKey"), dict) else spec.get("publicKey")]
+
+      def describe(pk_b64):
+          row = {"signer_type": "UNPARSED"}
+          if not pk_b64:
+              return row
+          pem = base64.b64decode(pk_b64)
+          if b"-----BEGIN" not in pem:
+              pem = base64.b64decode(pem)
+          if b"BEGIN CERTIFICATE" in pem:
+              c = x509.load_pem_x509_certificate(pem)
+              ext = {e.oid.dotted_string.rsplit(".", 1)[1]: e.value.value for e in c.extensions if e.oid.dotted_string.startswith("1.3.6.1.4.1.57264.1.")}
+              get = lambda new_oid, old_oid=None: der_text(ext[new_oid]) if new_oid in ext else (ext[old_oid].decode(errors="replace") if old_oid in ext else None)
+              try:
+                  san = [str(g.value) if not isinstance(g, x509.OtherName) else der_text(g.value) for g in c.extensions.get_extension_for_class(x509.SubjectAlternativeName).value]
+              except x509.ExtensionNotFound:
+                  san = []
+              row.update(signer_type="CERTIFICATE", identity=san[0] if san else None, issuer=get("8", "1"),
+                         cert_issuer=c.issuer.rfc4514_string(), not_before=int(c.not_valid_before_utc.timestamp()), not_after=int(c.not_valid_after_utc.timestamp()),
+                         source_repo=get("12") or (("https://github.com/" + get("5")) if get("5") else None), source_ref=get("14", "6"),
+                         source_sha=get("13", "3"), trigger=get("20", "2"), build_config=get("18"), run_url=get("21"))
+          elif b"PUBLIC KEY" in pem:
+              k = serialization.load_pem_public_key(pem)
+              spki = k.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+              row.update(signer_type="PUBLIC_KEY", identity="sha256:" + hashlib.sha256(spki).hexdigest())
+          return row
+
+      entries = []
+      for i in range(0, len(to_fetch), 10):
+          for item in call(f"{REKOR}/api/v1/log/entries/retrieve", {"entryUUIDs": to_fetch[i:i + 10]}):
+              for uuid, e in item.items():
+                  uuid = next((u for u in to_fetch if u.endswith(uuid[-64:])), uuid)
+                  raw = base64.b64decode(e["body"])
+                  body = json.loads(raw)
+                  proof = (e.get("verification") or {}).get("inclusionProof")
+                  inclusion = "NO_PROOF"
+                  if proof:
+                      cp = parse_checkpoint(proof["checkpoint"])
+                      ok = (inclusion_ok(H(b"\x00", raw), proof["logIndex"], proof["treeSize"], [bytes.fromhex(h) for h in proof["hashes"]], bytes.fromhex(proof["rootHash"]))
+                            and cp["root"].hex() == proof["rootHash"] and cp["size"] == proof["treeSize"] and checkpoint_signed(cp)
+                            and cp["tree_id"] in shards)
+                      inclusion = "VERIFIED" if ok else "FAILED"
+                  digest = body.get("spec", {}).get("data", {}).get("hash", {})
+                  for n, pk in enumerate(signers(body) or [None]):
+                      try:
+                          s = describe(pk)
+                      except Exception as ex:
+                          s = {"signer_type": "UNPARSED", "identity": f"parse error {type(ex).__name__}"}
+                      entries.append(dict(s, uuid=uuid, signer=n, log_index=e["logIndex"], integrated_time=e["integratedTime"],
+                                          kind=f"{body.get('kind')} {body.get('apiVersion')}", artifact_digest=(f"{digest['algorithm']}:{digest['value']}" if digest.get("value") else None),
+                                          matched=found[uuid], inclusion=inclusion))
+                  seen[uuid] = e["logIndex"]
+
+      fetched = {e["uuid"] for e in entries}
+      missing = [u for u in to_fetch if u not in fetched]
+      if missing:
+          problems.append(f"{len(missing)} UUIDs returned by the index could not be retrieved; they are retried next run")
+      if baseline:
+          for u in deferred:
+              seen[u] = None
+
+      json.dump(entries, open("entries.json", "w"))
+      json.dump(releases, open("releases.json", "w"))
+      # A failed check keeps the old head, so every later run alerts again until someone looks.
+      json.dump({"checkpoint": {"tree_id": cur["tree_id"], "size": cur["size"], "root": cur["root"].hex()} if head_signed and consistency != "FAILED" else prev,
+                 "max_log_index": max([v for v in seen.values() if v is not None] + [state.get("max_log_index") or 0]),
+                 "entries": seen}, open("state.json", "w"))
+      print("::" + json.dumps({"outputs": {
+          "is_baseline": baseline, "queries": len(queries), "release_assets": len(releases), "index_hits": "; ".join(f"{labels.get(k, k)} {n}" for k, n in hits.items()),
+          "uuids_found": len(found), "new_uuids": len(new), "fetched": len(fetched), "deferred": len(deferred),
+          "baseline_unaudited": len(deferred) if baseline else 0, "tree_id": cur["tree_id"], "tree_size": cur["size"],
+          "head_signature": "VERIFIED" if head_signed else "FAILED", "consistency": consistency,
+          "previous_tree_size": prev.get("size"), "problems": problems,
+          "unsigned_assets": [labels[r["digest"]] for r in releases if hits.get(r["digest"]) == 0], "seen_total": len(seen)}}) + "::")
+
+  - id: evaluate
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Applies your policy to the facts in SQL: identity globs, issuer and ref allowlists, the caller repository of reusable
+      workflows, key fingerprints, release windows, certificate validity at log time and inclusion status. Writes one CSV
+      row per new signature and returns counts plus the alert text.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      config.json: "{{ inputs | toJson }}"
+      entries.json: "{{ outputs.scan_rekor.outputFiles['entries.json'] }}"
+      releases.json: "{{ outputs.scan_rekor.outputFiles['releases.json'] }}"
+    outputFiles:
+      - signatures_csv
+    sql: |
+      SET TimeZone = 'UTC';
+      CREATE TABLE cfg AS SELECT CAST(content AS JSON) AS c FROM read_text('config.json');
+      CREATE TABLE id_patterns AS SELECT lower(trim(p)) AS p FROM cfg, unnest(from_json(json_extract(c, '$.identities'), '["VARCHAR"]')) AS t(p);
+      CREATE TABLE issuers AS SELECT trim(i) AS i FROM cfg, unnest(from_json(json_extract(c, '$.allowed_issuers'), '["VARCHAR"]')) AS t(i);
+      CREATE TABLE refs AS SELECT trim(r) AS r FROM cfg, unnest(from_json(coalesce(json_extract(c, '$.allowed_refs'), '[]'), '["VARCHAR"]')) AS t(r) WHERE trim(r) <> '';
+      CREATE TABLE keys AS SELECT lower(trim(k)) AS k FROM cfg, unnest(from_json(coalesce(json_extract(c, '$.allowed_key_fingerprints'), '[]'), '["VARCHAR"]')) AS t(k);
+
+      CREATE TABLE e AS
+      SELECT j->>'$.uuid' AS uuid, CAST(j->>'$.signer' AS INTEGER) AS signer, CAST(j->>'$.log_index' AS BIGINT) AS log_index,
+             to_timestamp(CAST(j->>'$.integrated_time' AS BIGINT)) AS integrated_at, j->>'$.kind' AS kind,
+             j->>'$.signer_type' AS signer_type, j->>'$.identity' AS identity, j->>'$.issuer' AS issuer,
+             j->>'$.source_repo' AS source_repo, j->>'$.source_ref' AS source_ref, j->>'$.source_sha' AS source_sha,
+             j->>'$.trigger' AS trigger_event, j->>'$.run_url' AS run_url, j->>'$.artifact_digest' AS artifact_digest,
+             to_timestamp(CAST(j->>'$.not_before' AS BIGINT)) AS cert_not_before, to_timestamp(CAST(j->>'$.not_after' AS BIGINT)) AS cert_not_after,
+             j->>'$.inclusion' AS inclusion, CAST(json_extract(j, '$.matched') AS VARCHAR) AS matched
+      FROM (SELECT unnest(from_json(content, '["JSON"]')) AS j FROM read_text('entries.json'));
+
+      CREATE TABLE rel AS
+      SELECT r->>'$.repo' AS repo, r->>'$.tag' AS tag, r->>'$.asset' AS asset, r->>'$.digest' AS digest,
+             CAST(r->>'$.created_at' AS TIMESTAMPTZ) AS created_at, CAST(r->>'$.published_at' AS TIMESTAMPTZ) AS published_at
+      FROM (SELECT unnest(from_json(content, '["JSON"]')) AS r FROM read_text('releases.json'));
+
+      CREATE TABLE win AS
+      SELECT e.uuid, e.signer,
+             count(rel.created_at) AS releases_matched,
+             bool_or(e.integrated_at BETWEEN rel.created_at - to_hours(CAST((SELECT c->>'$.window_hours_before' FROM cfg) AS INTEGER))
+                                         AND rel.published_at + to_hours(CAST((SELECT c->>'$.window_hours_after' FROM cfg) AS INTEGER))) AS in_window,
+             string_agg(DISTINCT CASE WHEN rel.repo <> '' THEN rel.repo || '@' || rel.tag || ' ' || rel.asset ELSE 'listed ' || rel.digest END, '; ') AS release_assets
+      FROM e
+      LEFT JOIN rel ON rel.digest = e.artifact_digest OR list_contains(from_json(e.matched, '["VARCHAR"]'), rel.digest)
+      GROUP BY e.uuid, e.signer;
+
+      CREATE TABLE findings AS
+      SELECT e.*, w.release_assets,
+             regexp_extract(e.identity, '^(https.//github\.com/[^/]+/[^/]+)/\.github/workflows/', 1) AS workflow_repo,
+             concat_ws(' ',
+               CASE WHEN e.signer_type = 'PUBLIC_KEY' AND lower(e.identity) NOT IN (SELECT k FROM keys) THEN 'UNKNOWN_SIGNING_KEY' END,
+               CASE WHEN e.signer_type = 'CERTIFICATE' AND NOT EXISTS (SELECT 1 FROM id_patterns WHERE lower(e.identity) GLOB p) THEN 'UNEXPECTED_IDENTITY' END,
+               CASE WHEN e.signer_type = 'CERTIFICATE' AND coalesce(e.issuer, '') NOT IN (SELECT i FROM issuers) THEN 'UNEXPECTED_ISSUER' END,
+               CASE WHEN e.source_ref IS NOT NULL AND (SELECT count(*) FROM refs) > 0 AND NOT EXISTS (SELECT 1 FROM refs WHERE e.source_ref GLOB r) THEN 'UNEXPECTED_REF' END,
+               CASE WHEN workflow_repo <> '' AND e.source_repo IS NOT NULL AND lower(e.source_repo) <> lower(workflow_repo) THEN 'FOREIGN_CALLER' END,
+               CASE WHEN w.releases_matched > 0 AND NOT w.in_window THEN 'OUTSIDE_RELEASE_WINDOW' END,
+               CASE WHEN e.signer_type = 'CERTIFICATE' AND e.integrated_at NOT BETWEEN e.cert_not_before AND e.cert_not_after THEN 'LOGGED_OUTSIDE_CERT_VALIDITY' END,
+               CASE WHEN e.inclusion <> 'VERIFIED' THEN 'INCLUSION_' || e.inclusion END,
+               CASE WHEN e.signer_type = 'UNPARSED' THEN 'SIGNER_NOT_PARSED' END
+             ) AS flags
+      FROM e JOIN win w USING (uuid, signer);
+
+      COPY (
+        SELECT CASE WHEN flags = '' THEN 'OK' ELSE 'FLAGGED' END AS status, flags, log_index, strftime(integrated_at, '%Y-%m-%d %H.%M.%S') AS integrated_utc,
+               kind, signer_type, identity, issuer, source_repo, source_ref, source_sha, trigger_event, release_assets, artifact_digest,
+               inclusion, run_url, 'https://search.sigstore.dev/?logIndex=' || log_index AS search_url, uuid
+        FROM findings ORDER BY flags = '', integrated_at DESC
+      ) TO '{{ outputFiles.signatures_csv }}' (HEADER, DELIMITER ',');
+
+      CREATE TABLE flag_hits AS
+      SELECT f, count(*) AS n FROM (SELECT unnest(string_split(flags, ' ')) AS f FROM findings WHERE flags <> '') GROUP BY f;
+
+      SELECT
+        (SELECT count(DISTINCT uuid) FROM findings) AS entries_audited,
+        (SELECT count(*) FILTER (WHERE flags <> '') FROM findings) AS flagged,
+        (SELECT count(*) FILTER (WHERE flags = '') FROM findings) AS ok,
+        (SELECT count(*) FILTER (WHERE inclusion = 'VERIFIED') FROM findings) AS inclusion_verified,
+        (SELECT coalesce(string_agg(f || ' ' || n, ', ' ORDER BY n DESC), '') FROM flag_hits) AS flag_counts,
+        (SELECT coalesce(string_agg(DISTINCT identity, ', '), '') FROM findings WHERE flags <> '') AS flagged_identities,
+        (SELECT coalesce(string_agg(line, '' ORDER BY integrated_at DESC), '') FROM (
+            SELECT integrated_at, chr(10) || '- ' || flags || ' | ' || coalesce(identity, '?') || ' | ' || coalesce(issuer, 'no issuer') || coalesce(' | ' || source_ref, '')
+                   || coalesce(' | ' || release_assets, '') || ' | ' || strftime(integrated_at, '%Y-%m-%d %H.%M') || ' UTC | https://search.sigstore.dev/?logIndex=' || log_index AS line
+            FROM findings WHERE flags <> '' ORDER BY integrated_at DESC LIMIT 15)) AS alert_lines;
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Seen UUIDs with their logIndex (null for baseline entries recorded without fetching) and the last verified tree head.
+    key: "{{ inputs.state_key }}"
+    value: "{{ read(outputs.scan_rekor.outputFiles['state.json']) }}"
+
+  - id: alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.outputs[0].row.flagged > 0 or outputs.scan_rekor.vars.consistency == 'FAILED' or outputs.scan_rekor.vars.head_signature == 'FAILED' }}"
+    then:
+      - id: headline
+        type: io.kestra.plugin.core.debug.Return
+        format: "{{ outputs.scan_rekor.vars.consistency == 'FAILED' or outputs.scan_rekor.vars.head_signature == 'FAILED' ? 'Rekor tree head check FAILED (signature ' ~ outputs.scan_rekor.vars.head_signature ~ ', consistency with the head stored at size ' ~ outputs.scan_rekor.vars.previous_tree_size ~ ' ' ~ outputs.scan_rekor.vars.consistency ~ '). The log may have been forked or rewritten; the old head is kept so this alert repeats until resolved. ' : '' }}{{ outputs.evaluate.outputs[0].row.flagged }} unexpected signature(s) in Rekor{{ outputs.evaluate.outputs[0].row.flagged > 0 ? ' (' ~ outputs.evaluate.outputs[0].row.flag_counts ~ '), newest first' : '' }}."
+
+      - id: log_flagged
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.headline.value }}{{ outputs.evaluate.outputs[0].row.alert_lines }}"
+
+      - id: notify_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: allowFailure keeps the run usable without a webhook; the findings are still in the WARN log and the CSV.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": {{ (':warning: *Sigstore Rekor monitor*: ' ~ outputs.headline.value ~ outputs.evaluate.outputs[0].row.alert_lines) | toJson }} }
+    else:
+      - id: all_expected
+        type: io.kestra.plugin.core.log.Log
+        message: "No unexpected signatures: {{ outputs.evaluate.outputs[0].row.entries_audited }} new entries audited, all from expected identities, issuers, refs and windows."
+
+  - id: report_problems
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.scan_rekor.vars.problems | length > 0 }}"
+    level: WARN
+    message: "Input or API problems: {{ outputs.scan_rekor.vars.problems | join('; ') }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.scan_rekor.vars.is_baseline ? 'BASELINE run. ' : '' }}Rekor shard {{ outputs.scan_rekor.vars.tree_id }} at size {{ outputs.scan_rekor.vars.tree_size }} (head signature {{ outputs.scan_rekor.vars.head_signature }}, consistency with previous head {{ outputs.scan_rekor.vars.previous_tree_size ?? 'none' }} {{ outputs.scan_rekor.vars.consistency }}).
+      {{ outputs.scan_rekor.vars.queries }} index searches over {{ outputs.scan_rekor.vars.release_assets }} watched artifacts and the email identities: {{ outputs.scan_rekor.vars.uuids_found }} UUIDs, {{ outputs.scan_rekor.vars.new_uuids }} new, {{ outputs.scan_rekor.vars.fetched }} fetched, {{ outputs.scan_rekor.vars.deferred }} deferred{{ outputs.scan_rekor.vars.deferred == 0 ? '' : (outputs.scan_rekor.vars.is_baseline ? ' (recorded as baseline without fetching)' : ' to the next run') }}.
+      Audited {{ outputs.evaluate.outputs[0].row.entries_audited }} entries: {{ outputs.evaluate.outputs[0].row.ok }} signer(s) as expected, {{ outputs.evaluate.outputs[0].row.flagged }} flagged, {{ outputs.evaluate.outputs[0].row.inclusion_verified }} inclusion proofs verified.
+      UUIDs per search: {{ outputs.scan_rekor.vars.index_hits }}
+      Watched release assets with no Rekor entry at all: {{ outputs.scan_rekor.vars.unsigned_assets is empty ? 'none' : (outputs.scan_rekor.vars.unsigned_assets | join('; ')) }}
+
+outputs:
+  - id: audit
+    type: JSON
+    value: "{{ outputs.evaluate.outputs[0].row }}"
+  - id: log_scan
+    type: JSON
+    value: "{{ outputs.scan_rekor.vars }}"
+  - id: signatures_csv
+    type: FILE
+    value: "{{ outputs.evaluate.outputFiles.signatures_csv }}"
+
+extend:
+  title: Monitor the Sigstore Rekor Transparency Log for Unexpected Signatures with Your Identities
+  metaTitle: Sigstore Rekor Signing Identity Monitor with DuckDB and Slack | Kestra
+  shortDescription: Search the public Rekor log daily for signatures over your release assets and by your email identities, parse the Fulcio certificate of every new entry, verify its inclusion proof and the log's consistency, and alert on unexpected identities, issuers, refs, keys or signing times.
+  metaDescription: Daily Sigstore Rekor monitor. Find unexpected signers of your release artifacts, verify inclusion proofs and log consistency, alert in Slack, export a CSV.
+  description: |
+    With keyless signing, anyone who gets an OIDC token for your identity, or runs your release workflow, can make a valid signature, and every one of them lands in the public Rekor transparency log. The log only helps if somebody reads it. This flow reads it daily, extracts who signed each new entry (certificate SAN, OIDC issuer, GitHub repository, ref, commit), verifies the entry is in the log and flags what your policy does not expect.
+
+    **What Rekor can and cannot search.** The v1 index (`POST /api/v1/index/retrieve`) accepts an `email` or an artifact `hash`, nothing else; a workflow URI is rejected with HTTP 422 (`email in body must be of type email`). So workflow identities are watched through the sha256 of your release assets, which the GitHub releases API returns as `digest`, and emails are searched directly. Rekor v2 shards (such as `log2025-1.rekor.sigstore.dev`) have no search index, so entries logged only there are not visible.
+
+    ## How it works
+
+    1. A daily `Schedule` starts the run; `previous_state` (KV Get) loads the seen UUIDs with their logIndex and the last verified tree head.
+    2. `scan_rekor` (Python with `cryptography`) collects facts, no policy. It verifies the signed tree head from `/api/v1/log` and, through `/api/v1/log/proof`, that the head stored by the last run is a prefix of it (RFC 9162 consistency). It lists the assets matching `asset_name_regex` in the latest releases of `github_repos`, searches the index by hash for them and for `artifact_digests`, and by email for the plain emails in `identities`. New UUIDs are fetched via `/api/v1/log/entries/retrieve`, 10 per request; each base64 body (hashedrekord, dsse, intoto, rekord) is decoded, the certificate parsed or key fingerprinted, and the inclusion proof checked against the entry's signed checkpoint.
+    3. `evaluate` (DuckDB) applies the policy in SQL, one CSV row per new signer: `UNEXPECTED_IDENTITY` (no `identities` glob matches), `UNEXPECTED_ISSUER`, `UNEXPECTED_REF`, `FOREIGN_CALLER` (your reusable workflow called from another repository), `UNKNOWN_SIGNING_KEY`, `OUTSIDE_RELEASE_WINDOW`, `LOGGED_OUTSIDE_CERT_VALIDITY`, `INCLUSION_FAILED`.
+    4. `save_state` (KV Set) stores the seen UUIDs and the new head; after a failed consistency check the old head is kept, so the alert repeats.
+    5. `alert` (If) runs when anything is flagged or the head check failed: a WARN log with up to 15 findings and a Slack message (`allowFailure`); otherwise an all-clear line.
+    6. `report_problems` names unknown repositories, malformed digests and emails with no entry; `summary` logs the counts. Outputs: audit row, scan facts, CSV.
+
+    ## What you get
+
+    - A CSV row per new signature: flags, logIndex, time, kind, identity, issuer, repository, ref, commit, release asset, inclusion status and a `search.sigstore.dev` link.
+    - Each entry reported once: the index returns UUIDs unordered, so a seen set, not a logIndex cursor, decides what is new.
+    - Inclusion proofs, checkpoint signatures and log consistency between runs, not just a lookup.
+    - Release assets with no Rekor entry at all, so silently broken signing shows up.
+
+    ## Who it's for
+
+    - Maintainers and platform teams signing releases with cosign, GoReleaser or GitHub attestations.
+    - Security teams who want to know when a fork, a branch build or a stolen token signs as them.
+
+    ## Why orchestrate this with Kestra
+
+    - The policy is plain SQL and every threshold an input; one flow serves many watchlists via `state_key`.
+    - KV state carries "report once" and the consistency check across runs, no database needed.
+    - `If`, `allowFailure` and the schedule replace cron glue, and every run keeps its logs and CSV.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the Python, DuckDB and Slack plugins and a Docker-capable worker (`python:3.13-slim`, `cryptography` installed at start).
+    - Outbound HTTPS to `rekor.sigstore.dev` and `api.github.com`, both keyless (GitHub allows 60 requests per hour; one per repository per run).
+    - The first run is a BASELINE: it fetches up to `max_entries_per_run` entries, release digests first, and records the rest of a busy email identity unfetched.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the alert (optional; without it the task warns and the findings stay in the log and the CSV).
+
+    ## Quick start
+
+    1. Execute with the defaults. They watch GoReleaser (signed by `release.yml` on tags) and cosign (signed by the `keyless@projectsigstore` account and a KMS key). The baseline flags real oddities on cosign binaries: a third-party packaging workflow signing from a branch, and an unknown key signing two weeks after a release.
+    2. Execute again: nothing new, consistency `VERIFIED`.
+    3. Set `include_prereleases` to true with a new `state_key`: GoReleaser nightlies, signed by `nightly-oss.yml@refs/heads/main`, are flagged.
+    4. Put in your repositories, identities and issuers, add `SLACK_WEBHOOK_URL` and keep the schedule.
+
+    ## How to extend
+
+    - Verify the Fulcio chain against the Sigstore TUF trust root, or run `cosign verify-blob` on flagged entries.
+    - Add container image digests from your registry to `artifact_digests`.
+    - Page on-call for `FOREIGN_CALLER` and failed consistency checks; keep Slack for the rest.
+
+    ## Links
+
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script) and [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store) and [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Rekor overview](https://docs.sigstore.dev/logging/overview/) and [Rekor API](https://www.sigstore.dev/swagger/)
+    - [Fulcio certificate extensions](https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md)
+    - [RFC 9162, inclusion and consistency proofs](https://www.rfc-editor.org/rfc/rfc9162)
+    - [GitHub releases API](https://docs.github.com/en/rest/releases/releases)
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+    - Monitoring & Alerting
+  ee: false
+  demo: false
