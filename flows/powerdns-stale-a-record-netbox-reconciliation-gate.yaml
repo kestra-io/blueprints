@@ -1,0 +1,752 @@
+id: powerdns-stale-a-record-netbox-reconciliation-gate
+namespace: company.team
+
+description: |
+  Remove DNS A records that point at addresses your IPAM says are gone. Every A record in the managed
+  prefixes of a PowerDNS zone is checked against NetBox. Records on deprecated addresses are tracked in Kestra
+  KV, wait out a grace window, and are removed after an operator confirms the count. The PATCH is rebuilt from
+  fresh zone data after approval, applied atomically per zone and verified by reading the zone back.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: pdns_url
+    type: STRING
+    displayName: PowerDNS API URL
+    description: Base URL of the PowerDNS Authoritative webserver, reachable from the Docker task runner.
+    defaults: "http://host.docker.internal:8081"
+
+  - id: netbox_url
+    type: STRING
+    displayName: NetBox URL
+    defaults: "http://host.docker.internal:8000"
+
+  - id: zones
+    type: ARRAY
+    itemType: STRING
+    displayName: Zones to audit
+    description: Zone names with the trailing dot, exactly as PowerDNS knows them.
+    defaults:
+      - "corp.example.com."
+
+  - id: managed_prefixes
+    type: ARRAY
+    itemType: STRING
+    displayName: Managed IPv4 prefixes
+    description: Only A records whose address lies in one of these prefixes are judged. NetBox must be the source of truth for them.
+    defaults:
+      - "10.0.0.0/16"
+
+  - id: protected_name_regex
+    type: STRING
+    displayName: Protected record names
+    description: Record labels matching this regular expression are never removed. The zone apex is always protected.
+    defaults: "^(ns[0-9]*|mail|mx[0-9]*|smtp|vpn|_.*)$"
+
+  - id: deprecated_min_days
+    type: INT
+    displayName: Days an address must stay deprecated in NetBox
+    description: Measured from the address's last_updated in NetBox, so addresses are not released to DNS removal the day they are retired.
+    defaults: 14
+
+  - id: grace_hours
+    type: INT
+    displayName: Grace window in hours
+    description: A record must be seen as stale for this long, with the same classification, before it can be removed.
+    defaults: 48
+
+  - id: remove_reassigned
+    type: BOOL
+    displayName: Also remove records on reassigned addresses
+    description: Off by default. A reassigned address now belongs to a host with a different name; it is always reported, and removed only when this is on.
+    defaults: false
+
+  - id: remove_unregistered
+    type: BOOL
+    displayName: Also remove records on addresses NetBox does not know
+    description: Off by default, because an incomplete IPAM would turn every missing address into a deletion.
+    defaults: false
+
+  - id: max_ops_per_run
+    type: INT
+    displayName: Max records removed per run
+    defaults: 20
+
+  - id: max_zone_share_pct
+    type: INT
+    displayName: Max share of a zone's managed A records removed per run
+    description: Above this share nothing is planned for the zone, because the problem is probably the IPAM data.
+    defaults: 30
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the plan is reported and tracked, but no approval is requested and no record is changed.
+    defaults: true
+
+variables:
+  state_key: "dns_stale_records_state_{{ (inputs.pdns_url ~ '-' ~ inputs.netbox_url) | slugify }}"
+  audit_key: "dns_stale_records_audit_{{ (inputs.pdns_url ~ '-' ~ inputs.netbox_url) | slugify }}"
+  lib_js: |
+    const crypto = require("crypto");
+
+    const DAY = 864e5;
+    const ACTIVE_LIKE = new Set(["active", "reserved", "dhcp", "slaac"]);
+
+    const normName = (n) => String(n).toLowerCase().replace(/\.$/, "");
+    const zoneId = (z) => (z.endsWith(".") ? z : z + ".");
+
+    function ipv4ToInt(ip) {
+      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+      if (!m || m.slice(1).some((o) => Number(o) > 255)) return null;
+      return ((Number(m[1]) << 24) | (Number(m[2]) << 16) | (Number(m[3]) << 8) | Number(m[4])) >>> 0;
+    }
+    function inPrefix(ip, cidr) {
+      const [net, bits] = cidr.split("/");
+      const n = ipv4ToInt(net), a = ipv4ToInt(ip), b = Number(bits);
+      if (n === null || a === null || !(b >= 0 && b <= 32)) return false;
+      const mask = b === 0 ? 0 : (~0 << (32 - b)) >>> 0;
+      return (a & mask) === (n & mask);
+    }
+
+    function powerdns({ url, apiKey }) {
+      const base = url.replace(/\/+$/, "");
+      const call = async (method, path, body) => {
+        const res = await fetch(`${base}/api/v1/servers/localhost${path}`, { method, headers: { "X-API-Key": apiKey, "Content-Type": "application/json", Accept: "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+        const text = await res.text();
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (e) { /* non-JSON error body */ }
+        return { status: res.status, json, text };
+      };
+      return {
+        async getZone(zone) {
+          const r = await call("GET", `/zones/${encodeURIComponent(zoneId(zone))}`);
+          if (r.status !== 200 || !r.json || !Array.isArray(r.json.rrsets)) throw new Error(`PowerDNS zone ${zone} read failed (HTTP ${r.status}): ${r.text.slice(0, 160)}`);
+          for (const s of r.json.rrsets) {
+            if (typeof s.name !== "string" || typeof s.type !== "string" || typeof s.ttl !== "number" || !Array.isArray(s.records)) throw new Error(`Unexpected rrset shape in zone ${zone}: expected name, type, ttl and records`);
+            for (const rec of s.records) if (typeof rec.content !== "string" || typeof rec.disabled !== "boolean") throw new Error(`Unexpected record shape in zone ${zone}: expected content and disabled`);
+          }
+          return r.json;
+        },
+        async patchZone(zone, rrsets) { return call("PATCH", `/zones/${encodeURIComponent(zoneId(zone))}`, { rrsets }); },
+      };
+    }
+
+    function netbox({ url, token }) {
+      const base = url.replace(/\/+$/, "");
+      const get = async (pathAndQuery) => {
+        const res = await fetch(`${base}${pathAndQuery}`, { headers: { Authorization: `Token ${token}`, Accept: "application/json" } });
+        const text = await res.text();
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (e) { /* non-JSON error body */ }
+        if (res.status !== 200 || !json || !Array.isArray(json.results)) throw new Error(`NetBox ${pathAndQuery.split("?")[0]} failed (HTTP ${res.status}): ${text.slice(0, 160)}`);
+        return json;
+      };
+      return {
+        // `next` links are absolute URLs built from NetBox's own BASE_URL; follow only their path and query against our base.
+        async ipsInPrefix(prefix) {
+          let next = `/api/ipam/ip-addresses/?parent=${encodeURIComponent(prefix)}&limit=1000`;
+          const out = [];
+          for (let guard = 0; next && guard < 1000; guard++) {
+            const page = await get(next);
+            for (const r of page.results) {
+              const status = r.status && typeof r.status === "object" ? r.status.value : r.status;
+              if (typeof r.address !== "string" || typeof status !== "string") throw new Error("Unexpected NetBox IP shape: expected address and status");
+              out.push({ host: r.address.split("/")[0], status, dnsName: r.dns_name || "", vrf: r.vrf ? (r.vrf.name || String(r.vrf.id)) : "", lastUpdated: r.last_updated ? Date.parse(r.last_updated) : null });
+            }
+            next = page.next ? (() => { const u = new URL(page.next); return u.pathname + u.search; })() : null;
+          }
+          return out;
+        },
+      };
+    }
+
+
+    function indexNetbox(ips) {
+      const m = new Map();
+      for (const e of ips) { if (!m.has(e.host)) m.set(e.host, []); m.get(e.host).push(e); }
+      return m;
+    }
+
+    // DEPRECATED: IPAM says the address is retired. REASSIGNED: it now belongs to a host with a different name. UNREGISTERED: IPAM does not know it.
+    function classify(name, ip, index, now) {
+      const entries = index.get(ip);
+      if (!entries) return { cls: "UNREGISTERED", detail: "not in NetBox" };
+      if (entries.every((e) => e.status === "deprecated")) {
+        const newest = Math.max(...entries.map((e) => e.lastUpdated || 0));
+        return { cls: "DEPRECATED", ageDays: newest ? (now - newest) / DAY : 0, detail: "deprecated in NetBox" };
+      }
+      const owners = entries.filter((e) => ACTIVE_LIKE.has(e.status)).map((e) => normName(e.dnsName)).filter(Boolean);
+      if (owners.length && !owners.includes(normName(name))) return { cls: "REASSIGNED", detail: `NetBox assigns it to ${owners.join(", ")}` };
+      return { cls: "OK", detail: "" };
+    }
+
+    function hashRrset(s) {
+      const recs = s.records.map((r) => `${r.content}|${r.disabled}`).sort().join(";");
+      return crypto.createHash("sha256").update(`${s.ttl}#${recs}`).digest("hex");
+    }
+    const rrsetKey = (s) => `${normName(s.name)}|${s.type}`;
+
+    // Build one atomic PATCH body for a zone from FRESH zone data: drop only the stale IPs from each A rrset.
+    function buildPatch(zoneData, intents) {
+      const byKey = new Map(zoneData.rrsets.map((s) => [rrsetKey(s), s]));
+      const grouped = new Map();
+      for (const i of intents) {
+        const k = `${normName(i.name)}|A`;
+        if (!grouped.has(k)) grouped.set(k, new Set());
+        grouped.get(k).add(i.ip);
+      }
+      const rrsets = [];
+      const expected = [];
+      for (const [k, ips] of grouped) {
+        const s = byKey.get(k);
+        if (!s) continue;
+        const remaining = s.records.filter((r) => !ips.has(r.content));
+        if (remaining.length === s.records.length) continue;
+        if (remaining.length === 0) {
+          rrsets.push({ name: s.name, type: "A", changetype: "DELETE", records: [] });
+          expected.push({ name: s.name, type: "A", remaining: [], previous: s });
+        } else {
+          rrsets.push({ name: s.name, type: "A", ttl: s.ttl, changetype: "REPLACE", records: remaining.map((r) => ({ content: r.content, disabled: r.disabled })) });
+          expected.push({ name: s.name, type: "A", remaining: remaining.map((r) => r.content), previous: s });
+        }
+      }
+      return { rrsets, expected };
+    }
+
+    module.exports = { DAY, ACTIVE_LIKE, normName, zoneId, inPrefix, powerdns, netbox, indexNetbox, classify, hashRrset, rrsetKey, buildPatch };
+
+triggers:
+  - id: nightly_dns_reconciliation
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Age stale records through the grace window every night. Shipped disabled until pdns_url, netbox_url, zones and managed_prefixes point at your systems.
+    cron: "20 2 * * *"
+    disabled: true
+
+  - id: decommission_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call from a NetBox webhook or a decommission pipeline when addresses are marked deprecated.
+    key: "{{ secret('DNS_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: scan_dns_records
+    type: io.kestra.plugin.scripts.node.Script
+    description: Read every managed A record from PowerDNS, look its address up in NetBox, classify it, age stale records in the KV ledger and plan the removals.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: node:20-slim
+    inputFiles:
+      lib.js: "{{ vars.lib_js }}"
+      state.json: "{{ kv(key=render(vars.state_key), errorOnMissing=false) | default('{}') }}"
+    env:
+      PDNS_URL: "{{ inputs.pdns_url }}"
+      PDNS_API_KEY: "{{ secret('PDNS_API_KEY') }}"
+      NETBOX_URL: "{{ inputs.netbox_url }}"
+      NETBOX_TOKEN: "{{ secret('NETBOX_TOKEN') }}"
+      ZONES: "{{ inputs.zones | toJson }}"
+      MANAGED_PREFIXES: "{{ inputs.managed_prefixes | toJson }}"
+      PROTECTED_NAME_REGEX: "{{ inputs.protected_name_regex }}"
+      DEPRECATED_MIN_DAYS: "{{ inputs.deprecated_min_days }}"
+      GRACE_HOURS: "{{ inputs.grace_hours }}"
+      REMOVE_REASSIGNED: "{{ inputs.remove_reassigned }}"
+      REMOVE_UNREGISTERED: "{{ inputs.remove_unregistered }}"
+      MAX_OPS_PER_RUN: "{{ inputs.max_ops_per_run }}"
+      MAX_ZONE_SHARE_PCT: "{{ inputs.max_zone_share_pct }}"
+    outputFiles:
+      - ops.json
+      - snapshot.json
+      - state.json
+      - findings.json
+    script: |
+      const fs = require("fs");
+      const lib = require("./lib.js");
+
+      const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+      const num = (key, fallback) => {
+        const value = Number(env(key, fallback));
+        if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid numeric setting ${key}`);
+        return value;
+      };
+      for (const k of ["PDNS_URL", "PDNS_API_KEY", "NETBOX_URL", "NETBOX_TOKEN"]) if (!env(k, "")) throw new Error(`${k} is required`);
+      const zones = JSON.parse(env("ZONES", "[]"));
+      const prefixes = JSON.parse(env("MANAGED_PREFIXES", "[]"));
+      if (!Array.isArray(zones) || !zones.length) throw new Error("ZONES must list at least one zone");
+      if (!Array.isArray(prefixes) || !prefixes.length || prefixes.some((p) => !/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(p))) throw new Error("MANAGED_PREFIXES must list IPv4 CIDR prefixes");
+      const cfg = {
+        protectedRe: new RegExp(env("PROTECTED_NAME_REGEX", "^(ns[0-9]*|mail|mx[0-9]*|smtp|vpn|_.*)$")),
+        deprecatedMinDays: num("DEPRECATED_MIN_DAYS", "14"),
+        graceHours: num("GRACE_HOURS", "48"),
+        removeReassigned: env("REMOVE_REASSIGNED", "false") === "true",
+        removeUnregistered: env("REMOVE_UNREGISTERED", "false") === "true",
+        maxOps: num("MAX_OPS_PER_RUN", "20"),
+        maxZoneSharePct: num("MAX_ZONE_SHARE_PCT", "30"),
+      };
+      const pdns = lib.powerdns({ url: env("PDNS_URL", ""), apiKey: env("PDNS_API_KEY", "") });
+      const nb = lib.netbox({ url: env("NETBOX_URL", ""), token: env("NETBOX_TOKEN", "") });
+
+      const readJson = (file, fallback) => {
+        const text = fs.readFileSync(file, "utf8").trim();
+        return text === "" || text === "null" ? fallback : JSON.parse(text);
+      };
+
+      (async () => {
+        const now = Date.now();
+        const nowIso = new Date(now).toISOString();
+        const ledger = (readJson("state.json", {}) || {}).records || {};
+
+        const allIps = [];
+        for (const p of prefixes) {
+          const ips = await nb.ipsInPrefix(p);
+          if (!ips.length) throw new Error(`NetBox returned no IP addresses for ${p}; refusing to judge DNS records against an empty source of truth`);
+          allIps.push(...ips);
+        }
+        const index = lib.indexNetbox(allIps);
+
+        const findings = [];
+        const intents = [];
+        const newLedger = {};
+        const snapshot = {};
+        let recordsChecked = 0;
+        const blockedZones = [];
+
+        for (const zone of zones) {
+          const z = await pdns.getZone(zone);
+          const zname = lib.normName(z.name);
+          snapshot[zone] = Object.fromEntries(z.rrsets.filter((s) => s.type !== "SOA").map((s) => [lib.rrsetKey(s), lib.hashRrset(s)]));
+          const zoneIntents = [];
+          let zoneARecords = 0;
+          for (const s of z.rrsets) {
+            if (s.type !== "A") continue;
+            const label = lib.normName(s.name) === zname ? "@" : lib.normName(s.name).slice(0, -(zname.length + 1));
+            for (const rec of s.records) {
+              if (rec.disabled) continue;
+              if (!prefixes.some((p) => lib.inPrefix(rec.content, p))) continue;
+              zoneARecords++;
+              recordsChecked++;
+              if (label === "@" || cfg.protectedRe.test(label)) continue;
+              const c = lib.classify(s.name, rec.content, index, now);
+              if (c.cls === "OK") continue;
+              const id = `${zone}|${lib.normName(s.name)}|${rec.content}`;
+              const firstSeen = ledger[id] && ledger[id].cls === c.cls ? ledger[id].first_seen : nowIso;
+              newLedger[id] = { zone, name: s.name, ip: rec.content, cls: c.cls, first_seen: firstSeen };
+              const ledgerAged = now - Date.parse(firstSeen) >= cfg.graceHours * 36e5;
+              let eligible = false;
+              if (c.cls === "DEPRECATED") eligible = ledgerAged && c.ageDays >= cfg.deprecatedMinDays;
+              else if (c.cls === "REASSIGNED") { eligible = cfg.removeReassigned && ledgerAged; findings.push({ kind: "REASSIGNED_IP", severity: "warning", is_new: firstSeen === nowIso, name: s.name, ip: rec.content, detail: `${s.name} -> ${rec.content}: ${c.detail}; the record may send traffic to another host` }); }
+              else if (c.cls === "UNREGISTERED") eligible = cfg.removeUnregistered && ledgerAged;
+              if (eligible) zoneIntents.push({ zone, name: s.name, ip: rec.content, cls: c.cls, reason: c.cls === "DEPRECATED" ? `${c.detail} for ${Math.floor(c.ageDays)} days` : c.detail, first_seen: firstSeen });
+            }
+          }
+          if (zoneARecords >= 5 && (zoneIntents.length * 100) / zoneARecords > cfg.maxZoneSharePct) {
+            blockedZones.push(zone);
+            findings.push({ kind: "ZONE_BLOCKED", severity: "warning", is_new: true, detail: `${zone}: ${zoneIntents.length} of ${zoneARecords} managed A records would be removed (more than ${cfg.maxZoneSharePct}%); this looks like an IPAM data problem, nothing is planned for the zone` });
+          } else intents.push(...zoneIntents);
+        }
+
+        intents.sort((a, b) => a.zone.localeCompare(b.zone) || a.name.localeCompare(b.name) || a.ip.localeCompare(b.ip));
+        const capped = intents.slice(0, cfg.maxOps);
+        const lines = [
+          ...capped.map((o) => `• ${o.zone} ${o.name} A ${o.ip}: ${o.cls} (${o.reason})`),
+          ...findings.filter((f) => f.is_new).map((f) => `• [${f.kind}] ${f.detail}`),
+          ...(intents.length > capped.length ? [`• ${intents.length - capped.length} more record(s) wait for the next run (max_ops_per_run)`] : []),
+        ];
+        fs.writeFileSync("ops.json", JSON.stringify(capped));
+        fs.writeFileSync("snapshot.json", JSON.stringify(snapshot));
+        fs.writeFileSync("state.json", JSON.stringify({ version: 1, records: newLedger }));
+        fs.writeFileSync("findings.json", JSON.stringify(findings));
+        console.log("::" + JSON.stringify({ outputs: {
+          zones: zones.length,
+          records_checked: recordsChecked,
+          netbox_addresses: allIps.length,
+          ops_count: capped.length,
+          pending: Object.keys(newLedger).length - capped.length,
+          blocked_zones: blockedZones.length,
+          findings_count: findings.filter((f) => f.is_new).length,
+          has_ops: capped.length > 0,
+          has_attention: capped.length > 0 || findings.some((f) => f.is_new),
+          summary: lines.join("\n"),
+        } }) + "::");
+      })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+  - id: gate_attention
+    type: io.kestra.plugin.core.flow.If
+    description: Only alert when records are planned for removal or a new finding such as a reassigned address or a blocked zone appears.
+    condition: "{{ outputs.scan_dns_records.vars.has_attention }}"
+    then:
+      - id: notify_plan
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the removal plan and every new finding.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":mag: *Stale DNS records* (execution `" ~ execution.id ~ "`, dry_run=" ~ inputs.dry_run ~ "): " ~ outputs.scan_dns_records.vars.ops_count ~ " record(s) planned for removal from " ~ outputs.scan_dns_records.vars.records_checked ~ " managed A records, " ~ outputs.scan_dns_records.vars.pending ~ " still ageing.",
+            "attachments": [ { "color": "#E2B93B", "text": outputs.scan_dns_records.vars.summary } ]
+          } | toJson }}
+
+      - id: gate_ops
+        type: io.kestra.plugin.core.flow.If
+        description: Findings without a removal end here.
+        condition: "{{ outputs.scan_dns_records.vars.has_ops }}"
+        then:
+          - id: gate_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Dry runs stop after reporting so the plan can be reviewed for several nights before removal is enabled.
+            condition: "{{ inputs.dry_run }}"
+            then:
+              - id: log_dry_run
+                type: io.kestra.plugin.core.log.Log
+                description: Record what a real run would remove.
+                message: "Dry run: {{ outputs.scan_dns_records.vars.ops_count }} record(s) would be removed. Set dry_run to false to enable removal."
+            else:
+              - id: pause_for_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Hold the plan for an operator. Unapproved plans fail after 12 hours and the state is not advanced.
+                pauseDuration: PT12H
+                behavior: FAIL
+                onResume:
+                  - id: confirm_count
+                    type: INT
+                    defaults: 0
+                    description: Type the number of records listed in the Slack plan. A different number aborts the run.
+                  - id: approver_note
+                    type: STRING
+                    defaults: ""
+                    description: Change ticket or reason recorded in the audit entry.
+
+              - id: check_confirmation
+                type: io.kestra.plugin.core.flow.If
+                description: The operator must have read the plan well enough to repeat its size.
+                condition: "{{ (outputs.pause_for_approval.onResume.confirm_count ~ '') != (outputs.scan_dns_records.vars.ops_count ~ '') }}"
+                then:
+                  - id: fail_confirmation
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort before any record is changed.
+                    errorMessage: "Confirmation mismatch: the plan removes {{ outputs.scan_dns_records.vars.ops_count }} record(s) but {{ outputs.pause_for_approval.onResume.confirm_count }} was entered."
+
+              - id: recheck_ops
+                type: io.kestra.plugin.scripts.node.Script
+                description: Approval can take hours. Re-read NetBox and the zones, drop records whose address is no longer stale, and rebuild every PATCH from fresh zone data so concurrent edits are not overwritten.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: node:20-slim
+                inputFiles:
+                  lib.js: "{{ vars.lib_js }}"
+                  ops.json: "{{ outputs.scan_dns_records.outputFiles['ops.json'] }}"
+                env:
+                  PDNS_URL: "{{ inputs.pdns_url }}"
+                  PDNS_API_KEY: "{{ secret('PDNS_API_KEY') }}"
+                  NETBOX_URL: "{{ inputs.netbox_url }}"
+                  NETBOX_TOKEN: "{{ secret('NETBOX_TOKEN') }}"
+                  MANAGED_PREFIXES: "{{ inputs.managed_prefixes | toJson }}"
+                  DEPRECATED_MIN_DAYS: "{{ inputs.deprecated_min_days }}"
+                outputFiles:
+                  - expected.json
+                  - snapshot_fresh.json
+                  - ops_fresh.json
+                script: |
+                  const fs = require("fs");
+                  const lib = require("./lib.js");
+
+                  const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+                  const num = (key, fallback) => Number(env(key, fallback));
+                  for (const k of ["PDNS_URL", "PDNS_API_KEY", "NETBOX_URL", "NETBOX_TOKEN"]) if (!env(k, "")) throw new Error(`${k} is required`);
+                  const prefixes = JSON.parse(env("MANAGED_PREFIXES", "[]"));
+                  const deprecatedMinDays = num("DEPRECATED_MIN_DAYS", "14");
+                  const pdns = lib.powerdns({ url: env("PDNS_URL", ""), apiKey: env("PDNS_API_KEY", "") });
+                  const nb = lib.netbox({ url: env("NETBOX_URL", ""), token: env("NETBOX_TOKEN", "") });
+
+                  // Approval can take hours. Re-read DNS and IPAM and rebuild every PATCH from fresh zone data, so concurrent edits are never overwritten.
+                  (async () => {
+                    const now = Date.now();
+                    const intents = JSON.parse(fs.readFileSync("ops.json", "utf8"));
+                    const allIps = [];
+                    for (const p of prefixes) allIps.push(...(await nb.ipsInPrefix(p)));
+                    const index = lib.indexNetbox(allIps);
+
+                    const zoneCache = new Map();
+                    const dropped = [];
+                    const freshByZone = new Map();
+                    for (const i of intents) {
+                      if (!zoneCache.has(i.zone)) zoneCache.set(i.zone, await pdns.getZone(i.zone));
+                      const z = zoneCache.get(i.zone);
+                      const rrset = z.rrsets.find((s) => s.type === "A" && lib.normName(s.name) === lib.normName(i.name));
+                      if (!rrset || !rrset.records.some((r) => r.content === i.ip)) { dropped.push(`${i.name} ${i.ip}: record no longer exists`); continue; }
+                      const c = lib.classify(i.name, i.ip, index, now);
+                      if (c.cls !== i.cls || (c.cls === "DEPRECATED" && c.ageDays < deprecatedMinDays)) { dropped.push(`${i.name} ${i.ip}: NetBox now says ${c.cls}`); continue; }
+                      if (!freshByZone.has(i.zone)) freshByZone.set(i.zone, []);
+                      freshByZone.get(i.zone).push(i);
+                    }
+
+                    const patches = [];
+                    const expected = [];
+                    const fresh = [];
+                    for (const [zone, list] of freshByZone) {
+                      const { rrsets, expected: exp } = lib.buildPatch(zoneCache.get(zone), list);
+                      if (!rrsets.length) continue;
+                      patches.push({ zone, body: JSON.stringify({ rrsets }), rrsets: rrsets.length });
+                      expected.push({ zone, expected: exp });
+                      fresh.push(...list);
+                    }
+                    // The collateral check compares against zone data read just before the PATCH, not hours earlier, so unrelated edits made during approval are not blamed on this run.
+                    const freshSnapshot = {};
+                    for (const p of patches) freshSnapshot[p.zone] = Object.fromEntries(zoneCache.get(p.zone).rrsets.filter((s) => s.type !== "SOA").map((s) => [lib.rrsetKey(s), lib.hashRrset(s)]));
+                    fs.writeFileSync("snapshot_fresh.json", JSON.stringify(freshSnapshot));
+                    fs.writeFileSync("expected.json", JSON.stringify(expected));
+                    fs.writeFileSync("ops_fresh.json", JSON.stringify(fresh));
+                    console.log("::" + JSON.stringify({ outputs: { patches, fresh_count: fresh.length, zone_patches: patches.length, dropped_count: dropped.length, has_fresh: patches.length > 0, dropped_summary: dropped.join("; ") } }) + "::");
+                  })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: gate_fresh
+                type: io.kestra.plugin.core.flow.If
+                description: Nothing left after the re-check means nothing to change.
+                condition: "{{ outputs.recheck_ops.vars.has_fresh }}"
+                then:
+                  - id: apply_zone_patches
+                    type: io.kestra.plugin.core.flow.Loop
+                    description: Patch one zone at a time. PowerDNS applies each PATCH in a single transaction, so a zone changes completely or not at all.
+                    values: "{{ outputs.recheck_ops.vars.patches }}"
+                    concurrencyLimit: 1
+                    tasks:
+                      - id: patch_zone
+                        type: io.kestra.plugin.core.http.Request
+                        description: Send the rebuilt rrset changes for the zone. A 204 means the transaction committed; anything else fails the run.
+                        uri: "{{ inputs.pdns_url }}/api/v1/servers/localhost/zones/{{ item.value.zone }}"
+                        method: PATCH
+                        headers:
+                          X-API-Key: "{{ secret('PDNS_API_KEY') }}"
+                          Content-Type: "application/json"
+                        body: "{{ item.value.body }}"
+                        options:
+                          allowedResponseCodes:
+                            - 204
+
+                  - id: verify_zones
+                    type: io.kestra.plugin.scripts.node.Script
+                    description: Read every patched zone again. Removed records must be gone, kept records and TTLs intact, and no other rrset may have changed since just before the PATCH.
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                    containerImage: node:20-slim
+                    inputFiles:
+                      lib.js: "{{ vars.lib_js }}"
+                      expected.json: "{{ outputs.recheck_ops.outputFiles['expected.json'] }}"
+                      ops_fresh.json: "{{ outputs.recheck_ops.outputFiles['ops_fresh.json'] }}"
+                      snapshot.json: "{{ outputs.recheck_ops.outputFiles['snapshot_fresh.json'] }}"
+                      state.json: "{{ outputs.scan_dns_records.outputFiles['state.json'] }}"
+                    env:
+                      PDNS_URL: "{{ inputs.pdns_url }}"
+                      PDNS_API_KEY: "{{ secret('PDNS_API_KEY') }}"
+                      EXECUTION_ID: "{{ execution.id }}"
+                      APPROVER_NOTE: "{{ outputs.pause_for_approval.onResume.approver_note }}"
+                    outputFiles:
+                      - audit.json
+                      - state.json
+                    script: |
+                      const fs = require("fs");
+                      const lib = require("./lib.js");
+
+                      const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+                      for (const k of ["PDNS_URL", "PDNS_API_KEY"]) if (!env(k, "")) throw new Error(`${k} is required`);
+                      const pdns = lib.powerdns({ url: env("PDNS_URL", ""), apiKey: env("PDNS_API_KEY", "") });
+
+                      (async () => {
+                        const expected = JSON.parse(fs.readFileSync("expected.json", "utf8"));
+                        const ops = JSON.parse(fs.readFileSync("ops_fresh.json", "utf8"));
+                        const snapshot = JSON.parse(fs.readFileSync("snapshot.json", "utf8"));
+                        const state = JSON.parse(fs.readFileSync("state.json", "utf8"));
+                        const records = state.records || {};
+                        const mismatches = [];
+                        const confirmed = [];
+                        const touched = new Set();
+
+                        for (const z of expected) {
+                          const zone = await pdns.getZone(z.zone);
+                          for (const e of z.expected) {
+                            touched.add(`${z.zone}#${lib.normName(e.name)}|${e.type}`);
+                            const live = zone.rrsets.find((s) => s.type === e.type && lib.normName(s.name) === lib.normName(e.name));
+                            if (e.remaining.length === 0) {
+                              if (live && live.records.length) mismatches.push(`${z.zone} ${e.name}: rrset still present after the delete`);
+                              else confirmed.push(`${z.zone} ${e.name}: rrset deleted`);
+                            } else if (!live) {
+                              mismatches.push(`${z.zone} ${e.name}: rrset disappeared instead of keeping ${e.remaining.join(", ")}`);
+                            } else {
+                              const have = live.records.map((r) => r.content).sort().join(",");
+                              const want = [...e.remaining].sort().join(",");
+                              if (have !== want) mismatches.push(`${z.zone} ${e.name}: records are [${have}] but [${want}] were expected`);
+                              else if (live.ttl !== e.previous.ttl) mismatches.push(`${z.zone} ${e.name}: ttl changed from ${e.previous.ttl} to ${live.ttl}`);
+                              else confirmed.push(`${z.zone} ${e.name}: stale record removed, ${want} kept`);
+                            }
+                          }
+                        }
+                        // Collateral check: no other rrset in a patched zone may have changed since the re-check.
+                        for (const [zoneName, hashes] of Object.entries(snapshot)) {
+                          const zone = await pdns.getZone(zoneName);
+                          const live = new Map(zone.rrsets.filter((s) => s.type !== "SOA").map((s) => [lib.rrsetKey(s), lib.hashRrset(s)]));
+                          for (const [key, hash] of Object.entries(hashes)) {
+                            if (touched.has(`${zoneName}#${key}`)) continue;
+                            if (!live.has(key)) mismatches.push(`${zoneName} ${key}: disappeared although it was not in the plan`);
+                            else if (live.get(key) !== hash) mismatches.push(`${zoneName} ${key}: changed although it was not in the plan`);
+                          }
+                        }
+                        for (const o of ops) delete records[`${o.zone}|${lib.normName(o.name)}|${o.ip}`];
+
+                        const verified = mismatches.length === 0;
+                        const audit = {
+                          executed_at: new Date().toISOString(),
+                          execution_id: process.env.EXECUTION_ID || "",
+                          verified,
+                          confirmed,
+                          approver_note: process.env.APPROVER_NOTE || "",
+                          mismatches,
+                          // Rollback: re-create each rrset exactly as it was (REPLACE with these records and ttl).
+                          previous_rrsets: expected.flatMap((z) => z.expected.map((e) => ({ zone: z.zone, name: e.previous.name, type: e.previous.type, ttl: e.previous.ttl, records: e.previous.records, comments: e.previous.comments || [] }))),
+                          removed: ops.map((o) => ({ zone: o.zone, name: o.name, ip: o.ip, cls: o.cls, reason: o.reason })),
+                        };
+                        fs.writeFileSync("audit.json", JSON.stringify(audit));
+                        fs.writeFileSync("state.json", JSON.stringify({ version: 1, records }));
+                        console.log("::" + JSON.stringify({ outputs: { verified, confirmed: confirmed.length, mismatch_summary: mismatches.slice(0, 10).join("; ") } }) + "::");
+                      })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+                  - id: check_verification
+                    type: io.kestra.plugin.core.flow.If
+                    description: A zone that does not match the plan is an incident, not a success.
+                    condition: "{{ not outputs.verify_zones.vars.verified }}"
+                    then:
+                      - id: fail_verification
+                        type: io.kestra.plugin.core.execution.Fail
+                        description: Stop before the ledger is advanced.
+                        errorMessage: "Zones do not match the plan after the change: {{ outputs.verify_zones.vars.mismatch_summary }}"
+
+                  - id: record_audit
+                    type: io.kestra.plugin.core.kv.Set
+                    description: Keep the last verified change with the exact previous rrsets so a removal can be undone.
+                    key: "{{ render(vars.audit_key) }}"
+                    kvType: JSON
+                    value: "{{ read(outputs.verify_zones.outputFiles['audit.json']) }}"
+
+                  - id: persist_state_after_apply
+                    type: io.kestra.plugin.core.kv.Set
+                    description: Store the ageing ledger after the verified change.
+                    key: "{{ render(vars.state_key) }}"
+                    kvType: STRING
+                    value: "{{ read(outputs.verify_zones.outputFiles['state.json']) }}"
+
+                  - id: notify_result
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    description: Confirm the verified result and say how many records the re-check dropped.
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    payload: >-
+                      {{ {
+                        "text": ":white_check_mark: *Stale DNS records* verified: " ~ outputs.verify_zones.vars.confirmed ~ " rrset change(s) confirmed, " ~ outputs.recheck_ops.vars.dropped_count ~ " record(s) dropped by the re-check (execution `" ~ execution.id ~ "`)."
+                      } | toJson }}
+                else:
+                  - id: persist_state_nothing_fresh
+                    type: io.kestra.plugin.core.kv.Set
+                    description: Every record became non-stale during approval; keep the ledger and change nothing.
+                    key: "{{ render(vars.state_key) }}"
+                    kvType: STRING
+                    value: "{{ read(outputs.scan_dns_records.outputFiles['state.json']) }}"
+        else:
+          - id: log_findings_only
+            type: io.kestra.plugin.core.log.Log
+            description: Findings such as a reassigned address need a human, not an automated change.
+            message: "No removal planned. {{ outputs.scan_dns_records.vars.findings_count }} new finding(s) reported."
+    else:
+      - id: log_nothing_due
+        type: io.kestra.plugin.core.log.Log
+        description: Every managed record matches NetBox or is still ageing.
+        message: "Checked {{ outputs.scan_dns_records.vars.records_checked }} managed A record(s) against {{ outputs.scan_dns_records.vars.netbox_addresses }} NetBox address(es): nothing due."
+
+  - id: gate_persist
+    type: io.kestra.plugin.core.flow.If
+    description: Runs that changed nothing store their ledger here; runs that applied changes stored it after verification.
+    condition: "{{ (not outputs.scan_dns_records.vars.has_ops) or inputs.dry_run }}"
+    then:
+      - id: persist_state
+        type: io.kestra.plugin.core.kv.Set
+        description: Advance the ageing ledger only after the run finished cleanly.
+        key: "{{ render(vars.state_key) }}"
+        kvType: STRING
+        value: "{{ read(outputs.scan_dns_records.outputFiles['state.json']) }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Page the channel when PowerDNS or NetBox return an unexpected answer, NetBox is empty, approval times out, confirmation is wrong or verification finds a mismatch.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Stale DNS record reconciliation failed* (execution `" ~ execution.id ~ "`). The ledger was not advanced; compare the zones with NetBox before the next run."
+      } | toJson }}
+
+extend:
+  title: PowerDNS Stale A Record NetBox Reconciliation Gate
+  metaTitle: Remove Stale PowerDNS A Records Using NetBox | Kestra
+  shortDescription: Compares PowerDNS A records with NetBox, ages records on deprecated or reassigned addresses in KV, and removes them after count-confirmed approval with an atomic per-zone PATCH and read-back proof.
+  metaDescription: Remove stale PowerDNS A records for deprecated NetBox addresses with a KV grace ledger, count-confirmed approval, fresh-data PATCH and read-back verification.
+  description: |
+    Stale A records are a quiet risk: when an IP address is retired and later reused, old names start resolving to someone else's host. This blueprint uses NetBox as the source of truth to find and remove them, without trusting either system blindly.
+
+    ## How it works
+
+    1. A nightly schedule or a webhook from a decommission pipeline starts the flow; `concurrency` allows one run at a time.
+    2. `scan_dns_records` reads each zone from PowerDNS and the managed prefixes from NetBox (`/api/ipam/ip-addresses/?parent=`), following pagination.
+    3. Each enabled A record in a managed prefix is `DEPRECATED` (NetBox status deprecated), `REASSIGNED` (the address now has another dns_name) or `UNREGISTERED`. The apex and protected names are never touched.
+    4. A KV ledger records when each record became stale. A deprecated record is planned only after `grace_hours` and after the address has been deprecated in NetBox for `deprecated_min_days`. Reassigned and unregistered records are report-only unless opted in. A zone where too many records look stale is blocked.
+    5. `pause_for_approval` holds the plan and the operator types the record count.
+    6. `recheck_ops` re-reads NetBox and the zones, drops records that are no longer stale, and builds the PATCH from the fresh zone: a round-robin rrset keeps its live addresses with `REPLACE`, a fully stale rrset is removed with `DELETE`.
+    7. `apply_zone_patches` sends one PATCH per zone with `io.kestra.plugin.core.http.Request`; PowerDNS commits it in a single transaction and answers 204.
+    8. `verify_zones` reads every zone again and checks the result and that no other rrset changed.
+
+    ## What you get
+
+    - Removal that cannot overwrite a concurrent zone edit and keeps live round-robin members.
+    - A record of the previous rrsets for undo, and a report of addresses reused by other hosts.
+    - Protection against an empty or incomplete IPAM wiping a zone.
+
+    ## Who it's for
+
+    - Network and platform teams running PowerDNS with NetBox as the IP source of truth.
+
+    ## Why orchestrate this with Kestra
+
+    Two systems must agree before anything is deleted, the evidence needs time to age, and a person approves the result. KV, `Pause`, `Loop` and verification express that as one flow.
+
+    ## Prerequisites
+
+    - PowerDNS Authoritative with the API enabled, NetBox with a read token, Docker on the worker and a Slack webhook.
+
+    ### Secrets
+
+    - `PDNS_API_KEY`: PowerDNS API key sent as X-API-Key.
+    - `NETBOX_TOKEN`: NetBox API token with read access to IP addresses.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook.
+    - `DNS_GUARD_WEBHOOK_KEY`: key protecting the webhook trigger.
+
+    ## Quick start
+
+    1. Run PowerDNS Authoritative with `PDNS_AUTH_API_KEY` set (`powerdns/pdns-auth-49`) and NetBox with netbox-docker, then create a zone and a few IP addresses.
+    2. Mark one NetBox address as deprecated and add A records for it, for an active address and for a reassigned one.
+    3. Create the four secrets and execute with `dry_run: true`, `deprecated_min_days: 0` and `grace_hours: 0`.
+    4. Execute with `dry_run: false`, resume the pause with the planned count and check the verified message.
+
+    ## How to extend
+
+    - Remove the matching PTR records in the reverse zone.
+    - Replace the deprecated-days rule with a NetBox custom field such as a decommission date.
+
+    ## Links
+
+    - [PowerDNS zone API](https://doc.powerdns.com/authoritative/http-api/zone.html)
+    - [PowerDNS API setup](https://doc.powerdns.com/authoritative/http-api/index.html)
+    - [NetBox Docker](https://github.com/netbox-community/netbox-docker)
+    - [Kestra Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+  tags:
+    - Infrastructure
+  subTags:
+    - Infrastructure Automation
+    - Approval Gates
+  ee: false
+  demo: false
