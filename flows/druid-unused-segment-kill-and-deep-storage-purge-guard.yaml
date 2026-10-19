@@ -1,0 +1,413 @@
+id: druid-unused-segment-kill-and-deep-storage-purge-guard
+namespace: company.analytics
+
+description: |
+  Audit Apache Druid segments that the Coordinator has already marked unused (via the
+  authoritative /unusedSegments metadata endpoint, never an invented age heuristic),
+  pause for operator approval, physically purge them from deep storage through the
+  Coordinator's dedicated kill endpoint, and verify zero unused segments remain.
+
+inputs:
+  - id: overlord_url
+    type: STRING
+    displayName: Druid Router / Coordinator / Overlord URL
+    description: Base HTTP URL reachable by both Coordinator and Overlord APIs (the Druid Router on port 8888 proxies both in a typical deployment).
+    defaults: "http://localhost:8888"
+
+  - id: datasource
+    type: STRING
+    displayName: Target Datasource Name
+    description: Specific Druid datasource to audit for already-unused segments and deep storage reclamation.
+    defaults: "wikipedia"
+
+  - id: min_unused_age_days
+    type: INT
+    displayName: Minimum Unused Age (Days)
+    description: >-
+      Extra, operator-controlled safety margin on top of Druid's own unused marking: only
+      physically purge segments that have been confirmed unused (used=false in Druid's metadata
+      store) for at least this many days, giving time to notice and reverse a mistaken markUnused
+      via Druid's own markUsed API before the data is irreversibly deleted. Set to 0 to act on
+      any segment Druid currently reports as unused, with no extra buffer.
+    defaults: 1
+
+  - id: min_reclaimable_mb
+    type: INT
+    displayName: Minimum Reclaimable Threshold (MB)
+    description: Minimum aggregate size in megabytes of already-unused segments required before proposing kill tasks.
+    defaults: 50
+
+  - id: auto_kill
+    type: BOOL
+    displayName: Auto Kill
+    description: When true and dry_run is false, prompts approval and dispatches kill tasks to the Overlord.
+    defaults: true
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits already-unused segments and logs the proposed kill plan without submitting any kill tasks.
+    defaults: true
+
+triggers:
+  - id: scheduled_kill_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Automated scheduled audit running daily to detect and purge Druid-confirmed-unused segments from deep storage. Shipped disabled so connection settings and thresholds can be verified first.
+    cron: "0 3 * * *"
+    disabled: true
+
+  - id: on_demand_kill_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by storage quota alarms, FinOps cost monitors, or on-call runbooks.
+    key: "{{ secret('DRUID_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy threshold and sanity constraints.
+    conditions:
+      - "{{ inputs.overlord_url | length > 0 }}"
+      - "{{ inputs.datasource | length > 0 }}"
+      - "{{ inputs.min_unused_age_days >= 0 }}"
+      - "{{ inputs.min_reclaimable_mb >= 1 }}"
+    errorMessage: "Invalid inputs. Provide a valid Overlord/Coordinator URL, datasource, and positive thresholds."
+
+  - id: load_previous_guard_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve previous run audit state from Kestra KV store, for cross-run reclaimed-volume trend reporting only -- never used to decide what is safe to kill.
+    key: "druid_unused_segments_guard_state_{{ inputs.datasource | slugify }}"
+    errorOnMissing: false
+
+  - id: query_unused_segments
+    type: io.kestra.plugin.core.http.Request
+    description: >-
+      Query the Druid Coordinator's authoritative unused-segments endpoint. This returns only
+      segments Druid's own metadata store has already marked used=false -- never segments that
+      are still actively serving queries. No independent retention policy is invented here;
+      Druid's own rule engine is the sole source of truth for what is safe to consider.
+    uri: "{{ inputs.overlord_url }}/druid/coordinator/v1/metadata/datasources/{{ inputs.datasource }}/unusedSegments?limit=1000"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (secret('DRUID_USERNAME') ~ ':' ~ secret('DRUID_PASSWORD')) | base64Encode }}"
+      Accept: application/json
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: triage_unused_segments
+    type: io.kestra.plugin.scripts.python.Script
+    description: Apply the operator-controlled unused-age safety margin and reclaimable-size threshold to Druid's own unused-segment list, and group eligible segments into killable intervals.
+    containerImage: python:3.11-slim
+    inputFiles:
+      unused_segments.json: "{{ (outputs.query_unused_segments.body ?? []) | toJson }}"
+      previous_kv.json: "{{ (outputs.load_previous_guard_state.value ?? {}) | toJson }}"
+    env:
+      MIN_UNUSED_AGE_DAYS: "{{ inputs.min_unused_age_days }}"
+      MIN_RECLAIMABLE_MB: "{{ inputs.min_reclaimable_mb }}"
+      DATASOURCE: "{{ inputs.datasource }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone, timedelta
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      min_unused_age_days = int(os.environ.get("MIN_UNUSED_AGE_DAYS", "1"))
+      min_reclaimable_mb = float(os.environ.get("MIN_RECLAIMABLE_MB", "50"))
+      datasource = os.environ.get("DATASOURCE", "wikipedia")
+
+      with open("unused_segments.json", "r", encoding="utf-8") as f:
+          raw_segments = f.read().strip()
+          unused_segments = json.loads(raw_segments) if raw_segments else []
+
+      with open("previous_kv.json", "r", encoding="utf-8") as f:
+          raw_kv = f.read().strip()
+          previous_state = json.loads(raw_kv) if raw_kv else {}
+
+      if not isinstance(unused_segments, list):
+          unused_segments = []
+
+      now = datetime.now(timezone.utc)
+      age_cutoff = now - timedelta(days=min_unused_age_days)
+
+      eligible_segments = []
+      intervals_set = set()
+      total_bytes = 0
+
+      for entry in unused_segments:
+          if not isinstance(entry, dict):
+              continue
+          seg = entry.get("dataSegment") or {}
+          interval = seg.get("interval")
+          if not interval:
+              continue
+
+          size = int(seg.get("size") or 0)
+          identifier = seg.get("identifier", "unknown")
+          used_status_updated = entry.get("usedStatusLastUpdatedDate")
+
+          # Extra safety margin: only act on segments Druid has reported unused for at least
+          # min_unused_age_days. A missing/unparseable timestamp is treated conservatively as
+          # "too recent to act on" rather than silently including it.
+          if min_unused_age_days > 0:
+              if not used_status_updated:
+                  continue
+              try:
+                  clean_ts = str(used_status_updated).replace("Z", "+00:00")
+                  updated_dt = datetime.fromisoformat(clean_ts)
+              except Exception:
+                  continue
+              if updated_dt > age_cutoff:
+                  continue
+
+          eligible_segments.append({
+              "identifier": identifier,
+              "interval": interval,
+              "size_bytes": size,
+              "used_status_last_updated": used_status_updated
+          })
+          total_bytes += size
+          intervals_set.add(interval)
+
+      reclaimable_mb = round(total_bytes / (1024 * 1024), 2)
+      sorted_intervals = sorted(intervals_set)
+
+      has_breach = len(eligible_segments) > 0 and reclaimable_mb >= min_reclaimable_mb
+      print(
+          f"Datasource '{datasource}': {len(eligible_segments)} Druid-confirmed-unused segment(s) "
+          f"({reclaimable_mb} MB) across {len(sorted_intervals)} interval(s) eligible for physical purge "
+          f"(unused for >= {min_unused_age_days} day(s))."
+      )
+
+      new_state = {
+          "datasource": datasource,
+          "last_scanned_epoch": now.timestamp(),
+          "eligible_count": len(eligible_segments),
+          "reclaimable_mb": reclaimable_mb,
+          "intervals": sorted_intervals
+      }
+
+      output_data = {
+          "total_unused_segments": len(unused_segments),
+          "eligible_segment_count": len(eligible_segments) if has_breach else 0,
+          "reclaimable_mb": reclaimable_mb,
+          "kill_intervals": sorted_intervals if has_breach else [],
+          "kill_plan": eligible_segments[:50],
+          "new_state": new_state
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print(f"::{json.dumps({'outputs': output_data})}::")
+
+  - id: persist_guard_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Update Kestra KV store with current audit telemetry for multi-run reclaimed-volume trend reporting.
+    key: "druid_unused_segments_guard_state_{{ inputs.datasource | slugify }}"
+    kvType: JSON
+    value: "{{ outputs.triage_unused_segments.vars.new_state | toJson }}"
+
+  - id: branch_on_reclaimable_segments
+    type: io.kestra.plugin.core.flow.If
+    description: Branch based on whether Druid-confirmed-unused segments exceed storage thresholds.
+    condition: "{{ outputs.triage_unused_segments.vars.eligible_segment_count > 0 }}"
+    then:
+      - id: quarantine_kill_manifest
+        type: io.kestra.plugin.core.kv.Set
+        description: Save quarantined kill candidate manifest into Kestra KV for audit compliance.
+        key: "druid_kill_quarantine_manifest_{{ inputs.datasource | slugify }}"
+        kvType: JSON
+        value: "{{ outputs.triage_unused_segments.vars.kill_plan | toJson }}"
+
+      - id: notify_reclaimable_storage
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch high-priority storage reclamation alert to Slack detailing datasource and reclaimable volume.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":warning: *Apache Druid Deep Storage Purge Candidate Identified*\n*Datasource:* `" ~ inputs.datasource ~ "`\n*Already-Unused Eligible Segments:* *" ~ outputs.triage_unused_segments.vars.eligible_segment_count ~ "*\n*Reclaimable Volume:* *" ~ outputs.triage_unused_segments.vars.reclaimable_mb ~ " MB*\n*Target Intervals:* `" ~ (outputs.triage_unused_segments.vars.kill_intervals | join(', ')) ~ "`\n*Auto-Kill:* `" ~ inputs.auto_kill ~ "` (Dry Run: `" ~ inputs.dry_run ~ "`)\nAll targets are segments Druid itself has already marked unused -- no active data is at risk. Review the quarantined manifest in execution `" ~ execution.id ~ "` before approving the kill."
+          } | toJson }}
+
+      - id: evaluate_auto_kill
+        type: io.kestra.plugin.core.flow.If
+        description: Determine if automated kill task dispatch is authorized by input configuration.
+        condition: "{{ inputs.auto_kill == true }}"
+        then:
+          - id: check_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Guard against accidental mutation when running in dry-run mode.
+            condition: "{{ inputs.dry_run == false }}"
+            then:
+              - id: pause_for_kill_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Interactive human approval gate before submitting kill tasks to the Druid Coordinator. Resume to execute kill tasks or cancel to preserve segments.
+
+              - id: execute_kill_intervals
+                type: io.kestra.plugin.core.flow.Loop
+                description: >-
+                  Iterate across Druid-confirmed-unused intervals and call the Coordinator's
+                  dedicated kill endpoint for each one. This endpoint (and the KillUnusedSegmentsTask
+                  it submits) only ever physically deletes segments already marked used=false in
+                  Druid's metadata store -- it cannot touch active, currently-serving data, by
+                  Druid's own design, regardless of how the eligibility list above was computed.
+                values: "{{ outputs.triage_unused_segments.vars.kill_intervals }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: kill_interval
+                    type: io.kestra.plugin.core.http.Request
+                    description: Submit a kill task for this interval via the Coordinator's dedicated unused-segment kill endpoint (DELETE .../intervals/{interval}).
+                    uri: "{{ inputs.overlord_url }}/druid/coordinator/v1/datasources/{{ inputs.datasource }}/intervals/{{ item.value | replace({'/': '_'}) }}"
+                    method: DELETE
+                    headers:
+                      Authorization: "Basic {{ (secret('DRUID_USERNAME') ~ ':' ~ secret('DRUID_PASSWORD')) | base64Encode }}"
+                      Accept: application/json
+
+                  - id: wait_for_kill_completion
+                    type: io.kestra.plugin.core.flow.LoopUntil
+                    description: >-
+                      Kill tasks run asynchronously on the Overlord. Poll the same authoritative
+                      unused-segments endpoint for this interval until it reports zero remaining
+                      unused segments, proving the kill actually completed, instead of assuming
+                      success immediately after submission.
+                    condition: "{{ (outputs.check_interval_cleared.body ?? []) | length == 0 }}"
+                    failOnMaxReached: true
+                    checkFrequency:
+                      interval: PT15S
+                      maxIterations: 20
+                    tasks:
+                      - id: check_interval_cleared
+                        type: io.kestra.plugin.core.http.Request
+                        description: Re-query unused segments scoped to this interval to confirm the kill task has finished removing them.
+                        uri: "{{ inputs.overlord_url }}/druid/coordinator/v1/metadata/datasources/{{ inputs.datasource }}/unusedSegments?interval={{ item.value | replace({'/': '_'}) }}"
+                        method: GET
+                        headers:
+                          Authorization: "Basic {{ (secret('DRUID_USERNAME') ~ ':' ~ secret('DRUID_PASSWORD')) | base64Encode }}"
+                          Accept: application/json
+
+              - id: notify_kill_success
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Dispatch confirmation notification to Slack after every targeted interval was verified cleared of unused segments.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: >-
+                  {{ {
+                    "text": ":white_check_mark: *Apache Druid Deep Storage Purge Completed*\n*Datasource:* `" ~ inputs.datasource ~ "`\n*Purged Segments:* *" ~ outputs.triage_unused_segments.vars.eligible_segment_count ~ "*\n*Reclaimed Volume:* *" ~ outputs.triage_unused_segments.vars.reclaimable_mb ~ " MB*\n*Intervals Verified Cleared:* `" ~ (outputs.triage_unused_segments.vars.kill_intervals | length) ~ "`\nEvery targeted interval was re-queried after the kill and confirmed to have zero remaining unused segments."
+                  } | toJson }}
+
+            else:
+              - id: log_dry_run
+                type: io.kestra.plugin.core.log.Log
+                description: Log dry-run assessment without executing mutating Overlord requests.
+                message: "Dry-run mode active. Identified {{ outputs.triage_unused_segments.vars.eligible_segment_count }} already-unused segments ({{ outputs.triage_unused_segments.vars.reclaimable_mb }} MB) in intervals: {{ outputs.triage_unused_segments.vars.kill_intervals }}. Skipping kill tasks."
+
+    else:
+      - id: log_storage_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: Log nominal status when no already-unused segments meet the reclaimable threshold.
+        message: "Datasource '{{ inputs.datasource }}' has {{ outputs.triage_unused_segments.vars.total_unused_segments }} unused segment(s) known to Druid, none meeting the {{ inputs.min_reclaimable_mb }} MB / {{ inputs.min_unused_age_days }}-day reclamation threshold. Deep storage is clean."
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Emergency alert dispatched to Slack if Druid query, kill orchestration, or post-kill verification fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Flow Execution Failed*: `druid-unused-segment-kill-and-deep-storage-purge-guard` (Execution: `" ~ execution.id ~ "`). Failed to complete Druid segment audit, kill task submission, or post-kill verification. If a kill was submitted, check the Overlord task list directly before retrying -- verification failing does not necessarily mean the kill itself failed. Check cluster connectivity and credentials."
+      } | toJson }}
+
+extend:
+  title: Apache Druid Unused Segment Deep Storage Kill and Purge Guard
+  metaTitle: Apache Druid Deep Storage Segment Kill Guard | Kestra
+  shortDescription: Audit Apache Druid segments already marked unused by the Coordinator, pause for operator approval, submit kill tasks via the dedicated safe endpoint, and verify deep storage purge.
+  metaDescription: Audit Druid Coordinator-confirmed unused segments, pause for approval, submit kill tasks, and verify deep storage purge completion with Kestra.
+  description: |
+    Apache Druid coordinates real-time and historical analytical workloads by storing immutable segments across Historical nodes and object storage (Amazon S3, Google Cloud Storage, or HDFS). When retention rules expire data or batch reindexing compacts older data, Druid's Coordinator marks segments as unused (`used = false`) in its metadata store. However, marking a segment unused does not delete its physical binary files from deep storage or remove its metadata record -- that requires a separate, explicit Kill task. Over time, if a cluster's automatic kill duty is disabled or configured with a long retention buffer, terabytes of already-unused segment files accumulate in deep storage, driving up cloud infrastructure bills.
+
+    This blueprint only ever considers segments Druid's own Coordinator has already and independently marked unused, queried from the authoritative `/druid/coordinator/v1/metadata/datasources/{datasource}/unusedSegments` endpoint. It never infers unused status from an invented age or retention heuristic, and the Kill endpoint it calls is, by Druid's own design, incapable of deleting a segment that is still actively serving queries. It groups eligible segments into killable intervals, persists multi-run state in Kestra KV store for trend reporting, halts for operator approval behind an interactive Pause gate, dispatches native Coordinator Kill requests, polls until each targeted interval is verified cleared, and alerts Slack.
+
+    ## How it works
+
+    1. The `scheduled_kill_guard` schedule trigger executes the audit daily at 03:00 UTC (shipped disabled), while `on_demand_kill_webhook` provides an authenticated HTTP entry point for external FinOps alerts or runbooks.
+    2. The `validate_inputs` task (`io.kestra.plugin.core.execution.Assert`) validates connection URLs, datasource names, and threshold sanity constraints.
+    3. The `load_previous_guard_state` task (`io.kestra.plugin.core.kv.Get`) retrieves historical scan telemetry from Kestra KV store for trend reporting only -- it has no bearing on what is considered safe to kill.
+    4. The `query_unused_segments` task (`io.kestra.plugin.core.http.Request`) calls the Coordinator's `/unusedSegments` metadata endpoint, the single authoritative source of which segments Druid itself has already marked `used = false`.
+    5. The `triage_unused_segments` task (`io.kestra.plugin.scripts.python.Script`) applies an operator-controlled `min_unused_age_days` safety margin (via each segment's own `usedStatusLastUpdatedDate`) and the `min_reclaimable_mb` threshold, then groups eligible segments into unique killable intervals.
+    6. The `persist_guard_state` task (`io.kestra.plugin.core.kv.Set`) writes current audit telemetry to Kestra KV for trend tracking.
+    7. The `branch_on_reclaimable_segments` task (`io.kestra.plugin.core.flow.If`) evaluates whether eligible segments exceed `min_reclaimable_mb`:
+       - Archives the target kill manifest to Kestra KV.
+       - Posts a formatted incident notification to Slack with datasource name, eligible segment count, and reclaimable megabytes.
+       - If `auto_kill` is enabled and `dry_run` is false, triggers the interactive `pause_for_kill_approval` gate (`io.kestra.plugin.core.flow.Pause`) requiring operator confirmation.
+       - Upon operator approval, `execute_kill_intervals` (`io.kestra.plugin.core.flow.Loop`) iterates over each target interval, calling `DELETE /druid/coordinator/v1/datasources/{datasource}/intervals/{interval}` -- the Coordinator's dedicated kill endpoint, which only ever submits a `KillUnusedSegmentsTask` scoped to segments already marked unused.
+       - For each interval, `wait_for_kill_completion` (`io.kestra.plugin.core.flow.LoopUntil`) polls the same `/unusedSegments` endpoint, scoped to that interval, until it reports zero remaining segments or the poll window (5 minutes) is exhausted, in which case the execution fails loudly rather than assuming success.
+       - Posts a confirmation alert to Slack once every targeted interval is verified cleared.
+    8. An `errors` handler catches unexpected execution or verification failures and pages on-call engineers via Slack.
+
+    ## What you get
+
+    - Automated discovery of Apache Druid segments that Druid's own Coordinator has already decided are unused -- never an independently invented retention policy that could target actively-queryable historical data.
+    - A kill mechanism that is safe by construction: the Coordinator's dedicated kill endpoint and the `KillUnusedSegmentsTask` it submits only ever operate on segments already marked `used = false`.
+    - An additional, fully operator-controlled safety buffer (`min_unused_age_days`) layered on top of Druid's own unused marking.
+    - Interactive human-in-the-loop approval gate before submitting irreversible deep storage file deletions.
+    - Genuine post-remediation verification: each interval is re-queried and confirmed cleared, with a bounded poll loop that fails loudly (not silently) if verification cannot complete.
+    - Quarantined audit trail preserved in Kestra KV for FinOps accounting and regulatory compliance.
+
+    ## Who it's for
+
+    - Data Platform Engineers and SREs maintaining Apache Druid clusters and large-scale OLAP pipelines.
+    - FinOps Practitioners optimizing cloud object storage (AWS S3, Google Cloud Storage, Azure Blob) costs.
+    - Analytics Engineers operating clusters where the Coordinator's automatic kill duty is disabled or configured with a long retention buffer, who want a manual, gated reclamation path for the resulting backlog.
+
+    ## Why orchestrate this with Kestra
+
+    Druid Kill tasks permanently delete binary files from cloud storage. Firing them through uncontrolled cron scripts, or worse, through logic that invents its own notion of "old enough to delete" independent of Druid's actual metadata, risks destroying data. Kestra solves this by querying Druid's own authoritative unused-segment source directly, maintaining atomic state in KV storage, gating kill requests behind interactive human approval, polling for genuine post-kill confirmation, and alerting operational teams in a single declarative, version-controlled workflow.
+
+    ## Prerequisites
+
+    - Reachable Apache Druid cluster (version 26.x, 28.x, 30.x, or newer) with Coordinator and Overlord APIs accessible, typically via the Router on port 8888.
+    - User credentials with permissions to read Coordinator metadata and submit kill tasks to the Overlord.
+    - Slack Incoming Webhook URL configured for incident triage notifications.
+
+    ### Secrets
+
+    - `DRUID_USERNAME`: Username for Druid HTTP Basic authentication (leave empty if unauthenticated).
+    - `DRUID_PASSWORD`: Password for Druid HTTP Basic authentication (leave empty if unauthenticated).
+    - `DRUID_GUARD_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for operational notifications and alerts.
+
+    ## Quick start
+
+    1. Configure `DRUID_USERNAME`, `DRUID_PASSWORD`, `DRUID_GUARD_WEBHOOK_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Run an initial manual execution with default parameters (`dry_run: true`) to audit already-unused segments and preview reclaimable megabytes.
+    3. Review the execution logs, Slack triage notification, and Kestra KV store entries.
+    4. Run with `auto_kill: true` and `dry_run: false`. When reclaimable segments are identified, review the intervals and approve the `pause_for_kill_approval` gate in the Kestra UI.
+    5. Enable the `scheduled_kill_guard` schedule trigger to maintain continuous automated deep storage reclamation.
+
+    ## How to extend
+
+    - Add multi-datasource fan-out by wrapping the audit in a parent workflow that iterates across all active datasources from `sys.datasources`.
+    - Integrate Amazon S3 or Google Cloud Storage billing metrics to calculate dollar savings per reclaimed gigabyte.
+    - Add PagerDuty or Opsgenie alerts if a kill interval fails to clear within the verification poll window.
+    - Route quarantined kill interval manifests to cloud storage for long-term audit logging.
+
+    ## Links
+
+    - [Apache Druid Data Deletion and Kill Task Documentation](https://druid.apache.org/docs/latest/data-management/delete/)
+    - [Apache Druid Unused Segments Metadata API](https://druid.apache.org/docs/latest/api-reference/legacy-metadata-api/#segments)
+    - [Kestra HTTP Request Plugin Documentation](https://kestra.io/plugins/core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Pause Flow Documentation](https://kestra.io/plugins/core/flow/pause)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
