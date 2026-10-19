@@ -56,6 +56,15 @@ Minimum 3 runnable tasks
 - At least 1 trigger; event-based triggers are a nice to have
 - At least 1 non-core plugin (i.e., some third party plugin such as the Git plugin)
 
+What gets a PR closed without review
+- The flow does not call the system named in the title. A script that hard-codes its result (for example `anomalies_detected = 0` or `echo '{"status": "evaluated"}'`), a "simulated probe", or a Log task that always prints "healthy" is a placeholder, not a blueprint.
+- The same task body submitted many times with only the names swapped. Ten real blueprints are worth more than a hundred copies.
+- Plugin classes that do not exist. Check every `type:` against [kestra.io/plugins](https://kestra.io/plugins) or load the flow in a Kestra 2.0 editor before opening the PR.
+- Non-technical or small-business chores (timesheets, invoices, loyalty points, HR reminders) where Kestra only sends an email or a Slack message.
+- Files outside `flows/`, or a flow with no `extend` block.
+
+Open one PR per blueprint, after you have run it at least once. Proposal issues are not needed; the PR is the proposal.
+
 Required & recommended fields
 - `id` (required): hyphen-case, must match filename.
 - `namespace` (required): owner/team namespace (e.g., `company.analytics`, `company.ai`, `company.team`).

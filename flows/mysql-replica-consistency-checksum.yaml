@@ -1,0 +1,397 @@
+id: mysql-replica-consistency-checksum
+namespace: company.team
+description: |
+  Find the rows where your MySQL replicas silently differ from the primary, and fix them safely. pt-table-checksum
+  compares every table chunk by chunk through replication itself; pt-table-sync previews the statements that would
+  repair each replica; a person approves; the fix runs on the primary and reaches the replicas through replication;
+  then the affected tables are checksummed again to prove they match.
+
+triggers:
+  - id: weekly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: A full checksum writes a little on the primary for every chunk, so it runs off-peak. Shipped disabled.
+    cron: "10 3 * * 0"
+    disabled: true
+  - id: after_incident
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call it after a failover, a crashed replica or a replica rebuilt from a backup, the moments drift is most likely.
+    key: "{{ secret('MYSQL_CHECKSUM_WEBHOOK_KEY') }}"
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: primary
+    type: STRING
+    defaults: 127.0.0.1:3310
+    description: host:port of the primary.
+  - id: replicas
+    type: STRING
+    defaults: 127.0.0.1:3311,127.0.0.1:3312
+    description: host:port of every replica to check, comma-separated. They are written to percona.dsns so exactly these are compared.
+  - id: databases
+    type: STRING
+    defaults: shop
+    description: Comma-separated databases to checksum.
+  - id: max_lag_seconds
+    type: INT
+    defaults: 5
+    description: pt-table-checksum pauses while any replica is further behind than this, so the check never makes replication lag worse.
+  - id: chunk_time
+    type: FLOAT
+    defaults: 0.5
+    description: Target seconds per checksum chunk on the primary. Smaller chunks mean shorter locks and a finer diff.
+  - id: max_fix_statements
+    type: INT
+    defaults: 1000
+    description: Above this many repair statements for one replica, the flow refuses to fix and recommends rebuilding the replica; a drift that large has a cause worth finding first.
+  - id: toolkit_image
+    type: STRING
+    defaults: percona/percona-toolkit:3.7.1
+
+variables:
+  last_clean_key: mysql_replica_checksum_last_clean
+  cnf: |
+    CNF=$PWD/client.cnf; printf '[client]\nuser=%s\npassword=%s\n' "$MYSQL_USER" "$MYSQL_PASS" > $CNF; chmod 600 $CNF
+    P_HOST=${PRIMARY%:*}; P_PORT=${PRIMARY##*:}
+    my() { hp=$1; shift; mysql --defaults-extra-file=client.cnf -h "${hp%:*}" -P "${hp##*:}" -N -B "$@"; }
+
+tasks:
+  - id: preflight
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Checks that every replica replicates from the primary and has no replicas of its own, finds tables pt-table-sync cannot repair, and records the replicas in percona.dsns.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+      pullPolicy: IF_NOT_PRESENT
+      user: root
+    containerImage: "{{ inputs.toolkit_image }}"
+    env:
+      MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+      MYSQL_PASS: "{{ secret('MYSQL_PASSWORD') }}"
+      PRIMARY: "{{ inputs.primary }}"
+      REPLICAS: "{{ inputs.replicas }}"
+      DATABASES: "{{ inputs.databases }}"
+    commands:
+      - |
+        {{ render(vars.cnf) }}
+        problems=""; warnings=""
+        my $PRIMARY -e "SELECT 1" > /dev/null 2> err.txt || { echo "CHECK FAILED: cannot connect to the primary $PRIMARY: $(head -n 1 err.txt)" >&2; exit 1; }
+        pg=$(my $PRIMARY -e "SELECT @@global.gtid_executed" | tr -d '\n' || true)
+        for r in $(echo "$REPLICAS" | tr ',' ' '); do
+          if ! mysql --defaults-extra-file=client.cnf -h "${r%:*}" -P "${r##*:}" -e "SHOW REPLICA STATUS\G" > rs.txt 2> err.txt; then problems="$problems$r does not answer: $(head -n 1 err.txt | sed 's/.*ERROR [0-9]* ([^)]*): //'); "; continue; fi
+          v() { grep -m1 -E "^ *$1:" rs.txt | sed 's/^[^:]*: *//' || true; }
+          if [ ! -s rs.txt ]; then problems="$problems$r is not a replica; "; continue; fi
+          if [ "$(v Replica_IO_Running)" != Yes ] || [ "$(v Replica_SQL_Running)" != Yes ]; then
+            # The applier's own message names the table and the row; Last_SQL_Error only says a worker stopped.
+            why=$(my $r -e "SELECT LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker WHERE LAST_ERROR_NUMBER <> 0 LIMIT 1" 2> /dev/null | sed 's/^[^;]*; //' | cut -c1-200 || true)
+            [ -n "$why" ] || why=$(v Last_IO_Error | cut -c1-200)
+            problems="$problems$r is not replicating (IO $(v Replica_IO_Running), SQL $(v Replica_SQL_Running)${why:+: $why}): its checksums would never arrive; "
+          fi
+          [ "$(v Source_Port)" = "$P_PORT" ] || warnings="${warnings}$r replicates from $(v Source_Host):$(v Source_Port), not $PRIMARY; "
+          lag=$(v Seconds_Behind_Source); [ "$lag" = NULL ] || [ "${lag:-0}" -le 300 ] || warnings="${warnings}$r is ${lag} s behind; "
+          # pt-table-checksum's statements are replayed on each replica, which computes its own checksum. A replica
+          # with replicas of its own logs that result in ROW format, so its replicas would copy it instead of computing theirs.
+          down=$(my $r -e "SHOW REPLICAS" 2> /dev/null | grep -c . || true)
+          [ "$down" -eq 0 ] || problems="$problems$r has $down replica(s) of its own: with row-based binlogs they would copy its checksums instead of computing theirs. Check them separately; "
+          errant=$(my $r -e "SELECT GTID_SUBTRACT(@@global.gtid_executed, '$pg')" 2> /dev/null | tr -d '\n' || true)
+          [ -z "$errant" ] || warnings="${warnings}$r has transactions the primary never ran (errant GTIDs $errant): something wrote to it directly, which is how drift starts, and a failover to it would replay them; "
+        done
+        dbs=$(echo "$DATABASES" | sed "s/[^A-Za-z0-9_,]//g; s/,/','/g")
+        nokey=$(my $PRIMARY -e "SELECT CONCAT(t.table_schema, '.', t.table_name) FROM information_schema.tables t WHERE t.table_schema IN ('$dbs') AND t.table_type = 'BASE TABLE' AND NOT EXISTS (SELECT 1 FROM information_schema.statistics s WHERE s.table_schema = t.table_schema AND s.table_name = t.table_name AND s.non_unique = 0)" | paste -sd, -)
+        [ -z "$nokey" ] || warnings="${warnings}no PRIMARY or UNIQUE key on $nokey: they are checksummed, but pt-table-sync cannot repair them; "
+        my $PRIMARY -e "CREATE DATABASE IF NOT EXISTS percona; CREATE TABLE IF NOT EXISTS percona.dsns (id INT AUTO_INCREMENT PRIMARY KEY, parent_id INT, dsn VARCHAR(255) NOT NULL); DELETE FROM percona.dsns" 2> err.txt \
+          || { echo "CHECK FAILED: cannot write percona.dsns on the primary: $(head -n 1 err.txt)" >&2; exit 1; }
+        for r in $(echo "$REPLICAS" | tr ',' ' '); do my $PRIMARY -e "INSERT INTO percona.dsns (dsn) VALUES ('h=${r%:*},P=${r##*:}')"; done
+        echo "::{\"outputs\":{\"problems\":\"$(echo "${problems%; }" | tr -d '"\\')\",\"warnings\":\"$(echo "${warnings%; }" | tr -d '"\\')\",\"no_key_tables\":\"$nokey\"}}::"
+
+  - id: replicas_ready
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.preflight.vars.problems != '' }}"
+    then:
+      - id: not_checkable
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "CHECK FAILED: {{ outputs.preflight.vars.problems }}"
+
+  - id: checksum
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: pt-table-checksum on the primary, then the documented diff query on every replica.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+      pullPolicy: IF_NOT_PRESENT
+      user: root
+    containerImage: "{{ inputs.toolkit_image }}"
+    env:
+      MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+      MYSQL_PASS: "{{ secret('MYSQL_PASSWORD') }}"
+      PRIMARY: "{{ inputs.primary }}"
+      REPLICAS: "{{ inputs.replicas }}"
+      DATABASES: "{{ inputs.databases }}"
+    commands:
+      - |
+        {{ render(vars.cnf) }}
+        rc=0
+        pt-table-checksum "h=$P_HOST,P=$P_PORT,F=$CNF" --databases "$DATABASES" --replicate percona.checksums \
+          --recursion-method "dsn=h=$P_HOST,P=$P_PORT,F=$CNF,D=percona,t=dsns" --no-check-binlog-format \
+          --max-lag {{ inputs.max_lag_seconds }} --chunk-time {{ inputs.chunk_time }} --no-version-check > checksum.txt 2>&1 || rc=$?
+        cat checksum.txt
+        # Exit status is a bit field: 16 means differences were found, which is this flow's job to report.
+        [ $((rc & ~16)) -eq 0 ] || { echo "CHECK FAILED: pt-table-checksum exited $rc: $(grep -iE 'error|denied|failed|skipp|cannot' checksum.txt | head -n 1 | sed 's/ at \/usr\/bin.*//; s/^[0-9T:-]* //')" >&2; exit 1; }
+        tables=$(awk '$NF ~ /\./ && $2 ~ /^[0-9]+$/' checksum.txt | wc -l); rows=$(awk '$NF ~ /\./ && $2 ~ /^[0-9]+$/ {s += $4} END {print s + 0}' checksum.txt)
+        diffs=""; total=0
+        for r in $(echo "$REPLICAS" | tr ',' ' '); do
+          d=$(my $r -e "SELECT CONCAT(db, '.', tbl, ' (', COUNT(*), ' chunk', IF(COUNT(*) > 1, 's', ''), ')') FROM percona.checksums WHERE source_cnt <> this_cnt OR source_crc <> this_crc OR ISNULL(source_crc) <> ISNULL(this_crc) GROUP BY db, tbl" | paste -sd, -)
+          [ -z "$d" ] || { diffs="$diffs$r: $d; "; total=$((total + 1)); }
+        done
+        echo "::{\"outputs\":{\"tables\":$tables,\"rows\":$rows,\"replicas_with_diffs\":$total,\"diffs\":\"${diffs%; }\"}}::"
+
+  - id: any_drift
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.checksum.vars.replicas_with_diffs == 0 }}"
+    then:
+      - id: remember_clean
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ vars.last_clean_key }}"
+        kvType: JSON
+        value: "{{ {'at': execution.startDate, 'tables': outputs.checksum.vars.tables, 'rows': outputs.checksum.vars.rows} | toJson }}"
+      - id: report_clean
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "MySQL replicas consistent: {{ outputs.checksum.vars.tables }} table(s), {{ outputs.checksum.vars.rows }} rows of {{ inputs.databases }} identical on {{ inputs.replicas }} and the primary {{ inputs.primary }}.{% if outputs.preflight.vars.warnings != '' %} Note: {{ outputs.preflight.vars.warnings }}{% endif %}"
+    else:
+      - id: preview_fix
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: pt-table-sync --print for every replica that differs. Nothing is changed.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: host
+          pullPolicy: IF_NOT_PRESENT
+          user: root
+        containerImage: "{{ inputs.toolkit_image }}"
+        env:
+          MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+          MYSQL_PASS: "{{ secret('MYSQL_PASSWORD') }}"
+          PRIMARY: "{{ inputs.primary }}"
+          DIFFS: "{{ outputs.checksum.vars.diffs }}"
+          NOKEY: "{{ outputs.preflight.vars.no_key_tables }}"
+          MAX: "{{ inputs.max_fix_statements }}"
+        outputFiles:
+          - "fix-*.sql"
+        commands:
+          - |
+            {{ render(vars.cnf) }}
+            summary=""; too_big=""; sample=""
+            for r in $(echo "$DIFFS" | tr ';' '\n' | sed -n 's/^ *\([^:]*:[0-9]*\):.*/\1/p'); do
+              f="fix-$(echo $r | tr ':.' '--').sql"
+              pt-table-sync --replicate percona.checksums --sync-to-source "h=${r%:*},P=${r##*:},F=$CNF" ${NOKEY:+--ignore-tables "$NOKEY"} --print --no-version-check 2> err.txt \
+                | sed 's| /\*percona-toolkit.*\*/||' > $f || true
+              ! grep -qiE 'error|cannot|failed' err.txt || { echo "CHECK FAILED: pt-table-sync cannot plan a fix for $r: $(grep -m1 -iE 'error|cannot|failed' err.txt)" >&2; exit 1; }
+              n=$(grep -c . $f || true); rep=$(grep -c '^REPLACE' $f || true); del=$(grep -c '^DELETE' $f || true); ins=$(grep -c '^INSERT' $f || true)
+              summary="$summary$r: $n statement(s) ($rep REPLACE, $del DELETE, $ins INSERT); "
+              [ "$n" -le "$MAX" ] || too_big="$too_big$r ($n), "
+              sample="$sample$(head -n 3 $f | cut -c1-160 | sed "s|^|$r  |" | tr '\n' '|')"
+            done
+            echo "::{\"outputs\":{\"summary\":\"$(echo "${summary%; }" | tr -d '"\\')\",\"too_big\":\"${too_big%, }\",\"sample\":\"$(echo "$sample" | tr -d '"\\')\"}}::"
+
+      - id: fix_size
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.preview_fix.vars.too_big != '' }}"
+        then:
+          - id: too_much_drift
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "CHECK FAILED: the replicas differ from the primary ({{ outputs.checksum.vars.diffs }}), and the fix for {{ outputs.preview_fix.vars.too_big }} is over {{ inputs.max_fix_statements }} statements. Rebuild that replica from a backup instead, and find out why it drifted. Nothing was changed."
+
+      - id: request_approval
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          MySQL replica drift: {{ outputs.checksum.vars.diffs }}.
+          Fix planned by pt-table-sync: {{ outputs.preview_fix.vars.summary }}. The statements run on the primary {{ inputs.primary }} and reach the replicas through replication; on the primary they rewrite rows with the values they already have.{% if outputs.preflight.vars.no_key_tables != '' %} Not repaired, no PRIMARY or UNIQUE key: {{ outputs.preflight.vars.no_key_tables }}.{% endif %} First lines:
+          {{ outputs.preview_fix.vars.sample | replace({'|': '
+          '}) }}
+          The full statements are in this execution's outputs (fix-*.sql). Resume execution {{ execution.id }} in Kestra to apply them.{% if outputs.preflight.vars.warnings != '' %}
+          Note: {{ outputs.preflight.vars.warnings }}{% endif %}
+
+      - id: approve_fix
+        type: io.kestra.plugin.core.flow.Pause
+        description: Waits up to 4 hours. No decision means nothing is changed.
+        pauseDuration: PT4H
+        behavior: RESUME
+        onResume:
+          - id: apply
+            type: BOOL
+            displayName: Apply the fix through the primary now?
+            defaults: false
+
+      - id: fix_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_fix.onResume.apply ?? false }}"
+        then:
+          - id: apply_fix
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: pt-table-sync --execute for each replica that differed, then pt-table-checksum again on the affected tables only.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: host
+              pullPolicy: IF_NOT_PRESENT
+              user: root
+            containerImage: "{{ inputs.toolkit_image }}"
+            env:
+              MYSQL_USER: "{{ secret('MYSQL_USERNAME') }}"
+              MYSQL_PASS: "{{ secret('MYSQL_PASSWORD') }}"
+              PRIMARY: "{{ inputs.primary }}"
+              REPLICAS: "{{ inputs.replicas }}"
+              DIFFS: "{{ outputs.checksum.vars.diffs }}"
+              NOKEY: "{{ outputs.preflight.vars.no_key_tables }}"
+            commands:
+              - |
+                {{ render(vars.cnf) }}
+                for r in $(echo "$DIFFS" | tr ';' '\n' | sed -n 's/^ *\([^:]*:[0-9]*\):.*/\1/p'); do
+                  pt-table-sync --replicate percona.checksums --sync-to-source "h=${r%:*},P=${r##*:},F=$CNF" ${NOKEY:+--ignore-tables "$NOKEY"} --execute --verbose --no-version-check > sync.txt 2>&1 \
+                    || [ $? -eq 2 ] || { cat sync.txt; echo "CHECK FAILED: pt-table-sync --execute failed for $r: $(grep -m1 -iE 'error|cannot|failed' sync.txt)" >&2; exit 1; }
+                  grep -E '^#|DELETE|REPLACE|INSERT|UPDATE' sync.txt | tail -n 5
+                done
+                tables=$(echo "$DIFFS" | grep -oE '[A-Za-z0-9_]+\.[A-Za-z0-9_]+ \(' | tr -d ' (' | sort -u | paste -sd, -)
+                rc=0
+                pt-table-checksum "h=$P_HOST,P=$P_PORT,F=$CNF" --tables "$tables" --replicate percona.checksums \
+                  --recursion-method "dsn=h=$P_HOST,P=$P_PORT,F=$CNF,D=percona,t=dsns" --no-check-binlog-format --no-version-check > recheck.txt 2>&1 || rc=$?
+                cat recheck.txt
+                left=""
+                for r in $(echo "$REPLICAS" | tr ',' ' '); do
+                  d=$(my $r -e "SELECT CONCAT(db, '.', tbl) FROM percona.checksums WHERE CONCAT(db, '.', tbl) IN ('$(echo $tables | sed "s/,/','/g")') AND (source_cnt <> this_cnt OR source_crc <> this_crc OR ISNULL(source_crc) <> ISNULL(this_crc)) GROUP BY db, tbl" | paste -sd, -)
+                  [ -z "$d" ] || left="$left$r: $d; "
+                done
+                echo "::{\"outputs\":{\"tables\":\"$tables\",\"recheck_exit\":$rc,\"still_different\":\"${left%; }\"}}::"
+          - id: fixed
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.apply_fix.vars.still_different == '' }}"
+            then:
+              - id: remember_fixed
+                type: io.kestra.plugin.core.kv.Set
+                key: "{{ vars.last_clean_key }}"
+                kvType: JSON
+                value: "{{ {'at': execution.startDate, 'fixed': outputs.checksum.vars.diffs} | toJson }}"
+              - id: report_fixed
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: "MySQL replica drift fixed: {{ outputs.preview_fix.vars.summary }}, applied through the primary. A new checksum of {{ outputs.apply_fix.vars.tables }} matches on every replica."
+            else:
+              - id: still_drifting
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "CHECK FAILED: after the fix these tables still differ: {{ outputs.apply_fix.vars.still_different }}.{% if outputs.preflight.vars.no_key_tables != '' %} {{ outputs.preflight.vars.no_key_tables }} has no PRIMARY or UNIQUE key, so pt-table-sync cannot repair it: copy it from the primary by hand or add a key.{% endif %} Any other table that still differs means something keeps writing to the replica directly: check read_only and super_read_only."
+        else:
+          - id: report_not_fixed
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "MySQL replica drift left as it is ({% if outputs.approve_fix.onResume.apply is defined %}declined{% else %}no decision within 4 h{% endif %}): {{ outputs.checksum.vars.diffs }}. Nothing was changed; reads from those replicas can return different rows than the primary."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      MySQL replica consistency check FAILED in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at {{ errorLogs() | jq('([.[] | select(.message | test("CHECK FAILED"))] + .)[0] | "`" + .taskId + "`: " + (.message | sub("^.*CHECK FAILED: "; "") | split("\n")[0])') | first }}{% endif %}
+      Last clean check: {{ (kv(vars.last_clean_key, errorOnMissing=false) ?? {}).at ?? 'never' }}
+
+outputs:
+  - id: result
+    type: JSON
+    value: "{{ {'checksum': outputs.checksum.vars ?? {}, 'fix': outputs.preview_fix.vars ?? {}, 'applied': outputs.apply_fix.vars ?? {}} }}"
+
+extend:
+  title: Find and Fix Silent MySQL Replica Drift with pt-table-checksum and an Approval
+  shortDescription: Checksum every table on the primary and its replicas, preview the repair with pt-table-sync, apply it through the primary after approval, and prove the replicas match.
+  metaTitle: MySQL Replica Consistency Check and Repair with Percona Toolkit | Kestra
+  metaDescription: Detect rows where MySQL replicas differ from the primary with pt-table-checksum, preview the pt-table-sync fix, apply it after approval and re-check.
+  description: |
+    A MySQL replica can be "healthy" (both threads running, zero lag) and still hold different data than the primary: a write made directly on the replica, a crash with an unsafe setting, a replica rebuilt from a broken backup, a statement that is not deterministic. Nobody notices until a read from that replica returns the wrong row, or until it is promoted and becomes the truth. Replication lag monitors cannot see it; only comparing the data can.
+
+    This blueprint runs Percona Toolkit's standard procedure end to end. `pt-table-checksum` compares every table chunk by chunk through replication itself, so each replica computes its own checksum of exactly the rows the primary checksummed. When something differs, `pt-table-sync` previews the statements that would repair each replica, a person approves them, and they run on the primary, from where they replicate, so the fix never writes to a replica directly. The tables that differed are then checksummed again to prove they match.
+
+    ## How it works
+    1. `weekly_check` (`Schedule`, shipped disabled) or `after_incident` (`Webhook`, after a failover or a replica rebuild). `concurrency` limit 1.
+    2. `preflight` (`shell.Commands`, Percona Toolkit image):
+       - every replica answers and both replication threads run; a stopped applier is reported with the error from `performance_schema.replication_applier_status_by_worker` (the table and the row), not just "a worker stopped";
+       - no replica has replicas of its own (they would copy its checksum results instead of computing theirs);
+       - errant GTIDs: transactions a replica has and the primary never ran, the usual sign of direct writes;
+       - tables without a PRIMARY or UNIQUE key, which pt-table-sync cannot repair;
+       - the replicas are written to `percona.dsns`, so exactly the listed ones are checked.
+    3. `replicas_ready` (`If` + `Fail`) stops before any checksum when a replica cannot take part.
+    4. `checksum`: `pt-table-checksum` with `--max-lag` (it pauses while a replica lags) and `--chunk-time`, then the documented diff query on `percona.checksums` on every replica. Its exit code 16 means "differences found" and is this flow's result, not an error.
+    5. `any_drift` (`If`):
+       - none: `kv.Set` (last clean check) and Slack;
+       - otherwise `preview_fix`: `pt-table-sync --replicate --sync-to-source --print` per replica, with the statements saved as `fix-*.sql` outputs. Over `max_fix_statements` the flow refuses: rebuild that replica instead.
+    6. `request_approval` (Slack: what differs, how many REPLACE and DELETE statements, the first lines) and `approve_fix` (`Pause`, 4 h).
+    7. `apply_fix`: `pt-table-sync --execute` through the primary, then `pt-table-checksum --tables` on the tables that differed. `fixed` (`If`) reports success or fails with what still differs.
+    8. `errors` → one Slack alert with the task, the reason and the last clean check.
+
+    ## What you get
+    - Messages from the test runs:
+      - "MySQL replicas consistent: 3 table(s), 52002 rows of shop identical on 127.0.0.1:3311,127.0.0.1:3312 and the primary 127.0.0.1:3310."
+      - "MySQL replica drift: 127.0.0.1:3311: shop.orders (1 chunk); 127.0.0.1:3312: shop.customers (1 chunk). Fix planned by pt-table-sync: 127.0.0.1:3311: 6 statement(s) (5 REPLACE, 1 DELETE, 0 INSERT); …"
+      - "MySQL replica drift fixed: … applied through the primary. A new checksum of shop.customers,shop.orders matches on every replica."
+      - "FAILED at `not_checkable`: 127.0.0.1:3311 has 1 replica(s) of its own: with row-based binlogs they would copy its checksums instead of computing theirs."
+    - `outputs.result`: the checksum totals and differences, the planned fix, and the result of the re-check. The planned statements are in the `preview_fix` output files.
+    - The KV entry `mysql_replica_checksum_last_clean`.
+
+    ## Error handling
+    - **Nothing is repaired without an approval**, and nothing at all is changed when the fix is declined, not answered within 4 hours, or larger than `max_fix_statements`.
+    - **A replica that cannot take part stops the check before it starts**: not answering, not replicating (with the applier's error), or chained.
+    - **The fix never writes to a replica.** pt-table-sync runs `REPLACE` and `DELETE` on the primary with the primary's own values, so they are no-ops there and repair the replica as they replicate; GTIDs stay consistent.
+    - **The repair is verified.** If a table still differs after the fix, the run fails and says why: a table without a unique key, or something still writing to the replica directly.
+    - **Credentials** go to a defaults file inside the task container, never onto a command line.
+    - Every failure sends one Slack alert with the reason and the date of the last clean check.
+
+    ## What this blueprint teaches about Kestra
+    - **Exit codes as data**: a tool whose non-zero exit status means "found something" is handled in the script, so the flow decides with `If` instead of failing the task.
+    - **`outputFiles` for review**: the exact SQL a person approves is attached to the execution.
+    - **`Pause` with a typed `onResume` input**, nested `If`s for the clean, refused, declined and fixed paths, and `kv.Set` to remember the last clean check.
+
+    ## Prerequisites
+    - MySQL 8.0 with replicas (GTIDs recommended). A user that can connect to the primary and every replica with `SELECT, PROCESS, SUPER` (or `SYSTEM_VARIABLES_ADMIN`), `REPLICATION SLAVE, REPLICATION CLIENT`, and `ALL` on the `percona` database; pt-table-sync also needs `INSERT, UPDATE, DELETE` on the checked databases.
+    - A Kestra worker that can run Docker containers and reach the servers (the tasks use `networkMode: host`).
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `MYSQL_USERNAME`, `MYSQL_PASSWORD`: the user above.
+    - `SLACK_WEBHOOK_URL`.
+    - `MYSQL_CHECKSUM_WEBHOOK_KEY`: a long random string for the webhook.
+
+    ### Inputs
+    - `primary` and `replicas` (`host:port`), `databases`.
+    - `max_lag_seconds` (5), `chunk_time` (0.5), `max_fix_statements` (1000), `toolkit_image` (`percona/percona-toolkit:3.7.1`).
+    - The approval waits 4 hours (`pauseDuration` of `approve_fix`).
+
+    ### Outputs
+    - `result` (JSON), described above.
+
+    ## Quick start
+    1. Point `primary`, `replicas` and `databases` at your servers, add the secrets, and run. A healthy set of replicas reports "consistent" with the number of tables and rows compared.
+    2. To see a repair, make a replica drift on purpose: `SET SESSION sql_log_bin = 0; UPDATE shop.orders SET total = total + 1 WHERE id = 10;` on the replica, run again, read the plan in Slack and resume with **Apply the fix through the primary now?** checked.
+    3. Real result from the test servers: 6 statements for one replica and 1 for the other, applied through the primary, and the re-check of both tables matched.
+
+    ## How to read the result
+    - **Errant GTIDs stay after a fix.** pt-table-sync repairs the rows, not the replica's GTID history, so the warning keeps appearing until the errant transactions are dealt with: inject empty transactions with those GTIDs on the primary if the writes were harmless, or rebuild the replica. Until then, a failover to that replica would send them to the others.
+    - A table "without a PRIMARY or UNIQUE key" is still checksummed, so drift in it is reported; it just has to be repaired by hand.
+    - A diff of one chunk in a big table means the drift is within that chunk's key range; `percona.checksums` on the replica shows the boundaries.
+
+    ## How to extend
+    - Checksum one large database per run with `--databases` and a `Loop`, so each run stays inside a maintenance window.
+    - Add `--where` per table to check only recent rows on huge append-only tables.
+    - Point the webhook at your failover tooling, so every promoted replica is checked before it takes writes.
+
+    ## Links
+    - [pt-table-checksum](https://docs.percona.com/percona-toolkit/pt-table-checksum.html) and [pt-table-sync](https://docs.percona.com/percona-toolkit/pt-table-sync.html)
+    - [MySQL: replication and GTIDs](https://dev.mysql.com/doc/refman/8.0/en/replication-gtids-concepts.html)
+    - [Shell Commands](https://kestra.io/plugins/plugin-script-shell) with the [Docker task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.scripts.runner.docker.docker)
+    - [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause), [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if), [Fail](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.fail), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook), [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule) and [Webhook](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.webhook) triggers
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false
