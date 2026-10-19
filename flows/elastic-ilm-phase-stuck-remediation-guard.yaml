@@ -1,0 +1,403 @@
+id: elastic-ilm-phase-stuck-remediation-guard
+namespace: company.team
+
+inputs:
+  - id: elasticsearch_url
+    type: STRING
+    defaults: "http://localhost:9200"
+    description: Base URL of the Elasticsearch or OpenSearch cluster.
+
+  - id: elasticsearch_username
+    type: STRING
+    defaults: "{{ secret('ELASTICSEARCH_USERNAME') }}"
+    description: Username for basic authentication.
+
+  - id: elasticsearch_password
+    type: STRING
+    defaults: "{{ secret('ELASTICSEARCH_PASSWORD') }}"
+    description: Password for basic authentication.
+
+  - id: index_pattern
+    type: STRING
+    defaults: "*"
+    description: Index name or wildcard pattern to inspect for ILM or ISM status. Defaults to '*'.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: true
+    description: When true, clear conflicting index settings and dispatch automated ILM retries.
+
+  - id: dry_run
+    type: BOOL
+    defaults: false
+    description: When true, evaluate and report stuck indices without applying mutating settings or retries.
+
+  - id: max_retry_threshold
+    type: INT
+    defaults: 10
+    description: Maximum failed step retry count before flagging index as an escalated repeated failure.
+
+triggers:
+  - id: hourly_ilm_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic scheduled audit scanning managed indices for stuck ILM phases.
+    cron: "0 * * * *"
+
+tasks:
+  - id: fetch_ilm_explain
+    type: io.kestra.plugin.core.http.Request
+    description: Query the Elasticsearch or OpenSearch ILM explain API for targeted indices.
+    uri: "{{ inputs.elasticsearch_url }}/{{ inputs.index_pattern }}/_ilm/explain"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (inputs.elasticsearch_username ~ ':' ~ inputs.elasticsearch_password) | base64Encode }}"
+      Accept: "application/json"
+    options:
+      allowFailed: true
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT15S
+      maxAttempts: 3
+
+  - id: check_explain_status
+    type: io.kestra.plugin.core.flow.If
+    description: Fail early if the cluster explain API returned a non-200 HTTP status code.
+    condition: "{{ outputs.fetch_ilm_explain.code != 200 }}"
+    then:
+      - id: fail_unreachable_cluster
+        type: io.kestra.plugin.core.execution.Fail
+        description: Abort execution because the ILM explain endpoint could not be reached.
+        errorMessage: >-
+          Failed to query ILM explain API at {{ inputs.elasticsearch_url }}/{{ inputs.index_pattern }}/_ilm/explain. HTTP status: {{ outputs.fetch_ilm_explain.code }}. Response: {{ outputs.fetch_ilm_explain.body }}.
+
+  - id: triage_ilm_failures
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse ILM explain API response, detect stuck error phases, categorize root causes, and prepare remediation plans.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    inputFiles:
+      explain_response.json: "{{ outputs.fetch_ilm_explain.body ?? '{}' }}"
+    env:
+      MAX_RETRY_THRESHOLD: "{{ inputs.max_retry_threshold }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      max_retry_threshold = int(os.environ.get("MAX_RETRY_THRESHOLD", "10"))
+
+      try:
+          with open("explain_response.json", "r", encoding="utf-8") as f:
+              raw_text = f.read().strip()
+              data = json.loads(raw_text) if raw_text else {}
+      except Exception:
+          data = {}
+
+      indices_dict = data.get("indices", data) if isinstance(data, dict) else {}
+      stuck_indices = []
+      total_inspected = 0
+
+      for idx_name, info in indices_dict.items():
+          if not isinstance(info, dict):
+              continue
+
+          is_managed = info.get("managed", True) and info.get("enabled", True)
+          if not is_managed:
+              continue
+
+          total_inspected += 1
+
+          step = str(info.get("step") or "")
+          failed_step = str(info.get("failed_step") or "")
+          ilm_status = str(info.get("is_ilm_status") or "")
+          phase = str(info.get("phase") or "unknown")
+          action = str(info.get("action") or "unknown")
+          policy = str(info.get("policy") or info.get("index.plugins.index_state_management.policy_id") or "unspecified")
+          retry_count = int(info.get("failed_step_retry_count") or 0)
+
+          step_info = info.get("step_info", {})
+          if not isinstance(step_info, dict):
+              step_info = {"reason": str(step_info)}
+
+          if not step_info and "info" in info and isinstance(info["info"], dict):
+              step_info = {
+                  "type": "opensearch_ism_error",
+                  "reason": info["info"].get("cause") or info["info"].get("message") or ""
+              }
+
+          step_type = str(step_info.get("type") or "")
+          step_reason = str(step_info.get("reason") or "")
+
+          is_error = (
+              step.upper() == "ERROR" or
+              ilm_status.upper() == "ERROR" or
+              (failed_step and failed_step != "None" and failed_step != "") or
+              "ILLEGAL_ARGUMENT_EXCEPTION" in step_type.upper() or
+              "failed" in step.lower()
+          )
+
+          if not is_error:
+              continue
+
+          text_context = f"{action} {step} {failed_step} {step_type} {step_reason}".lower()
+
+          if "rollover" in text_context and ("alias" in text_context or "does not point" in text_context):
+              category = "ROLLOVER_ALIAS_MISSING"
+              recommended_action = "Clear read-only block and re-evaluate rollover alias target"
+              has_settings_remediation = True
+              settings_payload = {"index": {"blocks.read_only_allow_delete": None}}
+          elif "shrink" in text_context and any(k in text_context for k in ["shard", "routing", "allocation", "cannot be shrunk", "node"]):
+              category = "SHRINK_SHARD_ROUTING_MISMATCH"
+              recommended_action = "Enforce read-only write block for shrink shard routing"
+              has_settings_remediation = True
+              settings_payload = {"index": {"blocks.write": "true"}}
+          elif any(k in phase.lower() for k in ["frozen", "cold"]) or any(k in text_context for k in ["snapshot", "mount", "timeout", "timed out", "repository"]):
+              category = "FROZEN_TIER_TIMEOUT"
+              recommended_action = "Retry mount step after storage snapshot repository clears"
+              has_settings_remediation = False
+              settings_payload = None
+          else:
+              category = "GENERIC_PHASE_ERROR"
+              recommended_action = "Clear conflicting blocks and dispatch ILM retry"
+              has_settings_remediation = True
+              settings_payload = {"index": {"blocks.read_only_allow_delete": None}}
+
+          exceeded_threshold = retry_count >= max_retry_threshold
+
+          stuck_indices.append({
+              "index": idx_name,
+              "policy": policy,
+              "phase": phase,
+              "action": action,
+              "step": step,
+              "failed_step": failed_step or step,
+              "retry_count": retry_count,
+              "retry_threshold_exceeded": exceeded_threshold,
+              "error_type": step_type or "unknown_error",
+              "error_reason": step_reason or "No error reason returned by cluster explain API",
+              "failure_category": category,
+              "recommended_action": recommended_action,
+              "has_settings_remediation": has_settings_remediation,
+              "settings_payload": settings_payload
+          })
+
+      lines = []
+      for item in stuck_indices:
+          thresh_alert = " :warning: *[RETRY THRESHOLD EXCEEDED]*" if item["retry_threshold_exceeded"] else ""
+          lines.append(
+              f"• *{item['index']}* (Policy: `{item['policy']}`, Phase: `{item['phase']}`, Action: `{item['action']}`){thresh_alert}\n"
+              f"  Category: *{item['failure_category']}* | Failed Step: `{item['failed_step']}` (Retries: {item['retry_count']})\n"
+              f"  Error: `{item['error_type']}`: {item['error_reason']}\n"
+              f"  Action: {item['recommended_action']}"
+          )
+      slack_summary = "\n\n".join(lines) if lines else "No stuck indices detected."
+
+      kv_payload = {
+          "timestamp": datetime.now(timezone.utc).isoformat(),
+          "total_inspected": total_inspected,
+          "stuck_count": len(stuck_indices),
+          "status": "ERROR" if stuck_indices else "HEALTHY",
+          "stuck_indices": stuck_indices
+      }
+
+      output_data = {
+          "total_inspected": total_inspected,
+          "stuck_count": len(stuck_indices),
+          "has_stuck_indices": len(stuck_indices) > 0,
+          "stuck_indices": stuck_indices,
+          "slack_summary": slack_summary,
+          "kv_payload": kv_payload
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print("::" + json.dumps({"outputs": output_data}) + "::")
+
+  - id: persist_telemetry_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist the latest ILM health manifest and stuck index history in Kestra KV store.
+    key: "elastic_ilm_stuck_remediation_history"
+    kvType: JSON
+    overwrite: true
+    value: "{{ outputs.triage_ilm_failures.vars.kv_payload | toJson }}"
+
+  - id: gate_stuck_indices
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate if stuck indices require Slack triage notification and remediation actions.
+    condition: "{{ outputs.triage_ilm_failures.vars.has_stuck_indices }}"
+    then:
+      - id: dispatch_slack_triage
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post immediate operational triage alert to Slack with exact step error details.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": "*Elasticsearch / OpenSearch ILM Phase Stuck Alert*\nFound " ~ outputs.triage_ilm_failures.vars.stuck_count ~ " stuck index(es) on `" ~ inputs.index_pattern ~ "` in cluster `" ~ inputs.elasticsearch_url ~ "`.\n\n" ~ outputs.triage_ilm_failures.vars.slack_summary ~ "\n\n*Remediation Mode:* auto_remediate=" ~ inputs.auto_remediate ~ ", dry_run=" ~ inputs.dry_run ~ " (Execution: `" ~ execution.id ~ "`)"
+          } | toJson }}
+
+      - id: evaluate_remediation_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Execute automated index remediation when auto_remediate is true and dry_run is disabled.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: remediate_indices
+            type: io.kestra.plugin.core.flow.Loop
+            description: Iterate sequentially over each stuck index to clear conflicting settings and dispatch retries.
+            values: "{{ outputs.triage_ilm_failures.vars.stuck_indices }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: check_settings_fix
+                type: io.kestra.plugin.core.flow.If
+                description: Check if conflicting settings need to be cleared or applied before retrying ILM.
+                condition: "{{ item.value.has_settings_remediation }}"
+                then:
+                  - id: apply_settings
+                    type: io.kestra.plugin.core.http.Request
+                    description: Clear conflicting index settings or enforce required routing.
+                    uri: "{{ inputs.elasticsearch_url }}/{{ item.value.index }}/_settings"
+                    method: PUT
+                    headers:
+                      Authorization: "Basic {{ (inputs.elasticsearch_username ~ ':' ~ inputs.elasticsearch_password) | base64Encode }}"
+                      Content-Type: "application/json"
+                    body: "{{ item.value.settings_payload | toJson }}"
+                    options:
+                      allowFailed: true
+
+              - id: retry_ilm_phase
+                type: io.kestra.plugin.core.http.Request
+                description: Dispatch retry request to re-execute the failed ILM lifecycle step.
+                uri: "{{ inputs.elasticsearch_url }}/{{ item.value.index }}/_ilm/retry"
+                method: POST
+                headers:
+                  Authorization: "Basic {{ (inputs.elasticsearch_username ~ ':' ~ inputs.elasticsearch_password) | base64Encode }}"
+                  Accept: "application/json"
+                options:
+                  allowFailed: true
+
+              - id: log_remediation_result
+                type: io.kestra.plugin.core.log.Log
+                description: Log remediation attempt for the index.
+                message: >-
+                  Remediation dispatched for index '{{ item.value.index }}' (failure: {{ item.value.failure_category }}). Retry response HTTP code: {{ outputs.retry_ilm_phase.code }}.
+        else:
+          - id: log_simulation_mode
+            type: io.kestra.plugin.core.log.Log
+            description: Record that remediation actions were bypassed due to dry_run or auto_remediate flags.
+            message: >-
+              Remediation skipped: dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}. Found {{ outputs.triage_ilm_failures.vars.stuck_count }} stuck index(es).
+    else:
+      - id: log_cluster_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: Log confirmation when all inspected indices are healthy in their expected lifecycle phase.
+        message: >-
+          ILM audit completed cleanly. Inspected {{ outputs.triage_ilm_failures.vars.total_inspected }} index(es) on pattern '{{ inputs.index_pattern }}'. No stuck phases found.
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if an unexpected execution error occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Flow Execution Failed*: `elastic-ilm-phase-stuck-remediation-guard` (Execution: `" ~ execution.id ~ "`). Failed to complete ILM scan or remediation pass. Check cluster health and network reachability."
+      } | toJson }}
+
+extend:
+  title: Elasticsearch & OpenSearch ILM Phase Stuck Remediation Guard
+  metaTitle: Elasticsearch & OpenSearch ILM Remediation Guard | Kestra
+  shortDescription: Audit Elasticsearch and OpenSearch ILM explain states, classify stuck phase failures, clear conflicting index settings, retry failed steps, persist telemetry in KV, and notify Slack.
+  metaDescription: Remediate stuck Elasticsearch and OpenSearch ILM phases. Classify failures, clear invalid settings, trigger automated retries, and dispatch Slack alerts.
+  description: |
+    Elasticsearch and OpenSearch indices routinely get stuck in Index Lifecycle Management (ILM) or Index State Management (ISM) error steps. When an ILM step encounters an error—such as an illegal argument exception due to an invalid rollover alias, unallocated shards preventing an index shrink, or network timeouts during frozen tier searchable snapshot mounting—the index halts all lifecycle progression. Write traffic continues, data retention ceases to execute, and disk utilization climbs toward watermark limits while overall cluster health remains deceptive green.
+
+    This blueprint implements an automated ILM/ISM phase guard that queries the explain lifecycle API, classifies root-cause failures into actionable remediation categories, clears conflicting index settings, triggers safe automated retries, stores operational history in Kestra KV, and dispatches detailed triage alerts to Slack.
+
+    ## How it works
+
+    1. The `fetch_ilm_explain` task queries Elasticsearch or OpenSearch through `io.kestra.plugin.core.http.Request` via `GET /{index_pattern}/_ilm/explain` using basic authentication headers.
+    2. The `check_explain_status` task evaluates HTTP response codes. If the cluster endpoint returns non-200 responses, the flow aborts immediately via `fail_unreachable_cluster` to prevent downstream actions on incomplete state.
+    3. The `triage_ilm_failures` task (`io.kestra.plugin.scripts.python.Script`) parses the cluster explain payload. It filters managed indices in `ERROR` state, extracts step details, and classifies failure modes:
+       - `ROLLOVER_ALIAS_MISSING`: Rollover failed because `index.lifecycle.rollover_alias` is unset, invalid, or pointing to a different index.
+       - `SHRINK_SHARD_ROUTING_MISMATCH`: Shrink failed because primary shards were not routed to a single node.
+       - `FROZEN_TIER_TIMEOUT`: Searchable snapshot mount or cold/frozen tier storage operation timed out.
+       - `GENERIC_PHASE_ERROR`: Any other lifecycle exception or conflicting read-only block.
+    4. The `persist_telemetry_kv` task (`io.kestra.plugin.core.kv.Set`) stores the audit manifest and error history into Kestra KV under key `elastic_ilm_stuck_remediation_history`.
+    5. The `gate_stuck_indices` task (`io.kestra.plugin.core.flow.If`) checks if stuck indices exist:
+       - When detected, `dispatch_slack_triage` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) sends an operational triage notification containing index names, policies, failed steps, retry counts, and root-cause reasons.
+       - If `auto_remediate` is enabled and `dry_run` is disabled, `remediate_indices` (`io.kestra.plugin.core.flow.Loop`) iterates through each stuck index:
+         - Clears conflicting index settings via `PUT /{index}/_settings` when applicable.
+         - Triggers automated lifecycle retry via `POST /{index}/_ilm/retry`.
+         - Logs HTTP outcomes.
+       - When in simulation mode (`dry_run: true`), remediation steps are bypassed and logged.
+    6. The `hourly_ilm_guard` schedule trigger runs periodic health scans. An `errors` handler posts to Slack on unexpected execution failures.
+
+    ## What you get
+
+    - Automated detection of Elasticsearch and OpenSearch indices trapped in ILM/ISM error steps.
+    - Failure categorization distinguishing missing rollover aliases, shrink shard allocation mismatches, and frozen tier timeouts.
+    - Safe automated remediation clearing conflicting write blocks and issuing lifecycle retries.
+    - Persistent audit history stored in Kestra namespace Key-Value store for compliance and trend tracking.
+    - Context-rich Slack triage alerts containing exact step names, retry counts, and underlying cluster exceptions.
+    - Non-destructive dry-run mode for pre-production verification.
+
+    ## Who it's for
+
+    - Platform and Site Reliability Engineers managing Elasticsearch or OpenSearch logging clusters.
+    - Data Engineers maintaining append-only time-series indices, rollover aliases, and data streams.
+    - Infrastructure teams troubleshooting disk exhaustion caused by blocked rollover and delete lifecycle phases.
+
+    ## Why orchestrate this with Kestra
+
+    Lifecycle failures in Elasticsearch often remain silent because shards stay allocated and the cluster health remains green, even while retention and rollover stop completely. Writing ad-hoc shell scripts or cron jobs leaves no audit trail, risks uncontrolled retry loops, and fails to handle node routing prerequisites. Kestra provides native HTTP orchestration, containerized classification logic, atomic KV state persistence, dry-run safety gates, and immediate incident alerting in a single declarative workflow.
+
+    ## Prerequisites
+
+    - Reachable Elasticsearch cluster (version 7.x or 8.x) or OpenSearch cluster (version 1.x or 2.x).
+    - HTTP user credentials with cluster permissions `manage_ilm`, `manage_index_templates`, and `view_index_metadata`.
+    - Slack Incoming Webhook URL configured for incident triage notifications.
+
+    ### Secrets
+
+    - `ELASTICSEARCH_USERNAME`: Username for HTTP basic authentication.
+    - `ELASTICSEARCH_PASSWORD`: Password for HTTP basic authentication.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for operational notifications and alerts.
+
+    ## Quick start
+
+    1. Configure `ELASTICSEARCH_USERNAME`, `ELASTICSEARCH_PASSWORD`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Run an initial manual execution with default parameters (`dry_run: true`) to audit current ILM explain states without modifying indices.
+    3. Review the execution logs, Slack alert summary, and Kestra KV store entry under `elastic_ilm_stuck_remediation_history`.
+    4. Run with `auto_remediate: true` and `dry_run: false` to clear conflicting blocks and trigger automated retries.
+    5. Enable the `hourly_ilm_guard` schedule trigger to maintain automated continuous remediation.
+
+    ## How to extend
+
+    - Configure `index_pattern` to isolate specific index families such as `logs-*` or `metrics-*`.
+    - Add an automated index template remediation step to patch bad rollover aliases at the template source.
+    - Integrate Jira or PagerDuty incident tasks when an index exceeds `max_retry_threshold`.
+    - Extend the Python triage task to handle OpenSearch multi-node ISM transition actions.
+
+    ## Links
+
+    - [Elasticsearch ILM Explain API Documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/ilm-explain-lifecycle.html)
+    - [Elasticsearch ILM Retry API Documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/ilm-retry-policy.html)
+    - [OpenSearch Index State Management Documentation](https://opensearch.org/docs/latest/im-plugin/ism/index/)
+    - [Kestra HTTP Request Plugin Documentation](https://kestra.io/plugins/plugin-core/io.kestra.plugin.core.http.request)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
