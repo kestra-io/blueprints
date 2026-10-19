@@ -1,0 +1,573 @@
+id: clinicaltrials-study-status-change-tracker
+namespace: company.team
+
+description: |
+  Track a set of ClinicalTrials.gov studies (a condition, intervention or sponsor search,
+  plus any NCT ids you watch explicitly) and find out what changed since the last run:
+  status transitions such as RECRUITING to TERMINATED, results posted, enrollment revised,
+  primary completion dates slipping, new studies registered and studies dropping out of
+  the search. Each run pulls only the fields it compares through the API v2 `fields`
+  parameter, keeps a Parquet snapshot and a cumulative change log in Kestra's internal
+  storage (URIs in the KV store), diffs in DuckDB and sends a Slack digest when something
+  material moved.
+
+inputs:
+  - id: use_search
+    type: BOOL
+    defaults: true
+    description: Search the registry with `condition`, `intervention` and `sponsor`. Set to false to track only the `nct_ids` watchlist.
+
+  - id: condition
+    type: STRING
+    defaults: glioblastoma
+    description: Condition or disease search (`query.cond`), for example `glioblastoma`, `type 2 diabetes`, `ALS`.
+
+  - id: intervention
+    type: STRING
+    defaults: ""
+    description: Intervention or treatment search (`query.intr`), for example `pembrolizumab` or `CAR-T`. Combined with the other search fields (AND).
+
+  - id: sponsor
+    type: STRING
+    defaults: ""
+    description: Sponsor or collaborator search (`query.spons`), for example `Novartis`. Combined with the other search fields (AND).
+
+  - id: nct_ids
+    type: STRING
+    defaults: "NCT04368728,NCT04470427"
+    description: NCT ids to watch in addition to the search, separated by commas, spaces or semicolons. They are tracked even when they do not match the search. Malformed ids are reported as INVALID and unknown ids as NOT_FOUND instead of failing the run.
+
+  - id: status_filter
+    type: STRING
+    defaults: ""
+    description: Optional `filter.overallStatus` list such as `RECRUITING,NOT_YET_RECRUITING`. Studies that leave the filter (for example because they were terminated) are re-fetched by id, so the transition is still reported.
+
+  - id: max_studies
+    type: INT
+    defaults: 5000
+    description: Safety cap on the search size. The run fails before paginating when the search matches more studies, so a too-broad query (`cancer` matches over 100,000) does not hammer the API or flood the snapshot.
+
+  - id: enrollment_change_pct
+    type: FLOAT
+    defaults: 10
+    description: Relative enrollment change (percent) that counts as ENROLLMENT_CHANGE. Smaller revisions are kept in the snapshot but not reported.
+
+  - id: completion_slip_days
+    type: INT
+    defaults: 30
+    description: Days a primary completion date must move later to count as COMPLETION_DATE_SLIP (or earlier, as COMPLETION_DATE_PULLED_IN). Month-only dates such as `2027-06` are compared as the last day of the month.
+
+  - id: alert_on_info
+    type: BOOL
+    defaults: false
+    description: Also send the Slack digest for INFO changes (new studies, studies leaving the search, primary completion reached, dates pulled in). By default only HIGH (stopped, suspended, withdrawn, removed) and MEDIUM (other status changes, results posted, enrollment change, completion slip) alert; INFO changes are always in the CSV.
+
+  - id: snapshot_key
+    type: STRING
+    defaults: clinicaltrials_snapshot
+    description: KV key holding the snapshot URI; the change log uses the same key with a `_changelog` suffix. Use one key per watchlist.
+
+triggers:
+  - id: weekly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 7 * * 1"
+    description: ClinicalTrials.gov publishes updates every weekday; weekly suits a portfolio review, use `0 7 * * 2-6` for a daily morning check.
+
+tasks:
+  - id: previous_snapshot
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.snapshot_key }}"
+    errorOnMissing: false
+    description: URI of the Parquet snapshot written by the last run; missing on the first run, which is then a BASELINE.
+
+  - id: previous_changelog
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.snapshot_key }}_changelog"
+    errorOnMissing: false
+
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Writes an empty snapshot and change log with the right schema so every later task has one code path.
+    condition: "{{ outputs.previous_snapshot.value is not defined or outputs.previous_snapshot.value is empty }}"
+    then:
+      - id: empty_state
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        fetchType: NONE
+        outputFiles:
+          - snapshot
+          - changelog
+        sql: |
+          CREATE TABLE snapshot (
+            nct_id VARCHAR, title VARCHAR, sponsor VARCHAR, phase VARCHAR, overall_status VARCHAR, why_stopped VARCHAR,
+            enrollment_count BIGINT, enrollment_type VARCHAR, primary_completion_raw VARCHAR, primary_completion_date DATE,
+            primary_completion_type VARCHAR, study_first_post_date DATE, last_update_post_date DATE, results_first_post_date DATE,
+            has_results BOOLEAN, in_search BOOLEAN, watched BOOLEAN, snapshot_at TIMESTAMP
+          );
+          CREATE TABLE changelog (
+            detected_at TIMESTAMP, nct_id VARCHAR, title VARCHAR, sponsor VARCHAR, phase VARCHAR, change_type VARCHAR,
+            severity VARCHAR, old_value VARCHAR, new_value VARCHAR, detail VARCHAR, last_update_post_date DATE, url VARCHAR
+          );
+          COPY snapshot TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+          COPY changelog TO '{{ outputFiles.changelog }}' (FORMAT PARQUET);
+
+  - id: previous_ids
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Lists the NCT ids of the previous snapshot so the fetch can re-request the ones that no longer match the search.
+    url: "jdbc:duckdb:"
+    fetchType: NONE
+    inputFiles:
+      previous.parquet: "{{ outputs.previous_snapshot.value ?? outputs.empty_state.outputFiles.snapshot }}"
+    outputFiles:
+      - ids_txt
+    sql: |
+      COPY (SELECT nct_id FROM read_parquet('previous.parquet') ORDER BY nct_id) TO '{{ outputFiles.ids_txt }}' (HEADER false, DELIMITER ',');
+
+  - id: fetch_studies
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Standard-library Python, no packages to install. Pages through `/api/v2/studies` with `pageSize=1000` and
+      `pageToken`, asking only for the 15 fields it compares (`fields=`), with `countTotal=true` on the first page to
+      enforce `max_studies` before paginating. It then fetches, in batches of 100 through `filter.ids`, the watched ids
+      and the previously tracked ids the search no longer returns, so a study that left the search (status filter,
+      edited conditions) still shows its new status. Ids are validated against `NCT` + 8 digits first because one
+      malformed id makes the API reject the whole request with HTTP 400. Retries 429 and 5xx with backoff, waits
+      1.2 seconds between requests (the public API allows about 50 per minute) and sends a descriptive User-Agent.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      previous_ids.txt: "{{ outputs.previous_ids.outputFiles.ids_txt }}"
+    outputFiles:
+      - studies.ndjson
+      - id_report.json
+    env:
+      CT_USE_SEARCH: "{{ inputs.use_search }}"
+      CT_CONDITION: "{{ inputs.condition }}"
+      CT_INTERVENTION: "{{ inputs.intervention }}"
+      CT_SPONSOR: "{{ inputs.sponsor }}"
+      CT_STATUS_FILTER: "{{ inputs.status_filter }}"
+      CT_NCT_IDS: "{{ inputs.nct_ids }}"
+      CT_MAX_STUDIES: "{{ inputs.max_studies }}"
+    script: |
+      import json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+      BASE = "https://clinicaltrials.gov/api/v2/studies"
+      FIELDS = ",".join([
+          "NCTId", "NCTIdAlias", "BriefTitle", "LeadSponsorName", "Phase", "OverallStatus", "WhyStopped",
+          "EnrollmentCount", "EnrollmentType", "PrimaryCompletionDate", "PrimaryCompletionDateType",
+          "StudyFirstPostDate", "LastUpdatePostDate", "ResultsFirstPostDate", "HasResults",
+      ])
+      HEADERS = {"User-Agent": "kestra-clinicaltrials-study-status-change-tracker/1.0 (+https://kestra.io/blueprints)", "Accept": "application/json"}
+      requests_made = 0
+
+      def get(params):
+          global requests_made
+          url = BASE + "?" + urllib.parse.urlencode(params)
+          for attempt in range(6):
+              if requests_made:
+                  time.sleep(1.2)
+              requests_made += 1
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=90) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")[:300]
+                  if e.code == 400:
+                      sys.exit(f"ClinicalTrials.gov rejected the request (HTTP 400): {body}")
+                  if e.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                      raise
+                  wait = int(e.headers.get("Retry-After") or 0) or 2 ** (attempt + 1)
+                  print(f"HTTP {e.code}, retrying in {wait}s", file=sys.stderr)
+                  time.sleep(wait)
+              except urllib.error.URLError as e:
+                  if attempt == 5:
+                      raise
+                  print(f"Network error {e.reason}, retrying", file=sys.stderr)
+                  time.sleep(2 ** (attempt + 1))
+
+      def flatten(s):
+          p = s.get("protocolSection", {})
+          ident, st = p.get("identificationModule", {}), p.get("statusModule", {})
+          design = p.get("designModule", {})
+          enr, pcd = design.get("enrollmentInfo", {}), st.get("primaryCompletionDateStruct", {})
+          return {
+              "nct_id": ident.get("nctId"),
+              "aliases": ident.get("nctIdAliases", []),
+              "title": ident.get("briefTitle"),
+              "sponsor": p.get("sponsorCollaboratorsModule", {}).get("leadSponsor", {}).get("name"),
+              "phase": "/".join(design.get("phases", [])) or None,
+              "overall_status": st.get("overallStatus"),
+              "why_stopped": st.get("whyStopped"),
+              "enrollment_count": enr.get("count"),
+              "enrollment_type": enr.get("type"),
+              "primary_completion_raw": pcd.get("date"),
+              "primary_completion_type": pcd.get("type"),
+              "study_first_post_date": st.get("studyFirstPostDateStruct", {}).get("date"),
+              "last_update_post_date": st.get("lastUpdatePostDateStruct", {}).get("date"),
+              "results_first_post_date": st.get("resultsFirstPostDateStruct", {}).get("date"),
+              "has_results": bool(s.get("hasResults", False)),
+          }
+
+      search = {k: v.strip() for k, v in {
+          "query.cond": os.environ.get("CT_CONDITION", ""),
+          "query.intr": os.environ.get("CT_INTERVENTION", ""),
+          "query.spons": os.environ.get("CT_SPONSOR", ""),
+      }.items() if v.strip()}
+      if os.environ.get("CT_USE_SEARCH", "true").lower() != "true":
+          search = {}
+      status_filter = os.environ.get("CT_STATUS_FILTER", "").replace(" ", "").replace("|", ",").upper()
+      max_studies = int(os.environ.get("CT_MAX_STUDIES") or 5000)
+
+      raw_ids = [t.strip().upper() for t in re.split(r"[\s,;]+", os.environ.get("CT_NCT_IDS", "")) if t.strip()]
+      watched = list(dict.fromkeys(i for i in raw_ids if re.fullmatch(r"NCT\d{8}", i)))
+      invalid = sorted({i for i in raw_ids if not re.fullmatch(r"NCT\d{8}", i)})
+      with open("previous_ids.txt", encoding="utf-8") as f:
+          previous = [l.strip() for l in f if l.strip()]
+
+      if not search and not watched:
+          sys.exit("Nothing to track: enable use_search with a condition, intervention or sponsor, or give at least one valid NCT id.")
+
+      studies, total = {}, 0
+      if search:
+          params = dict(search, fields=FIELDS, pageSize=1000, countTotal="true", format="json")
+          if status_filter:
+              params["filter.overallStatus"] = status_filter
+          page = get(params)
+          total = page.get("totalCount", 0)
+          if total > max_studies:
+              sys.exit(f"The search matches {total} studies, above max_studies={max_studies}. Narrow the search (intervention, sponsor, status_filter) or raise the cap.")
+          pages = 0
+          while True:
+              pages += 1
+              for s in page.get("studies", []):
+                  row = flatten(s)
+                  row["in_search"] = True
+                  studies[row["nct_id"]] = row
+              token = page.get("nextPageToken")
+              if not token:
+                  break
+              params.pop("countTotal", None)
+              page = get(dict(params, pageToken=token))
+          print(f"Search {search}{' status ' + status_filter if status_filter else ''}: {total} matching studies in {pages} page(s).")
+
+      alias_of = {}
+      to_fetch = [i for i in dict.fromkeys(watched + previous) if i not in studies]
+      for start in range(0, len(to_fetch), 100):
+          chunk = to_fetch[start:start + 100]
+          page = get({"filter.ids": ",".join(chunk), "fields": FIELDS, "pageSize": 1000, "format": "json"})
+          for s in page.get("studies", []):
+              row = flatten(s)
+              row["in_search"] = False
+              studies.setdefault(row["nct_id"], row)
+              for a in row["aliases"]:
+                  alias_of[a] = row["nct_id"]
+      if to_fetch:
+          print(f"Fetched {len(to_fetch)} watched or previously tracked id(s) outside the search by filter.ids.")
+
+      watched_resolved = {alias_of.get(i, i) for i in watched}
+      not_found = [i for i in watched if alias_of.get(i, i) not in studies]
+      aliases = {i: alias_of[i] for i in watched if i in alias_of}
+
+      with open("studies.ndjson", "w", encoding="utf-8") as f:
+          for row in studies.values():
+              row["watched"] = row["nct_id"] in watched_resolved
+              row.pop("aliases")
+              f.write(json.dumps(row, ensure_ascii=False) + "\n")
+      with open("id_report.json", "w", encoding="utf-8") as f:
+          json.dump({"invalid": invalid, "not_found": not_found, "aliases": aliases}, f)
+
+      print(f"{len(studies)} studies in this snapshot, {requests_made} API request(s). Watched ids: {len(watched)} valid, {len(invalid)} invalid, {len(not_found)} not found, {len(aliases)} resolved as alias.")
+      print("::" + json.dumps({"outputs": {
+          "search_total": total, "studies": len(studies), "requests": requests_made,
+          "invalid_ids": ", ".join(invalid), "not_found_ids": ", ".join(not_found),
+          "aliases": ", ".join(f"{k} -> {v}" for k, v in aliases.items()),
+      }}) + "::")
+
+  - id: diff
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Loads the fetched studies with an explicit schema, normalises month-only completion dates to the last day of the month,
+      compares every study with the previous snapshot and classifies the changes. Writes the new snapshot and the appended
+      change log as Parquet, this run's changes as CSV, and returns counts plus a ready-to-send Slack payload (built with
+      `json_object`, so titles with quotes cannot break the JSON). On the BASELINE run nothing is reported as a change.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      studies.ndjson: "{{ outputs.fetch_studies.outputFiles['studies.ndjson'] }}"
+      previous.parquet: "{{ outputs.previous_snapshot.value ?? outputs.empty_state.outputFiles.snapshot }}"
+      changelog.parquet: "{{ outputs.previous_changelog.value ?? outputs.empty_state.outputFiles.changelog }}"
+    outputFiles:
+      - snapshot
+      - changelog
+      - changes_csv
+    parameters:
+      run_at: "{{ execution.startDate }}"
+      enrollment_pct: "{{ inputs.enrollment_change_pct }}"
+      slip_days: "{{ inputs.completion_slip_days }}"
+      alert_on_info: "{{ inputs.alert_on_info }}"
+      execution_url: "{{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+      scope: "{{ inputs.use_search ? (inputs.condition ~ ' ' ~ inputs.intervention ~ ' ' ~ inputs.sponsor) | trim : '' }}"
+    sql: |
+      CREATE TABLE cur AS
+      SELECT nct_id, title, sponsor, phase, overall_status, why_stopped,
+             CAST(enrollment_count AS BIGINT) AS enrollment_count, enrollment_type,
+             primary_completion_raw,
+             CASE WHEN length(primary_completion_raw) = 7 THEN last_day(CAST(primary_completion_raw || '-01' AS DATE))
+                  WHEN length(primary_completion_raw) = 10 THEN CAST(primary_completion_raw AS DATE) END AS primary_completion_date,
+             primary_completion_type,
+             CAST(study_first_post_date AS DATE) AS study_first_post_date,
+             CAST(last_update_post_date AS DATE) AS last_update_post_date,
+             CAST(results_first_post_date AS DATE) AS results_first_post_date,
+             has_results, in_search, watched,
+             CAST(:run_at AS TIMESTAMP) AS snapshot_at
+      FROM read_json('studies.ndjson', format = 'newline_delimited', columns = {
+        'nct_id': 'VARCHAR', 'title': 'VARCHAR', 'sponsor': 'VARCHAR', 'phase': 'VARCHAR', 'overall_status': 'VARCHAR',
+        'why_stopped': 'VARCHAR', 'enrollment_count': 'BIGINT', 'enrollment_type': 'VARCHAR', 'primary_completion_raw': 'VARCHAR',
+        'primary_completion_type': 'VARCHAR', 'study_first_post_date': 'VARCHAR', 'last_update_post_date': 'VARCHAR', 'results_first_post_date': 'VARCHAR',
+        'has_results': 'BOOLEAN', 'in_search': 'BOOLEAN', 'watched': 'BOOLEAN'});
+
+      CREATE TABLE prev AS SELECT * FROM read_parquet('previous.parquet');
+      CREATE TABLE is_baseline AS SELECT (SELECT count(*) FROM prev) = 0 AS v;
+
+      CREATE TABLE pairs AS
+      SELECT c.nct_id, c.title, c.sponsor, c.phase, c.last_update_post_date, c.why_stopped, c.results_first_post_date, c.in_search,
+             p.overall_status AS old_status, c.overall_status AS new_status,
+             p.has_results AS old_results, c.has_results AS new_results,
+             p.enrollment_count AS old_enr, c.enrollment_count AS new_enr, p.enrollment_type AS old_enr_type, c.enrollment_type AS new_enr_type,
+             p.primary_completion_raw AS old_pcd_raw, c.primary_completion_raw AS new_pcd_raw,
+             p.primary_completion_date AS old_pcd, c.primary_completion_date AS new_pcd,
+             p.primary_completion_type AS old_pcd_type, c.primary_completion_type AS new_pcd_type,
+             p.in_search AS old_in_search
+      FROM cur c JOIN prev p USING (nct_id);
+
+      CREATE TABLE raw_changes AS
+      SELECT nct_id, title, sponsor, phase, last_update_post_date, 'STATUS_CHANGE' AS change_type,
+             CASE WHEN new_status IN ('TERMINATED', 'WITHDRAWN', 'SUSPENDED') THEN 'HIGH' ELSE 'MEDIUM' END AS severity,
+             old_status AS old_value, new_status AS new_value,
+             CASE WHEN why_stopped IS NOT NULL AND new_status IN ('TERMINATED', 'WITHDRAWN', 'SUSPENDED') THEN 'why stopped: ' || why_stopped END AS detail
+      FROM pairs WHERE old_status IS DISTINCT FROM new_status
+      UNION ALL
+      SELECT nct_id, title, sponsor, phase, last_update_post_date, 'RESULTS_POSTED', 'MEDIUM', 'no results', 'results posted',
+             'results first posted ' || coalesce(CAST(results_first_post_date AS VARCHAR), 'n/a')
+      FROM pairs WHERE NOT coalesce(old_results, false) AND new_results
+      UNION ALL
+      SELECT nct_id, title, sponsor, phase, last_update_post_date, 'ENROLLMENT_CHANGE', 'MEDIUM',
+             old_enr || ' ' || coalesce(old_enr_type, ''), new_enr || ' ' || coalesce(new_enr_type, ''),
+             CASE WHEN old_enr = 0 THEN 'from zero' ELSE printf('%+.1f%%', 100.0 * (new_enr - old_enr) / old_enr) END
+      FROM pairs
+      WHERE old_enr IS NOT NULL AND new_enr IS NOT NULL AND old_enr <> new_enr
+        AND (old_enr = 0 OR abs(100.0 * (new_enr - old_enr) / old_enr) >= CAST(:enrollment_pct AS DOUBLE))
+      UNION ALL
+      SELECT nct_id, title, sponsor, phase, last_update_post_date,
+             CASE WHEN new_pcd > old_pcd THEN 'COMPLETION_DATE_SLIP' ELSE 'COMPLETION_DATE_PULLED_IN' END,
+             CASE WHEN new_pcd > old_pcd THEN 'MEDIUM' ELSE 'INFO' END,
+             old_pcd_raw, new_pcd_raw, (new_pcd - old_pcd) || ' days'
+      FROM pairs WHERE abs(new_pcd - old_pcd) >= CAST(:slip_days AS INTEGER)
+      UNION ALL
+      SELECT nct_id, title, sponsor, phase, last_update_post_date, 'PRIMARY_COMPLETION_REACHED', 'INFO',
+             old_pcd_raw || ' ' || old_pcd_type, new_pcd_raw || ' ' || new_pcd_type, 'primary completion date is now ACTUAL'
+      FROM pairs WHERE old_pcd_type = 'ESTIMATED' AND new_pcd_type = 'ACTUAL'
+      UNION ALL
+      SELECT nct_id, title, sponsor, phase, last_update_post_date, 'LEFT_SEARCH', 'INFO', 'in search', 'outside search',
+             'no longer matches the search, still tracked by id (status ' || new_status || ')'
+      FROM pairs WHERE old_in_search AND NOT in_search
+      UNION ALL
+      SELECT c.nct_id, c.title, c.sponsor, c.phase, c.last_update_post_date, 'NEW_STUDY', 'INFO', NULL, c.overall_status,
+             CASE WHEN c.study_first_post_date >= (SELECT CAST(max(snapshot_at) AS DATE) FROM prev) THEN 'newly registered, first posted ' || c.study_first_post_date
+                  WHEN c.in_search THEN 'existing study that now matches the search' ELSE 'added to the watched ids' END
+      FROM cur c ANTI JOIN prev p USING (nct_id)
+      UNION ALL
+      SELECT p.nct_id, p.title, p.sponsor, p.phase, p.last_update_post_date, 'REMOVED', 'HIGH', p.overall_status, NULL,
+             'no longer returned by ClinicalTrials.gov, even by id'
+      FROM prev p ANTI JOIN cur c USING (nct_id);
+
+      CREATE TABLE changes AS
+      SELECT CAST(:run_at AS TIMESTAMP) AS detected_at, nct_id, title, sponsor, phase, change_type, severity, old_value, new_value, detail,
+             last_update_post_date, 'https://clinicaltrials.gov/study/' || nct_id AS url,
+             severity IN ('HIGH', 'MEDIUM') OR CAST(:alert_on_info AS BOOLEAN) AS alert
+      FROM raw_changes WHERE NOT (SELECT v FROM is_baseline);
+
+      COPY (SELECT * FROM cur) TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+      COPY (SELECT * FROM read_parquet('changelog.parquet') UNION ALL SELECT * EXCLUDE (alert) FROM changes)
+        TO '{{ outputFiles.changelog }}' (FORMAT PARQUET);
+      COPY (SELECT * EXCLUDE (alert) FROM changes
+            ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, nct_id)
+        TO '{{ outputFiles.changes_csv }}' (HEADER, DELIMITER ',');
+
+      CREATE TABLE digest AS
+      SELECT (SELECT count(*) FROM changes WHERE alert) AS n,
+             string_agg('• *' || change_type || '* <' || url || '|' || nct_id || '> ' || left(title, 90) || ' (' || coalesce(sponsor, 'n/a') || ')'
+                        || ': ' || coalesce(old_value, '-') || ' -> ' || coalesce(new_value, '-') || coalesce(' — ' || detail, ''), chr(10)
+                        ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, nct_id) AS lines
+      FROM (SELECT * FROM changes WHERE alert
+            ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, nct_id LIMIT 20);
+
+      SELECT
+        (SELECT v FROM is_baseline) AS is_baseline,
+        (SELECT count(*) FROM cur) AS studies,
+        (SELECT count(*) FILTER (WHERE in_search) FROM cur) AS in_search,
+        (SELECT count(*) FILTER (WHERE watched) FROM cur) AS watched,
+        (SELECT count(*) FROM prev) AS previous_studies,
+        (SELECT count(*) FROM pairs p JOIN prev USING (nct_id) WHERE p.last_update_post_date IS DISTINCT FROM prev.last_update_post_date) AS updated_since_last_run,
+        (SELECT count(*) FROM changes) AS changes,
+        (SELECT count(*) FILTER (WHERE alert) FROM changes) AS alert_changes,
+        (SELECT count(*) FILTER (WHERE severity = 'HIGH') FROM changes) AS high,
+        (SELECT count(*) FILTER (WHERE change_type = 'STATUS_CHANGE') FROM changes) AS status_changes,
+        (SELECT count(*) FILTER (WHERE change_type = 'RESULTS_POSTED') FROM changes) AS results_posted,
+        (SELECT count(*) FILTER (WHERE change_type = 'ENROLLMENT_CHANGE') FROM changes) AS enrollment_changes,
+        (SELECT count(*) FILTER (WHERE change_type = 'COMPLETION_DATE_SLIP') FROM changes) AS completion_slips,
+        (SELECT count(*) FILTER (WHERE change_type = 'NEW_STUDY') FROM changes) AS new_studies,
+        (SELECT count(*) FILTER (WHERE change_type IN ('LEFT_SEARCH', 'REMOVED')) FROM changes) AS left_or_removed,
+        (SELECT coalesce(string_agg(overall_status || ' ' || n, ', ' ORDER BY n DESC), '')
+           FROM (SELECT overall_status, count(*) AS n FROM cur GROUP BY 1)) AS status_breakdown,
+        (SELECT count(*) FILTER (WHERE has_results) FROM cur) AS with_results,
+        (SELECT (SELECT count(*) FROM read_parquet('changelog.parquet')) + count(*) FROM changes) AS changelog_rows,
+        CAST(json_object('text',
+          'ClinicalTrials.gov changes for *' || CASE WHEN trim(:scope) = '' THEN 'watched NCT ids' ELSE regexp_replace(:scope, '\s+', ' ', 'g') END || '*: ' || (SELECT n FROM digest) || ' study change(s) to review'
+          || CASE WHEN (SELECT n FROM digest) > 20 THEN ' (first 20 shown, full list in the CSV)' ELSE '' END || chr(10)
+          || coalesce((SELECT lines FROM digest), '') || chr(10) || 'Execution: ' || :execution_url) AS VARCHAR) AS slack_payload;
+
+  - id: save_snapshot
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.snapshot_key }}"
+    value: "{{ outputs.diff.outputFiles.snapshot }}"
+    description: Points the KV key at the new snapshot. Old snapshot files stay with their executions until purged.
+
+  - id: save_changelog
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.snapshot_key }}_changelog"
+    value: "{{ outputs.diff.outputFiles.changelog }}"
+
+  - id: report_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.diff.outputs[0].row.alert_changes > 0 }}"
+    then:
+      - id: notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: One digest per run, HIGH changes first. allowFailure keeps the snapshot saved and the run green-with-warning when the webhook is not configured.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: "{{ outputs.diff.outputs[0].row.slack_payload }}"
+
+      - id: log_changes
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ fromJson(outputs.diff.outputs[0].row.slack_payload).text }}"
+    else:
+      - id: nothing_to_report
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ outputs.diff.outputs[0].row.is_baseline ? 'BASELINE run: ' ~ outputs.diff.outputs[0].row.studies ~ ' studies recorded, changes are reported from the next run on.' : 'No material changes: ' ~ outputs.diff.outputs[0].row.updated_since_last_run ~ ' of ' ~ outputs.diff.outputs[0].row.studies ~ ' studies were updated since the last run, ' ~ outputs.diff.outputs[0].row.changes ~ ' INFO change(s) in the CSV.' }}"
+
+  - id: warn_ids
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.fetch_studies.vars.invalid_ids is not empty or outputs.fetch_studies.vars.not_found_ids is not empty or outputs.fetch_studies.vars.aliases is not empty }}"
+    level: WARN
+    message: |
+      Watched NCT ids that need attention:
+      {{ outputs.fetch_studies.vars.invalid_ids is not empty ? 'INVALID (not NCT + 8 digits, skipped): ' ~ outputs.fetch_studies.vars.invalid_ids : '' }}
+      {{ outputs.fetch_studies.vars.not_found_ids is not empty ? 'NOT_FOUND on ClinicalTrials.gov: ' ~ outputs.fetch_studies.vars.not_found_ids : '' }}
+      {{ outputs.fetch_studies.vars.aliases is not empty ? 'Old ids resolved to the current record (update your list): ' ~ outputs.fetch_studies.vars.aliases : '' }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.diff.outputs[0].row.studies }} studies tracked ({{ outputs.diff.outputs[0].row.in_search }} from the search of {{ outputs.fetch_studies.vars.search_total }} matches, {{ outputs.diff.outputs[0].row.watched }} watched by id) with {{ outputs.fetch_studies.vars.requests }} API request(s){{ outputs.diff.outputs[0].row.is_baseline ? ', BASELINE run' : '' }}.
+      Status: {{ outputs.diff.outputs[0].row.status_breakdown }}; {{ outputs.diff.outputs[0].row.with_results }} with results posted.
+      Since last run: {{ outputs.diff.outputs[0].row.updated_since_last_run }} updated, {{ outputs.diff.outputs[0].row.changes }} change(s) ({{ outputs.diff.outputs[0].row.high }} HIGH, {{ outputs.diff.outputs[0].row.alert_changes }} alerted): {{ outputs.diff.outputs[0].row.status_changes }} status, {{ outputs.diff.outputs[0].row.results_posted }} results posted, {{ outputs.diff.outputs[0].row.enrollment_changes }} enrollment, {{ outputs.diff.outputs[0].row.completion_slips }} completion slip, {{ outputs.diff.outputs[0].row.new_studies }} new, {{ outputs.diff.outputs[0].row.left_or_removed }} left search or removed.
+      Change log: {{ outputs.diff.outputs[0].row.changelog_rows }} rows. This run's changes (CSV): {{ outputs.diff.outputFiles.changes_csv }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.diff.outputs[0].row }}"
+  - id: changes_csv
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.changes_csv }}"
+  - id: snapshot_parquet
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.snapshot }}"
+  - id: changelog_parquet
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.changelog }}"
+
+extend:
+  title: Track ClinicalTrials.gov Study Status Changes, Results Postings and Completion Slips
+  metaTitle: ClinicalTrials.gov Study Status Change Tracker with DuckDB | Kestra
+  shortDescription: Snapshot a ClinicalTrials.gov search and watched NCT ids every week, diff them in DuckDB and get a Slack digest of terminated or suspended trials, newly posted results, enrollment revisions and primary completion dates that slipped.
+  metaDescription: Track ClinicalTrials.gov studies weekly, diff Parquet snapshots in DuckDB and alert on terminations, posted results, enrollment changes and completion slips.
+  description: |
+    Competitive intelligence, medical affairs and patient-advocacy teams follow dozens to thousands of clinical trials and need to know when one of them stops, posts results or pushes its readout back. ClinicalTrials.gov shows the current state of each record, not what changed. This flow searches the registry through the public API v2 (by condition, intervention, sponsor, plus NCT ids you watch explicitly), keeps a Parquet snapshot of the fields that matter, diffs every run against the previous one in DuckDB and sends one Slack digest with the transitions, ordered by severity. A cumulative change log keeps the history of every transition detected.
+
+    ## How it works
+
+    1. A weekly `Schedule` (Monday 07:00) runs the check; any input can be changed for an ad-hoc run.
+    2. `previous_snapshot` and `previous_changelog` (KV Get) read the URIs of the Parquet files written by the last run. On the first run they are missing: `bootstrap` (If) writes empty files with the right schema and the run is a BASELINE that records the studies without reporting changes.
+    3. `previous_ids` (DuckDB) lists the NCT ids of the previous snapshot.
+    4. `fetch_studies` (Python, standard library only) calls `GET /api/v2/studies` with `query.cond`, `query.intr`, `query.spons` and the optional `filter.overallStatus` (skipped when `use_search` is false), `pageSize=1000` and `pageToken` pagination, and the `fields` parameter limited to the 15 compared fields (about 0.5 KB per study). The first page uses `countTotal=true` and the run stops before paginating when the search exceeds `max_studies`. Watched ids and previously tracked ids that the search no longer returns are then fetched by `filter.ids` in batches of 100, so a study that left a status filter or had its conditions edited still shows its new status. Ids are validated first (one malformed id makes the API answer HTTP 400 for the whole batch); unknown ids are reported as NOT_FOUND and old ids merged into another record are resolved through `NCTIdAlias`. Requests are paced at 1.2 seconds with backoff on 429 and 5xx.
+    5. `diff` (DuckDB) normalises month-only completion dates (`2027-06`) to the last day of the month, joins the new studies to the previous snapshot and classifies changes: `STATUS_CHANGE` (HIGH when the new status is TERMINATED, WITHDRAWN or SUSPENDED, with the `whyStopped` reason), `RESULTS_POSTED`, `ENROLLMENT_CHANGE` above `enrollment_change_pct`, `COMPLETION_DATE_SLIP` and `COMPLETION_DATE_PULLED_IN` beyond `completion_slip_days`, `PRIMARY_COMPLETION_REACHED`, `NEW_STUDY` (newly registered since the last snapshot, or an existing study that now matches), `LEFT_SEARCH` and `REMOVED`. It writes the new snapshot, the appended change log, this run's changes as CSV and a Slack payload built with `json_object`.
+    6. `save_snapshot` and `save_changelog` (KV Set) point the keys at the new files.
+    7. `report_changes` (If) sends the digest (`SlackIncomingWebhook`, `allowFailure`) and logs it when HIGH or MEDIUM changes exist (INFO too with `alert_on_info`); otherwise it logs how many studies were updated without a material change. `warn_ids` lists invalid, unknown and alias ids, and `summary` logs the counts and status breakdown.
+
+    ## What you get
+
+    - A Slack digest of the trials that stopped, posted results, changed enrollment or slipped their primary completion date, HIGH first, each linked to its study page.
+    - `changes_csv` with one row per change (type, severity, old and new value, reason, last update date, URL) as a flow output, plus the snapshot and the cumulative change log as Parquet.
+    - Transitions caught even when the study leaves the search, and typos in the watched ids surfaced as INVALID or NOT_FOUND instead of silently ignored.
+    - No false completion slips from month-only dates, and no alert storm on the first run.
+    - A hard cap on search size so a broad query fails fast instead of paging the whole registry.
+
+    ## Who it's for
+
+    - Competitive intelligence and business development teams in pharma and biotech following competitor pipelines.
+    - Medical affairs, clinical operations and investor-relations analysts tracking readout timelines.
+    - Patient-advocacy groups, research librarians and journalists watching trials in one disease area.
+
+    ## Why orchestrate this with Kestra
+
+    - State lives in the KV store and internal storage, so one flow serves many watchlists through `snapshot_key`, with no database to run.
+    - DuckDB `inputFiles` and `outputFiles` hand the snapshot, the change log and the CSV between tasks declaratively.
+    - `If` branches handle the baseline and skip the alert when nothing material moved; `allowFailure` keeps state saved when Slack is down or not configured.
+    - Every run keeps its CSV, snapshot and logs for audit, and the schedule replaces a fragile cron script.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the Python script, JDBC DuckDB and Slack plugins.
+    - `python3` on the worker: the script uses only the standard library and runs with the `Process` task runner (switch to the Docker runner and `python:3.13-slim` if your workers have Docker).
+    - Outbound HTTPS to `clinicaltrials.gov`. The API v2 is public, no key or account needed; stay within about 50 requests per minute.
+    - Snapshot files live in the execution that wrote them; if you purge executions, keep the latest successful run of this flow.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the digest (optional; without it the notify task ends in WARNING and the digest is still logged).
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` as a secret if you want the Slack digest.
+    2. Execute with the defaults: every glioblastoma study (2,274 in October 2026, three pages of 1,000) plus two COVID-19 vaccine trials watched by id, in 4 API requests. The first run is the BASELINE and logs the status breakdown (1,033 completed, 323 recruiting, 277 terminated, 96 withdrawn, 418 with results).
+    3. Execute again: the snapshot is compared and the run logs how many studies were updated and whether any change is material.
+    4. For a pure watchlist, set `use_search` to false and list NCT ids: malformed ids are logged as INVALID, unknown ones as NOT_FOUND, and merged ids are resolved to the current record.
+    5. Point the inputs at your own portfolio (an intervention, a sponsor, or a list of NCT ids) with its own `snapshot_key` (changing the search under an existing key reports every newly matching study as NEW_STUDY), then enable the schedule.
+    6. Download `changes_csv` from the execution outputs for the full list.
+
+    ## How to extend
+
+    - Load `changes_csv` or the change log into Postgres, Snowflake or BigQuery for a trial-timeline dashboard.
+    - Add an AI task that summarises newly posted results from the full study record (`/api/v2/studies/{nctId}`).
+    - Fan out several watchlists with a ForEach over sponsor names, each with its own `snapshot_key`.
+    - Route HIGH changes to email or Microsoft Teams with the notifications plugin, and post MEDIUM ones as a weekly digest.
+
+    ## Links
+
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script) and [Process task runner](https://kestra.io/plugins/core/runner/io.kestra.plugin.core.runner.process)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if) and [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [ClinicalTrials.gov API v2](https://clinicaltrials.gov/data-api/api) and [data structure and field names](https://clinicaltrials.gov/data-api/about-api/study-data-structure)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - ELT & Data Landing
+  ee: false
+  demo: false
