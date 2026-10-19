@@ -1,0 +1,538 @@
+id: company-record-cross-source-verification-hitl
+namespace: company.team
+
+description: |
+  Verify a company master-data record against two independent public registries
+  (GLEIF and Wikidata, joined on the Legal Entity Identifier), let an LLM explain
+  each disagreement, pause for a human reviewer only when the sources do not agree,
+  and keep a DuckDB ledger of verdicts so the AI's accuracy is measured from real
+  human decisions rather than assumed.
+
+inputs:
+  - id: record
+    type: JSON
+    description: |
+      The company record under verification, as it sits in your CRM, vendor master or
+      enrichment output. Keys are optional; a key that is absent is skipped, not failed.
+      Supported keys: legal_name, lei, country (ISO 3166-1 alpha-2), city, website,
+      status (ACTIVE or INACTIVE), founded_year, employees.
+    defaults:
+      legal_name: "Amazon.com, Inc."
+      country: "US"
+      city: "Seattle"
+      website: "https://www.amazon.com"
+      status: "ACTIVE"
+      founded_year: 1994
+      employees: 1550000
+
+  - id: agreement_threshold
+    type: FLOAT
+    defaults: 0.8
+    description: Share of checkable fields that must agree across sources before the record is accepted without a human. Below this, the execution pauses for review.
+
+  - id: employees_tolerance
+    type: FLOAT
+    defaults: 0.15
+    description: Relative tolerance when comparing employee counts (0.15 = 15 percent), because registries lag.
+
+  - id: model_name
+    type: STRING
+    defaults: gemini-2.5-flash
+    description: Google Gemini model used to adjudicate disagreements.
+
+triggers:
+  - id: record_submitted
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: replace-with-a-long-random-string
+    description: |
+      POST a record JSON body to /api/v1/executions/webhook/{namespace}/{flowId}/{key}
+      from your CRM, data-quality tool or enrichment pipeline. The body becomes the
+      `record` input through the trigger body mapping below.
+    inputs:
+      record: "{{ trigger.body }}"
+
+  - id: weekly_reverification
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * 1"
+    disabled: true
+    description: Re-verify the default record every Monday 06:00 UTC. Enable after wiring a real record source (for example a subflow that iterates over your vendor master).
+
+tasks:
+  - id: resolve_lei
+    type: io.kestra.plugin.core.flow.If
+    description: The LEI is the hard join key between registries. If the record does not carry one, resolve it from the legal name through GLEIF fuzzy completion.
+    condition: "{{ inputs.record.lei is defined and inputs.record.lei is not empty }}"
+    then:
+      - id: lei_from_record
+        type: io.kestra.plugin.core.debug.Return
+        format: "{{ inputs.record.lei | upper | trim }}"
+    else:
+      - id: gleif_name_search
+        type: io.kestra.plugin.core.http.Request
+        description: GLEIF legal-name search (keyless, 60 requests per minute). Exact legal names rank first; the resolved name is compared to the record later, so a wrong match surfaces as a legal_name mismatch instead of passing silently.
+        uri: "https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]={{ inputs.record.legal_name | urlencode }}&page[size]=1"
+        headers:
+          Accept: application/vnd.api+json
+      - id: lei_from_gleif
+        type: io.kestra.plugin.core.debug.Return
+        format: "{{ (outputs.gleif_name_search.body | jq('.data[0].id') | first) ?? '' }}"
+
+  - id: require_lei
+    type: io.kestra.plugin.core.execution.Fail
+    description: Stop with a clear message instead of querying the registries with an empty key.
+    condition: "{{ (outputs.lei_from_record ?? outputs.lei_from_gleif).value is empty }}"
+    errorMessage: "No LEI found for '{{ inputs.record.legal_name }}'. Add the lei key to the record or check the legal name at https://search.gleif.org"
+
+  - id: lookup_sources
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Query both registries by LEI at the same time. Each lookup is independent, so a slow registry does not delay the other.
+    tasks:
+      - id: gleif_record
+        type: io.kestra.plugin.core.http.Request
+        description: Authoritative legal entity data from the Global LEI Foundation (legal name, registered address, registration status).
+        uri: "https://api.gleif.org/api/v1/lei-records?filter[lei]={{ (outputs.lei_from_record ?? outputs.lei_from_gleif).value }}"
+        headers:
+          Accept: application/vnd.api+json
+
+      - id: wikidata_record
+        type: io.kestra.plugin.core.http.Request
+        description: Community-maintained operational facts (official name, headquarters city, country, website, inception, latest employee count) keyed on the same LEI via property P1278.
+        uri: "https://query.wikidata.org/sparql"
+        method: POST
+        contentType: application/x-www-form-urlencoded
+        headers:
+          Accept: application/sparql-results+json
+          User-Agent: kestra-blueprint-company-verification/1.0 (https://kestra.io)
+        formData:
+          query: |
+            SELECT ?item ?itemLabel ?officialName ?hqLabel ?countryCode ?inception ?website ?employees WHERE {
+              ?item wdt:P1278 "{{ (outputs.lei_from_record ?? outputs.lei_from_gleif).value }}" .
+              OPTIONAL { ?item wdt:P1448 ?officialName . FILTER(lang(?officialName) = "en") }
+              OPTIONAL { ?item wdt:P159 ?hq }
+              OPTIONAL { ?item wdt:P17 ?country . ?country wdt:P297 ?countryCode }
+              OPTIONAL { ?item wdt:P571 ?inception }
+              OPTIONAL { ?item wdt:P856 ?website }
+              OPTIONAL { ?item p:P1128 ?es . ?es ps:P1128 ?employees . OPTIONAL { ?es pq:P585 ?pointInTime } }
+              SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+            }
+            ORDER BY DESC(?pointInTime)
+            LIMIT 1
+
+  - id: compare_fields
+    type: io.kestra.plugin.graalvm.js.Eval
+    description: |
+      Deterministic field-by-field comparison. Runs inside the worker JVM (GraalVM), so it
+      needs no Docker image or Python runtime. Normalises names (case, punctuation, legal
+      suffixes), websites (registrable domain), years and statuses, then scores agreement
+      as matched / checkable. A field is checkable when the record and at least one source
+      carry a value.
+    outputs:
+      - lei
+      - score
+      - checked
+      - matched
+      - mismatch_count
+      - identity_confirmed
+      - fields_json
+      - mismatches_json
+    script: |
+      // The value of the last expression is the task output; declared `outputs` are picked from its keys.
+      // Arrays are passed as JSON text because the GraalVM bridge hands JS arrays to Kestra as index-keyed maps.
+      (function () {
+        const record = {{ inputs.record | toJson }};
+        const gleifBody = {{ outputs.gleif_record.body | toJson }};
+        const wikiBody = {{ outputs.wikidata_record.body | toJson }};
+        const lei = {{ (outputs.lei_from_record ?? outputs.lei_from_gleif).value | toJson }};
+        const tolerance = {{ inputs.employees_tolerance }};
+
+        const gleif = (JSON.parse(gleifBody).data || [])[0];
+        const wikiRows = JSON.parse(wikiBody).results.bindings;
+        const wiki = wikiRows.length ? wikiRows[0] : null;
+        const w = (k) => (wiki && wiki[k] ? wiki[k].value : null);
+        const g = gleif ? gleif.attributes.entity : null;
+
+        const normName = (s) => s == null ? null : String(s).toLowerCase()
+          .replace(/[.,'"()]/g, ' ')
+          .replace(/\b(inc|incorporated|corp|corporation|co|company|ltd|limited|llc|plc|sa|ag|gmbh|nv|bv|se)\b/g, ' ')
+          .replace(/\s+/g, ' ').trim();
+        const normDomain = (s) => s == null ? null : String(s).toLowerCase()
+          .replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '').trim();
+        const normYear = (s) => s == null ? null : String(s).slice(0, 4);
+        const normUpper = (s) => s == null ? null : String(s).toUpperCase().trim();
+        const normCity = (s) => s == null ? null : String(s).toLowerCase().trim();
+
+        const fields = [];
+        function check(field, recordValue, sources, norm, equals) {
+          const present = sources.filter((s) => s.value != null && s.value !== '');
+          if (recordValue == null || recordValue === '' || present.length === 0) {
+            fields.push({ field, record: recordValue ?? null, sources: Object.fromEntries(sources.map((s) => [s.name, s.value ?? null])), verdict: 'UNVERIFIABLE' });
+            return;
+          }
+          const eq = equals || ((a, b) => norm(a) === norm(b));
+          const agreeing = present.filter((s) => eq(recordValue, s.value)).map((s) => s.name);
+          const verdict = agreeing.length === present.length ? 'MATCH' : agreeing.length > 0 ? 'PARTIAL' : 'MISMATCH';
+          fields.push({ field, record: recordValue, sources: Object.fromEntries(sources.map((s) => [s.name, s.value ?? null])), agreeing, verdict });
+        }
+
+        check('legal_name', record.legal_name,
+          [{ name: 'gleif', value: g ? g.legalName.name : null }, { name: 'wikidata', value: w('officialName') || w('itemLabel') }], normName);
+        check('country', record.country,
+          [{ name: 'gleif', value: g ? g.legalAddress.country : null }, { name: 'wikidata', value: w('countryCode') }], normUpper);
+        check('city', record.city,
+          [{ name: 'gleif', value: g ? g.legalAddress.city : null }, { name: 'wikidata', value: w('hqLabel') }], normCity);
+        check('website', record.website, [{ name: 'wikidata', value: w('website') }], normDomain);
+        check('status', record.status, [{ name: 'gleif', value: g ? g.status : null }], normUpper);
+        check('founded_year', record.founded_year, [{ name: 'wikidata', value: w('inception') }], normYear);
+        check('employees', record.employees, [{ name: 'wikidata', value: w('employees') }], null,
+          (a, b) => Math.abs(Number(a) - Number(b)) <= tolerance * Math.max(Number(a), Number(b)));
+
+        const checkable = fields.filter((f) => f.verdict !== 'UNVERIFIABLE');
+        const matched = checkable.filter((f) => f.verdict === 'MATCH');
+        const mismatches = checkable.filter((f) => f.verdict !== 'MATCH');
+        const score = checkable.length ? Math.round((matched.length / checkable.length) * 1000) / 1000 : 0;
+
+        logger.info('LEI ' + lei + ': ' + matched.length + '/' + checkable.length + ' fields agree (score ' + score + '), ' + mismatches.length + ' to adjudicate');
+        return {
+          lei: lei,
+          score: score,
+          checked: checkable.length,
+          matched: matched.length,
+          mismatch_count: mismatches.length,
+          identity_confirmed: !!(g && wiki),
+          fields_json: JSON.stringify(fields),
+          mismatches_json: JSON.stringify(mismatches)
+        };
+      })()
+
+  - id: adjudicate_mismatches
+    type: io.kestra.plugin.ai.completion.ChatCompletion
+    runIf: "{{ outputs.compare_fields.outputs.mismatch_count > 0 }}"
+    allowFailure: true
+    description: |
+      Only runs when sources disagree. allowFailure: if the model call fails (quota, missing
+      key), the record is routed to a human instead of failing the execution. The model does not look anything up; it classifies
+      each disagreement from the values it is given: a naming or address convention
+      difference (registered office vs operating HQ, trading name vs legal name), a real
+      conflict, or a source that is probably stale, with a confidence and a recommendation.
+      Low-confidence or CONFLICT classifications route the record to a human.
+    provider:
+      type: io.kestra.plugin.ai.provider.GoogleGemini
+      apiKey: "{{ secret('GEMINI_API_KEY') }}"
+      modelName: "{{ inputs.model_name }}"
+    configuration:
+      temperature: 0.0
+      responseFormat:
+        type: JSON
+        jsonSchema:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  classification:
+                    type: string
+                    enum: [CONVENTION_DIFFERENCE, CONFLICT, LIKELY_STALE_SOURCE, LIKELY_STALE_RECORD]
+                  confidence:
+                    type: number
+                  preferred_value:
+                    type: string
+                  rationale:
+                    type: string
+                required: [field, classification, confidence, preferred_value, rationale]
+            recommendation:
+              type: string
+              enum: [AUTO_ACCEPT, HUMAN_REVIEW]
+          required: [items, recommendation]
+    messages:
+      - type: SYSTEM
+        content: |
+          You are a data steward for a company master-data accuracy programme. You receive
+          a company record and the values two registries hold for the same legal entity:
+          GLEIF (authoritative legal registration data, registered office address) and
+          Wikidata (community-maintained operating facts). For every disagreeing field,
+          classify it as CONVENTION_DIFFERENCE (same fact expressed differently, e.g. the
+          registered office in Wilmington versus the operating headquarters in Seattle, or
+          "Amazon" versus "Amazon.com, Inc."), CONFLICT (the values cannot both be true for
+          this entity), LIKELY_STALE_SOURCE (the record is probably more current than the
+          registry) or LIKELY_STALE_RECORD (the registry is probably more current). Give a
+          confidence between 0 and 1, the value you would keep, and a rationale of at most
+          30 words. Use only the values provided; never invent facts. Recommend AUTO_ACCEPT
+          only when every item is a CONVENTION_DIFFERENCE with confidence 0.85 or higher,
+          otherwise HUMAN_REVIEW.
+      - type: USER
+        content: |
+          Legal Entity Identifier: {{ outputs.compare_fields.outputs.lei }}
+          Disagreeing fields (record value and each source value):
+          {{ outputs.compare_fields.outputs.mismatches_json }}
+
+  - id: review_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Human in the loop only when needed. Pauses when agreement is below the threshold, or when sources disagreed and the model did not clear every disagreement as a convention difference (or could not run); otherwise accepts automatically and records that fact.
+    condition: "{{ outputs.compare_fields.outputs.score < inputs.agreement_threshold or (outputs.compare_fields.outputs.mismatch_count > 0 and (outputs.adjudicate_mismatches.jsonOutput.recommendation ?? 'HUMAN_REVIEW') == 'HUMAN_REVIEW') }}"
+    then:
+      - id: notify_reviewer
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: Post the review request with a deep link to this execution. allowFailure keeps the pause reachable if the webhook is not configured.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":mag: Company record needs review\n*{{ inputs.record.legal_name }}* (LEI {{ outputs.compare_fields.outputs.lei }})\nAgreement {{ outputs.compare_fields.outputs.matched }}/{{ outputs.compare_fields.outputs.checked }} fields ({{ outputs.compare_fields.outputs.score }}), threshold {{ inputs.agreement_threshold }}\nAI recommendation: {{ outputs.adjudicate_mismatches.jsonOutput.recommendation ?? 'n/a (no disagreements)' }}\nResume here: {{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+          }
+
+      - id: human_review
+        type: io.kestra.plugin.core.flow.Pause
+        description: Waits for a reviewer. The resume form captures the decision, an optional corrected record and a note, all of which land in the ledger.
+        onResume:
+          - id: decision
+            type: SELECT
+            displayName: Decision
+            description: keep_record = the submitted record is right; take_sources = replace disputed fields with the registry values; corrected = use the JSON below; reject = the record does not describe this entity
+            values: [keep_record, take_sources, corrected, reject]
+            defaults: take_sources
+          - id: corrected_record
+            type: JSON
+            displayName: Corrected record (only for decision = corrected)
+            required: false
+          - id: reviewer_note
+            type: STRING
+            displayName: Reviewer note
+            required: false
+    else:
+      - id: auto_accept
+        type: io.kestra.plugin.core.log.Log
+        message: "Auto-accepted: {{ outputs.compare_fields.outputs.matched }}/{{ outputs.compare_fields.outputs.checked }} fields agree (score {{ outputs.compare_fields.outputs.score }}), AI recommendation {{ outputs.adjudicate_mismatches.jsonOutput.recommendation ?? 'not needed' }}."
+
+  - id: finalize_verdict
+    type: io.kestra.plugin.graalvm.js.Eval
+    description: Builds the golden record from the decision and derives whether the human overturned the AI (the signal that makes the accuracy figure in the ledger honest).
+    outputs:
+      - decision
+      - decided_by
+      - golden_record
+      - ai_recommendation
+      - ai_overturned
+    script: |
+      (function () {
+        const record = {{ inputs.record | toJson }};
+        const fields = {{ outputs.compare_fields.outputs.fields_json }};
+        const aiRaw = {{ (outputs.adjudicate_mismatches.jsonOutput ?? {}) | toJson }};
+        const resumeRaw = {{ (outputs.human_review.onResume ?? {}) | toJson }};
+        const mismatchCount = {{ outputs.compare_fields.outputs.mismatch_count }};
+        const ai = aiRaw.recommendation ? aiRaw : null;
+        const resume = resumeRaw.decision ? resumeRaw : null;
+
+        const golden = Object.assign({}, record);
+        let decision, decidedBy;
+        if (!resume) {
+          decision = 'auto_accept'; decidedBy = 'system';
+        } else {
+          decision = resume.decision; decidedBy = 'human';
+          if (decision === 'take_sources') {
+            for (const f of fields) {
+              if (f.verdict === 'MISMATCH' || f.verdict === 'PARTIAL') {
+                const src = f.sources.gleif != null ? f.sources.gleif : f.sources.wikidata;
+                if (src != null) golden[f.field] = src;
+              }
+            }
+          } else if (decision === 'corrected' && resume.corrected_record) {
+            Object.assign(golden, resume.corrected_record);
+          }
+        }
+        // The AI is counted as overturned when it said AUTO_ACCEPT and a human still changed or rejected the record,
+        // or when it said HUMAN_REVIEW and the human kept the record untouched.
+        let overturned = null;
+        if (ai) {
+          if (ai.recommendation === 'AUTO_ACCEPT') overturned = decidedBy === 'human' && decision !== 'keep_record';
+          else overturned = decidedBy === 'human' && decision === 'keep_record';
+        }
+        return {
+          decision: decision,
+          decided_by: decidedBy,
+          golden_record: golden,
+          // NOT_NEEDED: sources agreed, no model call. UNAVAILABLE: there were disagreements but the model call failed.
+          ai_recommendation: ai ? ai.recommendation : (mismatchCount > 0 ? 'UNAVAILABLE' : 'NOT_NEEDED'),
+          ai_overturned: overturned === null ? '' : String(overturned)
+        };
+      })()
+
+  - id: previous_ledger
+    type: io.kestra.plugin.core.kv.Get
+    key: company_verification_ledger_uri
+    errorOnMissing: false
+    description: Kestra's KV store holds the internal-storage URI of the DuckDB ledger written by the previous execution.
+
+  - id: write_ledger
+    type: io.kestra.plugin.core.flow.If
+    description: Append this verdict to the DuckDB ledger (created on first run) and compute the running accuracy figures.
+    condition: "{{ outputs.previous_ledger.value is defined and outputs.previous_ledger.value is not empty }}"
+    then:
+      - id: append_verdict
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        databaseUri: "{{ outputs.previous_ledger.value }}"
+        outputDbFile: true
+        fetchType: FETCH_ONE
+        parameters:
+          execution_id: "{{ execution.id }}"
+          lei: "{{ outputs.compare_fields.outputs.lei }}"
+          legal_name: "{{ inputs.record.legal_name }}"
+          score: "{{ outputs.compare_fields.outputs.score }}"
+          checked: "{{ outputs.compare_fields.outputs.checked }}"
+          matched: "{{ outputs.compare_fields.outputs.matched }}"
+          ai_recommendation: "{{ outputs.finalize_verdict.outputs.ai_recommendation }}"
+          decision: "{{ outputs.finalize_verdict.outputs.decision }}"
+          decided_by: "{{ outputs.finalize_verdict.outputs.decided_by }}"
+          ai_overturned: "{{ outputs.finalize_verdict.outputs.ai_overturned }}"
+          reviewer_note: "{{ outputs.human_review.onResume.reviewer_note ?? '' }}"
+          golden_record: "{{ outputs.finalize_verdict.outputs.golden_record | toJson }}"
+        sql: |
+          INSERT INTO verdicts (execution_id, lei, legal_name, score, checked, matched, ai_recommendation, decision, decided_by, ai_overturned, reviewer_note, golden_record)
+          VALUES (:execution_id, :lei, :legal_name, CAST(:score AS DOUBLE), CAST(:checked AS INTEGER), CAST(:matched AS INTEGER), :ai_recommendation, :decision, :decided_by, CAST(NULLIF(:ai_overturned, '') AS BOOLEAN), :reviewer_note, :golden_record);
+          SELECT
+            count(*) AS verdicts,
+            round(avg(CASE WHEN decided_by = 'system' THEN 1 ELSE 0 END), 3) AS auto_accept_rate,
+            count(*) FILTER (WHERE ai_recommendation IN ('AUTO_ACCEPT', 'HUMAN_REVIEW')) AS ai_adjudicated,
+            round(1 - avg(CASE WHEN ai_overturned THEN 1 ELSE 0 END) FILTER (WHERE ai_overturned IS NOT NULL), 3) AS ai_accuracy
+          FROM verdicts;
+    else:
+      - id: create_ledger
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        outputDbFile: true
+        fetchType: FETCH_ONE
+        parameters:
+          execution_id: "{{ execution.id }}"
+          lei: "{{ outputs.compare_fields.outputs.lei }}"
+          legal_name: "{{ inputs.record.legal_name }}"
+          score: "{{ outputs.compare_fields.outputs.score }}"
+          checked: "{{ outputs.compare_fields.outputs.checked }}"
+          matched: "{{ outputs.compare_fields.outputs.matched }}"
+          ai_recommendation: "{{ outputs.finalize_verdict.outputs.ai_recommendation }}"
+          decision: "{{ outputs.finalize_verdict.outputs.decision }}"
+          decided_by: "{{ outputs.finalize_verdict.outputs.decided_by }}"
+          ai_overturned: "{{ outputs.finalize_verdict.outputs.ai_overturned }}"
+          reviewer_note: "{{ outputs.human_review.onResume.reviewer_note ?? '' }}"
+          golden_record: "{{ outputs.finalize_verdict.outputs.golden_record | toJson }}"
+        sql: |
+          CREATE TABLE verdicts (
+            execution_id VARCHAR, verified_at TIMESTAMP DEFAULT now(), lei VARCHAR, legal_name VARCHAR,
+            score DOUBLE, checked INTEGER, matched INTEGER, ai_recommendation VARCHAR,
+            decision VARCHAR, decided_by VARCHAR, ai_overturned BOOLEAN, reviewer_note VARCHAR, golden_record JSON
+          );
+          INSERT INTO verdicts (execution_id, lei, legal_name, score, checked, matched, ai_recommendation, decision, decided_by, ai_overturned, reviewer_note, golden_record)
+          VALUES (:execution_id, :lei, :legal_name, CAST(:score AS DOUBLE), CAST(:checked AS INTEGER), CAST(:matched AS INTEGER), :ai_recommendation, :decision, :decided_by, CAST(NULLIF(:ai_overturned, '') AS BOOLEAN), :reviewer_note, :golden_record);
+          SELECT
+            count(*) AS verdicts,
+            round(avg(CASE WHEN decided_by = 'system' THEN 1 ELSE 0 END), 3) AS auto_accept_rate,
+            count(*) FILTER (WHERE ai_recommendation IN ('AUTO_ACCEPT', 'HUMAN_REVIEW')) AS ai_adjudicated,
+            round(1 - avg(CASE WHEN ai_overturned THEN 1 ELSE 0 END) FILTER (WHERE ai_overturned IS NOT NULL), 3) AS ai_accuracy
+          FROM verdicts;
+
+  - id: save_ledger_uri
+    type: io.kestra.plugin.core.kv.Set
+    key: company_verification_ledger_uri
+    value: "{{ (outputs.append_verdict ?? outputs.create_ledger).databaseUri }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ inputs.record.legal_name }} (LEI {{ outputs.compare_fields.outputs.lei }}): {{ outputs.finalize_verdict.outputs.decision }} by {{ outputs.finalize_verdict.outputs.decided_by }}.
+      Agreement {{ outputs.compare_fields.outputs.matched }}/{{ outputs.compare_fields.outputs.checked }} (score {{ outputs.compare_fields.outputs.score }}). AI: {{ outputs.finalize_verdict.outputs.ai_recommendation }}.
+      Ledger: {{ (outputs.append_verdict ?? outputs.create_ledger).outputs[0].row | toJson }}
+
+outputs:
+  - id: decision
+    type: STRING
+    value: "{{ outputs.finalize_verdict.outputs.decision }}"
+  - id: agreement_score
+    type: FLOAT
+    value: "{{ outputs.compare_fields.outputs.score }}"
+  - id: golden_record
+    type: JSON
+    value: "{{ outputs.finalize_verdict.outputs.golden_record }}"
+  - id: ledger_summary
+    type: JSON
+    value: "{{ (outputs.append_verdict ?? outputs.create_ledger).outputs[0].row }}"
+
+extend:
+  title: Verify Company Records Against GLEIF and Wikidata with Gemini Adjudication and Human Review
+  metaTitle: Company Record Verification with GLEIF, Wikidata, Gemini and Human-in-the-Loop Review | Kestra
+  shortDescription: Cross-check a company master-data record against two public registries joined on the LEI, let Gemini classify each disagreement, pause for a human only when needed, and keep a DuckDB ledger that measures the AI against real human decisions.
+  metaDescription: Verify company records against GLEIF and Wikidata, adjudicate mismatches with Gemini, pause for human review and track AI accuracy in DuckDB.
+  description: |
+    Company master data (legal name, address, website, status, headcount) drifts in every CRM and vendor master. This flow verifies a record against two independent public registries, GLEIF (authoritative legal registration data) and Wikidata (community-maintained operating facts), joined on the Legal Entity Identifier so both describe the same entity. Gemini classifies each disagreement, a human is pulled in only when sources or model are inconclusive, and a DuckDB ledger measures the AI's accuracy from real human decisions.
+
+    ## How it works
+
+    1. A `Webhook` trigger receives the record from your CRM or data-quality tool; a disabled weekly `Schedule` covers periodic re-verification.
+    2. `resolve_lei` (If) uses the record's LEI or resolves it from the legal name through a GLEIF legal-name search; `require_lei` stops early when neither works.
+    3. `lookup_sources` (Parallel) fetches the GLEIF LEI record and runs a Wikidata SPARQL query keyed on property P1278 (LEI).
+    4. `compare_fields` (GraalVM JS) normalises names, websites, years and statuses, compares field by field and scores agreement as matched / checkable.
+    5. `adjudicate_mismatches` (Gemini ChatCompletion, JSON schema) runs only when sources disagree and labels each disagreement CONVENTION_DIFFERENCE, CONFLICT, LIKELY_STALE_SOURCE or LIKELY_STALE_RECORD with a confidence and a recommendation; `allowFailure` routes to a human if the call fails.
+    6. `review_gate` (If) pauses with a Slack deep link when agreement is below the threshold or the model did not clear every disagreement; the resume form captures decision, corrected record and note. Otherwise it auto-accepts.
+    7. `finalize_verdict` builds the golden record and flags whether the human overturned the AI; `write_ledger` (If) creates or appends the DuckDB ledger in internal storage (URI kept in the KV store) and returns the running auto-accept rate and AI accuracy.
+
+    ## What you get
+
+    - Golden record, decision, agreement score and ledger summary as flow outputs.
+    - Humans review only the records that need it; accepted ones keep their evidence in the logs.
+    - A ledger with `ai_overturned` per verdict, so AI accuracy is measured and the threshold is tuned on data.
+    - A missing Gemini key or Slack webhook never fails the execution; it routes to a human.
+
+    ## Who it's for
+
+    - Data stewards and MDM teams verifying customer, vendor or counterparty records.
+    - Analytics engineers who own company dimension tables and need an audit trail.
+    - AI practitioners who want human-in-the-loop evaluation of an LLM in production.
+
+    ## Why orchestrate this with Kestra
+
+    - `Pause` with `onResume` inputs is a review step without building a UI.
+    - `Parallel`, `If`, `runIf` and `allowFailure` express the control flow declaratively; outputs and logs are tracked per task.
+    - Secrets are masked; the ledger lives in internal storage and the KV store carries state between runs, no external database needed.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the GraalVM, AI, JDBC DuckDB and Slack plugins.
+    - Outbound HTTPS to api.gleif.org and query.wikidata.org (both keyless).
+
+    ### Secrets
+
+    - `GEMINI_API_KEY`: Google AI Studio key for the adjudication step (optional; without it every disagreement goes to a human).
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for review requests (optional).
+
+    ## Quick start
+
+    1. Import the flow and click **Execute** with the default inputs; the LEI is resolved, both registries are queried and the ledger is created.
+    2. Add `GEMINI_API_KEY` and `SLACK_WEBHOOK_URL` as secrets to enable adjudication and notifications.
+    3. Replace the webhook `key` with a long random string and POST a record JSON body to the webhook URL.
+    4. When an execution pauses, pick a decision in the resume form; the ledger summary is in the `summary` log.
+    5. Enable `weekly_reverification` once a real record source is wired in.
+
+    ## How to extend
+
+    - Add a third source (OpenCorporates, a national registry) inside `lookup_sources` and extend `compare_fields`.
+    - Iterate over a vendor master with `ForEach` or a `Subflow` per record.
+    - Export the ledger to your warehouse and chart auto-accept rate and AI accuracy over time.
+    - Swap Gemini for another provider in the AI plugin, or require a second reviewer for `CONFLICT`.
+
+    ## Links
+
+    - [GraalVM JS Eval](https://kestra.io/plugins/plugin-graalvm/js/io.kestra.plugin.graalvm.js.eval)
+    - [AI ChatCompletion](https://kestra.io/plugins/plugin-ai/completion/io.kestra.plugin.ai.completion.chatcompletion)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [GLEIF API](https://www.gleif.org/en/lei-data/gleif-api)
+    - [Wikidata SPARQL](https://query.wikidata.org/)
+  tags:
+    - AI
+    - Data
+  subTags:
+    - Agents & Structured Output
+    - Policy & Compliance
+    - Testing & Quality
+  ee: false
+  demo: false
