@@ -1,0 +1,506 @@
+id: uniprot-protein-entry-change-tracker
+namespace: company.team
+
+description: |
+  Watch a list of UniProtKB accessions (drug targets, biomarkers, assay proteins) and report
+  what changed between UniProt releases: new sequence versions, new PDB structures, renamed
+  proteins or genes, reviewed-status changes, annotation updates (function text, disease
+  involvement, feature counts) and accessions that became obsolete, were merged into another
+  entry or were demerged. A cheap release probe skips the whole diff when the UniProt release
+  has not changed since the last run.
+
+inputs:
+  - id: accessions
+    type: STRING
+    defaults: "P04637, P00533, P01116, P38398, P0DTC2, O60674, Q9Y6K9, A0A0B4J2F0, A0A000, P30443, Q9UIN1, P00001, A0A008APQ8"
+    description: |
+      UniProtKB accessions to watch, separated by commas, spaces, semicolons or new lines. Isoform suffixes
+      (`P04637-2`) are tracked as the canonical entry, malformed ids are reported as INVALID and skipped.
+      The defaults mix active Swiss-Prot entries (TP53, EGFR, KRAS, BRCA1, SARS-CoV-2 spike, JAK2, NEMO),
+      a small entry with no PDB structure, an unreviewed TrEMBL entry, two merged accessions (one through a two-step merge chain),
+      a demerged accession and a deleted TrEMBL entry.
+
+  - id: force_diff
+    type: BOOL
+    defaults: false
+    description: Fetch and diff even when the UniProt release is the same as on the last run (the watchlist is always re-fetched when its text changes).
+
+  - id: alert_on_info
+    type: BOOL
+    defaults: false
+    description: Also alert on INFO changes (entry version bumps without a function, disease, name or structure change, and accessions newly added to the watchlist). They are always in the CSV.
+
+  - id: state_key
+    type: STRING
+    defaults: uniprot_watchlist_state
+    description: KV key holding the last release, the watchlist text and the Parquet snapshot URI. Use one key per watchlist.
+
+triggers:
+  - id: weekly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * 3"
+    description: |
+      UniProt publishes a release roughly every eight weeks, on a date announced only shortly before. A weekly
+      probe costs one tiny request, catches each release within a week of publication and returns early otherwise.
+
+tasks:
+  - id: previous_state
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+    description: JSON state from the last run (release, watchlist text, snapshot URI); missing on the first run, which is then a BASELINE.
+
+  - id: probe_release
+    type: io.kestra.plugin.core.http.Request
+    description: |
+      One-result search that returns about 150 bytes. Only the `X-UniProt-Release` and `X-UniProt-Release-Date`
+      response headers are used, to decide whether there is anything to diff.
+    uri: https://rest.uniprot.org/uniprotkb/search?query=accession:P04637&fields=accession&size=1
+    headers:
+      User-Agent: kestra-uniprot-protein-entry-change-tracker/1.0 (+https://kestra.io/blueprints)
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 4
+
+  - id: release_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Runs the fetch and diff only on a new release, a first run, an edited watchlist or `force_diff`.
+    condition: >-
+      {{ inputs.force_diff
+         or outputs.previous_state.value is not defined
+         or outputs.previous_state.value is empty
+         or outputs.previous_state.value.release != outputs.probe_release.headers['x-uniprot-release'][0]
+         or outputs.previous_state.value.accessions != inputs.accessions }}
+    then:
+      - id: bootstrap
+        type: io.kestra.plugin.core.flow.If
+        description: First run only. Writes an empty snapshot with the right schema so the diff has one code path.
+        condition: "{{ outputs.previous_state.value is not defined or outputs.previous_state.value is empty }}"
+        then:
+          - id: empty_snapshot
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            url: "jdbc:duckdb:"
+            fetchType: NONE
+            outputFiles:
+              - snapshot
+            sql: |
+              CREATE TABLE snapshot (
+                watched VARCHAR, status VARCHAR, resolved VARCHAR, merge_path VARCHAR, inactive_detail VARCHAR,
+                entry_name VARCHAR, protein_name VARCHAR, gene VARCHAR, reviewed BOOLEAN, entry_version BIGINT,
+                sequence_version BIGINT, seq_length BIGINT, crc64 VARCHAR, md5 VARCHAR, last_annotation_update DATE,
+                last_sequence_update DATE, feature_count BIGINT, pdb_count BIGINT, pdb_ids VARCHAR[], function_md5 VARCHAR,
+                diseases VARCHAR[], release VARCHAR, snapshot_at TIMESTAMP
+              );
+              COPY snapshot TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+
+      - id: fetch_entries
+        type: io.kestra.plugin.scripts.python.Script
+        description: |
+          Standard-library Python. Uses `/uniprotkb/search` with `accession:A OR accession:B ...` in batches of 100
+          rather than `/uniprotkb/accessions`, because only search returns the inactive records (`entryType: Inactive`,
+          `inactiveReason`) that say whether an accession was DELETED, MERGED or DEMERGED. `fields` trims each entry to
+          the compared fields (the sequence itself is dropped after reading its CRC64 and MD5). Merge targets are
+          followed hop by hop, so an accession merged into an entry that was merged again resolves to the live entry.
+          Ids that return nothing are retried with `sec_acc:` to find the primary that lists them as secondary.
+          Retries 429 and 5xx with backoff and sends a descriptive User-Agent.
+        containerImage: python:3.13-slim
+        outputFiles:
+          - entries.ndjson
+        env:
+          UNIPROT_ACCESSIONS: "{{ inputs.accessions }}"
+        script: |
+          import hashlib, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+          SEARCH = "https://rest.uniprot.org/uniprotkb/search"
+          FIELDS = ("accession,id,protein_name,gene_primary,reviewed,version,sequence_version,sequence,"
+                    "date_modified,date_sequence_modified,feature_count,xref_pdb,cc_function,cc_disease")
+          ACC = re.compile(r"[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2}")
+          HEADERS = {"User-Agent": "kestra-uniprot-protein-entry-change-tracker/1.0 (+https://kestra.io/blueprints)", "Accept": "application/json"}
+          stats = {"requests": 0, "release": None, "release_date": None}
+
+          def search(query):
+              params = urllib.parse.urlencode({"query": query, "fields": FIELDS, "format": "json", "size": 500})
+              for attempt in range(5):
+                  if stats["requests"]:
+                      time.sleep(0.3)
+                  stats["requests"] += 1
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(SEARCH + "?" + params, headers=HEADERS), timeout=120) as r:
+                          stats["release"] = r.headers.get("X-UniProt-Release")
+                          stats["release_date"] = r.headers.get("X-UniProt-Release-Date")
+                          return json.load(r).get("results", [])
+                  except urllib.error.HTTPError as e:
+                      if e.code == 400:
+                          sys.exit("UniProt rejected the query (HTTP 400): " + e.read().decode("utf-8", "replace")[:300])
+                      if e.code not in (429, 500, 502, 503, 504) or attempt == 4:
+                          raise
+                      wait = int(e.headers.get("Retry-After") or 0) or 2 ** (attempt + 1)
+                      print(f"HTTP {e.code}, retrying in {wait}s", file=sys.stderr)
+                      time.sleep(wait)
+                  except urllib.error.URLError as e:
+                      if attempt == 4:
+                          raise
+                      print(f"Network error {e.reason}, retrying", file=sys.stderr)
+                      time.sleep(2 ** (attempt + 1))
+
+          def fetch(accs, field="accession"):
+              out = {}
+              for i in range(0, len(accs), 100):
+                  for r in search(" OR ".join(f"{field}:{a}" for a in accs[i:i + 100])):
+                      out[r["primaryAccession"]] = r
+              return out
+
+          def texts(comments, kind):
+              return [t.get("value", "") for c in comments if c.get("commentType") == kind for t in c.get("texts", [])]
+
+          def details(r):
+              audit, seq = r.get("entryAudit", {}), r.get("sequence", {})
+              desc = r.get("proteinDescription", {})
+              name = (desc.get("recommendedName") or (desc.get("submissionNames") or [{}])[0]).get("fullName", {}).get("value")
+              comments = r.get("comments", [])
+              pdb = sorted({x["id"] for x in r.get("uniProtKBCrossReferences", []) if x.get("database") == "PDB"})
+              function = "\n".join(texts(comments, "FUNCTION"))
+              return {
+                  "entry_name": r.get("uniProtkbId"), "protein_name": name,
+                  "gene": ((r.get("genes") or [{}])[0].get("geneName") or {}).get("value"),
+                  "reviewed": "Swiss-Prot" in r.get("entryType", ""),
+                  "entry_version": audit.get("entryVersion"), "sequence_version": audit.get("sequenceVersion"),
+                  "seq_length": seq.get("length"), "crc64": seq.get("crc64"), "md5": seq.get("md5"),
+                  "last_annotation_update": audit.get("lastAnnotationUpdateDate"),
+                  "last_sequence_update": audit.get("lastSequenceUpdateDate"),
+                  "feature_count": sum(r.get("extraAttributes", {}).get("countByFeatureType", {}).values()),
+                  "pdb_count": len(pdb), "pdb_ids": pdb,
+                  "function_md5": hashlib.md5(function.encode()).hexdigest() if function else None,
+                  "diseases": sorted({c["disease"].get("diseaseId") for c in comments
+                                      if c.get("commentType") == "DISEASE" and c.get("disease", {}).get("diseaseId")}),
+              }
+
+          tokens = [t.strip().upper() for t in re.split(r"[\s,;]+", os.environ.get("UNIPROT_ACCESSIONS", "")) if t.strip()]
+          watched, invalid = [], []
+          for t in tokens:
+              base = re.sub(r"-\d+$", "", t)
+              (watched if ACC.fullmatch(base) else invalid).append(base if ACC.fullmatch(base) else t)
+          watched = list(dict.fromkeys(watched))
+          if not watched:
+              sys.exit(f"No valid UniProtKB accession in the input (invalid: {', '.join(invalid) or 'none'}).")
+
+          entries = fetch(watched)
+          for _ in range(5):
+              targets = {t for r in entries.values() if r.get("entryType") == "Inactive"
+                         and r.get("inactiveReason", {}).get("inactiveReasonType") == "MERGED"
+                         for t in r["inactiveReason"].get("mergeDemergeTo", [])} - set(entries)
+              if not targets:
+                  break
+              entries.update(fetch(sorted(targets)))
+
+          secondary_of = {}
+          for a in [a for a in watched if a not in entries][:20]:
+              hits = fetch([a], "sec_acc")
+              if len(hits) == 1:
+                  (p, r), = hits.items()
+                  entries[p], secondary_of[a] = r, p
+
+          rows = []
+          for a in watched:
+              row = {"watched": a, "status": "ACTIVE", "resolved": a, "merge_path": None, "inactive_detail": None}
+              if a in secondary_of:
+                  row.update(status="SECONDARY", resolved=secondary_of[a], merge_path=f"{a} > {secondary_of[a]}")
+              elif a not in entries:
+                  row.update(status="NOT_FOUND", resolved=None)
+              else:
+                  path, cur = [a], entries[a]
+                  while cur.get("entryType") == "Inactive":
+                      reason = cur.get("inactiveReason", {})
+                      kind, to = reason.get("inactiveReasonType", "DELETED"), reason.get("mergeDemergeTo", [])
+                      if kind == "MERGED" and len(to) == 1 and to[0] in entries and to[0] not in path:
+                          path.append(to[0])
+                          cur = entries[to[0]]
+                          continue
+                      row.update(status=kind, resolved=None,
+                                 inactive_detail=reason.get("deletedReason") or ("to " + ", ".join(to) if to else None))
+                      break
+                  else:
+                      if len(path) > 1:
+                          row.update(status="MERGED", resolved=path[-1])
+                  if len(path) > 1:
+                      row["merge_path"] = " > ".join(path)
+              if row["resolved"]:
+                  row.update(details(entries[row["resolved"]]))
+              rows.append(row)
+
+          with open("entries.ndjson", "w", encoding="utf-8") as f:
+              for row in rows:
+                  f.write(json.dumps(row, ensure_ascii=False) + "\n")
+          counts = {s: sum(r["status"] == s for r in rows) for s in sorted({r["status"] for r in rows})}
+          print(f"UniProt release {stats['release']} ({stats['release_date']}): {len(watched)} accession(s) in {stats['requests']} request(s), {counts}.")
+          print("::" + json.dumps({"outputs": {
+              "release": stats["release"], "release_date": stats["release_date"], "requests": stats["requests"],
+              "watched": len(watched), "invalid": ", ".join(invalid),
+              "not_found": ", ".join(r["watched"] for r in rows if r["status"] == "NOT_FOUND"),
+          }}) + "::")
+
+      - id: diff
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: |
+          Joins this run's rows to the previous snapshot on the watched accession and classifies the changes.
+          Lifecycle changes (OBSOLETE, MERGED, DEMERGED, NOT_FOUND) win over field changes for the same accession, so
+          a merge does not also report every field of the target entry as changed. Writes the new snapshot (Parquet),
+          the changes (CSV) and a Slack payload built with `json_object`. The BASELINE run reports nothing.
+        url: "jdbc:duckdb:"
+        fetchType: FETCH_ONE
+        inputFiles:
+          entries.ndjson: "{{ outputs.fetch_entries.outputFiles['entries.ndjson'] }}"
+          previous.parquet: "{{ outputs.previous_state.value.snapshot ?? outputs.empty_snapshot.outputFiles.snapshot }}"
+        outputFiles:
+          - snapshot
+          - changes_csv
+        parameters:
+          run_at: "{{ execution.startDate }}"
+          release: "{{ outputs.fetch_entries.vars.release }}"
+          previous_release: "{{ outputs.previous_state.value.release ?? '' }}"
+          alert_on_info: "{{ inputs.alert_on_info }}"
+          execution_url: "{{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+        sql: |
+          SET TimeZone = 'UTC';
+          CREATE TABLE cur AS
+          SELECT * EXCLUDE (last_annotation_update, last_sequence_update),
+                 CAST(last_annotation_update AS DATE) AS last_annotation_update,
+                 CAST(last_sequence_update AS DATE) AS last_sequence_update,
+                 CAST(:release AS VARCHAR) AS release, CAST(:run_at AS TIMESTAMP) AS snapshot_at
+          FROM read_json('entries.ndjson', format = 'newline_delimited', columns = {
+            'watched': 'VARCHAR', 'status': 'VARCHAR', 'resolved': 'VARCHAR', 'merge_path': 'VARCHAR', 'inactive_detail': 'VARCHAR',
+            'entry_name': 'VARCHAR', 'protein_name': 'VARCHAR', 'gene': 'VARCHAR', 'reviewed': 'BOOLEAN', 'entry_version': 'BIGINT',
+            'sequence_version': 'BIGINT', 'seq_length': 'BIGINT', 'crc64': 'VARCHAR', 'md5': 'VARCHAR', 'last_annotation_update': 'VARCHAR',
+            'last_sequence_update': 'VARCHAR', 'feature_count': 'BIGINT', 'pdb_count': 'BIGINT', 'pdb_ids': 'VARCHAR[]',
+            'function_md5': 'VARCHAR', 'diseases': 'VARCHAR[]'});
+          CREATE TABLE prev AS SELECT * FROM read_parquet('previous.parquet');
+          CREATE TABLE is_baseline AS SELECT (SELECT count(*) FROM prev) = 0 AS v;
+
+          CREATE TABLE pairs AS
+          SELECT c.*, p.status AS o_status, p.resolved AS o_resolved, p.protein_name AS o_name, p.gene AS o_gene,
+                 p.reviewed AS o_reviewed, p.entry_version AS o_entry_version, p.sequence_version AS o_seq_version,
+                 p.seq_length AS o_length, p.md5 AS o_md5, p.feature_count AS o_features, p.pdb_count AS o_pdb_count,
+                 p.pdb_ids AS o_pdb_ids, p.function_md5 AS o_function_md5, p.diseases AS o_diseases,
+                 list_filter(coalesce(c.pdb_ids, []), x -> NOT list_contains(coalesce(p.pdb_ids, []), x)) AS new_pdb,
+                 list_filter(coalesce(c.diseases, []), x -> NOT list_contains(coalesce(p.diseases, []), x)) AS added_diseases,
+                 list_filter(coalesce(p.diseases, []), x -> NOT list_contains(coalesce(c.diseases, []), x)) AS removed_diseases
+          FROM cur c JOIN prev p USING (watched);
+          CREATE TABLE same_entry AS
+          SELECT * FROM pairs WHERE status = o_status AND resolved = o_resolved;
+
+          CREATE TABLE raw_changes AS
+          SELECT watched, resolved, coalesce(gene, o_gene) AS gene, coalesce(protein_name, o_name) AS protein_name,
+                 CASE status WHEN 'DELETED' THEN 'OBSOLETE' WHEN 'MERGED' THEN 'MERGED' WHEN 'DEMERGED' THEN 'DEMERGED'
+                             WHEN 'NOT_FOUND' THEN 'NOT_FOUND' WHEN 'SECONDARY' THEN 'MERGED' ELSE 'REACTIVATED' END AS change_type,
+                 CASE WHEN status = 'ACTIVE' THEN 'MEDIUM' ELSE 'HIGH' END AS severity,
+                 o_status || coalesce(' ' || o_resolved, '') AS old_value, status || coalesce(' ' || resolved, '') AS new_value,
+                 coalesce(merge_path, inactive_detail, 'replace this accession in downstream mappings') AS detail
+          FROM pairs WHERE status IS DISTINCT FROM o_status OR resolved IS DISTINCT FROM o_resolved
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'SEQUENCE_CHANGED', 'HIGH',
+                 'v' || o_seq_version || ' (' || o_length || ' aa)', 'v' || sequence_version || ' (' || seq_length || ' aa)',
+                 'sequence checksum ' || CASE WHEN md5 IS DISTINCT FROM o_md5 THEN 'changed' ELSE 'unchanged' END
+                   || ', re-check constructs, epitopes and residue numbering'
+          FROM same_entry WHERE sequence_version IS DISTINCT FROM o_seq_version OR md5 IS DISTINCT FROM o_md5
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'REVIEWED_STATUS_CHANGED', 'HIGH',
+                 CASE WHEN o_reviewed THEN 'Swiss-Prot' ELSE 'TrEMBL' END, CASE WHEN reviewed THEN 'Swiss-Prot' ELSE 'TrEMBL' END,
+                 CASE WHEN reviewed THEN 'entry is now manually reviewed' ELSE 'entry lost its reviewed status' END
+          FROM same_entry WHERE reviewed IS DISTINCT FROM o_reviewed
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'NEW_PDB_STRUCTURES', 'MEDIUM', CAST(o_pdb_count AS VARCHAR), CAST(pdb_count AS VARCHAR),
+                 '+' || len(new_pdb) || ' ' || array_to_string(list_slice(new_pdb, 1, 15), ' ') || CASE WHEN len(new_pdb) > 15 THEN ' ...' ELSE '' END
+          FROM same_entry WHERE len(new_pdb) > 0
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'NAME_CHANGED', 'MEDIUM', o_name, protein_name, 'recommended name'
+          FROM same_entry WHERE protein_name IS DISTINCT FROM o_name
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'GENE_CHANGED', 'MEDIUM', o_gene, gene, 'primary gene name'
+          FROM same_entry WHERE gene IS DISTINCT FROM o_gene
+          UNION ALL
+          SELECT watched, resolved, gene, protein_name, 'ANNOTATION_UPDATED',
+                 CASE WHEN function_md5 IS DISTINCT FROM o_function_md5 OR len(added_diseases) + len(removed_diseases) > 0 THEN 'MEDIUM' ELSE 'INFO' END,
+                 'entry v' || o_entry_version, 'entry v' || entry_version,
+                 concat_ws('; ',
+                   CASE WHEN function_md5 IS DISTINCT FROM o_function_md5 THEN 'function text changed' END,
+                   CASE WHEN len(added_diseases) > 0 THEN 'disease added ' || array_to_string(added_diseases, ', ') END,
+                   CASE WHEN len(removed_diseases) > 0 THEN 'disease removed ' || array_to_string(removed_diseases, ', ') END,
+                   CASE WHEN feature_count IS DISTINCT FROM o_features THEN 'features ' || o_features || ' -> ' || feature_count END,
+                   'annotation updated ' || last_annotation_update)
+          FROM same_entry WHERE entry_version IS DISTINCT FROM o_entry_version
+          UNION ALL
+          SELECT c.watched, c.resolved, c.gene, c.protein_name, 'NEW_IN_WATCHLIST', CASE WHEN c.status = 'ACTIVE' THEN 'INFO' ELSE 'HIGH' END,
+                 NULL, c.status || coalesce(' ' || c.resolved, ''), coalesce(c.merge_path, c.inactive_detail, 'tracked from this run on')
+          FROM cur c ANTI JOIN prev p USING (watched);
+
+          CREATE TABLE changes AS
+          SELECT CAST(:release AS VARCHAR) AS release, NULLIF(CAST(:previous_release AS VARCHAR), '') AS previous_release,
+                 watched, resolved, gene, protein_name, change_type, severity, old_value, new_value, detail,
+                 'https://www.uniprot.org/uniprotkb/' || coalesce(resolved, watched) || '/entry' AS url,
+                 severity IN ('HIGH', 'MEDIUM') OR CAST(:alert_on_info AS BOOLEAN) AS alert
+          FROM raw_changes WHERE NOT (SELECT v FROM is_baseline);
+
+          COPY (SELECT * FROM cur) TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+          COPY (SELECT * EXCLUDE (alert) FROM changes
+                ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, watched)
+            TO '{{ outputFiles.changes_csv }}' (HEADER, DELIMITER ',');
+
+          CREATE TABLE digest AS
+          SELECT count(*) AS n,
+                 string_agg('• *' || change_type || '* <' || url || '|' || watched || '> ' || coalesce(gene, '') || ' '
+                            || left(coalesce(protein_name, ''), 60) || ' — ' || coalesce(old_value, '-') || ' -> ' || coalesce(new_value, '-')
+                            || coalesce(' (' || detail || ')', ''), chr(10)
+                            ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, watched) AS lines
+          FROM (SELECT * FROM changes WHERE alert
+                ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, change_type, watched LIMIT 25);
+
+          SELECT
+            (SELECT v FROM is_baseline) AS is_baseline,
+            CAST(:release AS VARCHAR) AS release,
+            (SELECT count(*) FROM cur) AS accessions,
+            (SELECT coalesce(string_agg(status || ' ' || n, ', ' ORDER BY n DESC, status), '') FROM (SELECT status, count(*) AS n FROM cur GROUP BY 1)) AS status_breakdown,
+            (SELECT count(*) FILTER (WHERE reviewed) FROM cur) AS reviewed,
+            (SELECT CAST(coalesce(sum(pdb_count), 0) AS BIGINT) FROM cur WHERE status IN ('ACTIVE', 'SECONDARY', 'MERGED')) AS pdb_structures,
+            (SELECT count(*) FROM prev ANTI JOIN cur USING (watched)) AS dropped_from_watchlist,
+            (SELECT count(*) FROM changes) AS changes,
+            (SELECT count(*) FILTER (WHERE alert) FROM changes) AS alert_changes,
+            (SELECT count(*) FILTER (WHERE severity = 'HIGH') FROM changes) AS high,
+            (SELECT coalesce(string_agg(change_type || ' ' || n, ', ' ORDER BY n DESC, change_type), 'none') FROM (SELECT change_type, count(*) AS n FROM changes GROUP BY 1)) AS change_breakdown,
+            CAST(json_object('text',
+              'UniProt release *' || CAST(:release AS VARCHAR) || '*' || CASE WHEN CAST(:previous_release AS VARCHAR) <> '' THEN ' (previous ' || CAST(:previous_release AS VARCHAR) || ')' ELSE '' END
+              || ', ' || (SELECT n FROM digest) || ' change(s) in the watched proteins'
+              || CASE WHEN (SELECT count(*) FILTER (WHERE alert) FROM changes) > 25 THEN ' (first 25 shown, full list in the CSV)' ELSE '' END || chr(10)
+              || coalesce((SELECT lines FROM digest), '') || chr(10) || 'Execution ' || :execution_url) AS VARCHAR) AS slack_payload;
+
+      - id: save_state
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ inputs.state_key }}"
+        kvType: JSON
+        description: Stores the release, the watchlist text and the new snapshot URI. Old snapshots stay with their executions until purged.
+        value: |
+          {{ {'release': outputs.fetch_entries.vars.release, 'release_date': outputs.fetch_entries.vars.release_date, 'accessions': inputs.accessions, 'snapshot': outputs.diff.outputFiles.snapshot, 'updated': execution.startDate} | toJson }}
+
+      - id: report
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.diff.outputs[0].row.alert_changes > 0 }}"
+        then:
+          - id: notify
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            allowFailure: true
+            description: One digest per release, HIGH first. allowFailure keeps the state saved when the webhook is missing or down.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: "{{ outputs.diff.outputs[0].row.slack_payload }}"
+
+          - id: log_changes
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: "{{ fromJson(outputs.diff.outputs[0].row.slack_payload).text }}"
+        else:
+          - id: nothing_to_report
+            type: io.kestra.plugin.core.log.Log
+            message: "{{ outputs.diff.outputs[0].row.is_baseline ? 'BASELINE for release ' ~ outputs.diff.outputs[0].row.release ~ ': ' ~ outputs.diff.outputs[0].row.accessions ~ ' accessions recorded, changes are reported from the next release on.' : 'No material change in release ' ~ outputs.diff.outputs[0].row.release ~ ' (' ~ outputs.diff.outputs[0].row.changes ~ ' INFO change(s) in the CSV).' }}"
+
+      - id: summary
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          Release {{ outputs.fetch_entries.vars.release }} ({{ outputs.fetch_entries.vars.release_date }}), previous {{ outputs.previous_state.value.release ?? 'none' }}: {{ outputs.diff.outputs[0].row.accessions }} accessions in {{ outputs.fetch_entries.vars.requests }} request(s){{ outputs.diff.outputs[0].row.is_baseline ? ', BASELINE run' : '' }}.
+          Status: {{ outputs.diff.outputs[0].row.status_breakdown }}; {{ outputs.diff.outputs[0].row.reviewed }} reviewed, {{ outputs.diff.outputs[0].row.pdb_structures }} PDB cross-references on live entries.
+          Changes: {{ outputs.diff.outputs[0].row.changes }} ({{ outputs.diff.outputs[0].row.high }} HIGH, {{ outputs.diff.outputs[0].row.alert_changes }} alerted): {{ outputs.diff.outputs[0].row.change_breakdown }}. {{ outputs.diff.outputs[0].row.dropped_from_watchlist }} accession(s) dropped from the watchlist.{{ outputs.fetch_entries.vars.invalid is not empty ? ' INVALID accessions skipped: ' ~ outputs.fetch_entries.vars.invalid ~ '.' : '' }}{{ outputs.fetch_entries.vars.not_found is not empty ? ' NOT_FOUND in UniProtKB: ' ~ outputs.fetch_entries.vars.not_found ~ '.' : '' }}
+    else:
+      - id: release_unchanged
+        type: io.kestra.plugin.core.log.Log
+        message: "UniProt release {{ outputs.probe_release.headers['x-uniprot-release'][0] }} ({{ outputs.probe_release.headers['x-uniprot-release-date'][0] ?? '' }}) was already diffed on {{ outputs.previous_state.value.updated }}; nothing to do. Set force_diff to re-run the comparison."
+
+outputs:
+  - id: release
+    type: STRING
+    value: "{{ outputs.probe_release.headers['x-uniprot-release'][0] }}"
+  - id: summary
+    type: JSON
+    required: false
+    value: "{{ outputs.diff.outputs[0].row ?? null }}"
+  - id: changes_csv
+    type: FILE
+    required: false
+    value: "{{ outputs.diff.outputFiles.changes_csv ?? null }}"
+
+extend:
+  title: Track UniProtKB Protein Entry Changes Between UniProt Releases
+  metaTitle: UniProt Protein Entry Change Tracker with DuckDB | Kestra
+  shortDescription: Watch a list of UniProtKB accessions, skip runs when the UniProt release has not changed, and get a Slack digest of new sequence versions, new PDB structures, renamed proteins or genes, annotation updates and obsolete, merged or demerged accessions.
+  metaDescription: Diff UniProtKB entries between UniProt releases in DuckDB and alert on sequence changes, new PDB structures, renames and obsolete or merged accessions.
+  description: |
+    Target dossiers, assay constructs, ID mapping tables and ML training sets reference proteins by UniProtKB accession. A UniProt release can give a target a new sequence version, merge or delete an accession, rename a protein or gene, or add PDB structures, and the website only shows the current entry. This flow snapshots the fields that matter for each watched accession to Parquet, diffs them in DuckDB when a new release is out and sends one Slack digest per release, most serious changes first.
+
+    ## How it works
+
+    1. A weekly `Schedule` (Wednesday 06:00). UniProt releases roughly every eight weeks on dates announced shortly before, so a weekly probe catches each release within a week for one tiny request and returns early otherwise.
+    2. `previous_state` (KV Get) reads the last release, watchlist text and snapshot URI. `probe_release` (HTTP Request) runs a one-result search and reads the `X-UniProt-Release` header.
+    3. `release_gate` (If) continues only on a first run, a new release, an edited watchlist or `force_diff`; otherwise the run logs that the release was already diffed and ends.
+    4. `bootstrap` (If) writes an empty snapshot on the first run, a BASELINE that reports no changes.
+    5. `fetch_entries` (Python, standard library only) maps isoforms (`P04637-2`) to the canonical entry, reports malformed ids as INVALID and calls `/uniprotkb/search` with `accession:A OR accession:B ...` in batches of 100. Search is used instead of `/uniprotkb/accessions` because only search returns inactive records with their `inactiveReason` (DELETED, MERGED, DEMERGED). `fields` trims entries to versions, sequence checksums, update dates, protein name, gene, reviewed status, feature count, PDB cross-references and function and disease comments. Merge targets are followed hop by hop (`Q9UIN1` was merged into `P30459`, itself merged into HLA-A `P04439`). Ids that return nothing are retried with `sec_acc:`, then reported as NOT_FOUND.
+    6. `diff` (DuckDB) joins the rows to the previous snapshot and classifies HIGH `SEQUENCE_CHANGED`, `REVIEWED_STATUS_CHANGED`, `OBSOLETE`, `MERGED`, `DEMERGED`, `NOT_FOUND`; MEDIUM `NEW_PDB_STRUCTURES` (with the new ids), `NAME_CHANGED`, `GENE_CHANGED`, `ANNOTATION_UPDATED` with function or disease changes; INFO plain version bumps and `NEW_IN_WATCHLIST`. Lifecycle changes win over field changes, so a merge does not also report every field of the target. It writes the snapshot, the CSV and a Slack payload.
+    7. `save_state` (KV Set) stores the new state. `report` (If) posts the digest (`SlackIncomingWebhook`, `allowFailure`) and logs it at WARN when something alert-worthy changed; `summary` logs counts and INVALID or NOT_FOUND ids.
+
+    ## What you get
+
+    - One Slack digest per release, each accession linked to its entry.
+    - `changes_csv` (accession, resolved accession, gene, change type, severity, old and new value, detail) plus `summary` and `release` outputs.
+    - Merge chains resolved to the live entry, deleted entries flagged with their reason.
+    - Sequence changes caught by version and checksum.
+    - A cheap no-op on weeks without a release.
+
+    ## Who it's for
+
+    - Bioinformaticians maintaining target lists, ID mapping tables or protein reference sets.
+    - Drug-discovery and structural biology teams following new structures and sequence revisions.
+    - Data engineers who rebuild UniProt-derived features after a release.
+
+    ## Why orchestrate this with Kestra
+
+    - KV state and internal storage, one flow for many watchlists via `state_key`, no database.
+    - `If` gates the work on the release header and skips quiet runs.
+    - Each run keeps its CSV and logs.
+    - Retries, backoff and `allowFailure` on Slack keep state safe.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the Python script, JDBC DuckDB and Slack plugins.
+    - Docker on the worker for `python:3.13-slim` (standard library only), or the `Process` task runner with `python3`.
+    - Outbound HTTPS to `rest.uniprot.org`; no API key needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the digest (optional; without it the notify task ends in WARNING and the digest is still logged).
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` as a secret if you want the Slack digest.
+    2. Execute with the defaults: 13 accessions in two requests, a BASELINE (release 2026_03: 9 active, 2 merged into HLA-A, 1 demerged, 1 deleted).
+    3. Execute again: the release has not changed, so the run logs that and stops. Set `force_diff` to compare anyway.
+    4. Use your own targets under their own `state_key`; editing the list triggers a diff and reports additions as NEW_IN_WATCHLIST.
+    5. Enable the schedule and download `changes_csv` from the execution outputs after each release.
+
+    ## How to extend
+
+    - Remap changed accessions with the UniProt ID mapping service.
+    - Add an AI task that summarises how the function text changed, using the UniSave entry history.
+    - Load the CSV into a warehouse for a release-by-release audit.
+    - Route HIGH changes to email or Microsoft Teams with the notifications plugin.
+
+    ## Links
+
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script) and [HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set), [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if) and [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [UniProt REST API](https://www.uniprot.org/help/api), [query fields](https://www.uniprot.org/help/query-fields), [return fields](https://www.uniprot.org/help/return_fields) and [obsolete, merged and demerged entries](https://www.uniprot.org/help/deleted_accessions)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - ELT & Data Landing
+  ee: false
+  demo: false
