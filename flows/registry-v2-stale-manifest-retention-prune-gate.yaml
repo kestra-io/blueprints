@@ -1,0 +1,694 @@
+id: registry-v2-stale-manifest-retention-prune-gate
+namespace: company.team
+
+description: |
+  Retention for a self-hosted Docker Registry (CNCF Distribution, registry:2). Keeps the newest images,
+  protected release tags and anything pinned, tracks every other image as a delete candidate in Kestra KV
+  until it has stayed stale through a grace window, then deletes the manifests after an operator confirms
+  the exact count and proves through the registry API that nothing that should survive was touched.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: registry_url
+    type: STRING
+    displayName: Registry URL
+    description: Base URL of the registry without a trailing slash. Must be reachable both from the Docker task runner (scan and checks) and from the Kestra worker (the DELETE calls).
+    defaults: "http://host.docker.internal:5000"
+
+  - id: repository_regex
+    type: STRING
+    displayName: Repository filter
+    description: Only repositories matching this regular expression are evaluated.
+    defaults: "^team/.*"
+
+  - id: keep_latest
+    type: INT
+    displayName: Newest images to keep per repository
+    description: Counted per image (digest), not per tag, by the image config creation time.
+    defaults: 10
+
+  - id: min_age_days
+    type: INT
+    displayName: Minimum age in days
+    description: Images built more recently than this are never candidates.
+    defaults: 14
+
+  - id: protected_tag_regex
+    type: STRING
+    displayName: Protected tag regex
+    description: An image carrying any tag that matches is kept, together with every other tag on the same digest.
+    defaults: "^(latest|stable|prod.*|v?[0-9]+[.][0-9]+[.][0-9]+)$"
+
+  - id: pinned_references
+    type: ARRAY
+    itemType: STRING
+    displayName: Pinned references
+    description: repository:tag entries that must never be deleted, for example the images your clusters currently run.
+    defaults: []
+
+  - id: grace_hours
+    type: INT
+    displayName: Grace window in hours
+    description: A candidate must stay a candidate, with an unchanged tag set, for this long before it can be deleted.
+    defaults: 48
+
+  - id: max_delete_per_run
+    type: INT
+    displayName: Max images deleted per run
+    description: Blast-radius cap. Oldest images go first; the rest wait for the next run.
+    defaults: 25
+
+  - id: unknown_max_pct
+    type: INT
+    displayName: Max share of images without a usable timestamp
+    description: Above this percentage the run is blocked, because age ordering cannot be trusted (for example reproducible builds that stamp 1970).
+    defaults: 20
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the plan is reported and tracked but no approval is requested and nothing is deleted.
+    defaults: true
+
+variables:
+  ledger_key: "registry_prune_ledger_{{ inputs.registry_url | slugify }}"
+  audit_key: "registry_prune_audit_{{ inputs.registry_url | slugify }}"
+
+triggers:
+  - id: nightly_retention_run
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Re-evaluate the registry every night so candidates age through the grace window. Shipped disabled until registry_url points at your registry.
+    cron: "30 3 * * *"
+    disabled: true
+
+  - id: on_demand_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Start a run from a CI release job right after a new release tag is pushed.
+    key: "{{ secret('REGISTRY_PRUNE_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: scan_registry
+    type: io.kestra.plugin.scripts.node.Script
+    description: Walk the catalog, resolve every tag to its digest and creation time, protect what must survive, and update the candidate ledger kept in Kestra KV.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: node:20-slim
+    inputFiles:
+      ledger.json: "{{ kv(key=render(vars.ledger_key), errorOnMissing=false) | default('{}') }}"
+    env:
+      REGISTRY_URL: "{{ inputs.registry_url }}"
+      REGISTRY_BASIC_AUTH: "{{ secret('REGISTRY_BASIC_AUTH') }}"
+      REPOSITORY_REGEX: "{{ inputs.repository_regex }}"
+      KEEP_LATEST: "{{ inputs.keep_latest }}"
+      MIN_AGE_DAYS: "{{ inputs.min_age_days }}"
+      PROTECTED_TAG_REGEX: "{{ inputs.protected_tag_regex }}"
+      PINNED_REFERENCES: "{{ inputs.pinned_references | toJson }}"
+      GRACE_HOURS: "{{ inputs.grace_hours }}"
+      MAX_DELETE_PER_RUN: "{{ inputs.max_delete_per_run }}"
+      UNKNOWN_MAX_PCT: "{{ inputs.unknown_max_pct }}"
+    outputFiles:
+      - ledger.json
+      - ops.json
+      - kept.json
+    script: |
+      const fs = require("fs");
+      const crypto = require("crypto");
+
+      const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+      const num = (key, fallback) => {
+        const value = Number(env(key, fallback));
+        if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid numeric setting ${key}`);
+        return value;
+      };
+
+      const base = env("REGISTRY_URL", "").replace(/\/+$/, "");
+      if (!base) throw new Error("REGISTRY_URL is required");
+      const auth = env("REGISTRY_BASIC_AUTH", "");
+      const cfg = {
+        keepLatest: num("KEEP_LATEST", "10"),
+        minAgeDays: num("MIN_AGE_DAYS", "14"),
+        graceHours: num("GRACE_HOURS", "24"),
+        maxDelete: num("MAX_DELETE_PER_RUN", "25"),
+        unknownMaxPct: num("UNKNOWN_MAX_PCT", "20"),
+        pageSize: num("PAGE_SIZE", "100"),
+        repoRe: new RegExp(env("REPOSITORY_REGEX", ".*")),
+        protRe: new RegExp(env("PROTECTED_TAG_REGEX", "^(latest|stable|prod.*|v?[0-9]+[.][0-9]+[.][0-9]+)$")),
+        pinned: new Set(JSON.parse(env("PINNED_REFERENCES", "[]"))),
+      };
+      const ACCEPT = [
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+      ].join(", ");
+      const EPOCH_FLOOR = Date.parse("2000-01-01T00:00:00Z");
+
+      async function call(path) {
+        const headers = { Accept: ACCEPT };
+        if (auth) headers.Authorization = `Basic ${auth}`;
+        return fetch(new URL(path, base + "/").toString(), { headers });
+      }
+
+      async function paged(path, key) {
+        let next = `${path}${path.includes("?") ? "&" : "?"}n=${cfg.pageSize}`;
+        const out = [];
+        while (next) {
+          const res = await call(next);
+          if (!res.ok) throw new Error(`GET ${next} returned HTTP ${res.status}`);
+          const body = await res.json();
+          out.push(...(body[key] || []));
+          const link = res.headers.get("link");
+          const match = link && link.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+          next = match ? match[1] : null;
+        }
+        return out;
+      }
+
+      const cache = new Map();
+      async function manifestInfo(repo, ref) {
+        const cacheKey = `${repo}@${ref}`;
+        if (cache.has(cacheKey)) return cache.get(cacheKey);
+        const res = await call(`/v2/${repo}/manifests/${ref}`);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`GET manifest ${repo}:${ref} returned HTTP ${res.status}`);
+        const text = await res.text();
+        const body = JSON.parse(text);
+        const digest = res.headers.get("docker-content-digest") || `sha256:${crypto.createHash("sha256").update(text).digest("hex")}`;
+        const info = { digest, kind: "unknown", children: [], layers: [], created: null };
+        if (Array.isArray(body.manifests)) {
+          info.kind = "index";
+          info.children = body.manifests.map((m) => m.digest);
+          for (const child of info.children) {
+            const c = await manifestInfo(repo, child);
+            if (c && c.created !== null) info.created = Math.max(info.created === null ? 0 : info.created, c.created);
+          }
+        } else if (body.config && Array.isArray(body.layers)) {
+          info.kind = "image";
+          info.layers = [body.config, ...body.layers].map((l) => ({ digest: l.digest, size: l.size }));
+          const blob = await call(`/v2/${repo}/blobs/${body.config.digest}`);
+          if (blob.ok) {
+            const created = Date.parse((await blob.json()).created);
+            if (!Number.isNaN(created) && created >= EPOCH_FLOOR) info.created = created;
+          }
+        }
+        cache.set(cacheKey, info);
+        cache.set(`${repo}@${info.digest}`, info);
+        return info;
+      }
+
+      const readJson = (file, fallback) => {
+        const text = fs.readFileSync(file, "utf8").trim();
+        return text === "" || text === "null" ? fallback : JSON.parse(text);
+      };
+
+      (async () => {
+        const now = Date.now();
+        const ledger = (readJson("ledger.json", {}) || {}).candidates || {};
+        const repos = (await paged("/v2/_catalog", "repositories")).filter((r) => cfg.repoRe.test(r)).sort();
+
+        const images = [];
+        for (const repo of repos) {
+          const tags = (await paged(`/v2/${repo}/tags/list`, "tags")) || [];
+          const byDigest = new Map();
+          for (const tag of tags) {
+            const info = await manifestInfo(repo, tag);
+            if (!info) continue;
+            if (!byDigest.has(info.digest)) byDigest.set(info.digest, { repository: repo, digest: info.digest, tags: [], info });
+            byDigest.get(info.digest).tags.push(tag);
+          }
+          for (const img of byDigest.values()) {
+            img.tags.sort();
+            img.created = img.info.created;
+            img.reasons = [];
+            if (img.tags.some((t) => cfg.protRe.test(t))) img.reasons.push("protected_tag");
+            if (img.tags.some((t) => cfg.pinned.has(`${repo}:${t}`))) img.reasons.push("pinned");
+            if (img.created === null) img.reasons.push("unknown_created");
+            else if (now - img.created < cfg.minAgeDays * 864e5) img.reasons.push("recent");
+            images.push(img);
+          }
+          const ranked = [...byDigest.values()].filter((i) => i.created !== null).sort((a, b) => b.created - a.created);
+          ranked.slice(0, cfg.keepLatest).forEach((i) => i.reasons.push("latest_n"));
+        }
+
+        // A manifest referenced by a surviving index must survive too; iterate until stable.
+        const byKey = new Map(images.map((i) => [`${i.repository}@${i.digest}`, i]));
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const img of images) {
+            if (img.reasons.length === 0) continue;
+            for (const child of img.info.children) {
+              const c = byKey.get(`${img.repository}@${child}`);
+              if (c && c.reasons.length === 0) { c.reasons.push("child_of_kept"); changed = true; }
+            }
+          }
+        }
+
+        const unknown = images.filter((i) => i.reasons.includes("unknown_created")).length;
+        const unknownPct = images.length ? (unknown * 100) / images.length : 0;
+        const blocked = unknownPct > cfg.unknownMaxPct;
+        const blockedReason = blocked ? `${unknown} of ${images.length} images (${unknownPct.toFixed(0)}%) have no usable created timestamp, so age ordering cannot be trusted.` : "";
+
+        const candidates = images.filter((i) => i.reasons.length === 0);
+        const nowIso = new Date(now).toISOString();
+        const newLedger = {};
+        for (const c of candidates) {
+          const key = `${c.repository}@${c.digest}`;
+          const prev = ledger[key];
+          const same = prev && JSON.stringify(prev.tags) === JSON.stringify(c.tags);
+          newLedger[key] = { repository: c.repository, digest: c.digest, tags: c.tags, first_seen: same ? prev.first_seen : nowIso };
+        }
+        const eligible = blocked ? [] : candidates
+          .filter((c) => now - Date.parse(newLedger[`${c.repository}@${c.digest}`].first_seen) >= cfg.graceHours * 36e5)
+          .sort((a, b) => a.created - b.created);
+        const selected = eligible.slice(0, cfg.maxDelete);
+        const selectedKeys = new Set(selected.map((i) => `${i.repository}@${i.digest}`));
+
+        const survivors = images.filter((i) => !selectedKeys.has(`${i.repository}@${i.digest}`));
+        const survivorManifests = new Set();
+        for (const s of survivors) {
+          survivorManifests.add(`${s.repository}@${s.digest}`);
+          s.info.children.forEach((c) => survivorManifests.add(`${s.repository}@${c}`));
+        }
+
+        const ops = [];
+        const seen = new Set();
+        const pushOp = (op) => { const k = `${op.repository}@${op.digest}`; if (!seen.has(k)) { seen.add(k); ops.push(op); } };
+        for (const s of selected) {
+          pushOp({ role: "image", repository: s.repository, digest: s.digest, tags: s.tags, created: new Date(s.created).toISOString(), parent: "" });
+          for (const child of s.info.children) {
+            if (!survivorManifests.has(`${s.repository}@${child}`)) pushOp({ role: "child", repository: s.repository, digest: child, tags: [], created: "", parent: s.digest });
+          }
+        }
+
+        // Blobs are shared registry-wide, so only blobs no surviving manifest references will be freed by garbage collection.
+        const blobSizes = new Map();
+        const survivorBlobs = new Set();
+        const addBlobs = (target, repo, digest) => {
+          const info = cache.get(`${repo}@${digest}`);
+          if (info) info.layers.forEach((l) => target(l));
+        };
+        for (const s of survivors) {
+          const mark = (l) => survivorBlobs.add(l.digest);
+          addBlobs(mark, s.repository, s.digest);
+          s.info.children.forEach((c) => addBlobs(mark, s.repository, c));
+        }
+        for (const op of ops) addBlobs((l) => { if (!survivorBlobs.has(l.digest)) blobSizes.set(l.digest, l.size); }, op.repository, op.digest);
+        const exclusiveBytes = [...blobSizes.values()].reduce((a, b) => a + b, 0);
+
+        const touched = new Set(ops.map((o) => o.repository));
+        const keptRefs = [];
+        const keptManifests = [];
+        for (const s of survivors.filter((i) => touched.has(i.repository))) {
+          s.tags.forEach((t) => keptRefs.push({ repository: s.repository, tag: t, digest: s.digest }));
+          keptManifests.push({ repository: s.repository, digest: s.digest });
+          s.info.children.forEach((c) => keptManifests.push({ repository: s.repository, digest: c }));
+        }
+
+        const fmtBytes = (n) => (n >= 1073741824 ? `${(n / 1073741824).toFixed(2)} GiB` : `${(n / 1048576).toFixed(1)} MiB`);
+        const lines = ops.filter((o) => o.role === "image").slice(0, 25).map((o) => `• ${o.repository} ${o.digest.slice(0, 19)}… tags [${o.tags.join(", ")}] built ${o.created.slice(0, 10)}`);
+        const childCount = ops.filter((o) => o.role === "child").length;
+        const summary = [
+          ...(blocked ? [`*Blocked:* ${blockedReason}`] : []),
+          ...(ops.length ? [`${selected.length} stale image(s) plus ${childCount} orphaned child manifest(s); up to ${fmtBytes(exclusiveBytes)} freed by the next garbage collection.`, ...lines] : []),
+        ].join("\n");
+
+        fs.writeFileSync("ledger.json", JSON.stringify({ version: 1, candidates: newLedger }));
+        fs.writeFileSync("ops.json", JSON.stringify(ops));
+        fs.writeFileSync("kept.json", JSON.stringify({ refs: keptRefs, manifests: keptManifests }));
+
+        console.log("::" + JSON.stringify({ outputs: {
+          repositories: repos.length,
+          images_total: images.length,
+          candidates: candidates.length,
+          pending_grace: candidates.length - eligible.length,
+          ops_count: ops.length,
+          image_ops: selected.length,
+          exclusive_bytes: exclusiveBytes,
+          blocked,
+          has_ops: ops.length > 0,
+          ops,
+          has_attention: blocked || ops.length > 0,
+          summary,
+        } }) + "::");
+      })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+  - id: gate_attention
+    type: io.kestra.plugin.core.flow.If
+    description: Only alert when manifests are ready to delete or the run was blocked as unsafe.
+    condition: "{{ outputs.scan_registry.vars.has_attention }}"
+    then:
+      - id: notify_plan
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the deletion plan, or the reason the run was blocked.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":wastebasket: *Registry retention* on `" ~ inputs.registry_url ~ "` (execution `" ~ execution.id ~ "`, dry_run=" ~ inputs.dry_run ~ ")",
+            "attachments": [ { "color": "#E2B93B", "text": outputs.scan_registry.vars.summary } ]
+          } | toJson }}
+
+      - id: gate_ops
+        type: io.kestra.plugin.core.flow.If
+        description: Blocked runs end here; only a concrete plan continues.
+        condition: "{{ outputs.scan_registry.vars.has_ops }}"
+        then:
+          - id: gate_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Dry runs stop after reporting, so the plan can be reviewed for several nights before deletion is enabled.
+            condition: "{{ inputs.dry_run }}"
+            then:
+              - id: log_dry_run
+                type: io.kestra.plugin.core.log.Log
+                description: Record what a real run would delete.
+                message: "Dry run: {{ outputs.scan_registry.vars.ops_count }} manifest(s) would be deleted. Set dry_run to false to enable deletion."
+            else:
+              - id: pause_for_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Hold the plan for an operator. Unapproved plans fail after 12 hours; the ledger is not advanced.
+                pauseDuration: PT12H
+                behavior: FAIL
+                onResume:
+                  - id: confirm_count
+                    type: INT
+                    defaults: 0
+                    description: Type the number of manifests listed in the Slack plan. A different number aborts the run.
+                  - id: approver_note
+                    type: STRING
+                    defaults: ""
+                    description: Change ticket or reason recorded in the audit entry.
+
+              - id: check_confirmation
+                type: io.kestra.plugin.core.flow.If
+                description: The operator must have read the plan well enough to repeat its size.
+                condition: "{{ (outputs.pause_for_approval.onResume.confirm_count ~ '') != (outputs.scan_registry.vars.ops_count ~ '') }}"
+                then:
+                  - id: fail_confirmation
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort before anything is deleted.
+                    errorMessage: "Confirmation mismatch: the plan deletes {{ outputs.scan_registry.vars.ops_count }} manifest(s) but {{ outputs.pause_for_approval.onResume.confirm_count }} was entered."
+
+              - id: recheck_plan
+                type: io.kestra.plugin.scripts.node.Script
+                description: Registry state may have changed during the approval window. Re-read the tags of every repository in the plan and stop before deleting if an image gained or lost a tag since the scan.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: node:20-slim
+                inputFiles:
+                  ops.json: "{{ outputs.scan_registry.outputFiles['ops.json'] }}"
+                env:
+                  REGISTRY_URL: "{{ inputs.registry_url }}"
+                  REGISTRY_BASIC_AUTH: "{{ secret('REGISTRY_BASIC_AUTH') }}"
+                script: |
+                  const fs = require("fs");
+
+                  const base = (process.env.REGISTRY_URL || "").replace(/\/+$/, "");
+                  if (!base) throw new Error("REGISTRY_URL is required");
+                  const auth = process.env.REGISTRY_BASIC_AUTH || "";
+                  const ACCEPT = [
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                    "application/vnd.docker.distribution.manifest.list.v2+json",
+                    "application/vnd.oci.image.manifest.v1+json",
+                    "application/vnd.oci.image.index.v1+json",
+                  ].join(", ");
+                  const pageSize = process.env.PAGE_SIZE || "100";
+                  const call = (path) => fetch(new URL(path, base + "/").toString(), { headers: { Accept: ACCEPT, ...(auth ? { Authorization: `Basic ${auth}` } : {}) } });
+
+                  async function tagsOf(repo) {
+                    let next = `/v2/${repo}/tags/list?n=${pageSize}`;
+                    const out = [];
+                    while (next) {
+                      const res = await call(next);
+                      if (res.status === 404) return out;
+                      if (!res.ok) throw new Error(`tags/list for ${repo} returned HTTP ${res.status}`);
+                      out.push(...((await res.json()).tags || []));
+                      const match = (res.headers.get("link") || "").match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+                      next = match ? match[1] : null;
+                    }
+                    return out;
+                  }
+
+                  (async () => {
+                    const ops = JSON.parse(fs.readFileSync("ops.json", "utf8")).filter((o) => o.role === "image");
+                    const tagsByDigest = new Map();
+                    const problems = [];
+                    for (const repo of [...new Set(ops.map((o) => o.repository))]) {
+                      const map = new Map();
+                      for (const tag of await tagsOf(repo)) {
+                        const res = await call(`/v2/${repo}/manifests/${tag}`);
+                        if (!res.ok) continue;
+                        const digest = res.headers.get("docker-content-digest");
+                        if (!map.has(digest)) map.set(digest, []);
+                        map.get(digest).push(tag);
+                      }
+                      tagsByDigest.set(repo, map);
+                    }
+                    for (const op of ops) {
+                      const now = [...(tagsByDigest.get(op.repository).get(op.digest) || [])].sort();
+                      const planned = [...op.tags].sort();
+                      if (JSON.stringify(now) !== JSON.stringify(planned)) {
+                        problems.push(`${op.repository}@${op.digest.slice(0, 19)} had tags [${planned.join(", ")}] at scan time and has [${now.join(", ")}] now`);
+                      }
+                    }
+                    if (problems.length) {
+                      console.error("The registry changed after the plan was made. Nothing was deleted.\n" + problems.slice(0, 20).join("\n"));
+                      process.exit(1);
+                    }
+                    console.log("::" + JSON.stringify({ outputs: { rechecked: ops.length } }) + "::");
+                  })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: delete_manifests
+                type: io.kestra.plugin.core.flow.Loop
+                description: Delete the planned manifests one at a time, children of stale multi-arch indexes included.
+                values: "{{ outputs.scan_registry.vars.ops }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: delete_manifest
+                    type: io.kestra.plugin.core.http.Request
+                    description: DELETE the manifest by digest. The registry untags every tag on that digest and answers 202 Accepted; any other status fails the run.
+                    uri: "{{ inputs.registry_url }}/v2/{{ item.value.repository }}/manifests/{{ item.value.digest }}"
+                    method: DELETE
+                    headers:
+                      Authorization: "Basic {{ secret('REGISTRY_BASIC_AUTH') }}"
+                    options:
+                      allowedResponseCodes:
+                        - 202
+
+              - id: verify_deletions
+                type: io.kestra.plugin.scripts.node.Script
+                description: Re-read the registry. Deleted digests must 404, their tags must be gone from tags/list, and every surviving tag and manifest must still resolve to the same digest.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: node:20-slim
+                inputFiles:
+                  ops.json: "{{ outputs.scan_registry.outputFiles['ops.json'] }}"
+                  kept.json: "{{ outputs.scan_registry.outputFiles['kept.json'] }}"
+                env:
+                  REGISTRY_URL: "{{ inputs.registry_url }}"
+                  REGISTRY_BASIC_AUTH: "{{ secret('REGISTRY_BASIC_AUTH') }}"
+                  APPROVER_NOTE: "{{ outputs.pause_for_approval.onResume.approver_note }}"
+                  EXECUTION_ID: "{{ execution.id }}"
+                outputFiles:
+                  - audit.json
+                script: |
+                  const fs = require("fs");
+
+                  const base = (process.env.REGISTRY_URL || "").replace(/\/+$/, "");
+                  if (!base) throw new Error("REGISTRY_URL is required");
+                  const auth = process.env.REGISTRY_BASIC_AUTH || "";
+                  const ACCEPT = [
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                    "application/vnd.docker.distribution.manifest.list.v2+json",
+                    "application/vnd.oci.image.manifest.v1+json",
+                    "application/vnd.oci.image.index.v1+json",
+                  ].join(", ");
+                  const pageSize = process.env.PAGE_SIZE || "100";
+
+                  const call = (path) => fetch(new URL(path, base + "/").toString(), { headers: { Accept: ACCEPT, ...(auth ? { Authorization: `Basic ${auth}` } : {}) } });
+
+                  async function tagsOf(repo) {
+                    let next = `/v2/${repo}/tags/list?n=${pageSize}`;
+                    const out = [];
+                    while (next) {
+                      const res = await call(next);
+                      if (res.status === 404) return out;
+                      if (!res.ok) throw new Error(`tags/list for ${repo} returned HTTP ${res.status}`);
+                      out.push(...((await res.json()).tags || []));
+                      const match = (res.headers.get("link") || "").match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+                      next = match ? match[1] : null;
+                    }
+                    return out;
+                  }
+
+                  (async () => {
+                    const ops = JSON.parse(fs.readFileSync("ops.json", "utf8"));
+                    const kept = JSON.parse(fs.readFileSync("kept.json", "utf8"));
+                    const mismatches = [];
+                    const tagCache = new Map();
+
+                    for (const op of ops) {
+                      const res = await call(`/v2/${op.repository}/manifests/${op.digest}`);
+                      if (res.status !== 404) mismatches.push(`${op.repository}@${op.digest.slice(0, 19)} still resolves (HTTP ${res.status}) after DELETE`);
+                      if (op.role === "image" && op.tags.length) {
+                        if (!tagCache.has(op.repository)) tagCache.set(op.repository, await tagsOf(op.repository));
+                        for (const tag of op.tags.filter((t) => tagCache.get(op.repository).includes(t))) {
+                          const head = await call(`/v2/${op.repository}/manifests/${tag}`);
+                          const digest = head.headers.get("docker-content-digest");
+                          const repushed = head.status === 200 && digest !== op.digest;
+                          if (!repushed) mismatches.push(`${op.repository}:${tag} is still listed in tags/list although its manifest was deleted (HTTP ${head.status})`);
+                        }
+                      }
+                    }
+                    for (const ref of kept.refs) {
+                      const res = await call(`/v2/${ref.repository}/manifests/${ref.tag}`);
+                      const digest = res.headers.get("docker-content-digest");
+                      if (res.status !== 200 || digest !== ref.digest) mismatches.push(`kept tag ${ref.repository}:${ref.tag} no longer resolves to ${ref.digest.slice(0, 19)} (HTTP ${res.status})`);
+                    }
+                    for (const m of kept.manifests) {
+                      const res = await call(`/v2/${m.repository}/manifests/${m.digest}`);
+                      if (res.status !== 200) mismatches.push(`surviving manifest ${m.repository}@${m.digest.slice(0, 19)} is missing (HTTP ${res.status})`);
+                    }
+
+                    const verified = mismatches.length === 0;
+                    const audit = {
+                      executed_at: new Date().toISOString(),
+                      execution_id: process.env.EXECUTION_ID || "",
+                      verified,
+                      deleted: ops.length,
+                      kept_tags_checked: kept.refs.length,
+                      kept_manifests_checked: kept.manifests.length,
+                      approver_note: process.env.APPROVER_NOTE || "",
+                      mismatches,
+                      ops,
+                    };
+                    fs.writeFileSync("audit.json", JSON.stringify(audit));
+                    console.log("::" + JSON.stringify({ outputs: { verified, deleted: ops.length, kept_tags_checked: kept.refs.length, mismatch_summary: mismatches.slice(0, 10).join("; ") } }) + "::");
+                  })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: check_verification
+                type: io.kestra.plugin.core.flow.If
+                description: A registry that does not match the plan is an incident, not a success.
+                condition: "{{ not outputs.verify_deletions.vars.verified }}"
+                then:
+                  - id: fail_verification
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Stop before the ledger is advanced.
+                    errorMessage: "Registry does not match the plan after deletion: {{ outputs.verify_deletions.vars.mismatch_summary }}"
+
+              - id: record_audit
+                type: io.kestra.plugin.core.kv.Set
+                description: Keep the last verified deletion set, approver note and checks performed for review.
+                key: "{{ render(vars.audit_key) }}"
+                kvType: JSON
+                value: "{{ read(outputs.verify_deletions.outputFiles['audit.json']) }}"
+
+              - id: notify_result
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Confirm the verified result and remind the operator that blobs are only freed by garbage collection.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: >-
+                  {{ {
+                    "text": ":white_check_mark: *Registry retention* verified: " ~ outputs.verify_deletions.vars.deleted ~ " manifest(s) deleted, " ~ outputs.verify_deletions.vars.kept_tags_checked ~ " surviving tag(s) re-checked. Run registry garbage-collect to free up to " ~ outputs.scan_registry.vars.exclusive_bytes ~ " bytes."
+                  } | toJson }}
+        else:
+          - id: log_blocked
+            type: io.kestra.plugin.core.log.Log
+            description: A blocked run proposes no deletion.
+            message: "Run blocked, nothing deleted: {{ outputs.scan_registry.vars.summary }}"
+    else:
+      - id: log_nothing_due
+        type: io.kestra.plugin.core.log.Log
+        description: No candidate has cleared the grace window yet.
+        message: "Scanned {{ outputs.scan_registry.vars.repositories }} repositories and {{ outputs.scan_registry.vars.images_total }} images: {{ outputs.scan_registry.vars.candidates }} candidate(s), {{ outputs.scan_registry.vars.pending_grace }} still inside the grace window."
+
+  - id: persist_ledger
+    type: io.kestra.plugin.core.kv.Set
+    description: Advance the candidate ledger only after the run finished cleanly, so a rejected or failed run is re-evaluated from the same state.
+    key: "{{ render(vars.ledger_key) }}"
+    kvType: STRING
+    value: "{{ read(outputs.scan_registry.outputFiles['ledger.json']) }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Page the channel when the scan fails, approval times out, confirmation is wrong or verification finds a mismatch.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Registry retention failed* on `" ~ inputs.registry_url ~ "` (execution `" ~ execution.id ~ "`). The ledger was not advanced; inspect the registry before the next run."
+      } | toJson }}
+
+extend:
+  title: Docker Registry Stale Manifest Retention Prune Gate
+  metaTitle: Docker Registry v2 Retention Prune with Approval and Verification | Kestra
+  shortDescription: Prunes stale images from a self-hosted Docker Registry without orphaning shared digests or multi-arch children, with a KV grace ledger, count-confirmed approval and API verification.
+  metaDescription: Prune stale Docker Registry v2 manifests safely with a KV grace ledger, count-confirmed approval and API checks that surviving images still resolve.
+  description: |
+    Self-hosted registries fill up because nobody dares delete images. Deleting by tag is unsafe: the Distribution API deletes by digest and untags every tag on that digest, and a multi-arch index references child manifests that must not disappear. This blueprint decides what is stale, makes candidates prove they stay stale across runs, and verifies the result.
+
+    ## How it works
+
+    1. A nightly schedule or a CI webhook starts the flow; `concurrency` allows one run at a time.
+    2. `scan_registry` pages through `/v2/_catalog` and each `tags/list`, resolves every tag to its digest (`Docker-Content-Digest`) and reads the image config `created` time. Tags that share a digest are one image.
+    3. Images are kept if they are among the newest `keep_latest`, younger than `min_age_days`, carry a protected tag, are pinned, have no trustworthy timestamp, or are children of a kept index.
+    4. Everything else is a candidate. Its first-seen time and tag set live in a KV ledger; a changed tag set restarts the grace window, and only candidates older than `grace_hours` are planned, oldest first, capped by `max_delete_per_run`.
+    5. `pause_for_approval` holds the plan; the operator must type the planned manifest count.
+    6. `recheck_plan` re-reads the tags of every repository in the plan and stops before deleting if an image gained or lost a tag while the plan waited for approval.
+    7. `delete_manifests` loops over the plan with `DELETE /v2/<name>/manifests/<digest>`, expecting 202.
+    8. `verify_deletions` proves deleted digests return 404, their tags left `tags/list`, and every surviving tag and child manifest still resolves.
+
+    ## What you get
+
+    - Shared-digest and multi-arch aware deletion that cannot break a kept release.
+    - A reclaimable-bytes estimate that excludes layers still used by survivors, including other repositories.
+    - A circuit breaker for registries whose timestamps cannot be trusted.
+    - A re-check after approval, so a tag moved onto an old image during the review cannot be deleted by a stale plan.
+
+    ## Who it's for
+
+    - Platform teams running a self-hosted `registry:2` (CNCF Distribution) behind CI.
+
+    ## Why orchestrate this with Kestra
+
+    The safe answer needs memory (the grace ledger), a human in the loop (`Pause`) and an independent check afterwards; a cron script with `curl -X DELETE` has none. The DELETE call returns 202 even when untagging fails, which is exactly what verification catches.
+
+    ## Prerequisites
+
+    - A registry started with `REGISTRY_STORAGE_DELETE_ENABLED=true`, Docker on the worker, and a Slack webhook.
+
+    ### Secrets
+
+    - `REGISTRY_BASIC_AUTH`: base64 of `user:password` (any placeholder for an anonymous test registry).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook.
+    - `REGISTRY_PRUNE_WEBHOOK_KEY`: key protecting the webhook trigger.
+
+    ## Quick start
+
+    1. Run `docker run -d -p 5000:5000 -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:2` and push a dozen differently built images to `localhost:5000/team/app`.
+    2. Create the three secrets and execute once with `dry_run: true`; review the Slack plan.
+    3. Execute with `dry_run: false` and `grace_hours: 0`, resume the pause with the planned count, then confirm the verified message.
+    4. Stop the registry or make it read-only and run `registry garbage-collect` to free the blobs.
+
+    ## How to extend
+
+    - Feed `pinned_references` from the images your clusters run.
+    - Run garbage collection from a follow-up task that has access to the registry storage.
+    - Untagged manifests, which are left over when a tag is moved to a new build, are not tracked by this flow. Only manifests that carry a tag are candidates.
+
+    ## Links
+
+    - [Distribution API specification](https://distribution.github.io/distribution/spec/api/)
+    - [Distribution garbage collection](https://distribution.github.io/distribution/about/garbage-collection/)
+    - [Kestra Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request)
+
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
