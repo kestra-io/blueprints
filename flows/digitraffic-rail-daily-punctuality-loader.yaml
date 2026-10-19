@@ -1,0 +1,409 @@
+id: digitraffic-rail-daily-punctuality-loader
+namespace: company.team
+
+description: |
+  Load every Finnish train of each finished day from the Fintraffic Digitraffic rail API, measure
+  arrival punctuality at the final destination per train category, operator and commuter line,
+  and append the result to a Parquet KPI table. A date cursor in the KV store makes the loader
+  incremental and backfill-safe: missed days are caught up on the next run, a failed day is
+  retried, and a reloaded day replaces its old rows.
+
+inputs:
+  - id: backfill_from
+    type: DATE
+    required: false
+    description: Optional first day to (re)load. Empty means "the day after the cursor", or yesterday on the first run. Days already in the table are replaced, and the cursor never moves backwards.
+
+  - id: max_days_per_run
+    type: INT
+    defaults: 7
+    description: Maximum number of days loaded in one execution (one API request per day, about 17 MB of JSON once decompressed). The rest are loaded by the next runs.
+
+  - id: commuter_threshold_min
+    type: INT
+    defaults: 3
+    description: A commuter train is punctual when it reaches its final station less than this many minutes late (3 minutes is the usual Finnish convention for commuter trains).
+
+  - id: long_distance_threshold_min
+    type: INT
+    defaults: 5
+    description: The same threshold for long-distance trains.
+
+  - id: commuter_target_pct
+    type: FLOAT
+    defaults: 90.0
+    description: National commuter punctuality target. A loaded day below it is flagged in the log and the Slack message.
+
+  - id: long_distance_target_pct
+    type: FLOAT
+    defaults: 80.0
+    description: The same target for long-distance trains.
+
+tasks:
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Writes an empty KPI table with the final schema so every day is loaded with one code path.
+    condition: "{{ kv('digitraffic_rail_kpi', errorOnMissing=false) is null }}"
+    then:
+      - id: empty_table
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        fetchType: NONE
+        outputFiles:
+          - kpi_parquet
+        sql: |
+          CREATE TABLE kpi (
+            departure_date DATE, train_category VARCHAR, operator VARCHAR, commuter_line VARCHAR,
+            trains INTEGER, cancelled INTEGER, terminated_early INTEGER, no_actual_time INTEGER,
+            measured INTEGER, punctual INTEGER, punctuality_pct DOUBLE,
+            avg_delay_min DOUBLE, p90_delay_min DOUBLE, top_causes VARCHAR, loaded_at TIMESTAMP
+          );
+          COPY kpi TO '{{ outputFiles.kpi_parquet }}' (FORMAT PARQUET);
+
+      - id: init_kpi
+        type: io.kestra.plugin.core.kv.Set
+        key: digitraffic_rail_kpi
+        value: "{{ outputs.empty_table.outputFiles.kpi_parquet }}"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Lists the days to load: from `backfill_from`, else the day after the cursor, else yesterday, up to yesterday
+      in Finnish time (today's trains are still running) and at most `max_days_per_run` days.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH bounds AS (
+        SELECT coalesce(
+                 TRY_CAST('{{ inputs.backfill_from ?? "" }}' AS DATE),
+                 TRY_CAST('{{ kv("digitraffic_rail_cursor", errorOnMissing=false) ?? "" }}' AS DATE) + 1,
+                 CAST('{{ now(timeZone="Europe/Helsinki") | dateAdd(-1, "DAYS") | date("yyyy-MM-dd", timeZone="Europe/Helsinki") }}' AS DATE)
+               ) AS first_day,
+               CAST('{{ now(timeZone="Europe/Helsinki") | dateAdd(-1, "DAYS") | date("yyyy-MM-dd", timeZone="Europe/Helsinki") }}' AS DATE) AS last_day
+      ),
+      days AS (
+        SELECT CAST(d AS DATE) AS d
+        FROM bounds, generate_series(CAST(first_day AS TIMESTAMP), CAST(last_day AS TIMESTAMP), INTERVAL 1 DAY) AS g(d)
+        ORDER BY d
+        LIMIT {{ inputs.max_days_per_run }}
+      )
+      SELECT
+        (SELECT CAST(first_day AS VARCHAR) FROM bounds) AS first_day,
+        (SELECT CAST(last_day AS VARCHAR) FROM bounds) AS last_day,
+        (SELECT count(*) FROM days) AS day_count,
+        (SELECT coalesce(CAST(to_json(list(CAST(d AS VARCHAR) ORDER BY d)) AS VARCHAR), '[]') FROM days) AS dates,
+        (SELECT coalesce(CAST(to_json(list({'day': CAST(d AS VARCHAR), 'commuter_min': {{ inputs.commuter_threshold_min }}, 'long_distance_min': {{ inputs.long_distance_threshold_min }}} ORDER BY d)) AS VARCHAR), '[]') FROM days) AS items,
+        '{{ kv("digitraffic_rail_cursor", errorOnMissing=false) ?? "none" }}' AS cursor_before
+
+  - id: load_days
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan.outputs[0].row.day_count > 0 }}"
+    then:
+      - id: each_day
+        type: io.kestra.plugin.core.flow.Loop
+        description: One day at a time, oldest first, so the cursor only moves past days that were loaded. Each item carries the date and the thresholds.
+        values: "{{ outputs.plan.outputs[0].row.items }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: fetch_day
+            type: io.kestra.plugin.core.http.Download
+            description: |
+              All trains with a departure date of that day, timetable rows included. Digitraffic answers 406
+              without `Accept-Encoding: gzip` and asks every client to identify itself with `Digitraffic-User`.
+            uri: "https://rata.digitraffic.fi/api/v1/trains/{{ fromJson(item.value).day }}"
+            headers:
+              Accept-Encoding: gzip
+              Digitraffic-User: kestra-blueprint/digitraffic-rail-daily-punctuality-loader
+            options:
+              timeout:
+                readIdleTimeout: PT2M
+            retry:
+              type: exponential
+              interval: PT30S
+              maxInterval: PT5M
+              maxAttempts: 4
+
+          - id: load_day
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: |
+              Flattens the timetable rows into a stop-level Parquet file, takes each passenger train's last
+              ARRIVAL row as its final destination and classifies the train as cancelled, terminated early
+              (final stop cancelled), no actual time yet, punctual or late. The delay is computed from the
+              timestamps to the second, not from the rounded `differenceInMinutes`. The day's rows replace
+              any earlier rows for the same date in the KPI table. An empty answer fails the task, so the
+              cursor stays put and the day is retried by the next run.
+            url: "jdbc:duckdb:"
+            fetchType: FETCH_ONE
+            inputFiles:
+              day.json: "{{ outputs.fetch_day.uri }}"
+              kpi.parquet: "{{ kv('digitraffic_rail_kpi') }}"
+            outputFiles:
+              - stops_parquet
+              - kpi_parquet
+            sql: |
+              SET TimeZone = 'UTC';
+
+              CREATE TABLE trains AS
+              SELECT * FROM read_json('day.json', format = 'array', maximum_object_size = 104857600,
+                columns = {
+                  'departureDate': 'DATE', 'trainNumber': 'INTEGER', 'operatorShortCode': 'VARCHAR',
+                  'trainType': 'VARCHAR', 'trainCategory': 'VARCHAR', 'commuterLineID': 'VARCHAR', 'cancelled': 'BOOLEAN',
+                  'timeTableRows': 'STRUCT(stationShortCode VARCHAR, "type" VARCHAR, trainStopping BOOLEAN, commercialStop BOOLEAN, cancelled BOOLEAN, scheduledTime TIMESTAMPTZ, actualTime TIMESTAMPTZ, differenceInMinutes INTEGER, causes STRUCT(categoryCode VARCHAR, detailedCategoryCode VARCHAR)[])[]'
+                });
+
+              CREATE TABLE guard AS SELECT CASE WHEN (SELECT count(*) FROM trains) = 0
+                THEN error('Digitraffic returned no trains for {{ fromJson(item.value).day }}; the cursor is not moved')
+              END AS ok;
+
+              CREATE TABLE stops AS
+              SELECT departureDate AS departure_date, trainNumber AS train_number, operatorShortCode AS operator,
+                     trainType AS train_type, trainCategory AS train_category, nullif(commuterLineID, '') AS commuter_line,
+                     cancelled AS train_cancelled, generate_subscripts(timeTableRows, 1) AS row_index,
+                     unnest(timeTableRows) AS r
+              FROM trains;
+
+              CREATE TABLE stops_flat AS
+              SELECT departure_date, train_number, operator, train_type, train_category, commuter_line, train_cancelled, row_index,
+                     r.stationShortCode AS station, r."type" AS row_type, r.trainStopping AS stopping, r.commercialStop AS commercial_stop,
+                     r.cancelled AS row_cancelled, r.scheduledTime AS scheduled_time, r.actualTime AS actual_time,
+                     date_diff('second', r.scheduledTime, r.actualTime) / 60.0 AS delay_min,
+                     list_transform(r.causes, c -> c.detailedCategoryCode) AS cause_codes
+              FROM stops;
+
+              COPY (SELECT * FROM stops_flat ORDER BY train_number, row_index) TO '{{ outputFiles.stops_parquet }}' (FORMAT PARQUET);
+
+              CREATE TABLE final AS
+              SELECT s.*,
+                     CASE WHEN s.train_cancelled THEN 'cancelled'
+                          WHEN s.row_cancelled THEN 'terminated_early'
+                          WHEN s.actual_time IS NULL THEN 'no_actual_time'
+                          WHEN s.delay_min < CASE WHEN s.train_category = 'Commuter' THEN {{ fromJson(item.value).commuter_min }} ELSE {{ fromJson(item.value).long_distance_min }} END THEN 'punctual'
+                          ELSE 'late' END AS status
+              FROM stops_flat s
+              WHERE s.train_category IN ('Commuter', 'Long-distance') AND s.row_type = 'ARRIVAL'
+              QUALIFY row_number() OVER (PARTITION BY s.train_number ORDER BY s.row_index DESC) = 1;
+
+              CREATE TABLE causes AS
+              SELECT train_category, operator, coalesce(commuter_line, '-') AS commuter_line, code, count(DISTINCT train_number) AS n
+              FROM (SELECT train_number, train_category, operator, commuter_line, unnest(cause_codes) AS code FROM stops_flat
+                    WHERE train_category IN ('Commuter', 'Long-distance'))
+              GROUP BY 1, 2, 3, 4;
+
+              CREATE TABLE top_causes AS
+              SELECT train_category, operator, commuter_line, string_agg(code || ' x' || n, ', ' ORDER BY n DESC, code) AS top_causes
+              FROM (SELECT * FROM causes
+                    QUALIFY row_number() OVER (PARTITION BY train_category, operator, commuter_line ORDER BY n DESC, code) <= 3)
+              GROUP BY ALL;
+
+              CREATE TABLE day_kpi AS
+              SELECT k.*, t.top_causes, CAST('{{ execution.startDate }}' AS TIMESTAMP) AS loaded_at
+              FROM (
+                SELECT CAST('{{ fromJson(item.value).day }}' AS DATE) AS departure_date, train_category, operator,
+                       coalesce(commuter_line, '-') AS commuter_line,
+                       CAST(count(*) AS INTEGER) AS trains,
+                       CAST(count(*) FILTER (WHERE status = 'cancelled') AS INTEGER) AS cancelled,
+                       CAST(count(*) FILTER (WHERE status = 'terminated_early') AS INTEGER) AS terminated_early,
+                       CAST(count(*) FILTER (WHERE status = 'no_actual_time') AS INTEGER) AS no_actual_time,
+                       CAST(count(*) FILTER (WHERE status IN ('punctual', 'late', 'terminated_early')) AS INTEGER) AS measured,
+                       CAST(count(*) FILTER (WHERE status = 'punctual') AS INTEGER) AS punctual,
+                       round(100.0 * count(*) FILTER (WHERE status = 'punctual') / nullif(count(*) FILTER (WHERE status IN ('punctual', 'late', 'terminated_early')), 0), 2) AS punctuality_pct,
+                       round(avg(greatest(delay_min, 0)) FILTER (WHERE status IN ('punctual', 'late')), 2) AS avg_delay_min,
+                       round(quantile_cont(greatest(delay_min, 0), 0.9) FILTER (WHERE status IN ('punctual', 'late')), 2) AS p90_delay_min
+                FROM final
+                GROUP BY 1, 2, 3, 4
+              ) k
+              LEFT JOIN top_causes t USING (train_category, operator, commuter_line);
+
+              COPY (
+                SELECT * FROM read_parquet('kpi.parquet') WHERE departure_date <> CAST('{{ fromJson(item.value).day }}' AS DATE)
+                UNION ALL BY NAME SELECT * FROM day_kpi
+                ORDER BY departure_date, train_category, operator, commuter_line
+              ) TO '{{ outputFiles.kpi_parquet }}' (FORMAT PARQUET);
+
+              SELECT
+                (SELECT count(*) FROM trains) AS all_trains,
+                (SELECT count(*) FROM final) AS passenger_trains,
+                (SELECT count(*) FROM stops_flat) AS stop_rows,
+                (SELECT count(*) FROM day_kpi) AS kpi_rows,
+                CAST(greatest(CAST('{{ fromJson(item.value).day }}' AS DATE),
+                     coalesce(TRY_CAST('{{ kv("digitraffic_rail_cursor", errorOnMissing=false) ?? "" }}' AS DATE), DATE '1970-01-01')) AS VARCHAR) AS new_cursor;
+
+          - id: save_kpi
+            type: io.kestra.plugin.core.kv.Set
+            key: digitraffic_rail_kpi
+            value: "{{ outputs.load_day.outputFiles.kpi_parquet }}"
+
+          - id: save_stops
+            type: io.kestra.plugin.core.kv.Set
+            description: Stop-level Parquet of the day (one row per train and timetable row), kept for 90 days.
+            key: "digitraffic_rail_stops_{{ fromJson(item.value).day | replace({'-': '_'}) }}"
+            value: "{{ outputs.load_day.outputFiles.stops_parquet }}"
+            ttl: P90D
+
+          - id: move_cursor
+            type: io.kestra.plugin.core.kv.Set
+            key: digitraffic_rail_cursor
+            value: "{{ outputs.load_day.outputs[0].row.new_cursor }}"
+
+    else:
+      - id: nothing_to_load
+        type: io.kestra.plugin.core.log.Log
+        message: "Nothing to load: the first candidate day {{ outputs.plan.outputs[0].row.first_day }} is after yesterday ({{ outputs.plan.outputs[0].row.last_day }}, Europe/Helsinki). Cursor {{ outputs.plan.outputs[0].row.cursor_before }}."
+
+  - id: report
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Runs on every execution (empty when nothing was loaded). National punctuality per loaded day and category, compared with the 28 days before it, plus the three
+      least punctual commuter lines of the last loaded day (lines with at least 20 measured trains).
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      kpi.parquet: "{{ kv('digitraffic_rail_kpi') }}"
+    outputFiles:
+      - report_csv
+    sql: |
+      CREATE TABLE kpi AS SELECT * FROM read_parquet('kpi.parquet');
+      CREATE TABLE loaded AS SELECT CAST(unnest(from_json('{{ outputs.plan.outputs[0].row.dates }}', '["VARCHAR"]')) AS DATE) AS d;
+
+      CREATE TABLE national AS
+      SELECT departure_date, train_category, sum(trains) AS trains, sum(cancelled) AS cancelled,
+             sum(measured) AS measured, sum(punctual) AS punctual,
+             round(100.0 * sum(punctual) / nullif(sum(measured), 0), 2) AS punctuality_pct
+      FROM kpi GROUP BY ALL;
+
+      CREATE TABLE report AS
+      SELECT n.*,
+             (SELECT round(100.0 * sum(b.punctual) / nullif(sum(b.measured), 0), 2) FROM national b
+               WHERE b.train_category = n.train_category AND b.departure_date BETWEEN n.departure_date - 28 AND n.departure_date - 1) AS prior_28d_pct,
+             n.punctuality_pct < CASE WHEN n.train_category = 'Commuter' THEN {{ inputs.commuter_target_pct }} ELSE {{ inputs.long_distance_target_pct }} END AS below_target
+      FROM national n WHERE n.departure_date IN (SELECT d FROM loaded)
+      ORDER BY departure_date, train_category;
+
+      COPY report TO '{{ outputFiles.report_csv }}' (HEADER true, DELIMITER ',');
+
+      CREATE TABLE summary AS
+      SELECT
+        (SELECT string_agg(CAST(departure_date AS VARCHAR) || ' ' || train_category || ' ' || punctuality_pct || ' pct (' || punctual || '/' || measured
+           || ', ' || cancelled || ' cancelled' || coalesce(', prior 28 days ' || prior_28d_pct || ' pct', '') || ')'
+           || CASE WHEN below_target THEN ' BELOW TARGET' ELSE '' END, chr(10) ORDER BY departure_date, train_category) FROM report) AS lines,
+        (SELECT string_agg(CAST(departure_date AS VARCHAR) || ' ' || train_category || ' ' || punctuality_pct || ' pct (' || punctual || '/' || measured
+           || ', ' || cancelled || ' cancelled' || coalesce(', prior 28 days ' || prior_28d_pct || ' pct', '') || ')'
+           || CASE WHEN below_target THEN ' BELOW TARGET' ELSE '' END, chr(10) ORDER BY train_category)
+           FROM report WHERE departure_date = (SELECT max(d) FROM loaded)) AS last_day_lines,
+        (SELECT count(*) FROM report WHERE below_target) AS below_target,
+        (SELECT count(*) FROM report) AS category_days,
+        (SELECT string_agg(commuter_line || ' ' || punctuality_pct || ' pct (' || punctual || '/' || measured || coalesce(', causes ' || top_causes, '') || ')', '; ' ORDER BY punctuality_pct)
+           FROM (SELECT * FROM kpi WHERE train_category = 'Commuter' AND commuter_line <> '-' AND measured >= 20
+                 AND departure_date = (SELECT max(d) FROM loaded) ORDER BY punctuality_pct LIMIT 3)) AS worst_lines,
+        (SELECT count(DISTINCT departure_date) FROM kpi) AS days_in_table,
+        (SELECT count(*) FROM loaded) AS days_loaded;
+
+      SELECT *,
+             'Finnish rail punctuality: ' || days_loaded || ' day(s) loaded, ' || below_target || ' of ' || category_days
+               || ' category-days below target (commuter {{ inputs.commuter_target_pct }} pct, long-distance {{ inputs.long_distance_target_pct }} pct)'
+               || chr(10) || coalesce(last_day_lines, '')
+               || chr(10) || 'Least punctual commuter lines: ' || coalesce(worst_lines, 'none with 20+ trains') AS slack_text
+      FROM summary;
+
+  - id: notify
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.report.outputs[0].row.days_loaded > 0 }}"
+    then:
+      - id: summary
+        type: io.kestra.plugin.core.log.Log
+        level: "{{ outputs.report.outputs[0].row.below_target > 0 ? 'WARN' : 'INFO' }}"
+        message: |
+          Loaded {{ outputs.report.outputs[0].row.days_loaded }} day(s) {{ outputs.plan.outputs[0].row.dates }} (cursor was {{ outputs.plan.outputs[0].row.cursor_before }}); the KPI table now holds {{ outputs.report.outputs[0].row.days_in_table }} day(s).
+          {{ outputs.report.outputs[0].row.lines }}
+          Least punctual commuter lines on the last day: {{ outputs.report.outputs[0].row.worst_lines ?? 'none with 20+ trains' }}
+
+      - id: slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Daily summary; `allowFailure` keeps the load green when no webhook is configured.
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {"text": outputs.report.outputs[0].row.slack_text} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 6 * * *"
+    timezone: Europe/Helsinki
+
+outputs:
+  - id: report_csv
+    type: FILE
+    value: "{{ outputs.report.outputFiles.report_csv }}"
+  - id: kpi_parquet
+    type: FILE
+    value: "{{ kv('digitraffic_rail_kpi') }}"
+
+extend:
+  title: Finnish Rail Daily Punctuality Loader with Digitraffic, a KV Date Cursor and DuckDB
+  metaTitle: Digitraffic Finnish Rail Punctuality Incremental Loader | Kestra
+  shortDescription: Load every Finnish train of each finished day from the keyless Digitraffic rail API, measure final-destination punctuality per category, operator and commuter line in DuckDB, and append it to a Parquet KPI table with a backfill-safe date cursor.
+  metaDescription: Daily incremental loader for Finnish rail data from Digitraffic, with a KV date cursor, DuckDB punctuality KPIs per line and a Slack summary.
+  description: |
+    The open Digitraffic rail API returns every train that ran in Finland on a given date (about 1,250 a day) with scheduled and actual times for each timetable row. This flow turns it into a daily punctuality table: a KV date cursor makes it incremental and backfill-safe, DuckDB measures each passenger train at its final destination, and a Slack summary flags categories that missed their target.
+
+    ## How it works
+
+    1. A Schedule trigger runs at 06:30 Helsinki time; the first run writes an empty KPI Parquet table and keeps its URI in the KV store.
+    2. `plan` lists the days to load: from `backfill_from`, else the day after the `digitraffic_rail_cursor` KV value, else yesterday, up to yesterday in Finnish time and at most `max_days_per_run` days.
+    3. A `Loop` takes the days one at a time, oldest first. `fetch_day` downloads `/api/v1/trains/{date}` with `Accept-Encoding: gzip` (Digitraffic returns 406 without it), a `Digitraffic-User` header and retries.
+    4. `load_day` (DuckDB) flattens the timetable rows into a stop-level Parquet file and classifies each commuter and long-distance train at its last ARRIVAL row: cancelled, terminated early, no actual time, punctual or late. Delays are computed to the second rather than from the rounded `differenceInMinutes`; cargo and shunting runs are excluded.
+    5. The day's KPI rows replace earlier rows for that date, then the table URI, the stop file (90-day TTL) and the cursor are saved. An empty answer fails the day so the cursor stays put; a reload never moves it backwards.
+    6. `report` compares each loaded day with the 28 days before it, writes a CSV and lists the least punctual commuter lines with their top delay cause codes; `notify` logs it (WARN when a target is missed) and posts to Slack.
+
+    ## What you get
+
+    - A Parquet KPI table: one row per day, category, operator and commuter line with trains, cancellations, punctuality, average and p90 delay and top cause codes.
+    - Stop-level Parquet per day for station analysis.
+    - Idempotent backfills and reloads; missed days are caught up automatically.
+
+    ## Who it's for
+
+    - Rail and mobility analysts reporting on operator and line reliability.
+    - Data engineers who need a backfill-safe loader for a date-partitioned API.
+
+    ## Why orchestrate this with Kestra
+
+    - The KV cursor only moves after a day has loaded, so a failed day is simply retried next run.
+    - `Loop` with `concurrencyLimit: 1` keeps days in order, and HTTP retries absorb transient errors.
+    - DuckDB `inputFiles` and `outputFiles` carry JSON and Parquet between tasks with no database server.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB and Slack plugins.
+    - Outbound HTTPS to `rata.digitraffic.fi`. No key or account is needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the summary (optional; the task is allowed to fail).
+
+    ## Quick start
+
+    1. Click **Execute**: the first run loads yesterday. Run again and the log says there is nothing to load.
+    2. Run with `backfill_from` four weeks back and `max_days_per_run: 28` to fill the 28-day baseline; the cursor stays where it was.
+    3. Add `SLACK_WEBHOOK_URL` and enable the schedule.
+
+    ## How to extend
+
+    - Join cause codes to `/api/v1/metadata/detailed-cause-category-codes` for readable names.
+    - Ship the Parquet files to S3, GCS or a warehouse, or alert per line or station.
+
+    ## Links
+
+    - [Digitraffic rail API](https://www.digitraffic.fi/en/railway-traffic/) and [Swagger](https://rata.digitraffic.fi/swagger/)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop) and [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set) and [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Monitoring & Alerting
+  ee: false
+  demo: false
