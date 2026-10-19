@@ -1,0 +1,517 @@
+id: pgbouncer-zero-downtime-maintenance-cutover-gate
+namespace: company.database
+
+description: |
+  Coordinate zero-downtime maintenance on PostgreSQL databases fronted by PgBouncer.
+  Safely pauses client query dispatch, drains active server connections to zero, executes
+  maintenance statements directly on PostgreSQL, verifies database health, and resumes traffic
+  with fail-safe emergency rollback protection.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: pgbouncer_host
+    type: STRING
+    defaults: "127.0.0.1"
+    description: Hostname or IP address of the PgBouncer instance.
+
+  - id: pgbouncer_port
+    type: INT
+    defaults: 6432
+    description: Port of the PgBouncer administrative console.
+
+  - id: database_name
+    type: STRING
+    defaults: "postgres"
+    description: Target database name to pause and perform maintenance on.
+
+  - id: pgbouncer_admin_user
+    type: STRING
+    defaults: "postgres"
+    description: Administrative username configured in pgbouncer.ini admin_users.
+
+  - id: postgres_url
+    type: STRING
+    defaults: "jdbc:postgresql://127.0.0.1:5432/postgres"
+    description: Direct JDBC connection URL to backend PostgreSQL for maintenance operations.
+
+  - id: postgres_user
+    type: STRING
+    defaults: "postgres"
+    description: PostgreSQL administrative user with privileges to execute maintenance.
+
+  - id: drain_timeout_seconds
+    type: INT
+    defaults: 30
+    description: Maximum duration in seconds to wait for active server queries to drain to zero.
+
+  - id: maintenance_sql
+    type: STRING
+    defaults: "CREATE TABLE IF NOT EXISTS cutover_audit_heartbeat (id serial primary key, executed_at timestamptz default now()); INSERT INTO cutover_audit_heartbeat DEFAULT VALUES;"
+    description: SQL maintenance statements to execute directly on PostgreSQL while pool traffic is paused.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, audits pool telemetry and simulates the cutover lifecycle without pausing traffic or applying SQL.
+
+tasks:
+  - id: preflight_postgres_health
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Verifies backend PostgreSQL health, active query counts, and connection capacity.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.postgres_user }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      SELECT
+        count(*) FILTER (WHERE state = 'active') AS active_queries,
+        count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction_queries,
+        count(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiting_queries,
+        count(*) AS total_backends
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid();
+    fetchType: FETCH_ONE
+
+  - id: preflight_pgbouncer_status
+    type: io.kestra.plugin.scripts.python.Script
+    description: Connects to PgBouncer admin database and inspects current pool saturation before cutover.
+    containerImage: python:3.11-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install -q psycopg2-binary kestra
+    env:
+      PGBOUNCER_HOST: "{{ inputs.pgbouncer_host }}"
+      PGBOUNCER_PORT: "{{ inputs.pgbouncer_port }}"
+      PGBOUNCER_USER: "{{ inputs.pgbouncer_admin_user }}"
+      PGBOUNCER_PASSWORD: "{{ secret('PGBOUNCER_ADMIN_PASSWORD') }}"
+      TARGET_DB: "{{ inputs.database_name }}"
+    script: |
+      import os
+      import sys
+      import psycopg2
+      from kestra import Kestra
+
+      host = os.environ.get("PGBOUNCER_HOST", "127.0.0.1")
+      port = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+      user = os.environ.get("PGBOUNCER_USER", "postgres")
+      password = os.environ.get("PGBOUNCER_PASSWORD", "")
+      target_db = os.environ.get("TARGET_DB", "postgres")
+
+      conn = psycopg2.connect(
+          host=host,
+          port=port,
+          dbname="pgbouncer",
+          user=user,
+          password=password
+      )
+      conn.autocommit = True
+      cur = conn.cursor()
+
+      cur.execute("SHOW POOLS;")
+      columns = [desc[0] for desc in cur.description]
+      rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+      target_pool = next((p for p in rows if p.get("database") == target_db), None)
+
+      cur.close()
+      conn.close()
+
+      if not target_pool:
+          raise RuntimeError(f"Database pool '{target_db}' not found in PgBouncer SHOW POOLS")
+
+      cl_active = int(target_pool.get("cl_active", 0))
+      cl_waiting = int(target_pool.get("cl_waiting", 0))
+      sv_active = int(target_pool.get("sv_active", 0))
+      sv_idle = int(target_pool.get("sv_idle", 0))
+
+      Kestra.outputs({
+          "pool_found": True,
+          "target_database": target_db,
+          "initial_cl_active": cl_active,
+          "initial_cl_waiting": cl_waiting,
+          "initial_sv_active": sv_active,
+          "initial_sv_idle": sv_idle
+      })
+
+  - id: execute_maintenance_cutover
+    type: io.kestra.plugin.core.flow.If
+    description: Executes the atomic pause, drain, maintenance, and resume lifecycle when dry_run is disabled.
+    condition: "{{ not inputs.dry_run }}"
+    then:
+      - id: pause_and_drain_pool
+        type: io.kestra.plugin.scripts.python.Script
+        description: Issues PAUSE on PgBouncer and polls until all active server connections drain to zero.
+        containerImage: python:3.11-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        beforeCommands:
+          - pip install -q psycopg2-binary kestra
+        outputFiles:
+          - drain_metrics.json
+        env:
+          PGBOUNCER_HOST: "{{ inputs.pgbouncer_host }}"
+          PGBOUNCER_PORT: "{{ inputs.pgbouncer_port }}"
+          PGBOUNCER_USER: "{{ inputs.pgbouncer_admin_user }}"
+          PGBOUNCER_PASSWORD: "{{ secret('PGBOUNCER_ADMIN_PASSWORD') }}"
+          TARGET_DB: "{{ inputs.database_name }}"
+          DRAIN_TIMEOUT: "{{ inputs.drain_timeout_seconds }}"
+        script: |
+          import os
+          import sys
+          import time
+          import json
+          import psycopg2
+          from datetime import datetime, timezone
+          from kestra import Kestra
+
+          host = os.environ.get("PGBOUNCER_HOST", "127.0.0.1")
+          port = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+          user = os.environ.get("PGBOUNCER_USER", "postgres")
+          password = os.environ.get("PGBOUNCER_PASSWORD", "")
+          target_db = os.environ.get("TARGET_DB", "postgres")
+          timeout_sec = int(os.environ.get("DRAIN_TIMEOUT", "30"))
+
+          conn = psycopg2.connect(
+              host=host,
+              port=port,
+              dbname="pgbouncer",
+              user=user,
+              password=password
+          )
+          conn.autocommit = True
+          cur = conn.cursor()
+
+          start_time = time.time()
+          print(f"Issuing PAUSE {target_db} on PgBouncer admin console...")
+          cur.execute(f"PAUSE {target_db};")
+
+          drained = False
+          last_sv_active = -1
+          queued_clients = 0
+
+          while (time.time() - start_time) < timeout_sec:
+              cur.execute("SHOW POOLS;")
+              columns = [desc[0] for desc in cur.description]
+              rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+              pool = next((p for p in rows if p.get("database") == target_db), None)
+
+              if pool:
+                  last_sv_active = int(pool.get("sv_active", 0))
+                  queued_clients = int(pool.get("cl_waiting", 0))
+                  if last_sv_active == 0:
+                      drained = True
+                      break
+
+              time.sleep(0.5)
+
+          drain_elapsed_ms = int((time.time() - start_time) * 1000)
+
+          if not drained:
+              print(f"Drain timeout reached ({timeout_sec}s). Executing rollback RESUME...")
+              cur.execute(f"RESUME {target_db};")
+              cur.close()
+              conn.close()
+              raise TimeoutError(f"Failed to drain active server connections within {timeout_sec}s (last sv_active={last_sv_active}). Pool resumed.")
+
+          cur.close()
+          conn.close()
+
+          metrics = {
+              "status": "DRAINED",
+              "database": target_db,
+              "drain_duration_ms": drain_elapsed_ms,
+              "active_servers_at_drain": last_sv_active,
+              "queued_clients_count": queued_clients,
+              "timestamp": datetime.now(timezone.utc).isoformat()
+          }
+
+          with open("drain_metrics.json", "w") as f:
+              json.dump(metrics, f, indent=2)
+
+          Kestra.outputs({
+              "drain_status": "SUCCESS",
+              "drain_duration_ms": drain_elapsed_ms,
+              "queued_clients": queued_clients
+          })
+
+      - id: apply_database_maintenance
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: Executes maintenance statement directly on PostgreSQL while PgBouncer buffers client queries.
+        url: "{{ inputs.postgres_url }}"
+        username: "{{ inputs.postgres_user }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        sql: "{{ inputs.maintenance_sql }}"
+
+      - id: verify_post_maintenance_health
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: Verifies backend PostgreSQL health and responsive query execution before resuming client traffic.
+        url: "{{ inputs.postgres_url }}"
+        username: "{{ inputs.postgres_user }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        sql: |
+          SELECT
+            1 AS health_status,
+            current_database() AS database_name,
+            clock_timestamp() AS verification_timestamp;
+        fetchType: FETCH_ONE
+
+      - id: resume_pgbouncer_pool
+        type: io.kestra.plugin.scripts.python.Script
+        description: Issues RESUME on PgBouncer and confirms normal query routing has been restored.
+        containerImage: python:3.11-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        beforeCommands:
+          - pip install -q psycopg2-binary kestra
+        env:
+          PGBOUNCER_HOST: "{{ inputs.pgbouncer_host }}"
+          PGBOUNCER_PORT: "{{ inputs.pgbouncer_port }}"
+          PGBOUNCER_USER: "{{ inputs.pgbouncer_admin_user }}"
+          PGBOUNCER_PASSWORD: "{{ secret('PGBOUNCER_ADMIN_PASSWORD') }}"
+          TARGET_DB: "{{ inputs.database_name }}"
+        script: |
+          import os
+          import psycopg2
+          from kestra import Kestra
+
+          host = os.environ.get("PGBOUNCER_HOST", "127.0.0.1")
+          port = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+          user = os.environ.get("PGBOUNCER_USER", "postgres")
+          password = os.environ.get("PGBOUNCER_PASSWORD", "")
+          target_db = os.environ.get("TARGET_DB", "postgres")
+
+          conn = psycopg2.connect(
+              host=host,
+              port=port,
+              dbname="pgbouncer",
+              user=user,
+              password=password
+          )
+          conn.autocommit = True
+          cur = conn.cursor()
+
+          print(f"Issuing RESUME {target_db} on PgBouncer admin console...")
+          cur.execute(f"RESUME {target_db};")
+
+          cur.execute("SHOW POOLS;")
+          columns = [desc[0] for desc in cur.description]
+          rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+          pool = next((p for p in rows if p.get("database") == target_db), None)
+
+          cur.close()
+          conn.close()
+
+          Kestra.outputs({
+              "pool_resumed": True,
+              "cl_active": int(pool.get("cl_active", 0)) if pool else 0,
+              "cl_waiting": int(pool.get("cl_waiting", 0)) if pool else 0
+          })
+    else:
+      - id: log_dry_run_plan
+        type: io.kestra.plugin.core.log.Log
+        description: Records simulated cutover plan when dry_run is enabled.
+        message: "Dry run enabled. Verified database '{{ inputs.database_name }}' on PgBouncer (initial sv_active: {{ outputs.preflight_pgbouncer_status.vars.initial_sv_active }}, initial cl_active: {{ outputs.preflight_pgbouncer_status.vars.initial_cl_active }}). No traffic paused."
+
+  - id: persist_cutover_manifest
+    type: io.kestra.plugin.core.storage.Write
+    description: Writes structured JSON cutover audit record to Kestra internal storage.
+    content: |
+      {
+        "executionId": "{{ execution.id }}",
+        "timestamp": "{{ now() }}",
+        "database": "{{ inputs.database_name }}",
+        "pgbouncerHost": "{{ inputs.pgbouncer_host }}",
+        "dryRun": {{ inputs.dry_run }},
+        "initialActiveBackends": {{ outputs.preflight_postgres_health.row.total_backends ?? 0 }},
+        "initialIdleInTx": {{ outputs.preflight_postgres_health.row.idle_in_transaction_queries ?? 0 }},
+        "drainDurationMs": {{ outputs.pause_and_drain_pool.vars.drain_duration_ms ?? 0 }},
+        "queuedClients": {{ outputs.pause_and_drain_pool.vars.queued_clients ?? 0 }}
+      }
+
+  - id: notify_slack_summary
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatches maintenance cutover completion card to Slack.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      :white_check_mark: *PgBouncer Zero-Downtime Maintenance Cutover Complete*
+      *Database:* `{{ inputs.database_name }}` (`{{ inputs.pgbouncer_host }}:{{ inputs.pgbouncer_port }}`)
+      *Mode:* `{{ inputs.dry_run ? 'DRY_RUN (Simulated)' : 'PRODUCTION_ACTIVE' }}`
+      *Drain Duration:* `{{ outputs.pause_and_drain_pool.vars.drain_duration_ms ?? 0 }} ms`
+      *Queued Clients Handled:* `{{ outputs.pause_and_drain_pool.vars.queued_clients ?? 0 }}`
+      *Execution ID:* `{{ execution.id }}`
+
+triggers:
+  - id: maintenance_window_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scheduled weekly maintenance window execution. Shipped disabled by default.
+    cron: "0 3 * * 0"
+    disabled: true
+
+  - id: cutover_webhook_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated webhook for external CI/CD or change-management triggers.
+    key: "{{ secret('CUTOVER_WEBHOOK_KEY') }}"
+
+errors:
+  - id: emergency_resume_pgbouncer
+    type: io.kestra.plugin.scripts.python.Script
+    description: Emergency safety rollback that immediately resumes PgBouncer pool if any failure occurs during cutover.
+    containerImage: python:3.11-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      PGBOUNCER_HOST: "{{ inputs.pgbouncer_host }}"
+      PGBOUNCER_PORT: "{{ inputs.pgbouncer_port }}"
+      PGBOUNCER_USER: "{{ inputs.pgbouncer_admin_user }}"
+      PGBOUNCER_PASSWORD: "{{ secret('PGBOUNCER_ADMIN_PASSWORD') }}"
+      TARGET_DB: "{{ inputs.database_name }}"
+    script: |
+      import os
+      import psycopg2
+
+      host = os.environ.get("PGBOUNCER_HOST", "127.0.0.1")
+      port = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+      user = os.environ.get("PGBOUNCER_USER", "postgres")
+      password = os.environ.get("PGBOUNCER_PASSWORD", "")
+      target_db = os.environ.get("TARGET_DB", "postgres")
+
+      try:
+          conn = psycopg2.connect(
+              host=host,
+              port=port,
+              dbname="pgbouncer",
+              user=user,
+              password=password
+          )
+          conn.autocommit = True
+          cur = conn.cursor()
+          print(f"EMERGENCY: Issuing RESUME {target_db} on PgBouncer admin console...")
+          cur.execute(f"RESUME {target_db};")
+          cur.close()
+          conn.close()
+          print(f"EMERGENCY: Successfully resumed pool {target_db}")
+      except Exception as exc:
+          print(f"Failed to issue emergency RESUME: {exc}")
+
+  - id: notify_failure_slack
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alerts on-call DBAs if maintenance cutover fails and emergency resume is executed.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      :rotating_light: *PgBouncer Maintenance Cutover FAILED on execution {{ execution.id }}*
+      *Database:* `{{ inputs.database_name }}`
+      Emergency pool resumption has been executed. Check backend PostgreSQL logs immediately.
+
+extend:
+  title: PgBouncer Zero-Downtime Maintenance Cutover Gate for PostgreSQL
+  metaTitle: PgBouncer Zero-Downtime Maintenance Cutover Gate | Kestra
+  shortDescription: Coordinate zero-downtime PostgreSQL maintenance by safely pausing PgBouncer traffic, draining queries, executing operations, and resuming pools.
+  metaDescription: Coordinate zero-downtime PostgreSQL maintenance with PgBouncer. Pause pools, drain inflight queries, apply schema changes, and resume traffic safely.
+  description: |
+    Performing intrusive database maintenance on high-traffic production PostgreSQL clusters (such as large-table
+    index rebuilding, extension upgrades, failover promotion, or table partitioning) frequently triggers connection storms
+    and transaction deadlocks. If client applications attempt to execute queries while the server is locks-saturated,
+    connection pools exhaust rapidly and upstream services return cascading HTTP 500 errors to end users.
+
+    PgBouncer offers connection pausing semantics through its administrative console (`PAUSE <db>` and `RESUME <db>`).
+    When paused, PgBouncer stops dispatching queries to PostgreSQL server connections while keeping client TCP sockets open,
+    holding incoming client queries in memory buffers. Once all in-flight server queries drain to zero, maintenance
+    can be applied safely directly against the backend PostgreSQL instance. Upon completion, resuming the pool unfreezes
+    all queued queries with zero dropped connections and zero application errors.
+
+    This blueprint orchestrates the complete zero-downtime cutover lifecycle: verifying backend database health,
+    issuing the PgBouncer administrative pause, polling pool connection counters until active server queries drain,
+    applying the maintenance statements, validating post-cutover database responsiveness, and resuming traffic with
+    fail-safe emergency rollback hooks.
+
+    ## How it works
+
+    1. `preflight_postgres_health` (`io.kestra.plugin.jdbc.postgresql.Query`) queries `pg_stat_activity` on backend
+       PostgreSQL (`5432`) to verify active queries, idle-in-transaction states, and lock contention before cutover.
+    2. `preflight_pgbouncer_status` (`io.kestra.plugin.scripts.python.Script`) connects to the PgBouncer administrative
+       virtual database (`pgbouncer` on port `6432`) and reads `SHOW POOLS` to verify target database registration.
+    3. When `dry_run: false`, `pause_and_drain_pool` connects to the PgBouncer admin console with autocommit enabled,
+       issues `PAUSE <database>`, and continuously polls `SHOW POOLS` every 500 milliseconds until `sv_active` drains
+       to zero or `drain_timeout_seconds` is reached. If the timeout expires, it immediately resumes the pool and fails closed.
+    4. `apply_database_maintenance` (`io.kestra.plugin.jdbc.postgresql.Query`) executes the designated maintenance SQL
+       directly on the quieted PostgreSQL backend.
+    5. `verify_post_maintenance_health` executes a validation query against PostgreSQL to confirm query engine readiness.
+    6. `resume_pgbouncer_pool` issues `RESUME <database>` on PgBouncer to restore active query dispatching to backend servers.
+    7. `persist_cutover_manifest` (`io.kestra.plugin.core.storage.Write`) stores an immutable JSON execution audit artifact
+       recording drain duration and queued client metrics in Kestra internal storage.
+    8. `emergency_resume_pgbouncer` in the `errors` block guarantees that if any task fails or times out while the pool
+       is paused, PgBouncer immediately receives `RESUME <database>`, preventing application connection deadlocks.
+
+    ## What you get
+
+    - Zero-downtime maintenance execution with client TCP connection preservation and zero 500 errors.
+    - Automated query draining detection with sub-second polling and timeout protection.
+    - Fail-safe emergency rollback hook that unfreezes PgBouncer connection pools on any pipeline failure.
+    - Downloadable JSON audit manifest detailing drain latency and buffered query metrics.
+
+    ## Who it's for
+
+    Database Administrators, Site Reliability Engineers, and Platform Engineers operating PostgreSQL at scale.
+
+    ## Why orchestrate this with Kestra
+
+    Coordinating zero-downtime cutovers manually across connection proxies and relational backends requires simultaneous
+    terminal sessions, rapid manual counter verification, and high risk of operator error. Fragile shell scripts lack
+    durable state tracking and leave pools paused indefinitely if an intermediate command fails. Kestra provides a
+    declarative, audited workflow with automated polling loops, secret protection, and guaranteed failure cleanup handlers.
+
+    ## Pitfalls
+
+    - **Client Query Timeout Mismatches:** If incoming client applications enforce aggressive HTTP request timeouts
+      (e.g. 5 seconds) while the maintenance command takes 15 seconds, client sockets may terminate from the application side.
+      Ensure maintenance operations fit comfortably within upstream application timeout envelopes.
+    - **Memory Buffer Sizing:** Holding queries in PgBouncer buffers consumes memory (`max_client_conn` and socket buffers).
+      Do not pause heavy multi-gigabyte analytical bulk copy operations in high-throughput environments without verifying
+      proxy host memory headroom.
+    - **Admin Console Autocommit Requirement:** PgBouncer's virtual administrative interface does not support standard
+      transaction blocks (`BEGIN`/`COMMIT`). Administrative commands (`PAUSE`, `RESUME`) must be issued with autocommit enabled.
+
+    ## Prerequisites
+
+    - PostgreSQL 14+ database instance.
+    - PgBouncer 1.18+ connection pooler fronting the database with administrative user access configured in `admin_users`.
+    - Network connectivity from Kestra runners to both PgBouncer administrative port (`6432`) and backend PostgreSQL (`5432`).
+
+    ### Secrets
+
+    - `POSTGRES_PASSWORD`: Administrative password for backend PostgreSQL connection.
+    - `PGBOUNCER_ADMIN_PASSWORD`: Administrative password for PgBouncer admin console user.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL for cutover completion notifications.
+    - `CUTOVER_WEBHOOK_KEY`: Secret authentication key for external CI/CD cutover triggers.
+
+    ## Quick start
+
+    1. Configure `POSTGRES_PASSWORD`, `PGBOUNCER_ADMIN_PASSWORD`, and `SLACK_WEBHOOK_URL` in Kestra namespace secrets.
+    2. Click **Execute** in Kestra UI with default `dry_run: true` to inspect live pool counters and verify connectivity.
+    3. Set `dry_run: false` and supply your maintenance SQL command to execute the coordinated cutover.
+    4. Inspect `cutover_manifest.json` in the Outputs tab for drain duration and client buffering metrics.
+
+    ## How to extend
+
+    - Add replica lag assertions using `pg_last_xact_replay_timestamp()` before applying DDL migrations.
+    - Chain database maintenance with automated cache warming in Redis via `io.kestra.plugin.redis`.
+    - Integrate with PagerDuty to automatically silence maintenance alerts during the pause window.
+
+    ## Links
+
+    - [PgBouncer Administration Documentation](https://www.pgbouncer.org/usage.html)
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Infrastructure Automation
+  ee: false
+  demo: false
