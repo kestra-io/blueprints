@@ -1,0 +1,553 @@
+id: ssllabs-tls-grade-regression-audit
+namespace: company.team
+
+description: |
+  Weekly Qualys SSL Labs audit of your public HTTPS hostnames. Reuses SSL Labs' cached assessments
+  (or starts one), polls until each is READY, extracts grade, protocols, leaf certificate expiry,
+  HSTS and known-vulnerability flags per endpoint with DuckDB, compares them with the state kept in
+  the KV store and alerts Slack only on what is new: grade drops, grades below your floor,
+  certificates expiring or expired, TLS 1.0/1.1 still enabled, vulnerabilities and failed scans.
+
+inputs:
+  - id: hostnames
+    type: ARRAY
+    itemType: STRING
+    description: Public hostnames to assess on port 443. URLs, upper case, `:443` and trailing dots are normalised; IP addresses, other ports and malformed names are rejected before any API call.
+    defaults:
+      - www.ssllabs.com
+      - github.com
+      - www.jd.com
+      - expired.badssl.com
+
+  - id: max_cache_age_hours
+    type: INT
+    defaults: 24
+    description: SSL Labs `maxAge`. A cached assessment younger than this is reused; an older or missing one starts a new assessment. Lower it to force fresher scans.
+
+  - id: min_grade
+    type: SELECT
+    values: ["A+", "A", "A-", "B", "C", "D", "E", "F"]
+    defaults: A-
+    description: Grade floor. A host whose worst endpoint grades below it (including T for trust issues and M for name mismatch) raises BELOW_MIN_GRADE.
+
+  - id: cert_warning_days
+    type: INT
+    defaults: 30
+    description: Raise CERT_EXPIRING when the leaf certificate on any endpoint expires in fewer days than this.
+
+  - id: require_hsts
+    type: BOOL
+    defaults: false
+    description: Raise HSTS_MISSING when an endpoint does not send a Strict-Transport-Security header.
+
+  - id: remind_ongoing
+    type: BOOL
+    defaults: false
+    description: Also post to Slack when nothing is new but issues remain open (a weekly reminder). By default only new and resolved issues are posted.
+
+  - id: scan_timeout
+    type: DURATION
+    defaults: PT20M
+    description: How long to keep polling one host. Multi-IP hosts take 1 to 2 minutes per endpoint; a host still running after this is reported as SCAN_FAILED and retried next week.
+
+  - id: state_key
+    type: STRING
+    defaults: ssllabs_tls_audit_state
+    description: KV key holding last grades and open issues per host. Use a different key per host list.
+
+tasks:
+  - id: normalize_hosts
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Cleans the host list (scheme, path, `:443`, trailing dot, case), removes duplicates and rejects what SSL Labs refuses anyway:
+      IP addresses (HTTP 441), ports other than 443 and names that are not valid DNS hostnames. Saves API calls and keeps one cache entry per host.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    parameters:
+      hosts: "{{ inputs.hostnames | toJson }}"
+    sql: |
+      CREATE TABLE candidates AS
+      WITH raw AS (
+        SELECT unnest(from_json(CAST(:hosts AS JSON), '["VARCHAR"]')) AS input
+      ), cleaned AS (
+        SELECT input,
+               regexp_replace(regexp_replace(regexp_replace(regexp_replace(lower(trim(input)), '^[a-z][a-z0-9+.-]*://', ''), '[/?#].*$', ''), '[:]443$', ''), '\.$', '') AS host
+        FROM raw
+      )
+      SELECT input, host,
+             CASE
+               WHEN host = '' THEN 'empty value'
+               WHEN regexp_full_match(host, '[0-9.]+') OR host LIKE '[%' OR regexp_full_match(host, '[0-9a-f:]+') THEN 'IP addresses are not allowed by SSL Labs'
+               WHEN host LIKE '%:%' THEN 'SSL Labs only assesses port 443'
+               WHEN NOT regexp_full_match(host, '([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]') THEN 'not a valid public DNS hostname'
+             END AS reason
+      FROM cleaned;
+
+      SELECT
+        coalesce(CAST(to_json((SELECT list(DISTINCT host ORDER BY host) FROM candidates WHERE reason IS NULL)) AS VARCHAR), '[]') AS valid_json,
+        coalesce(CAST(to_json((SELECT list({'host': input, 'reason': reason}) FROM candidates WHERE reason IS NOT NULL)) AS VARCHAR), '[]') AS invalid_json,
+        (SELECT count(DISTINCT host) FROM candidates WHERE reason IS NULL) AS valid_hosts,
+        (SELECT count(*) FROM candidates WHERE reason IS NOT NULL) AS rejected,
+        (SELECT count(*) FROM candidates WHERE reason IS NULL) - (SELECT count(DISTINCT host) FROM candidates WHERE reason IS NULL) AS duplicates;
+
+  - id: api_info
+    type: io.kestra.plugin.core.http.Request
+    description: Cheap capacity check before scanning. Returns the engine and grading criteria version (stored with the state so a grade drop caused by a criteria change is labelled as such) and the client's assessment quota.
+    uri: https://api.ssllabs.com/api/v3/info
+    headers:
+      User-Agent: kestra-ssllabs-tls-grade-audit
+    options:
+      retryOnStatusCodes: [429, 500, 503, 529]
+      retry:
+        type: exponential
+        interval: PT30S
+        maxInterval: PT5M
+        maxAttempts: 5
+
+  - id: previous_state
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+    description: Grades and open issues per host from the last run; missing on the first (BASELINE) run.
+
+  - id: has_hosts
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.normalize_hosts.outputs[0].row.valid_hosts > 0 }}"
+    then:
+      - id: scan_hosts
+        type: io.kestra.plugin.core.flow.Loop
+        description: Two hosts at a time, well under the SSL Labs per-client limit of concurrent assessments.
+        values: "{{ outputs.normalize_hosts.outputs[0].row.valid_json }}"
+        concurrencyLimit: 2
+        fetchType: FETCH
+        tasks:
+          - id: wait_for_assessment
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: |
+              The first call returns a cached report younger than `maxAge` or starts a new assessment; later calls poll it.
+              Stops on READY or ERROR, or when the API rejects the host. Polls every 20 seconds as SSL Labs asks of API clients.
+            condition: "{% set r = fromJson(outputs.poll.body) %}{{ r.status == 'READY' or r.status == 'ERROR' or r.errors is defined }}"
+            failOnMaxReached: false
+            checkFrequency:
+              interval: PT20S
+              maxDuration: "{{ inputs.scan_timeout }}"
+            tasks:
+              - id: poll
+                type: io.kestra.plugin.core.http.Request
+                uri: https://api.ssllabs.com/api/v3/analyze
+                headers:
+                  User-Agent: kestra-ssllabs-tls-grade-audit
+                params:
+                  host: "{{ item.value }}"
+                  publish: "off"
+                  fromCache: "on"
+                  maxAge: "{{ inputs.max_cache_age_hours }}"
+                options:
+                  allowedResponseCodes: [200, 400, 441]
+                  retryOnStatusCodes: [429, 500, 503, 529]
+                  retry:
+                    type: exponential
+                    interval: PT30S
+                    maxInterval: PT5M
+                    maxAttempts: 6
+
+          - id: is_ready
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ fromJson(outputs.poll.body).status == 'READY' }}"
+            then:
+              - id: fetch_report
+                type: io.kestra.plugin.core.http.Download
+                description: Full report (`all=done`) served from the cache the poll just filled, saved to internal storage instead of the execution context.
+                uri: https://api.ssllabs.com/api/v3/analyze
+                headers:
+                  User-Agent: kestra-ssllabs-tls-grade-audit
+                params:
+                  host: "{{ item.value }}"
+                  publish: "off"
+                  fromCache: "on"
+                  maxAge: "{{ inputs.max_cache_age_hours }}"
+                  all: done
+                options:
+                  retryOnStatusCodes: [429, 500, 503, 529]
+                  retry:
+                    type: exponential
+                    interval: PT30S
+                    maxInterval: PT5M
+                    maxAttempts: 6
+        outputs:
+          - id: host
+            type: STRING
+            value: "{{ item.value }}"
+          - id: status
+            type: STRING
+            value: "{% set r = fromJson(outputs.poll.body) %}{{ r.errors is defined ? 'INVALID' : r.status }}"
+          - id: status_message
+            type: STRING
+            value: "{% set r = fromJson(outputs.poll.body) %}{{ r.errors is defined ? r.errors[0].message : (r.statusMessage ?? '') }}"
+          - id: polls
+            type: STRING
+            value: "{{ outputs.wait_for_assessment.iterationCount }}"
+          - id: report
+            type: STRING
+            value: "{{ outputs.fetch_report.uri ?? '' }}"
+
+  - id: build_report
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Flattens every READY report to one row per endpoint (IP): grade, grade ignoring trust, protocols, leaf certificate from the first chain,
+      days to expiry, HSTS, forward secrecy and 15 vulnerability flags decoded from SSL Labs' integer codes. Rolls endpoints up per host
+      (worst grade, mixed grades across load-balancer nodes, soonest expiry), compares with the KV state, classifies each issue as NEW or
+      ONGOING, lists RESOLVED ones, writes the CSV and returns the next state. Failed scans keep the last good grade so they never fake a regression.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles: |
+      {
+        "report_none.json": "{}"
+      {%- for r in (outputs.scan_hosts.outputs ?? []) %}{% if r.outputs.report != '' %},
+        "report_{{ loop.index }}.json": "{{ r.outputs.report }}"{% endif %}{% endfor %}
+      }
+    outputFiles:
+      - report_csv
+    parameters:
+      scans: "{{ (outputs.scan_hosts.outputs ?? []) | toJson }}"
+      invalid: "{{ outputs.normalize_hosts.outputs[0].row.invalid_json }}"
+      previous: "{{ (outputs.previous_state.value ?? {}) | toJson }}"
+      min_grade: "{{ inputs.min_grade }}"
+      cert_warning_days: "{{ inputs.cert_warning_days }}"
+      require_hsts: "{{ inputs.require_hsts }}"
+    sql: |
+      SET TimeZone = 'UTC';
+
+      CREATE TABLE grade_scale AS
+      SELECT * FROM (VALUES ('A+', 1), ('A', 2), ('A-', 3), ('B', 4), ('C', 5), ('D', 6), ('E', 7), ('F', 8), ('T', 9), ('M', 10)) AS g(grade, grade_rank);
+
+      CREATE TABLE scans AS
+      SELECT s.outputs.host AS host, s.outputs.status AS scan_status, s.outputs.status_message AS status_message,
+             CAST(s.outputs.polls AS INTEGER) AS polls
+      FROM (SELECT unnest(from_json(CAST(:scans AS JSON), '[{"outputs": {"host": "VARCHAR", "status": "VARCHAR", "status_message": "VARCHAR", "polls": "VARCHAR"}}]')) AS s)
+      UNION ALL
+      SELECT i.host, 'INVALID', i.reason, 0
+      FROM (SELECT unnest(from_json(CAST(:invalid AS JSON), '[{"host": "VARCHAR", "reason": "VARCHAR"}]')) AS i);
+
+      CREATE TABLE reports AS
+      SELECT json AS r FROM read_json_objects('report_*.json', format = 'auto')
+      WHERE json_extract_string(json, '$.host') IS NOT NULL;
+
+      CREATE TABLE endpoints AS
+      WITH ep AS (
+        SELECT json_extract_string(r, '$.host') AS host,
+               json_extract_string(r, '$.criteriaVersion') AS criteria_version,
+               to_timestamp(CAST(json_extract(r, '$.testTime') AS BIGINT) / 1000) AS tested_at,
+               from_json(json_extract(r, '$.certs'), '[{"id": "VARCHAR", "subject": "VARCHAR", "issuerSubject": "VARCHAR", "notAfter": "BIGINT"}]') AS certs,
+               unnest(from_json(json_extract(r, '$.endpoints'), '["JSON"]')) AS e
+        FROM reports
+      ), flat AS (
+        SELECT host, criteria_version, tested_at, certs,
+               json_extract_string(e, '$.ipAddress') AS ip_address,
+               json_extract_string(e, '$.serverName') AS server_name,
+               json_extract_string(e, '$.statusMessage') AS endpoint_status,
+               json_extract_string(e, '$.grade') AS grade,
+               json_extract_string(e, '$.gradeTrustIgnored') AS grade_trust_ignored,
+               CAST(json_extract(e, '$.hasWarnings') AS BOOLEAN) AS has_warnings,
+               json_extract(e, '$.details') AS d
+        FROM ep
+      )
+      SELECT f.host, f.ip_address, f.server_name, f.endpoint_status, f.grade, f.grade_trust_ignored, g.grade_rank, f.has_warnings,
+             array_to_string(list_transform(p.protocols, x -> x.name || ' ' || x.version), ', ') AS protocols,
+             list_filter(list_transform(p.protocols, x -> CASE WHEN x.id < 771 THEN x.name || ' ' || x.version END), x -> x IS NOT NULL) AS legacy_protocols,
+             list_filter(f.certs, c -> c.id = json_extract_string(f.d, '$.certChains[0].certIds[0]'))[1] AS leaf,
+             json_extract_string(f.d, '$.hstsPolicy.status') AS hsts_status,
+             CAST(json_extract(f.d, '$.hstsPolicy.maxAge') AS BIGINT) AS hsts_max_age,
+             CAST(json_extract(f.d, '$.forwardSecrecy') AS INTEGER) AS forward_secrecy,
+             list_filter([
+               CASE WHEN CAST(json_extract(f.d, '$.heartbleed') AS BOOLEAN) THEN 'Heartbleed' END,
+               CASE WHEN CAST(json_extract(f.d, '$.poodle') AS BOOLEAN) THEN 'POODLE (SSLv3)' END,
+               CASE WHEN CAST(json_extract(f.d, '$.poodleTls') AS INTEGER) = 2 THEN 'POODLE (TLS)' END,
+               CASE WHEN CAST(json_extract(f.d, '$.freak') AS BOOLEAN) THEN 'FREAK' END,
+               CASE WHEN CAST(json_extract(f.d, '$.logjam') AS BOOLEAN) THEN 'Logjam' END,
+               CASE WHEN CAST(json_extract(f.d, '$.drownVulnerable') AS BOOLEAN) THEN 'DROWN' END,
+               CASE WHEN CAST(json_extract(f.d, '$.openSslCcs') AS INTEGER) = 3 THEN 'OpenSSL CCS (CVE-2014-0224)' END,
+               CASE WHEN CAST(json_extract(f.d, '$.openSSLLuckyMinus20') AS INTEGER) = 2 THEN 'OpenSSL Padding Oracle (CVE-2016-2107)' END,
+               CASE WHEN CAST(json_extract(f.d, '$.ticketbleed') AS INTEGER) = 2 THEN 'Ticketbleed' END,
+               CASE WHEN CAST(json_extract(f.d, '$.bleichenbacher') AS INTEGER) IN (2, 3) THEN 'ROBOT' END,
+               CASE WHEN CAST(json_extract(f.d, '$.zombiePoodle') AS INTEGER) IN (2, 3) THEN 'Zombie POODLE' END,
+               CASE WHEN CAST(json_extract(f.d, '$.goldenDoodle') AS INTEGER) IN (4, 5) THEN 'GOLDENDOODLE' END,
+               CASE WHEN CAST(json_extract(f.d, '$.zeroLengthPaddingOracle') AS INTEGER) IN (6, 7) THEN '0-Length Padding Oracle' END,
+               CASE WHEN CAST(json_extract(f.d, '$.sleepingPoodle') AS INTEGER) IN (10, 11) THEN 'Sleeping POODLE' END,
+               CASE WHEN CAST(json_extract(f.d, '$.supportsRc4') AS BOOLEAN) THEN 'RC4' END
+             ], x -> x IS NOT NULL) AS vulnerabilities,
+             f.criteria_version, f.tested_at
+      FROM flat f
+      LEFT JOIN grade_scale g ON g.grade = f.grade,
+      LATERAL (SELECT from_json(json_extract(f.d, '$.protocols'), '[{"id": "INTEGER", "name": "VARCHAR", "version": "VARCHAR"}]') AS protocols) p;
+
+      CREATE TABLE prev AS
+      WITH p AS (SELECT coalesce(json_extract(CAST(:previous AS JSON), '$.hosts'), '{}') AS h)
+      SELECT k AS host, json_extract(h, '$."' || k || '"') AS v
+      FROM p, (SELECT unnest(json_keys(h)) AS k FROM p);
+
+      CREATE TABLE prev_hosts AS
+      SELECT host,
+             json_extract_string(v, '$.grade') AS prev_grade,
+             CAST(json_extract(v, '$.grade_rank') AS INTEGER) AS prev_rank,
+             json_extract_string(v, '$.assessed_at') AS prev_assessed_at,
+             coalesce(from_json(json_extract(v, '$.open_issues'), '["VARCHAR"]'), []) AS prev_open
+      FROM prev;
+
+      CREATE TABLE hosts AS
+      WITH agg AS (
+        SELECT host,
+               count(*) AS endpoints,
+               count(grade) AS graded_endpoints,
+               max(grade_rank) AS worst_rank,
+               min(grade_rank) AS best_rank,
+               count(DISTINCT grade) > 1 AS mixed_grades,
+               min(floor((leaf.notAfter - epoch_ms(current_timestamp)) / 86400000.0)) AS cert_days_left,
+               min(to_timestamp(leaf.notAfter / 1000)) AS cert_not_after,
+               list_distinct(flatten(list(legacy_protocols))) AS legacy_protocols,
+               list_distinct(flatten(list(vulnerabilities))) AS vulnerabilities,
+               bool_or(coalesce(hsts_status, 'absent') <> 'present') AS hsts_missing,
+               any_value(criteria_version) AS criteria_version,
+               max(tested_at) AS tested_at
+        FROM endpoints GROUP BY host
+      )
+      SELECT s.host, s.scan_status, s.status_message, s.polls,
+             a.endpoints, a.graded_endpoints,
+             gw.grade AS grade, a.worst_rank AS grade_rank, gb.grade AS best_grade, a.mixed_grades,
+             a.cert_days_left, a.cert_not_after, a.legacy_protocols, a.vulnerabilities, a.hsts_missing,
+             a.criteria_version, a.tested_at,
+             p.prev_grade, p.prev_rank, p.prev_open, p.host IS NOT NULL AS has_history,
+             s.scan_status = 'READY' AND coalesce(a.graded_endpoints, 0) > 0 AS assessed
+      FROM scans s
+      LEFT JOIN agg a ON a.host = s.host
+      LEFT JOIN grade_scale gw ON gw.grade_rank = a.worst_rank
+      LEFT JOIN grade_scale gb ON gb.grade_rank = a.best_rank
+      LEFT JOIN prev_hosts p ON p.host = s.host;
+
+      CREATE TABLE issues AS
+      WITH raw AS (
+        SELECT host, 'GRADE_DROP' AS code,
+               prev_grade || ' -> ' || grade || CASE WHEN criteria_version <> json_extract_string(CAST(:previous AS JSON), '$.criteria_version')
+                 THEN ' (SSL Labs criteria changed ' || json_extract_string(CAST(:previous AS JSON), '$.criteria_version') || ' -> ' || criteria_version || ')' ELSE '' END AS detail
+        FROM hosts WHERE assessed AND prev_rank IS NOT NULL AND grade_rank > prev_rank
+        UNION ALL
+        SELECT host, 'BELOW_MIN_GRADE', grade || ' is below ' || :min_grade FROM hosts WHERE assessed AND grade_rank > (SELECT grade_rank FROM grade_scale WHERE grade = :min_grade)
+        UNION ALL
+        SELECT host, 'CERT_EXPIRED', 'expired ' || CAST(-cert_days_left AS BIGINT) || ' days ago (' || strftime(cert_not_after, '%Y-%m-%d') || ')' FROM hosts WHERE assessed AND cert_days_left < 0
+        UNION ALL
+        SELECT host, 'CERT_EXPIRING', CAST(cert_days_left AS BIGINT) || ' days left (' || strftime(cert_not_after, '%Y-%m-%d') || ')' FROM hosts WHERE assessed AND cert_days_left >= 0 AND cert_days_left < CAST(:cert_warning_days AS INTEGER)
+        UNION ALL
+        SELECT host, 'LEGACY_TLS', array_to_string(legacy_protocols, ', ') || ' enabled' FROM hosts WHERE assessed AND len(legacy_protocols) > 0
+        UNION ALL
+        SELECT host, 'VULNERABLE', array_to_string(vulnerabilities, ', ') FROM hosts WHERE assessed AND len(vulnerabilities) > 0
+        UNION ALL
+        SELECT host, 'HSTS_MISSING', 'no Strict-Transport-Security header on at least one endpoint' FROM hosts WHERE assessed AND hsts_missing AND CAST(:require_hsts AS BOOLEAN)
+        UNION ALL
+        SELECT host, 'SCAN_FAILED', scan_status || ': ' || coalesce(status_message, 'no graded endpoint') FROM hosts WHERE NOT assessed
+      )
+      SELECT r.*, h.has_history,
+             CASE WHEN r.code = 'GRADE_DROP' OR NOT list_contains(coalesce(h.prev_open, []), r.code) THEN 'NEW' ELSE 'ONGOING' END AS issue_state
+      FROM raw r JOIN hosts h USING (host);
+
+      CREATE TABLE resolved AS
+      WITH current_codes AS (SELECT host, list(code) AS codes FROM issues GROUP BY host)
+      SELECT h.host, unnest(list_filter(coalesce(h.prev_open, []), c -> NOT list_contains(coalesce(cc.codes, []), c))) AS code
+      FROM hosts h LEFT JOIN current_codes cc USING (host)
+      WHERE h.assessed;
+
+      CREATE TABLE report AS
+      SELECT e.host, e.ip_address, e.server_name, e.endpoint_status, e.grade, e.grade_trust_ignored, e.has_warnings, e.protocols,
+             array_to_string(e.legacy_protocols, ', ') AS legacy_protocols,
+             e.leaf.subject AS cert_subject, e.leaf.issuerSubject AS cert_issuer,
+             to_timestamp(e.leaf.notAfter / 1000) AS cert_not_after,
+             CAST(floor((e.leaf.notAfter - epoch_ms(current_timestamp)) / 86400000.0) AS BIGINT) AS cert_days_left,
+             e.hsts_status, e.hsts_max_age, e.forward_secrecy,
+             array_to_string(e.vulnerabilities, ', ') AS vulnerabilities,
+             h.prev_grade AS previous_host_grade, h.grade AS host_grade, h.mixed_grades AS host_mixed_grades,
+             (SELECT string_agg(i.code || ' [' || i.issue_state || ']', '; ' ORDER BY i.code) FROM issues i WHERE i.host = e.host) AS host_issues,
+             e.criteria_version, e.tested_at
+      FROM endpoints e JOIN hosts h USING (host)
+      UNION ALL BY NAME
+      SELECT h.host, h.scan_status AS endpoint_status,
+             (SELECT string_agg(i.code || ' [' || i.issue_state || ']', '; ') FROM issues i WHERE i.host = h.host) AS host_issues,
+             h.prev_grade AS previous_host_grade
+      FROM hosts h WHERE h.endpoints IS NULL
+      ORDER BY host, ip_address;
+
+      COPY report TO '{{ outputFiles.report_csv }}' (HEADER true, DELIMITER ',');
+
+      CREATE TABLE new_state AS
+      SELECT json_object(
+        'criteria_version', coalesce((SELECT any_value(criteria_version) FROM hosts WHERE assessed), json_extract_string(CAST(:previous AS JSON), '$.criteria_version')),
+        'updated_at', CAST(current_timestamp AS VARCHAR),
+        'hosts', coalesce(json_group_object(host, state), '{}')
+      ) AS state_json
+      FROM (
+        SELECT h.host,
+               CASE WHEN h.assessed THEN
+                 json_object('grade', h.grade, 'grade_rank', h.grade_rank, 'assessed_at', CAST(h.tested_at AS VARCHAR),
+                             'cert_not_after', CAST(h.cert_not_after AS VARCHAR),
+                             'open_issues', coalesce((SELECT list(DISTINCT code) FROM issues i WHERE i.host = h.host AND code <> 'GRADE_DROP'), []))
+               ELSE
+                 json_object('grade', h.prev_grade, 'grade_rank', h.prev_rank, 'assessed_at', p.prev_assessed_at,
+                             'open_issues', list_distinct(list_append(coalesce(h.prev_open, []), 'SCAN_FAILED')))
+               END AS state
+        FROM hosts h LEFT JOIN prev_hosts p USING (host)
+      );
+
+      CREATE TABLE totals AS
+      SELECT (SELECT count(*) FROM hosts) AS hosts,
+             (SELECT count(*) FROM hosts WHERE assessed) AS assessed,
+             (SELECT count(*) FROM hosts WHERE has_history) = 0 AS baseline,
+             (SELECT count(*) FROM issues) AS open_issues,
+             (SELECT count(*) FROM issues WHERE issue_state = 'NEW') AS new_issues,
+             (SELECT count(*) FROM resolved) AS resolved_issues,
+             (SELECT string_agg(host || ' ' || coalesce(grade, '-'), ', ' ORDER BY host) FROM hosts) AS grades;
+
+      SELECT
+        (SELECT count(*) FROM hosts) AS hosts,
+        (SELECT count(*) FROM hosts WHERE assessed) AS assessed,
+        (SELECT count(*) FROM hosts WHERE NOT assessed) AS failed,
+        (SELECT count(*) FROM endpoints) AS endpoints,
+        (SELECT count(*) FROM hosts WHERE has_history) = 0 AS baseline,
+        (SELECT count(*) FROM issues) AS open_issues,
+        (SELECT count(*) FROM issues WHERE issue_state = 'NEW') AS new_issues,
+        (SELECT count(*) FROM resolved) AS resolved_issues,
+        (SELECT count(*) FROM issues WHERE code = 'GRADE_DROP') AS grade_drops,
+        (SELECT string_agg(host || ' ' || coalesce(grade, '-'), ', ' ORDER BY host) FROM hosts) AS grades,
+        coalesce((SELECT string_agg('- ' || host || ': ' || code || ' (' || detail || ')', chr(10) ORDER BY host, code) FROM issues WHERE issue_state = 'NEW'), '') AS new_issue_lines,
+        coalesce((SELECT string_agg('- ' || host || ': ' || code || ' (' || detail || ')', chr(10) ORDER BY host, code) FROM issues WHERE issue_state = 'ONGOING'), '') AS ongoing_issue_lines,
+        coalesce((SELECT string_agg('- ' || host || ': ' || code, chr(10) ORDER BY host, code) FROM resolved), '') AS resolved_lines,
+        (SELECT sum(polls) FROM hosts) AS api_polls,
+        (SELECT 'SSL Labs TLS audit' || CASE WHEN baseline THEN ' (BASELINE)' ELSE '' END || ': ' || assessed || '/' || hosts || ' hosts graded, '
+                || new_issues || ' new, ' || resolved_issues || ' resolved, ' || open_issues || ' open.' || chr(10) || 'Grades: ' || grades || chr(10) FROM totals)
+          || coalesce('*New*' || chr(10) || (SELECT string_agg('- ' || host || ': ' || code || ' (' || detail || ')', chr(10) ORDER BY host, code) FROM issues WHERE issue_state = 'NEW') || chr(10), '')
+          || coalesce('*Resolved*' || chr(10) || (SELECT string_agg('- ' || host || ': ' || code, chr(10) ORDER BY host, code) FROM resolved) || chr(10), '') AS slack_text,
+        coalesce('*Still open*' || chr(10) || (SELECT string_agg('- ' || host || ': ' || code || ' (' || detail || ')', chr(10) ORDER BY host, code) FROM issues WHERE issue_state = 'ONGOING') || chr(10), '') AS slack_ongoing_text,
+        (SELECT CAST(state_json AS VARCHAR) FROM new_state) AS new_state;
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.state_key }}"
+    kvType: JSON
+    value: "{{ outputs.build_report.outputs[0].row.new_state }}"
+    description: Grades, assessment time and open issues per host. Hosts whose scan failed keep their previous grade and issues.
+
+  - id: alert_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.build_report.outputs[0].row.new_issues > 0 or outputs.build_report.outputs[0].row.resolved_issues > 0 or (inputs.remind_ongoing and outputs.build_report.outputs[0].row.open_issues > 0) }}"
+    then:
+      - id: notify_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: allowFailure keeps the audit green (WARNING) when the webhook secret is not configured.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': outputs.build_report.outputs[0].row.slack_text ~ (inputs.remind_ongoing ? outputs.build_report.outputs[0].row.slack_ongoing_text : '') ~ 'Execution: ' ~ (kestra.url ?? '') ~ '/ui/executions/' ~ flow.namespace ~ '/' ~ flow.id ~ '/' ~ execution.id} | toJson }}
+    else:
+      - id: nothing_new
+        type: io.kestra.plugin.core.log.Log
+        message: "No new or resolved TLS issues; {{ outputs.build_report.outputs[0].row.open_issues }} still open. Grades: {{ outputs.build_report.outputs[0].row.grades }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      SSL Labs criteria {{ fromJson(outputs.api_info.body).criteriaVersion }}, engine {{ fromJson(outputs.api_info.body).engineVersion }}. {{ outputs.normalize_hosts.outputs[0].row.valid_hosts }} hosts scanned, {{ outputs.normalize_hosts.outputs[0].row.rejected }} rejected, {{ outputs.normalize_hosts.outputs[0].row.duplicates }} duplicates dropped.
+      {{ outputs.build_report.outputs[0].row.baseline ? 'BASELINE run. ' : '' }}{{ outputs.build_report.outputs[0].row.assessed }}/{{ outputs.build_report.outputs[0].row.hosts }} hosts graded over {{ outputs.build_report.outputs[0].row.endpoints }} endpoints; {{ outputs.build_report.outputs[0].row.failed }} failed. Grades: {{ outputs.build_report.outputs[0].row.grades }}
+      {{ outputs.build_report.outputs[0].row.api_polls }} analyze polls. Issues: {{ outputs.build_report.outputs[0].row.open_issues }} open, {{ outputs.build_report.outputs[0].row.new_issues }} new, {{ outputs.build_report.outputs[0].row.resolved_issues }} resolved, {{ outputs.build_report.outputs[0].row.grade_drops }} grade drops.
+      {{ outputs.build_report.outputs[0].row.new_issue_lines }}
+      {{ outputs.build_report.outputs[0].row.resolved_lines }}
+      Report: {{ outputs.build_report.outputFiles.report_csv }}
+
+outputs:
+  - id: report_csv
+    type: FILE
+    value: "{{ outputs.build_report.outputFiles.report_csv }}"
+  - id: summary
+    type: JSON
+    value: |
+      {{ {'hosts': outputs.build_report.outputs[0].row.hosts, 'assessed': outputs.build_report.outputs[0].row.assessed, 'failed': outputs.build_report.outputs[0].row.failed, 'endpoints': outputs.build_report.outputs[0].row.endpoints, 'baseline': outputs.build_report.outputs[0].row.baseline, 'open_issues': outputs.build_report.outputs[0].row.open_issues, 'new_issues': outputs.build_report.outputs[0].row.new_issues, 'resolved_issues': outputs.build_report.outputs[0].row.resolved_issues, 'grade_drops': outputs.build_report.outputs[0].row.grade_drops, 'grades': outputs.build_report.outputs[0].row.grades} | toJson }}
+
+triggers:
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * 1"
+    timezone: UTC
+
+extend:
+  title: Audit TLS Grades with Qualys SSL Labs and Alert on Regressions, Expiring Certificates and Legacy TLS
+  metaTitle: SSL Labs TLS Grade Regression Audit with DuckDB and Slack | Kestra
+  shortDescription: Grade your public HTTPS hostnames every week with the free Qualys SSL Labs API, flatten every endpoint's grade, protocols, certificate expiry, HSTS and vulnerability flags in DuckDB, and alert Slack only when a grade drops, a certificate nears expiry or TLS 1.0/1.1 appears.
+  metaDescription: Weekly Qualys SSL Labs audit of your hostnames. DuckDB tracks grades in KV and alerts Slack on grade drops, expiring certificates and legacy TLS.
+  description: |
+    Certificate expiry checks only answer one question. A load balancer change that re-enables TLS 1.0, a CDN node serving a weaker cipher list, a missing HSTS header after a migration or a new grading rule at SSL Labs all lower your TLS posture without any certificate changing. This flow runs the full Qualys SSL Labs assessment for a list of public hostnames every week, reuses SSL Labs' cache where it can, flattens every endpoint (one per IP address) with DuckDB, and compares the result with the grades and open issues stored in the KV store, so Slack only hears about what changed.
+
+    ## How it works
+
+    1. A weekly `Schedule` (Monday 06:00 UTC) starts the audit.
+    2. `normalize_hosts` (DuckDB) cleans the `hostnames` input (scheme, path, `:443`, trailing dot, case), drops duplicates and rejects IP addresses, other ports and malformed names before any API call; SSL Labs would refuse them anyway.
+    3. `api_info` calls `/api/v3/info` for the grading criteria version and the client's assessment quota; `previous_state` (KV Get) loads last run's grades and open issues.
+    4. `scan_hosts` (Loop, two hosts at a time) runs `wait_for_assessment` (LoopUntil) per host: `analyze` with `fromCache=on&maxAge=<max_cache_age_hours>` returns a recent cached report or starts a new assessment, then the same call is repeated every 20 seconds until the status is READY or ERROR or `scan_timeout` is reached. HTTP 429, 503 and 529 are retried with exponential backoff; HTTP 441 (IP address) ends the loop. `fetch_report` (HTTP Download) then fetches the full report (`all=done`) from the cache into internal storage.
+    5. `build_report` (DuckDB) reads every report and keeps one row per endpoint: grade, grade ignoring trust, protocols, leaf certificate and days to expiry, HSTS, forward secrecy and 15 vulnerability checks decoded from SSL Labs' integer codes (Heartbleed, ROBOT, POODLE, Zombie POODLE, GOLDENDOODLE, Ticketbleed, DROWN, RC4 and others). Each host takes its worst endpoint grade and soonest expiry. Issues: `GRADE_DROP`, `BELOW_MIN_GRADE`, `CERT_EXPIRED`, `CERT_EXPIRING`, `LEGACY_TLS`, `VULNERABLE`, `HSTS_MISSING` (opt-in) and `SCAN_FAILED`. Each issue is NEW or ONGOING compared with the state; issues that disappeared are RESOLVED. A grade drop that coincides with a new SSL Labs criteria version is labelled as such.
+    6. `save_state` (KV Set) stores grades and open issues per host. A host whose scan failed keeps its last good grade, so an outage never looks like a regression or a fix.
+    7. `alert_gate` (If) posts to Slack only when something is new or resolved (or every week with `remind_ongoing`); the webhook has `allowFailure`. `summary` logs the counts; the flow outputs the CSV and a summary JSON.
+
+    ## What you get
+
+    - A CSV with one row per endpoint: grade, protocols, certificate subject, issuer, expiry date and days left, HSTS, forward secrecy, vulnerabilities, previous grade and the host's issues with their NEW/ONGOING state.
+    - Slack messages for changes only: new issues, resolved issues and grade drops with the old and new grade.
+    - Detection of mixed grades across load-balancer nodes, because SSL Labs tests every IP behind a name.
+    - The first run is the BASELINE: existing problems are reported once as new, later runs only report changes.
+
+    ## Who it's for
+
+    - Platform, SRE and security teams who own public endpoints behind load balancers and CDNs.
+    - Compliance owners who must show that TLS 1.0/1.1 stays off and certificates are renewed in time (PCI DSS, ISO 27001).
+    - Agencies and MSPs watching TLS configuration across many customer domains.
+
+    ## Why orchestrate this with Kestra
+
+    - `LoopUntil` turns SSL Labs' asynchronous start-then-poll API into one declarative wait with an interval and a timeout; no sleep loops in a script.
+    - `Loop` with `concurrencyLimit` keeps the client under SSL Labs' concurrent-assessment limit, and HTTP `retryOnStatusCodes` handles 429 and 529 without custom code.
+    - The KV store carries grades between weekly runs, DuckDB does the JSON flattening and the diff in SQL, and every run keeps its reports and CSV in internal storage for audit.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB and Slack plugins.
+    - Outbound HTTPS to `api.ssllabs.com`. The v3 API used here needs no key or account. Only public hostnames on port 443 can be assessed; results are not published on the SSL Labs boards (`publish=off`).
+    - Use the API within the [SSL Labs terms](https://www.ssllabs.com/about/terms.html): it is free for assessing your own sites, not for bulk scanning of third parties.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for change alerts (optional; without it the run ends in WARNING and the findings stay in the log and CSV).
+
+    ## Quick start
+
+    1. Import the flow and click **Execute** with the defaults. `www.ssllabs.com` and `github.com` grade A+; `www.jd.com` grades B with TLS 1.0 and 1.1 enabled; `expired.badssl.com` grades T with a certificate that expired in 2015. The run is the BASELINE and reports those issues once.
+    2. Execute again: the cached assessments are reused, nothing is new, Slack stays quiet.
+    3. Replace `hostnames` with your own domains, set `min_grade` and `cert_warning_days`, add `SLACK_WEBHOOK_URL` and enable the schedule.
+    4. To see a regression alert, edit the KV entry `ssllabs_tls_audit_state`, set `www.jd.com` to `"grade": "A+"` and `"grade_rank": 1`, then run again: the next run posts `GRADE_DROP (A+ -> B)`.
+
+    ## How to extend
+
+    - Open a ticket in Jira, ServiceNow or GitHub for every NEW `CERT_EXPIRING` or `LEGACY_TLS` issue.
+    - Load the CSV into your warehouse to chart grade history per host.
+    - Read the host list from a CMDB, DNS zone export or a Terraform state instead of the input.
+    - SSL Labs announced API v4, which needs a registered email sent as an `email` header. To switch, register once at `api.ssllabs.com/api/v4/register`, change the two `analyze` URLs and `api_info` to `/api/v4/` and add `email: "{{ secret('SSLLABS_EMAIL') }}"` to their headers.
+
+    ## Links
+
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop) and [LoopUntil](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil)
+    - [HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request) and [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [SSL Labs API v3 documentation](https://github.com/ssllabs/ssllabs-scan/blob/master/ssllabs-api-docs-v3.md) and [API v4 documentation](https://github.com/ssllabs/ssllabs-scan/blob/master/ssllabs-api-docs-v4.md)
+    - [SSL Labs grading criteria](https://github.com/ssllabs/research/wiki/SSL-Server-Rating-Guide)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
