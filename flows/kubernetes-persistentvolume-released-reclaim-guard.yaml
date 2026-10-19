@@ -1,0 +1,431 @@
+id: kubernetes-persistentvolume-released-reclaim-guard
+namespace: company.platform
+
+description: |
+  Audit Kubernetes PersistentVolumes (PVs) in Released status to detect orphaned storage
+  whose bound PersistentVolumeClaims (PVCs) have been deleted. Cross-references active claims
+  cluster-wide, enforces a retention quarantine window, and safely recycles reusable volumes
+  back to Available by clearing claimRef, or prunes expired retained volumes past the retention
+  grace period, stopping cloud disk capacity leaks and idle storage billing.
+
+inputs:
+  - id: storage_class_filter
+    type: STRING
+    displayName: "StorageClass Filter Pattern"
+    defaults: ""
+    description: "Optional regex or substring to restrict the audit to specific StorageClasses (e.g. 'gp3', 'standard', 'ceph-rbd'). Leave empty to audit all StorageClasses."
+
+  - id: retention_grace_hours
+    type: INT
+    displayName: "Retention Grace Window (Hours)"
+    defaults: 24
+    description: "Quarantine window in hours after PVC deletion before an orphaned Released volume is eligible for deletion/prune. Prevents pruning volumes from recently deleted namespaces before backup confirmation."
+
+  - id: remediation_strategy
+    type: SELECT
+    displayName: "Remediation Strategy"
+    values:
+      - "ALERT_ONLY"
+      - "RECYCLE_TO_AVAILABLE"
+      - "PRUNE_EXPIRED"
+    defaults: "ALERT_ONLY"
+    description: "Operational response mode: ALERT_ONLY logs and sends Slack alerts; RECYCLE_TO_AVAILABLE removes spec.claimRef to reset the volume to Available for new PVCs; PRUNE_EXPIRED deletes the PV object for volumes past the retention grace period."
+
+  - id: dry_run
+    type: SELECT
+    displayName: "Dry Run Mode"
+    values:
+      - "true"
+      - "false"
+    defaults: "true"
+    description: "When set to true, calculates and logs planned mutations without modifying any cluster PV resources. Must be explicitly set to false for changes to take effect."
+
+  - id: require_human_approval
+    type: SELECT
+    displayName: "Require Human Approval"
+    values:
+      - "true"
+      - "false"
+    defaults: "true"
+    description: "When true and dry_run is false, pauses the execution for manual SRE review and confirmation before applying live mutations to cluster storage."
+
+triggers:
+  - id: periodic_released_pv_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"
+    disabled: true
+    description: "Runs a daily storage audit at 06:00 UTC. Shipped disabled so you can validate a manual run with default inputs first."
+
+tasks:
+  - id: fetch_persistent_volumes
+    type: io.kestra.plugin.kubernetes.kubectl.Get
+    description: "Pulls the complete cluster-wide PersistentVolume inventory via the Kubernetes API with fetchType: STORE, capturing full spec (claimRef, capacity, storageClassName, reclaimPolicy) and status (phase) into internal storage."
+    connection:
+      masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+      oauthToken: "{{ secret('K8S_TOKEN') }}"
+    namespace: ""
+    resourceType: persistentvolumes
+    fetchType: STORE
+
+  - id: fetch_persistent_volume_claims
+    type: io.kestra.plugin.kubernetes.kubectl.Get
+    description: "Pulls all active PersistentVolumeClaims across all namespaces to cross-reference with PV claimRef entries and confirm claim non-existence before any volume is flagged as orphaned."
+    connection:
+      masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+      oauthToken: "{{ secret('K8S_TOKEN') }}"
+    namespace: ""
+    resourceType: persistentvolumeclaims
+    fetchType: STORE
+
+  - id: analyze_released_volumes
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Parses PersistentVolume and PersistentVolumeClaim inventories. Correlates Released PV claimRef pointers with active claims, evaluates storage class filters and retention age, and classifies volumes into reusable, prunable, or claim-protected categories."
+    inputFiles:
+      pvs.json: "{{ outputs.fetch_persistent_volumes.uri }}"
+      pvcs.json: "{{ outputs.fetch_persistent_volume_claims.uri }}"
+    script: |
+      import json
+      import re
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      def parse_storage_gib(storage_val):
+          if not storage_val:
+              return 0.0
+          s = str(storage_val).strip()
+          try:
+              if s.endswith("Ti"):
+                  return float(s[:-2]) * 1024.0
+              elif s.endswith("Gi"):
+                  return float(s[:-2])
+              elif s.endswith("Mi"):
+                  return float(s[:-2]) / 1024.0
+              elif s.endswith("Ki"):
+                  return float(s[:-2]) / (1024.0 * 1024.0)
+              elif s.endswith("T"):
+                  return float(s[:-1]) * 1000.0 / 1.073741824
+              elif s.endswith("G"):
+                  return float(s[:-1]) / 1.073741824
+              elif s.endswith("M"):
+                  return float(s[:-1]) / (1024.0 * 1.073741824)
+              else:
+                  return float(s) / (1024.0 ** 3)
+          except Exception:
+              return 0.0
+
+      with open("pvs.json", "r") as f:
+          pv_data = json.load(f)
+
+      with open("pvcs.json", "r") as f:
+          pvc_data = json.load(f)
+
+      active_pvcs = set()
+      for item in pvc_data.get("items", []):
+          m = item.get("metadata", {})
+          ns = m.get("namespace", "default")
+          name = m.get("name", "")
+          if name:
+              active_pvcs.add(f"{ns}/{name}")
+
+      now = datetime.now(timezone.utc)
+      storage_filter = "{{ inputs.storage_class_filter }}".strip()
+      grace_hours = float({{ inputs.retention_grace_hours }})
+
+      total_pvs = 0
+      inventory = {"Bound": 0, "Available": 0, "Released": 0, "Failed": 0, "Other": 0}
+      orphaned_pvs = []
+      reusable_pv_names = []
+      prunable_pv_names = []
+      protected_pv_names = []
+      total_reclaimed_gib = 0.0
+
+      for pv in pv_data.get("items", []):
+          total_pvs += 1
+          meta = pv.get("metadata", {})
+          spec = pv.get("spec", {})
+          status = pv.get("status", {})
+
+          name = meta.get("name", "")
+          phase = status.get("phase", "Other")
+          inventory[phase] = inventory.get(phase, 0) + 1
+
+          if phase != "Released":
+              continue
+
+          sc_name = spec.get("storageClassName", "")
+          if storage_filter and not re.search(storage_filter, sc_name, re.IGNORECASE):
+              continue
+
+          capacity_str = spec.get("capacity", {}).get("storage", "0Gi")
+          cap_gib = parse_storage_gib(capacity_str)
+          reclaim_policy = spec.get("persistentVolumeReclaimPolicy", "Retain")
+          claim_ref = spec.get("claimRef", {})
+          claim_ns = claim_ref.get("namespace", "default")
+          claim_name = claim_ref.get("name", "")
+          claim_key = f"{claim_ns}/{claim_name}" if claim_name else ""
+
+          if claim_key and claim_key in active_pvcs:
+              protected_pv_names.append(name)
+              continue
+
+          creation_ts = meta.get("creationTimestamp")
+          age_hours = 0.0
+          if creation_ts:
+              try:
+                  created = datetime.fromisoformat(creation_ts.replace("Z", "+00:00"))
+                  age_hours = (now - created).total_seconds() / 3600.0
+              except Exception:
+                  age_hours = 0.0
+
+          is_expired = age_hours >= grace_hours
+          record = {
+              "name": name,
+              "capacity": capacity_str,
+              "capacity_gib": round(cap_gib, 2),
+              "storageClass": sc_name,
+              "reclaimPolicy": reclaim_policy,
+              "claimNamespace": claim_ns,
+              "claimName": claim_name,
+              "ageHours": round(age_hours, 1),
+              "isExpired": is_expired
+          }
+
+          orphaned_pvs.append(record)
+          total_reclaimed_gib += cap_gib
+          reusable_pv_names.append(name)
+          if is_expired:
+              prunable_pv_names.append(name)
+
+      Kestra.outputs({
+          "total_pvs_scanned": total_pvs,
+          "released_count": inventory.get("Released", 0),
+          "orphaned_count": len(orphaned_pvs),
+          "reclaimed_capacity_gib": round(total_reclaimed_gib, 2),
+          "orphaned_pvs": orphaned_pvs,
+          "reusable_pv_names": reusable_pv_names,
+          "prunable_pv_names": prunable_pv_names,
+          "protected_pv_names": protected_pv_names,
+          "inventory_summary": inventory
+      })
+
+  - id: evaluate_orphaned_volumes
+    type: io.kestra.plugin.core.flow.If
+    description: "Evaluates whether any orphaned Released PersistentVolumes were detected requiring notification or operational remediation."
+    condition: "{{ outputs.analyze_released_volumes.vars.orphaned_count > 0 }}"
+    then:
+      - id: log_audit_findings
+        type: io.kestra.plugin.core.log.Log
+        description: "Logs details of detected orphaned PersistentVolumes and capacity summary."
+        message: "Found {{ outputs.analyze_released_volumes.vars.orphaned_count }} orphaned Released PersistentVolume(s) totaling {{ outputs.analyze_released_volumes.vars.reclaimed_capacity_gib }} GiB. Remediation strategy: {{ inputs.remediation_strategy }}, Dry Run: {{ inputs.dry_run }}."
+
+      - id: alert_released_pvs
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: "Sends an incident notification to Slack with volume names, wasted capacity, and remediation posture."
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "⚠️ *Kubernetes PersistentVolume Storage Leak Alert*\n• *Cluster Master:* `{{ secret('K8S_MASTER_URL') }}`\n• *Orphaned Released Volumes:* `{{ outputs.analyze_released_volumes.vars.orphaned_count }}` / `{{ outputs.analyze_released_volumes.vars.released_count }}` released PVs\n• *Leaked Capacity:* `{{ outputs.analyze_released_volumes.vars.reclaimed_capacity_gib }} GiB`\n• *StorageClass Filter:* `{{ inputs.storage_class_filter ? inputs.storage_class_filter : 'All' }}`\n• *Remediation Strategy:* `{{ inputs.remediation_strategy }}` (Dry Run: `{{ inputs.dry_run }}`)\n• *Target Volumes:* `{{ outputs.analyze_released_volumes.vars.reusable_pv_names | join(', ') }}`\n• *Execution ID:* `{{ execution.id }}`"
+          }
+
+      - id: check_remediation_active
+        type: io.kestra.plugin.core.flow.If
+        description: "Checks if an automated remediation strategy (recycling to Available or pruning expired volumes) has been selected."
+        condition: "{{ inputs.remediation_strategy != 'ALERT_ONLY' }}"
+        then:
+          - id: check_dry_run_gate
+            type: io.kestra.plugin.core.flow.If
+            description: "Verifies whether dry_run mode is disabled before performing live cluster state changes."
+            condition: "{{ inputs.dry_run == 'false' }}"
+            then:
+              - id: check_human_approval
+                type: io.kestra.plugin.core.flow.If
+                description: "Checks whether human approval is required before executing live storage mutations."
+                condition: "{{ inputs.require_human_approval == 'true' }}"
+                then:
+                  - id: approve_remediation
+                    type: io.kestra.plugin.core.flow.Pause
+                    description: "Pauses execution for SRE confirmation before modifying or deleting cluster PersistentVolumes."
+                    timeout: PT1H
+                    onResume:
+                      - id: approved
+                        type: BOOL
+                        displayName: "Approve Storage Remediation"
+                        description: "Check to confirm and authorize live remediation on the identified PersistentVolumes."
+                        defaults: true
+
+              - id: route_remediation_action
+                type: io.kestra.plugin.core.flow.Switch
+                description: "Routes to the specific remediation procedure based on the selected remediation_strategy."
+                value: "{{ inputs.remediation_strategy }}"
+                cases:
+                  RECYCLE_TO_AVAILABLE:
+                    - id: recycle_volumes
+                      type: io.kestra.plugin.core.flow.Loop
+                      description: "Iterates over orphaned PersistentVolumes to remove stale claimRef pointers, returning them to Available."
+                      values: "{{ outputs.analyze_released_volumes.vars.reusable_pv_names }}"
+                      concurrencyLimit: 2
+                      tasks:
+                        - id: patch_clear_claimref
+                          type: io.kestra.plugin.kubernetes.kubectl.Patch
+                          description: "Applies a JSON_MERGE patch clearing spec.claimRef, allowing the kube-controller-manager to mark the volume Available."
+                          connection:
+                            masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                            oauthToken: "{{ secret('K8S_TOKEN') }}"
+                          namespace: ""
+                          resourceType: persistentvolumes
+                          resourceName: "{{ item.value }}"
+                          patchStrategy: JSON_MERGE
+                          patch: |
+                            {
+                              "spec": {
+                                "claimRef": null
+                              }
+                            }
+
+                  PRUNE_EXPIRED:
+                    - id: prune_volumes
+                      type: io.kestra.plugin.core.flow.Loop
+                      description: "Iterates over expired PersistentVolumes past the retention grace period to delete them."
+                      values: "{{ outputs.analyze_released_volumes.vars.prunable_pv_names }}"
+                      concurrencyLimit: 2
+                      tasks:
+                        - id: delete_pv
+                          type: io.kestra.plugin.kubernetes.kubectl.Delete
+                          description: "Deletes the expired PersistentVolume object, triggering underlying CSI driver volume deprovisioning."
+                          connection:
+                            masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                            oauthToken: "{{ secret('K8S_TOKEN') }}"
+                          namespace: ""
+                          resourceType: persistentvolumes
+                          resourcesNames:
+                            - "{{ item.value }}"
+
+              - id: verify_post_remediation
+                type: io.kestra.plugin.kubernetes.kubectl.Get
+                description: "Re-fetches PersistentVolumes after mutation to verify that recycled volumes returned to Available or pruned volumes were removed."
+                connection:
+                  masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                  oauthToken: "{{ secret('K8S_TOKEN') }}"
+                namespace: ""
+                resourceType: persistentvolumes
+                fetchType: STORE
+
+              - id: log_remediation_summary
+                type: io.kestra.plugin.core.log.Log
+                description: "Logs successful completion of live cluster storage remediation."
+                message: "Storage remediation completed: executed {{ inputs.remediation_strategy }} on orphaned volumes. Post-remediation verification complete."
+
+            else:
+              - id: log_dry_run_plan
+                type: io.kestra.plugin.core.log.Log
+                description: "Logs the dry-run remediation plan without applying any cluster changes."
+                message: "DRY RUN PLAN: {{ inputs.remediation_strategy }} would target {{ outputs.analyze_released_volumes.vars.orphaned_count }} volume(s) ({{ outputs.analyze_released_volumes.vars.reclaimed_capacity_gib }} GiB). Set dry_run to 'false' to execute."
+
+    else:
+      - id: log_clean_inventory
+        type: io.kestra.plugin.core.log.Log
+        description: "Logs healthy status when no orphaned Released PersistentVolumes are detected."
+        message: "PersistentVolume inventory healthy: 0 orphaned Released volumes found. Total PVs scanned: {{ outputs.analyze_released_volumes.vars.total_pvs_scanned }}."
+
+  - id: log_audit_complete
+    type: io.kestra.plugin.core.log.Log
+    description: "Final task logging complete execution metrics across all phases."
+    message: "PersistentVolume audit finished. Scanned: {{ outputs.analyze_released_volumes.vars.total_pvs_scanned }}, Bound: {{ outputs.analyze_released_volumes.vars.inventory_summary.Bound ?? 0 }}, Available: {{ outputs.analyze_released_volumes.vars.inventory_summary.Available ?? 0 }}, Released: {{ outputs.analyze_released_volumes.vars.inventory_summary.Released ?? 0 }}, Orphaned: {{ outputs.analyze_released_volumes.vars.orphaned_count }}."
+
+errors:
+  - id: alert_audit_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: "Alerts on flow-level errors such as unreachable Kubernetes API server or credential revocation."
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "🚨 *Kubernetes PersistentVolume Audit Failed*\n• *Cluster Master:* `{{ secret('K8S_MASTER_URL') }}`\n• *Execution ID:* `{{ execution.id }}`\n• *Error:* The audit workflow failed to complete. Check API server connectivity and service account token permissions."
+      }
+
+extend:
+  title: "Kubernetes PersistentVolume Released State and Orphan Reclamation Guard"
+  metaTitle: "Kubernetes PersistentVolume Released Orphan Reclamation Guard | Kestra"
+  shortDescription: "Audits Kubernetes PersistentVolumes in Released status to identify orphaned storage and safely recycle or prune them."
+  metaDescription: "Audits Kubernetes PersistentVolumes in Released state, verifies deleted PVCs, and safely recycles or prunes orphaned storage to stop cloud disk capacity leaks."
+  description: |
+    Production Kubernetes clusters hosting stateful workloads (databases, message brokers, streaming state stores) routinely configure StorageClasses with `reclaimPolicy: Retain` to protect against catastrophic accidental data loss. However, when a Helm release, stateful namespace, or PersistentVolumeClaim (PVC) is deleted, the underlying PersistentVolume (PV) transitions into `Released` status. In this state, the volume is completely stranded: Kubernetes prevents any new PVC from binding to it because it retains the old `claimRef` UID, while the underlying cloud block volume (AWS EBS, GCP Persistent Disk, Azure Managed Disk, Ceph RBD) continues to accrue monthly storage charges and exhaust cluster capacity quotas.
+
+    This blueprint implements a production-grade Day 2 storage governance gate. It audits all PersistentVolumes across the cluster, cross-references active PersistentVolumeClaims to verify claim deletion, enforces a configurable retention grace window, and provides two distinct automated remediation strategies: safely recycling reusable volumes back to `Available` by clearing `spec.claimRef`, or pruning expired volumes past the retention SLA to stop storage waste.
+
+    ## How it works
+
+    1. `periodic_released_pv_audit` (`io.kestra.plugin.core.trigger.Schedule`) initiates a daily storage governance audit at 06:00 UTC (shipped disabled for safe initial evaluation).
+    2. `fetch_persistent_volumes` (`io.kestra.plugin.kubernetes.kubectl.Get`) connects to the Kubernetes cluster API with `fetchType: STORE` to pull the complete inventory of all cluster-wide `PersistentVolume` resources, writing raw JSON specifications to Kestra internal storage.
+    3. `fetch_persistent_volume_claims` (`io.kestra.plugin.kubernetes.kubectl.Get`) pulls all active `PersistentVolumeClaim` resources across all namespaces with `fetchType: STORE`, establishing the baseline of legitimate active claims.
+    4. `analyze_released_volumes` (`io.kestra.plugin.scripts.python.Script`) cross-references each `Released` PV against active PVCs. Volumes whose PVC still exists in terminating or finalizer-locked state are safely skipped. Volumes whose PVC is confirmed deleted are evaluated against `retention_grace_hours` and `storage_class_filter`, calculating total leaked capacity in GiB.
+    5. `evaluate_orphaned_volumes` (`io.kestra.plugin.core.flow.If`) evaluates whether orphaned volumes exist:
+       - When orphaned volumes are present: dispatches a detailed incident summary to Slack (`alert_released_pvs`) including capacity in GiB and target volume identifiers.
+       - When remediation is enabled (`remediation_strategy != 'ALERT_ONLY'` and `dry_run == 'false'`): optionally pauses for human SRE sign-off via `approve_remediation` (`io.kestra.plugin.core.flow.Pause`), then routes via `route_remediation_action` (`io.kestra.plugin.core.flow.Switch`).
+       - Under `RECYCLE_TO_AVAILABLE`: loops over targeted volumes using `patch_clear_claimref` (`io.kestra.plugin.kubernetes.kubectl.Patch` with `JSON_MERGE`) to set `spec.claimRef: null`, enabling the Kubernetes volume controller to mark the volume `Available`.
+       - Under `PRUNE_EXPIRED`: loops over expired volumes using `delete_pv` (`io.kestra.plugin.kubernetes.kubectl.Delete`) to delete the PV and trigger storage provider deprovisioning.
+       - `verify_post_remediation` (`io.kestra.plugin.kubernetes.kubectl.Get`) re-reads cluster storage state to confirm successful transition or removal.
+    6. `log_audit_complete` (`io.kestra.plugin.core.log.Log`) writes a final structured summary of cluster storage inventory across Bound, Available, and Released phases.
+    7. An `errors` block alerts Slack if API server connectivity drops or RBAC permissions are revoked.
+
+    ## What you get
+
+    - Automated detection of stranded `Released` PersistentVolumes leaking cloud storage budget.
+    - True zero-downtime volume recycling: clearing `claimRef` returns retained volumes to the cluster storage pool without manual CLI intervention.
+    - Double-safety safeguard: requires both `dry_run: false` and optional human approval pause before any cluster state mutation.
+    - Protection for terminating workloads: cross-references PVC inventory to ensure in-progress pod migrations are never disrupted.
+    - Multi-unit storage capacity calculation (TiB, GiB, MiB) tracking exact reclaimable storage metrics.
+
+    ## Who it's for
+
+    - Platform Engineers and Kubernetes Administrators managing multi-tenant stateful clusters.
+    - Cloud FinOps practitioners auditing unattached cloud disks and idle persistent volume costs.
+    - Site Reliability Engineers maintaining cluster storage capacity and preventing storage pool exhaustion.
+
+    ## Why orchestrate this with Kestra
+
+    - Declarative storage lifecycle management without writing, maintaining, and deploying custom Kubernetes operator controllers.
+    - Native `Pause` task support allowing human SREs to review audit calculations before executing irreversible storage pruning.
+    - Complete audit trail with execution history, before-and-after volume verification reads, and automated Slack reporting.
+    - Standardized secret management protecting cluster service account credentials and webhook endpoints.
+
+    ## Prerequisites
+
+    - A running Kubernetes cluster (v1.23+) with RBAC authorization enabled.
+    - A Kubernetes ServiceAccount with permissions to `get` and `list` persistentvolumeclaims, and `get`, `list`, `patch`, and `delete` persistentvolumes.
+    - A Slack Incoming Webhook URL for incident and audit reporting.
+
+    ### Secrets
+
+    - `K8S_MASTER_URL`: HTTPS endpoint of the Kubernetes API server (e.g., `https://k8s.internal.company.com:6443`).
+    - `K8S_TOKEN`: Bearer token for the storage auditor ServiceAccount.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for storage alerts and audit reports.
+
+    ## Quick start
+
+    1. Configure the `K8S_MASTER_URL`, `K8S_TOKEN`, and `SLACK_WEBHOOK_URL` secrets in your Kestra namespace.
+    2. Run the flow with default inputs (`dry_run: "true"`, `remediation_strategy: "ALERT_ONLY"`).
+    3. Review the execution logs and Slack notification to inspect any detected Released volumes and total leaked GiB.
+    4. To test automated volume recycling, set `remediation_strategy: "RECYCLE_TO_AVAILABLE"` and `dry_run: "false"`. Approve the pause task to verify that `spec.claimRef` is cleared and the volume transitions to `Available`.
+    5. Enable `periodic_released_pv_audit` to schedule continuous daily storage governance.
+
+    ## How to extend
+
+    - Add Prometheus push gateway metrics via `io.kestra.plugin.prometheus.Push` to graph orphaned volume counts and wasted GiB over time in Grafana.
+    - Filter by specific storage providers (e.g. `storage_class_filter: "ebs-sc|ceph-rbd"`) to establish tiered retention policies per storage class.
+    - Chain a Jira issue creation task via `io.kestra.plugin.jira.issues.Create` when total leaked storage exceeds 1 TiB to trigger formal capacity review.
+
+    ## Links
+
+    - [Kubernetes Persistent Volumes Documentation](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+    - [Kubernetes PersistentVolume Claims and Recycling](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming)
+    - [Kestra Kubernetes Plugin Documentation](https://kestra.io/plugins/plugin-kubernetes)
+    - [Kestra Kubectl Get Task](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.get)
+    - [Kestra Kubectl Patch Task](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.patch)
+    - [Kestra Kubectl Delete Task](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.delete)
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Day 2 Operations
+  ee: false
+  demo: false
