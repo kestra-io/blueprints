@@ -1,0 +1,345 @@
+id: spamhaus-drop-firewall-denylist-sync
+namespace: company.team
+
+description: |
+  Downloads the Spamhaus DROP lists (IPv4 and IPv6), checks they are complete, diffs them with the previous
+  snapshot in the KV store, makes sure none of your own address ranges is listed, and writes a ready-to-load
+  nftables denylist. Slack gets the added and removed ranges, and a separate CRITICAL alert if one of your
+  own ranges shows up on DROP.
+
+inputs:
+  - id: own_ranges
+    type: ARRAY
+    itemType: STRING
+    description: |
+      CIDRs you must never block: your own allocations, your cloud egress ranges and critical partners.
+      A DROP entry that overlaps one of them is left out of the generated denylist and raises a CRITICAL alert.
+      The defaults are example public ranges (Cloudflare and Google DNS), not yours; replace them.
+    defaults:
+      - 104.16.0.0/13
+      - 8.8.8.0/24
+      - 2606:4700::/32
+
+  - id: max_feed_age_hours
+    type: INT
+    defaults: 48
+    description: Warn when the `timestamp` in a feed's metadata line is older than this. DROP is normally regenerated several times a day.
+
+  - id: max_shrink_percent
+    type: INT
+    defaults: 20
+    description: Refuse to publish (the run fails and the previous state is kept) when a list shrinks by more than this against the last snapshot. A sudden mass removal is far more likely to be a broken download than real delistings, and applying it would unblock those ranges.
+
+triggers:
+  - id: every_4_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "17 */4 * * *"
+
+tasks:
+  - id: get_state
+    type: io.kestra.plugin.core.kv.Get
+    key: spamhaus_drop_snapshot
+    errorOnMissing: false
+
+  - id: download
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Both files are NDJSON, one `{"cidr","sblid","rir"}` object per line, ending with a `{"type":"metadata",...}` line that carries the generation timestamp and the record count. Spamhaus serves them with `Cache-Control max-age=3600`, so polling more often than hourly gains nothing.
+    tasks:
+      - id: drop_v4
+        type: io.kestra.plugin.core.http.Download
+        uri: https://www.spamhaus.org/drop/drop_v4.json
+        headers:
+          User-Agent: kestra-blueprint-spamhaus-drop-sync
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 4
+      - id: drop_v6
+        type: io.kestra.plugin.core.http.Download
+        uri: https://www.spamhaus.org/drop/drop_v6.json
+        headers:
+          User-Agent: kestra-blueprint-spamhaus-drop-sync
+        retry:
+          type: exponential
+          interval: PT10S
+          maxInterval: PT2M
+          maxAttempts: 4
+
+  - id: diff
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Validates each feed before anything is published: every line must parse, the metadata line must be present and
+      its `records` count must equal the number of entries (catches truncated or HTML error responses), and the list
+      must not shrink by more than `max_shrink_percent`. The same CIDR can appear under two SBL records, so entries are
+      keyed by CIDR with all their SBL ids. Adjacent and nested ranges are collapsed before the nftables set is written
+      (about 1,690 IPv4 entries become about 1,600 intervals), which nft needs for an interval set.
+    containerImage: python:3.13-slim
+    inputFiles:
+      drop_v4.json: "{{ outputs.drop_v4.uri }}"
+      drop_v6.json: "{{ outputs.drop_v6.uri }}"
+      state.json: "{{ (outputs.get_state.value ?? {}) | toJson }}"
+    outputFiles:
+      - state.json
+      - changes.csv
+      - spamhaus-drop.nft
+      - spamhaus-drop.txt
+    env:
+      OWN_RANGES: "{{ inputs.own_ranges | toJson }}"
+      MAX_AGE_HOURS: "{{ inputs.max_feed_age_hours }}"
+      MAX_SHRINK: "{{ inputs.max_shrink_percent }}"
+    script: |
+      import csv, ipaddress, json, os, sys, time
+      from datetime import datetime, timezone
+
+      state = json.load(open("state.json"))
+      baseline = not state
+      now = time.time()
+      own, warnings = [], []
+      for raw in json.loads(os.environ["OWN_RANGES"]):
+          try:
+              own.append(ipaddress.ip_network(str(raw).strip(), strict=False))
+          except ValueError:
+              warnings.append(f"own_ranges value '{raw}' is not a CIDR and was ignored")
+
+      feeds, rows, critical = {}, [], []
+      for fam in ("v4", "v6"):
+          entries, meta, lines = {}, None, 0
+          for n, line in enumerate(open(f"drop_{fam}.json", encoding="utf-8"), 1):
+              if not line.strip():
+                  continue
+              try:
+                  rec = json.loads(line)
+                  if rec.get("type") == "metadata":
+                      meta = rec
+                      continue
+                  net = ipaddress.ip_network(rec["cidr"], strict=False)
+              except (ValueError, KeyError) as e:
+                  sys.exit(f"drop_{fam}.json line {n} is not a DROP record ({e}); refusing to publish")
+              if net.version != (4 if fam == "v4" else 6):
+                  sys.exit(f"drop_{fam}.json line {n}: {net} is the wrong address family")
+              lines += 1
+              entries.setdefault(net.with_prefixlen, set()).add(rec.get("sblid", ""))
+          if meta is None or meta.get("records") != lines:
+              sys.exit(f"drop_{fam}.json: metadata says {meta and meta.get('records')} records, parsed {lines}; "
+                       "download looks truncated, refusing to publish")
+          old = state.get(fam, {}).get("entries", {})
+          if old and len(entries) < len(old) * (1 - int(os.environ["MAX_SHRINK"]) / 100):
+              sys.exit(f"drop_{fam}: {len(old)} -> {len(entries)} ranges is a drop of more than "
+                       f"{os.environ['MAX_SHRINK']}%; refusing to publish, previous state kept")
+          age_h = (now - meta["timestamp"]) / 3600
+          generated = datetime.fromtimestamp(meta["timestamp"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          if age_h > int(os.environ["MAX_AGE_HOURS"]):
+              warnings.append(f"drop_{fam} was generated {age_h:.0f} h ago ({generated})")
+          if not baseline:
+              for cidr in sorted(set(entries) - set(old)):
+                  rows.append({"family": fam, "change": "ADDED", "cidr": cidr, "sblid": " ".join(sorted(entries[cidr]))})
+              for cidr in sorted(set(old) - set(entries)):
+                  rows.append({"family": fam, "change": "REMOVED", "cidr": cidr, "sblid": " ".join(old[cidr])})
+          keep = []
+          for cidr, sbl in entries.items():
+              net = ipaddress.ip_network(cidr)
+              hits = [o for o in own if o.version == net.version and o.overlaps(net)]
+              if hits:
+                  critical.append(f"{cidr} ({' '.join(sorted(sbl))}) overlaps own range {', '.join(map(str, hits))}")
+                  rows.append({"family": fam, "change": "OWN_RANGE_LISTED", "cidr": cidr, "sblid": " ".join(sorted(sbl))})
+              else:
+                  keep.append(net)
+          collapsed = list(ipaddress.collapse_addresses(keep))
+          feeds[fam] = {"entries": {c: sorted(s) for c, s in entries.items()}, "timestamp": meta["timestamp"],
+                        "generated": generated, "ranges": len(entries), "intervals": [str(c) for c in collapsed]}
+          print(f"drop_{fam}: {lines} records, {len(entries)} unique ranges, {len(collapsed)} intervals after "
+                f"collapsing, generated {generated}")
+
+      stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+      def nft_set(fam, addr_type):
+          body = "  set drop_" + fam + " {\n    type " + addr_type + "; flags interval;\n"
+          if feeds[fam]["intervals"]:
+              body += "    elements = {\n      " + ",\n      ".join(feeds[fam]["intervals"]) + "\n    }\n"
+          return body + "  }\n"
+      with open("spamhaus-drop.nft", "w") as f:
+          f.write(f"# Spamhaus DROP, built {stamp}; v4 {feeds['v4']['generated']}, v6 {feeds['v6']['generated']}\n"
+                  "# Load with: nft -f spamhaus-drop.nft (replaces the whole table atomically)\n"
+                  "table inet spamhaus_drop\ndelete table inet spamhaus_drop\ntable inet spamhaus_drop {\n"
+                  + nft_set("v4", "ipv4_addr") + nft_set("v6", "ipv6_addr") +
+                  "  chain inbound { type filter hook input priority -10; ip saddr @drop_v4 drop; ip6 saddr @drop_v6 drop; }\n"
+                  "  chain forward { type filter hook forward priority -10; ip saddr @drop_v4 drop; ip daddr @drop_v4 drop; "
+                  "ip6 saddr @drop_v6 drop; ip6 daddr @drop_v6 drop; }\n"
+                  "  chain outbound { type filter hook output priority -10; ip daddr @drop_v4 drop; ip6 daddr @drop_v6 drop; }\n}\n")
+      with open("spamhaus-drop.txt", "w") as f:
+          f.write("\n".join(feeds["v4"]["intervals"] + feeds["v6"]["intervals"]) + "\n")
+      with open("changes.csv", "w", newline="") as f:
+          w = csv.DictWriter(f, fieldnames=["family", "change", "cidr", "sblid"])
+          w.writeheader()
+          w.writerows(rows)
+      json.dump({fam: {"entries": d["entries"], "timestamp": d["timestamp"]} for fam, d in feeds.items()},
+                open("state.json", "w"))
+
+      added = [r for r in rows if r["change"] == "ADDED"]
+      removed = [r for r in rows if r["change"] == "REMOVED"]
+      status = "CRITICAL" if critical else "BASELINE" if baseline else "CHANGED" if added or removed else "UNCHANGED"
+      lines_out = [f"- +{r['cidr']} {r['sblid']}" for r in added[:25]] + [f"- -{r['cidr']} (delisted)" for r in removed[:25]]
+      slack_text = "\n".join([f"*Spamhaus DROP sync*: {len(added)} added, {len(removed)} removed; denylist now "
+                              f"{len(feeds['v4']['intervals'])} IPv4 + {len(feeds['v6']['intervals'])} IPv6 intervals"]
+                             + lines_out + ["SBL details: https://check.spamhaus.org/sbl/query/<SBL id>"])
+      critical_text = "\n".join([":rotating_light: *Own address space listed on Spamhaus DROP*"] + critical
+                                + ["These entries were left out of the generated denylist. Check the SBL record and "
+                                   "contact Spamhaus or your RIR.", "", slack_text])
+      print(f"Status {status}: added {len(added)}, removed {len(removed)}, own-range hits {len(critical)}")
+      print("::" + json.dumps({"outputs": {
+          "status": status, "added": len(added), "removed": len(removed), "critical": critical,
+          "warnings": warnings, "slack_text": slack_text, "critical_text": critical_text,
+          "v4_ranges": feeds["v4"]["ranges"], "v6_ranges": feeds["v6"]["ranges"],
+          "v4_intervals": len(feeds["v4"]["intervals"]), "v6_intervals": len(feeds["v6"]["intervals"])}}) + "::")
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: spamhaus_drop_snapshot
+    kvType: JSON
+    value: "{{ read(outputs.diff.outputFiles['state.json']) }}"
+
+  - id: route
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ outputs.diff.vars.status }}"
+    cases:
+      CRITICAL:
+        - id: log_critical
+          type: io.kestra.plugin.core.log.Log
+          level: ERROR
+          message: "Own address space is on Spamhaus DROP (left out of the denylist): {{ outputs.diff.vars.critical | join('; ') }}"
+        - id: slack_critical
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          allowFailure: true
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: "{{ {'text': outputs.diff.vars.critical_text} | toJson }}"
+      CHANGED:
+        - id: log_changes
+          type: io.kestra.plugin.core.log.Log
+          message: "{{ outputs.diff.vars.slack_text }}"
+        - id: slack_changes
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          allowFailure: true
+          description: allowFailure keeps the sync running (the denylist file is still produced) when the webhook secret is not set.
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: "{{ {'text': outputs.diff.vars.slack_text} | toJson }}"
+      BASELINE:
+        - id: log_baseline
+          type: io.kestra.plugin.core.log.Log
+          message: "Baseline recorded: {{ outputs.diff.vars.v4_ranges }} IPv4 and {{ outputs.diff.vars.v6_ranges }} IPv6 ranges. Later runs report added and removed ranges."
+    defaults:
+      - id: log_unchanged
+        type: io.kestra.plugin.core.log.Log
+        message: "DROP unchanged since the last run ({{ outputs.diff.vars.v4_ranges }} IPv4, {{ outputs.diff.vars.v6_ranges }} IPv6 ranges)."
+
+  - id: warn_inputs
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.diff.vars.warnings | length > 0 }}"
+    then:
+      - id: log_warnings
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.diff.vars.warnings | join('; ') }}"
+
+outputs:
+  - id: summary
+    type: JSON
+    value:
+      status: "{{ outputs.diff.vars.status }}"
+      added: "{{ outputs.diff.vars.added }}"
+      removed: "{{ outputs.diff.vars.removed }}"
+      own_range_hits: "{{ outputs.diff.vars.critical | length }}"
+      v4_intervals: "{{ outputs.diff.vars.v4_intervals }}"
+      v6_intervals: "{{ outputs.diff.vars.v6_intervals }}"
+  - id: nftables_denylist
+    type: FILE
+    value: "{{ outputs.diff.outputFiles['spamhaus-drop.nft'] }}"
+  - id: cidr_list
+    type: FILE
+    value: "{{ outputs.diff.outputFiles['spamhaus-drop.txt'] }}"
+  - id: changes_csv
+    type: FILE
+    value: "{{ outputs.diff.outputFiles['changes.csv'] }}"
+
+extend:
+  title: Spamhaus DROP Firewall Denylist Sync with Own-Range Guard
+  metaTitle: Spamhaus DROP to nftables Denylist Sync | Kestra
+  shortDescription: Download the Spamhaus DROP lists every 4 hours, validate and diff them against the last snapshot, build an nftables denylist and alert Slack on changes or if your own ranges get listed.
+  metaDescription: Sync Spamhaus DROP IPv4/IPv6 into an nftables denylist with integrity checks, KV diffing, Slack change alerts and an own-range listing guard.
+  description: |
+    Spamhaus DROP ("Don't Route Or Peer") lists netblocks that are hijacked or leased to spam and malware operators;
+    Spamhaus recommends dropping all traffic to and from them. This flow keeps a firewall denylist in sync with the
+    JSON feeds, refuses to publish a broken list, reports which ranges were added or delisted, and raises a CRITICAL
+    alert if a range you own or depend on appears on DROP.
+
+    The default `own_ranges` are example public ranges (Cloudflare and Google DNS), not yours. The DROP data always
+    comes from the live feeds.
+
+    ## How it works
+
+    1. A `Schedule` runs every 4 hours; `get_state` reads the previous snapshot from the KV store.
+    2. A `Parallel` block downloads `drop_v4.json` and `drop_v6.json` with retries. Each is NDJSON ending with a
+       metadata line holding the generation timestamp and the record count.
+    3. `diff` (Python, standard library) validates before publishing: every line must parse as a CIDR of the right
+       family, the metadata `records` count must match (catches truncated or HTML error responses), and the list
+       must not shrink by more than `max_shrink_percent`. A failed check stops the run and keeps the previous state.
+    4. Entries are keyed by CIDR, because the same range can be listed under two SBL records. The set difference with
+       the snapshot gives ADDED and REMOVED rows. Any entry overlapping `own_ranges` (in either direction) is left out of
+       the denylist and reported as OWN_RANGE_LISTED. The rest is collapsed into non-overlapping intervals, as an
+       nftables interval set requires.
+    5. `save_state` stores the new snapshot. A `Switch` routes on the status: CRITICAL logs at ERROR and posts a Slack
+       alert, CHANGED posts the diff, BASELINE (first run) and UNCHANGED only log. Stale feeds and invalid
+       `own_ranges` values are logged at WARN.
+
+    ## What you get
+
+    - `spamhaus-drop.nft`: an `inet` table with `drop_v4`/`drop_v6` sets and input, forward and output drop chains,
+      replaced atomically with `nft -f`.
+    - `spamhaus-drop.txt`: the same intervals as a plain CIDR list for other firewalls, proxies or cloud WAF IP sets.
+    - `changes.csv` and a JSON summary as flow outputs; Slack only when something changed.
+
+    ## Who it's for
+
+    - Network and security engineers running Linux edge firewalls, bastions or routers.
+    - SOC teams that want listing changes visible, not silently applied.
+
+    ## Why orchestrate this with Kestra
+
+    - Integrity checks gate publishing, retries cover transient errors, and the snapshot lives in the KV store.
+    - Each execution keeps its denylist file and diff as an audit trail.
+
+    ## Prerequisites
+
+    - A Docker task runner for the `python:3.13-slim` task (standard library only).
+    - Outbound HTTPS to `www.spamhaus.org`. No API key is needed; use is subject to the DROP terms.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook (optional; without it the alerts are still logged).
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` to the namespace secrets.
+    2. Set `own_ranges` to your allocations, cloud egress and critical partner ranges.
+    3. Execute once to record the baseline and inspect `nftables_denylist`, then enable the schedule.
+
+    ## How to extend
+
+    - Push `spamhaus-drop.txt` to an AWS WAF IP set, Cloudflare list or Terraform variable.
+    - Add the ASN-DROP feed (`asndrop.json`) to flag transit or peering ASNs.
+
+    ## Links
+
+    - [Spamhaus DROP](https://www.spamhaus.org/blocklists/do-not-route-or-peer/)
+    - [DROP terms of use](https://www.spamhaus.org/drop/terms/)
+    - [nftables sets](https://wiki.nftables.org/wiki-nftables/index.php/Sets)
+    - [Parallel task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.parallel)
+    - [Switch task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch)
+    - [Python Script task](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [Slack Incoming Webhook task](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
