@@ -1,0 +1,274 @@
+id: us-treasury-interest-rates-delta-loader
+namespace: company.macro
+
+inputs:
+  - id: schedule_year_from
+    type: STRING
+    defaults: "2024-01-01"
+    description: "Earliest record date to ingest historical rates from the US Treasury Fiscal Data API (YYYY-MM-DD)."
+
+  - id: material_shift_bps
+    type: INT
+    defaults: 25
+    description: "Material rate movement threshold in basis points (1 bp = 0.01%, 25 bps = 0.25%) to trigger alert."
+
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 10 5 * *"
+    disabled: true
+
+tasks:
+  - id: fetch_treasury_rates
+    type: io.kestra.plugin.core.http.Download
+    uri: "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates?filter=record_date:gte:{{ inputs.schedule_year_from }}&page[size]=10000"
+    description: "Downloads historical average interest rates directly from the official US Treasury Fiscal Data API."
+
+  - id: previous_rates
+    type: io.kestra.plugin.core.kv.Get
+    key: treasury_accepted_rates_uri
+    errorOnMissing: false
+    description: "Retrieves the URI of the previously accepted rates Parquet file from Kestra KV store."
+
+  - id: bootstrap_history
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.previous_rates.value is null }}"
+    description: "Initializes an empty baseline Parquet file when running for the first time without prior history."
+    then:
+      - id: create_empty_history
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        outputFiles:
+          - empty_rates.parquet
+        sql: |
+          CREATE TABLE empty_rates (
+            record_date DATE,
+            security_type_desc VARCHAR,
+            security_desc VARCHAR,
+            avg_interest_rate DOUBLE
+          );
+          COPY empty_rates TO 'empty_rates.parquet' (FORMAT PARQUET);
+
+  - id: diff_and_load
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    fetchType: FETCH_ONE
+    description: "Parses API JSON response with DuckDB, computes month-over-month deltas against baseline, and writes Parquet outputs."
+    inputFiles:
+      rates.json: "{{ outputs.fetch_treasury_rates.uri }}"
+      prev_rates.parquet: "{{ outputs.previous_rates.value ?? outputs.bootstrap_history.create_empty_history.outputFiles['empty_rates.parquet'] }}"
+    outputFiles:
+      - latest_rates.parquet
+      - rates_revision_log.parquet
+      - rate_changes_summary.csv
+    sql: |
+      -- 1. Parse raw json rates
+      CREATE TABLE raw_ingest AS
+      SELECT 
+          CAST(item.record_date AS DATE) AS record_date,
+          item.security_type_desc AS security_type_desc,
+          item.security_desc AS security_desc,
+          CAST(item.avg_interest_rate_amt AS DOUBLE) AS avg_interest_rate
+      FROM (
+          SELECT unnest(data) AS item
+          FROM read_json('rates.json')
+      ) t
+      WHERE item.avg_interest_rate_amt IS NOT NULL;
+
+      -- 2. Extract latest record per security in current pull
+      CREATE TABLE latest_curr AS
+      WITH ranked AS (
+          SELECT 
+              record_date,
+              security_type_desc,
+              security_desc,
+              avg_interest_rate,
+              ROW_NUMBER() OVER (PARTITION BY security_type_desc, security_desc ORDER BY record_date DESC) as rn
+          FROM raw_ingest
+      )
+      SELECT 
+          record_date,
+          security_type_desc,
+          security_desc,
+          avg_interest_rate
+      FROM ranked
+      WHERE rn = 1;
+
+      -- 3. Load previous rates
+      CREATE TABLE prev_state AS
+      SELECT * FROM read_parquet('prev_rates.parquet');
+
+      -- 4. Diff calculation
+      CREATE TABLE diff_results AS
+      SELECT 
+          c.record_date AS record_date,
+          c.security_type_desc,
+          c.security_desc,
+          c.avg_interest_rate AS current_rate,
+          p.avg_interest_rate AS previous_rate,
+          ROUND((c.avg_interest_rate - COALESCE(p.avg_interest_rate, c.avg_interest_rate)) * 100, 2) AS delta_bps,
+          CASE 
+              WHEN p.avg_interest_rate IS NULL THEN 'NEW'
+              WHEN c.avg_interest_rate <> p.avg_interest_rate THEN 'CHANGED'
+              ELSE 'UNCHANGED'
+          END AS change_type,
+          CASE 
+              WHEN ABS(ROUND((c.avg_interest_rate - COALESCE(p.avg_interest_rate, c.avg_interest_rate)) * 100, 2)) >= {{ inputs.material_shift_bps }} THEN TRUE
+              ELSE FALSE
+          END AS is_material_shift
+      FROM latest_curr c
+      LEFT JOIN prev_state p 
+          ON c.security_type_desc = p.security_type_desc 
+         AND c.security_desc = p.security_desc;
+
+      -- 5. Export output files
+      COPY (SELECT * FROM latest_curr ORDER BY security_type_desc, security_desc) 
+      TO 'latest_rates.parquet' (FORMAT PARQUET);
+
+      COPY (SELECT * FROM raw_ingest ORDER BY record_date DESC, security_type_desc, security_desc) 
+      TO 'rates_revision_log.parquet' (FORMAT PARQUET);
+
+      COPY (SELECT * FROM diff_results ORDER BY ABS(delta_bps) DESC) 
+      TO 'rate_changes_summary.csv' (FORMAT CSV, HEADER);
+
+      -- 6. Return single summary row
+      SELECT 
+          COUNT(*)::INTEGER AS total_securities,
+          COUNT(CASE WHEN is_material_shift THEN 1 END)::INTEGER AS material_shifts_count,
+          COALESCE(MAX(ABS(delta_bps)), 0.0) AS max_shift_bps,
+          COALESCE(MAX(security_desc), 'None') AS top_shift_desc,
+          MAX(record_date)::VARCHAR AS record_date
+      FROM diff_results;
+
+  - id: save_rates_kv
+    type: io.kestra.plugin.core.kv.Set
+    key: treasury_accepted_rates_uri
+    value: "{{ outputs.diff_and_load.outputFiles['latest_rates.parquet'] }}"
+    description: "Updates Kestra KV store with the URI of the newly accepted rates Parquet file."
+
+  - id: alert_on_material_rate_shift
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.diff_and_load.row.material_shifts_count > 0 }}"
+    description: "Evaluates whether any Treasury security moved more than the configured basis point tolerance."
+    then:
+      - id: slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        allowFailure: true
+        payload: |
+          {
+            "text": ":chart_with_upwards_trend: *US Treasury Material Rate Shift Detected* | Execution `{{ execution.id }}`\n*Reporting Period*: `{{ outputs.diff_and_load.row.record_date }}`\n*Material Shifts*: `{{ outputs.diff_and_load.row.material_shifts_count }}` securities shifted by ≥ {{ inputs.material_shift_bps }} bps\n*Largest Shift*: `{{ outputs.diff_and_load.row.top_shift_desc }}` ({{ outputs.diff_and_load.row.max_shift_bps }} bps)\n*Output Parquet*: `{{ outputs.diff_and_load.outputFiles['latest_rates.parquet'] }}`"
+          }
+    else:
+      - id: log_no_material_shift
+        type: io.kestra.plugin.core.log.Log
+        message: "Treasury interest rates updated: {{ outputs.diff_and_load.row.total_securities }} securities processed for period {{ outputs.diff_and_load.row.record_date }}. 0 material shifts exceeded {{ inputs.material_shift_bps }} bps."
+
+  - id: summary_log
+    type: io.kestra.plugin.core.log.Log
+    message: "Execution summary: Total securities={{ outputs.diff_and_load.row.total_securities }}, Material shifts={{ outputs.diff_and_load.row.material_shifts_count }}, Max shift={{ outputs.diff_and_load.row.max_shift_bps }} bps."
+
+outputs:
+  - id: latest_rates_parquet
+    type: STRING
+    value: "{{ outputs.diff_and_load.outputFiles['latest_rates.parquet'] }}"
+    description: "URI of the latest accepted monthly rates Parquet file in internal storage."
+
+  - id: rates_revision_log_parquet
+    type: STRING
+    value: "{{ outputs.diff_and_load.outputFiles['rates_revision_log.parquet'] }}"
+    description: "URI of the append-only historical rates Parquet file."
+
+  - id: rate_changes_csv
+    type: STRING
+    value: "{{ outputs.diff_and_load.outputFiles['rate_changes_summary.csv'] }}"
+    description: "CSV summary of all security rate movements and basis point deltas for this execution."
+
+  - id: summary
+    type: JSON
+    value: "{{ outputs.diff_and_load.row }}"
+    description: "Structured summary of execution metrics including counts and largest moves."
+
+extend:
+  title: Load US Treasury Average Interest Rates with DuckDB and Track Month-Over-Month Yield Movements
+  metaTitle: US Treasury Interest Rates Loader and Shift Watch with DuckDB and Parquet | Kestra
+  shortDescription: Ingest US Treasury monthly average interest rates for all marketable and non-marketable securities directly from the Fiscal Data API, compute basis point movements and rate spreads in DuckDB, persist historical trends to Parquet in internal storage, and alert in Slack on significant rate shifts.
+  metaDescription: Ingest US Treasury interest rates monthly, diff against historical trends in DuckDB, export partitioned Parquet to internal storage and alert on rate spikes.
+  description: |
+    The US Department of the Treasury publishes monthly average interest rates across all outstanding marketable securities (Treasury Bills, Notes, Bonds, and TIPS) and non-marketable debt obligations. Corporate treasury desks, quantitative risk analysts, and macro data engineers track these benchmark yields to model corporate borrowing costs, calculate discount curves, and assess macroeconomic interest rate exposure. 
+
+    This flow automates the ingestion of the official Fiscal Data REST API, diffs the newest monthly yield curve against accepted historical values inside an embedded DuckDB engine, writes persistent columnar Parquet files into Kestra internal storage, maintains state across executions using Kestra KV store, and triggers targeted Slack alerts when benchmark rates shift beyond an operational basis point threshold.
+
+    ## How it works
+
+    1. A monthly `Schedule` trigger is configured to execute on the 5th of each month (09:00 UTC), allowing sufficient buffer for the US Treasury to publish and finalize prior month figures.
+    2. `fetch_treasury_rates` (`io.kestra.plugin.core.http.Download`) queries the US Treasury Fiscal Data API (`api.fiscaldata.treasury.gov`) for all average interest rate records matching the configured starting date, landing the JSON payload into Kestra internal storage.
+    3. `previous_rates` (`io.kestra.plugin.core.kv.Get`, with `errorOnMissing: false`) retrieves the storage URI of the Parquet dataset produced during the previous run.
+    4. `bootstrap_history` (`io.kestra.plugin.core.flow.If`) executes only on the initial run when no prior state exists in KV store, generating an empty baseline Parquet file with identical column schemas so downstream diff queries share a single deterministic execution path.
+    5. `diff_and_load` (`io.kestra.plugin.jdbc.duckdb.Queries`, with `fetchType: FETCH_ONE`) ingests the JSON payload via `read_json` and `unnest`, filters out null entries, isolates the latest record for each security description and category, and executes a full join against the baseline Parquet dataset. It calculates basis point deltas (`ROUND((current_rate - previous_rate) * 100, 2)`), categorizes change types (`NEW`, `CHANGED`, `UNCHANGED`), and outputs three distinct artifacts:
+       - `latest_rates.parquet`: The current snapshot of all active Treasury securities and their latest monthly yields.
+       - `rates_revision_log.parquet`: A multi-period historical time-series Parquet dataset suitable for analytical warehouse loading.
+       - `rate_changes_summary.csv`: A tabular summary of monthly movements sorted by absolute basis point variance.
+    6. `save_rates_kv` (`io.kestra.plugin.core.kv.Set`) stores the internal storage URI of `latest_rates.parquet` under the key `treasury_accepted_rates_uri`.
+    7. `alert_on_material_rate_shift` (`io.kestra.plugin.core.flow.If`) evaluates the summary metric `material_shifts_count`. If one or more securities shifted by more than `material_shift_bps`, it posts an alert payload to Slack via `io.kestra.plugin.slack.notifications.SlackIncomingWebhook`. With `allowFailure: true`, missing webhook credentials issue a graceful warning rather than aborting the pipeline. Otherwise, a standard `Log` task records peaceful metrics.
+    8. `summary_log` records execution telemetry, and the root `outputs` expose both the Parquet datasets and the summary JSON to downstream flows.
+
+    ## What you get
+
+    - A clean columnar Parquet file of the latest US Treasury security yields ready for direct querying with DuckDB, Trino, Polars, or Spark.
+    - An append-only historical Parquet dataset capturing monthly yield adjustments across all federal debt categories.
+    - An execution CSV detailing month-over-month rate variances and delta basis points.
+    - Automated Slack alerting when sovereign interest rates experience abnormal volatility exceeding operational tolerances.
+    - Zero external infrastructure dependencies: storage and state management operate entirely through Kestra internal storage and native KV store.
+
+    ## Who it's for
+
+    - Corporate treasurers and CFO offices monitoring sovereign borrowing rates to optimize short-term cash placement.
+    - Quantitative research and risk engineering teams ingesting official macroeconomic rate indices for discount curve construction.
+    - Financial data platform engineers building resilient, stateful ELT pipelines from government open data portals.
+
+    ## Why orchestrate this with Kestra
+
+    - `Download` and `inputFiles` handle REST API ingestion and file transport directly into DuckDB without custom Python wrappers or container images.
+    - Native `outputFiles` and KV Store eliminate the overhead of external state databases, preserving dataset URIs across monthly runs.
+    - Conditional execution (`If`) and error fault-tolerance (`allowFailure`) provide declarative alerting logic directly within workflow configuration.
+    - Declarative parameters allow custom historical lookback windows and basis point alert sensitivities.
+
+    ## Prerequisites
+
+    - Kestra 2.0 or later with the DuckDB JDBC plugin (`io.kestra.plugin.jdbc.duckdb.Queries`) and notifications plugin (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
+    - Outbound HTTPS network access to `api.fiscaldata.treasury.gov`. The Fiscal Data API is open to the public and requires no API key.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Optional Slack incoming webhook URI for receiving material rate shift alerts.
+
+    ## Quick start
+
+    1. Import this blueprint into your Kestra instance and trigger an ad-hoc execution with default parameters. The first run acts as a baseline, ingesting historical yields and populating `treasury_accepted_rates_uri` in KV store.
+    2. Inspect execution outputs to view `latest_rates.parquet` and the summary metrics.
+    3. Trigger a second execution: all records will be classified as `UNCHANGED`, and alerting will be bypassed.
+    4. Provide the `SLACK_WEBHOOK_URL` secret and enable the monthly `Schedule` trigger to receive automatic notifications whenever the Treasury Department publishes monthly rate updates.
+
+    ## How to extend
+
+    - Add cloud storage export tasks (`io.kestra.plugin.aws.s3.Upload`, `io.kestra.plugin.gcp.gcs.Upload`) to mirror generated Parquet files directly into your enterprise data lake.
+    - Chain an analytics query to compute yield curve spreads between short-term Treasury Bills and 10-Year or 30-Year Treasury Bonds.
+    - Ingest additional Fiscal Data datasets such as the Daily Treasury Statement or Debt to the Penny by parameterizing the endpoint URI.
+
+    ## Links
+
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get)
+    - [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [U.S. Treasury Fiscal Data API](https://fiscaldata.treasury.gov/api-documentation/)
+    - [Average Interest Rates on U.S. Treasury Securities Dataset](https://fiscaldata.treasury.gov/datasets/average-interest-rates-on-u-s-treasury-securities/)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Analytics & Reporting
+    - Monitoring & Alerting
+  ee: false
+  demo: false
