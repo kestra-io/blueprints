@@ -1,0 +1,326 @@
+id: entur-station-departure-delay-sla
+namespace: company.team
+
+description: |
+  Departure punctuality SLA for the Norwegian stations your staff commute through, built on the keyless Entur Journey
+  Planner v3 GraphQL API. Every 15 minutes the flow asks for the departures of the last `lookback_minutes` at every
+  watched stop in one request, records each departure once in a DuckDB ledger with its real delay (actual time, or
+  the last realtime estimate), and scores each stop over a rolling window. It alerts when a stop falls below the
+  punctuality target and again when it recovers.
+
+inputs:
+  - id: stops
+    type: ARRAY
+    itemType: STRING
+    displayName: Watched stops
+    description: National Stop Register ids (NSR:StopPlace:...). Look them up at https://stoppested.entur.org or with the Entur geocoder. Unknown or malformed ids are reported and skipped.
+    defaults: ["NSR:StopPlace:337", "NSR:StopPlace:451", "NSR:StopPlace:59952", "NSR:StopPlace:60944", "NSR:StopPlace:548"]
+
+  - id: transport_modes
+    type: ARRAY
+    itemType: STRING
+    description: Transport modes to score (rail, bus, tram, metro, coach, water, air). Use `*` for all.
+    defaults: ["rail"]
+
+  - id: late_after_minutes
+    type: INT
+    defaults: 4
+    description: A departure is on time when it leaves less than this many minutes after the timetable (Bane NOR counts local trains as on time up to 3 min 59 s). Cancelled departures are never on time.
+
+  - id: target_punctuality_pct
+    type: FLOAT
+    defaults: 90
+    description: SLA target. A stop is in BREACH when its punctuality over the window is below this value.
+
+  - id: window_hours
+    type: INT
+    defaults: 24
+    description: Rolling window used for the SLA score. The ledger keeps 7 days.
+
+  - id: min_departures
+    type: INT
+    defaults: 10
+    description: A stop needs at least this many scored departures in the window before it can breach, so one late train at a quiet station does not page anyone.
+
+  - id: lookback_minutes
+    type: INT
+    defaults: 90
+    description: How far back each run asks for departures. Keep it well above the schedule interval so late trains are captured after they leave.
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+tasks:
+  - id: fetch_departures
+    type: io.kestra.plugin.core.http.Download
+    description: |
+      One GraphQL POST for all stops. `stopPlaces(ids)` returns the stops in input order, with `null` for an unknown id.
+      `estimatedCalls` from `startTime` = now minus `lookback_minutes` includes cancelled trips and departures only
+      (trains terminating at the stop are not departures). Entur asks every client to identify itself with `ET-Client-Name`.
+    uri: https://api.entur.io/journey-planner/v3/graphql
+    method: POST
+    contentType: application/json
+    headers:
+      ET-Client-Name: "kestra-entur-station-departure-delay-sla"
+    body: |
+      {"query": "query($ids: [String]!, $start: DateTime!, $range: Int!) { stopPlaces(ids: $ids) { id name estimatedCalls(startTime: $start, timeRange: $range, numberOfDepartures: 1000, includeCancelledTrips: true, arrivalDeparture: departures) { aimedDepartureTime expectedDepartureTime actualDepartureTime realtime cancellation serviceJourney { id line { publicCode transportMode authority { name } } } datedServiceJourney { extraJourney } } } }",
+       "variables": {"ids": {{ inputs.stops | toJson }}, "start": "{{ now() | dateAdd(0 - inputs.lookback_minutes, 'MINUTES') | date("yyyy-MM-dd'T'HH:mm:ssXXX", timeZone='UTC') }}", "range": {{ inputs.lookback_minutes * 60 }}}}
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+
+  - id: previous_ledger
+    type: io.kestra.plugin.core.kv.Get
+    key: entur_departure_sla_ledger_uri
+    errorOnMissing: false
+
+  - id: first_run
+    type: io.kestra.plugin.core.flow.If
+    description: Creates an empty ledger when the KV key is missing; that run is the BASELINE and reports the stops already in breach.
+    condition: "{{ outputs.previous_ledger.value is not defined or outputs.previous_ledger.value is empty }}"
+    then:
+      - id: init_ledger
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        outputDbFile: true
+        sql: |
+          CREATE TABLE departures (stop_id VARCHAR, stop_name VARCHAR, journey_id VARCHAR, aimed TIMESTAMPTZ, departed TIMESTAMPTZ,
+            delay_s INTEGER, cancelled BOOLEAN, measured_by VARCHAR, line VARCHAR, mode VARCHAR, operator VARCHAR,
+            first_seen TIMESTAMPTZ, PRIMARY KEY (stop_id, journey_id, aimed));
+          CREATE TABLE stop_status (stop_id VARCHAR PRIMARY KEY, status VARCHAR, since TIMESTAMPTZ);
+          CREATE TABLE runs (checked_at TIMESTAMPTZ, execution_id VARCHAR, new_departures INTEGER, unmeasured INTEGER, withdrawn_extras INTEGER);
+
+  - id: score_stops
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      A departure is scored once it has left: its delay is `actualDepartureTime` minus the timetable, or the last realtime
+      `expectedDepartureTime` when the operator does not report actuals. Calls without realtime data are counted as
+      unmeasured and left out of the score. Each departure is keyed on (stop, service journey, aimed time), so the
+      overlapping lookbacks of consecutive runs never count a train twice; a later run only refines its delay.
+      Operators add extra journeys in realtime (replacement or short-run trains) and often withdraw them again; such a
+      cancelled extra journey was never in the timetable, so it is ignored instead of counted as a cancellation.
+      Status changes (OK to BREACH, BREACH to OK) are what gets alerted.
+    databaseUri: "{{ outputs.previous_ledger.value ?? outputs.init_ledger.databaseUri }}"
+    outputDbFile: true
+    timeZoneId: UTC
+    fetchType: FETCH
+    inputFiles:
+      board.json: "{{ outputs.fetch_departures.uri }}"
+    parameters:
+      stops: "{{ inputs.stops | toJson }}"
+      modes: "{{ inputs.transport_modes | toJson }}"
+      late_s: "{{ inputs.late_after_minutes * 60 }}"
+      target: "{{ inputs.target_punctuality_pct }}"
+      window_h: "{{ inputs.window_hours }}"
+      min_deps: "{{ inputs.min_departures }}"
+      execution_id: "{{ execution.id }}"
+    sql: |
+      SET TimeZone = 'UTC';
+
+      CREATE OR REPLACE TEMP TABLE resp AS SELECT CAST(content AS JSON) AS j FROM read_text('board.json');
+
+      CREATE OR REPLACE TEMP TABLE stops AS
+      SELECT i, requested, sp, sp->>'$.id' AS stop_id, sp->>'$.name' AS stop_name
+      FROM (SELECT i, from_json(:stops, '["VARCHAR"]')[i + 1] AS requested, from_json(j->'$.data.stopPlaces', '["JSON"]')[i + 1] AS sp
+            FROM resp, range(CAST(json_array_length(:stops) AS BIGINT)) t(i));
+
+      CREATE OR REPLACE TEMP TABLE calls AS
+      SELECT stop_id, stop_name, c->>'$.serviceJourney.id' AS journey_id,
+             CAST(c->>'$.aimedDepartureTime' AS TIMESTAMPTZ) AS aimed,
+             CASE WHEN c->>'$.actualDepartureTime' IS NOT NULL THEN CAST(c->>'$.actualDepartureTime' AS TIMESTAMPTZ)
+                  WHEN CAST(c->>'$.realtime' AS BOOLEAN) THEN CAST(c->>'$.expectedDepartureTime' AS TIMESTAMPTZ) END AS departed,
+             CAST(c->>'$.cancellation' AS BOOLEAN) AS cancelled,
+             CASE WHEN c->>'$.actualDepartureTime' IS NOT NULL THEN 'actual' WHEN CAST(c->>'$.realtime' AS BOOLEAN) THEN 'estimate' END AS measured_by,
+             c->>'$.serviceJourney.line.publicCode' AS line, c->>'$.serviceJourney.line.transportMode' AS mode,
+             c->>'$.serviceJourney.line.authority.name' AS operator,
+             coalesce(CAST(c->>'$.datedServiceJourney.extraJourney' AS BOOLEAN), false) AS extra_journey
+      FROM (SELECT stop_id, stop_name, unnest(from_json(sp->'$.estimatedCalls', '["JSON"]')) AS c FROM stops WHERE sp IS NOT NULL)
+      WHERE c->>'$.serviceJourney.line.transportMode' IN (SELECT unnest(from_json(:modes, '["VARCHAR"]')))
+         OR list_contains(from_json(:modes, '["VARCHAR"]'), '*');
+
+      -- Only departures that have already left (or were cancelled and are past their timetable) are scored
+      CREATE OR REPLACE TEMP TABLE done AS
+      SELECT *, CAST(epoch(departed) - epoch(aimed) AS INTEGER) AS delay_s FROM calls
+      WHERE (cancelled AND NOT extra_journey AND aimed < now()) OR (NOT cancelled AND departed IS NOT NULL AND departed < now());
+
+      CREATE OR REPLACE TEMP TABLE new_keys AS
+      SELECT stop_id, journey_id, aimed FROM done EXCEPT SELECT stop_id, journey_id, aimed FROM departures;
+
+      INSERT INTO departures
+      SELECT stop_id, stop_name, journey_id, aimed, departed, CASE WHEN cancelled THEN NULL ELSE delay_s END, cancelled, measured_by,
+             line, mode, operator, now() FROM done
+      ON CONFLICT (stop_id, journey_id, aimed) DO UPDATE SET departed = excluded.departed, delay_s = excluded.delay_s,
+        cancelled = excluded.cancelled, measured_by = excluded.measured_by;
+      DELETE FROM departures WHERE aimed < now() - INTERVAL 7 DAY;
+
+      INSERT INTO runs SELECT now(), :execution_id, (SELECT count(*) FROM new_keys),
+        (SELECT count(*) FROM calls WHERE measured_by IS NULL AND NOT cancelled AND aimed < now() - INTERVAL 10 MINUTE),
+        (SELECT count(*) FROM calls WHERE cancelled AND extra_journey);
+
+      CREATE OR REPLACE TEMP TABLE win AS
+      SELECT * FROM departures WHERE aimed >= now() - to_hours(CAST(:window_h AS BIGINT))
+        AND stop_id IN (SELECT stop_id FROM stops WHERE sp IS NOT NULL)
+        AND (mode IN (SELECT unnest(from_json(:modes, '["VARCHAR"]'))) OR list_contains(from_json(:modes, '["VARCHAR"]'), '*'));
+
+      CREATE OR REPLACE TEMP TABLE line_score AS
+      SELECT stop_id, line, count(*) AS deps, round(100.0 * count(*) FILTER (WHERE NOT cancelled AND delay_s < CAST(:late_s AS INTEGER)) / count(*), 1) AS pct
+      FROM win GROUP BY ALL;
+
+      CREATE OR REPLACE TEMP TABLE score AS
+      SELECT s.stop_id, s.stop_name, count(w.stop_id) AS departures,
+             count(*) FILTER (WHERE NOT w.cancelled AND w.delay_s < CAST(:late_s AS INTEGER)) AS on_time,
+             count(*) FILTER (WHERE w.cancelled) AS cancelled,
+             round(100.0 * count(*) FILTER (WHERE NOT w.cancelled AND w.delay_s < CAST(:late_s AS INTEGER)) / nullif(count(w.stop_id), 0), 1) AS punctuality_pct,
+             round(quantile_cont(w.delay_s, 0.9) / 60.0, 1) AS p90_delay_min,
+             round(max(w.delay_s) / 60.0, 1) AS max_delay_min,
+             (SELECT string_agg(line || ' ' || pct || '% of ' || deps, ', ' ORDER BY pct, deps DESC) FROM
+                (SELECT * FROM line_score l WHERE l.stop_id = s.stop_id AND l.deps >= 3 AND l.pct < CAST(:target AS DOUBLE) ORDER BY pct, deps DESC LIMIT 3)) AS worst_lines
+      FROM stops s LEFT JOIN win w ON w.stop_id = s.stop_id
+      WHERE s.sp IS NOT NULL GROUP BY s.i, s.stop_id, s.stop_name ORDER BY s.i;
+
+      CREATE OR REPLACE TEMP TABLE changes AS
+      SELECT sc.*, CASE WHEN sc.departures < CAST(:min_deps AS INTEGER) THEN coalesce(st.status, 'OK')
+                        WHEN sc.punctuality_pct < CAST(:target AS DOUBLE) THEN 'BREACH' ELSE 'OK' END AS status,
+             coalesce(st.status, 'OK') AS previous_status, st.since
+      FROM score sc LEFT JOIN stop_status st USING (stop_id);
+
+      INSERT INTO stop_status SELECT stop_id, status, now() FROM changes
+      ON CONFLICT (stop_id) DO UPDATE SET status = excluded.status, since = CASE WHEN stop_status.status = excluded.status THEN stop_status.since ELSE excluded.since END;
+
+      CREATE OR REPLACE TEMP TABLE alerts AS
+      SELECT *, CASE WHEN status = 'BREACH' THEN 'BREACH ' ELSE 'RECOVERED ' END
+             || '*' || stop_name || '*: ' || punctuality_pct || '% on time (target ' || CAST(:target AS DOUBLE) || '%), '
+             || departures || ' departures in ' || CAST(:window_h AS INTEGER) || ' h, ' || cancelled || ' cancelled, p90 delay '
+             || coalesce(CAST(p90_delay_min AS VARCHAR), '-') || ' min, worst ' || coalesce(CAST(max_delay_min AS VARCHAR), '-') || ' min'
+             || coalesce('. Worst lines: ' || worst_lines, '') AS line
+      FROM changes WHERE status <> previous_status;
+
+      SELECT stop_id, stop_name, status, departures, on_time, cancelled, punctuality_pct, p90_delay_min, max_delay_min, worst_lines FROM changes;
+
+      SELECT (SELECT count(*) FROM runs) = 1 AS is_baseline,
+             (SELECT new_departures FROM runs ORDER BY checked_at DESC LIMIT 1) AS new_departures,
+             (SELECT unmeasured FROM runs ORDER BY checked_at DESC LIMIT 1) AS unmeasured,
+             (SELECT withdrawn_extras FROM runs ORDER BY checked_at DESC LIMIT 1) AS withdrawn_extras,
+             (SELECT count(*) FROM departures) AS ledger_departures,
+             (SELECT coalesce(string_agg(requested, ', '), '') FROM stops WHERE sp IS NULL) AS unknown_stops,
+             (SELECT string_agg(stop_name || ' ' || coalesce(CAST(punctuality_pct AS VARCHAR), '-') || '% (' || departures || ', ' || status || ')', '; ') FROM changes) AS scoreboard,
+             (SELECT count(*) FROM alerts) AS alert_count,
+             (SELECT coalesce(string_agg(line, chr(10) ORDER BY status DESC, stop_name), '') FROM alerts) AS alert_text;
+
+  - id: save_ledger
+    type: io.kestra.plugin.core.kv.Set
+    key: entur_departure_sla_ledger_uri
+    value: "{{ outputs.score_stops.databaseUri }}"
+
+  - id: notify
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.score_stops.outputs[1].rows[0].alert_count > 0 }}"
+    then:
+      - id: log_alerts
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.score_stops.outputs[1].rows[0].alert_text }}"
+
+      - id: slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": {{ ('*Departure punctuality SLA (Entur)*' ~ (outputs.score_stops.outputs[1].rows[0].is_baseline ? ' (first run)' : '') ~ '\n' ~ outputs.score_stops.outputs[1].rows[0].alert_text) | toJson }}}
+    else:
+      - id: no_change
+        type: io.kestra.plugin.core.log.Log
+        message: "No SLA status change. {{ outputs.score_stops.outputs[1].rows[0].scoreboard }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ outputs.score_stops.outputs[1].rows[0].is_baseline ? 'BASELINE run. ' : '' }}{{ outputs.score_stops.outputs[1].rows[0].new_departures }} new departures scored,
+      {{ outputs.score_stops.outputs[1].rows[0].unmeasured }} without realtime data, {{ outputs.score_stops.outputs[1].rows[0].withdrawn_extras }} withdrawn extra trips ignored, {{ outputs.score_stops.outputs[1].rows[0].ledger_departures }} in the ledger.
+      {{ outputs.score_stops.outputs[1].rows[0].scoreboard }}{{ outputs.score_stops.outputs[1].rows[0].unknown_stops != '' ? '. Unknown stop ids: ' ~ outputs.score_stops.outputs[1].rows[0].unknown_stops : '' }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.score_stops.outputs[1].rows[0] }}"
+  - id: stops
+    type: JSON
+    value: "{{ outputs.score_stops.outputs[0].rows }}"
+  - id: ledger
+    type: FILE
+    value: "{{ outputs.score_stops.databaseUri }}"
+
+extend:
+  title: Entur Station Departure Punctuality SLA for Norwegian Rail
+  metaTitle: Entur Departure Delay and Punctuality SLA Monitor | Kestra
+  shortDescription: Every 15 minutes, record the real departures at your Norwegian stations from the Entur Journey Planner, score punctuality over a rolling window in DuckDB and alert when a stop breaches or recovers its SLA.
+  metaDescription: Score departure punctuality at Norwegian stations from Entur realtime data in DuckDB and alert on Slack when a stop breaches or recovers its SLA.
+  description: |
+    A departure board shows what is late now, not whether your staff's station has been reliable today. This flow turns the keyless Entur Journey Planner, which covers every Norwegian operator, into a punctuality SLA per stop. You are alerted only when a stop's status changes.
+
+    ## How it works
+
+    1. A `Schedule` trigger runs every 15 minutes.
+    2. `fetch_departures` (HTTP Download) sends one GraphQL POST for all watched stops: `stopPlaces(ids)` with `estimatedCalls` from now minus `lookback_minutes`, departures only, cancelled trips included.
+    3. `previous_ledger` (KV Get) reads the DuckDB ledger URI. `first_run` (If) creates an empty ledger when it is missing; that run is the BASELINE and reports the stops already in breach.
+    4. `score_stops` (DuckDB):
+       - Unknown or malformed stop ids come back as `null` and are listed as unknown.
+       - A departure counts once it has left. Its delay is `actualDepartureTime` minus the timetable, or the last realtime estimate when the operator reports no actual. Calls with no realtime data are counted as unmeasured, not as on time.
+       - Departures are keyed on stop, service journey and aimed time, so overlapping lookbacks never count a train twice.
+       - Extra journeys that an operator adds in realtime and then withdraws were never timetabled, so they are ignored instead of counted as cancellations.
+       - Per stop over `window_hours`: punctuality (left less than `late_after_minutes` late, cancellations count as late), cancellations, p90 and worst delay, and the worst lines. A stop with at least `min_departures` departures is in BREACH below `target_punctuality_pct`.
+    5. `save_ledger` (KV Set) stores the new ledger URI.
+    6. `notify` (If) logs BREACH and RECOVERED changes at WARN and posts them to Slack, or logs the scoreboard when nothing changed.
+
+    ## What you get
+
+    - One alert per status change, not one per late train.
+    - A DuckDB ledger (flow output `ledger`) with 7 days of departures and delays.
+    - Flow outputs `summary` and `stops` as JSON.
+
+    ## Who it's for
+
+    - Facilities and workplace teams with offices near Norwegian stations.
+    - Rail operations analysts and commuter benefit or travel teams.
+
+    ## Why orchestrate this with Kestra
+
+    - One retried request per run, the ledger in KV, the SLA rules in readable SQL, and each run's ledger file kept for inspection.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB and Slack plugins, and outbound HTTPS to `api.entur.io` (no API key).
+    - Entur asks clients to send `ET-Client-Name` as `company-application`; change it to your own name.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the alerts (optional; without it the Slack task warns and the run continues).
+
+    ## Quick start
+
+    1. **Execute** with the defaults (Oslo S, Lillestrøm, Drammen, Ski, Bergen, rail only): a BASELINE scored on the last 90 minutes.
+    2. Execute again a few minutes later: no status change, and the scoreboard is logged.
+    3. Add `NSR:StopPlace:58366` (Jernbanetorget) with `transport_modes` set to `*` to score metro, tram and bus too.
+    4. Put in your stops, add `SLACK_WEBHOOK_URL` and keep the schedule on; the window fills up over the first day.
+
+    ## How to extend
+
+    - Use `late_after_minutes: 6` for long-distance trains.
+    - Add `situations` to the query to attach the operator's disruption message to each breach.
+
+    ## Links
+
+    - [Entur Journey Planner v3](https://developer.entur.org/pages-journeyplanner-journeyplanner) and the [GraphQL IDE](https://api.entur.io/graphql-explorer/journey-planner-v3)
+    - [National Stop Register](https://stoppested.entur.org/)
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download) and [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
