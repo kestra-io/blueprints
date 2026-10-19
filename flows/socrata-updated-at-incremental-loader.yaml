@@ -1,0 +1,349 @@
+id: socrata-updated-at-incremental-loader
+namespace: company.team
+
+description: |
+  Row-level change data capture for any Socrata open data portal. Socrata stamps every row
+  with a system field `:updated_at` that moves on inserts and on edits, so filtering on it
+  catches corrected and re-statused records that an "append new ids" loader misses. The flow
+  counts the changes since the stored cursor, pages them with keyset pagination, upserts
+  them by business key into a Parquet table in internal storage, then moves the cursor.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: domain
+    type: STRING
+    defaults: data.cityofchicago.org
+    validator: "^[A-Za-z0-9.-]+$"
+    description: Socrata portal host without https:// (for example data.cityofnewyork.us, data.sf.gov, data.transportation.gov).
+
+  - id: dataset_id
+    type: STRING
+    defaults: ydr8-5enu
+    validator: "^[a-z0-9]{4}-[a-z0-9]{4}$"
+    description: Four-by-four dataset id from the dataset URL. The default is Chicago Building Permits.
+
+  - id: key_column
+    type: STRING
+    defaults: id
+    description: Business key used for the upsert (a dataset column name). Use `_row_id` to key on the Socrata row id instead.
+
+  - id: track_column
+    type: STRING
+    defaults: permit_status
+    description: Column whose old -> new transitions are summarised for updated rows (for example a status column). Skipped when the dataset has no such column.
+
+  - id: initial_lookback_days
+    type: INT
+    defaults: 7
+    description: First run only (no cursor yet). Loads rows changed in the last N days instead of the whole dataset.
+
+  - id: page_size
+    type: INT
+    defaults: 1000
+    description: Rows per SoQL page (Socrata allows up to 50,000).
+
+  - id: max_rows
+    type: INT
+    defaults: 50000
+    description: Safety limit. More changed rows than this usually means a bulk re-publish or a backlog too large for one run; the flow stops without moving the cursor so you can decide on a full reload.
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 * * * *"
+
+tasks:
+  - id: get_cursor
+    type: io.kestra.plugin.core.kv.Get
+    key: "socrata_cursor_{{ inputs.domain }}_{{ inputs.dataset_id }}"
+    errorOnMissing: false
+
+  - id: get_table
+    type: io.kestra.plugin.core.kv.Get
+    key: "socrata_table_{{ inputs.domain }}_{{ inputs.dataset_id }}"
+    errorOnMissing: false
+    description: Internal-storage URI of the Parquet table written by the last load. Missing on the first run.
+
+  - id: since
+    type: io.kestra.plugin.core.debug.Return
+    description: The lower bound of this run, computed once so every task uses the same value. Stored cursor, or now minus the lookback on the first run.
+    format: "{{ outputs.get_cursor.value ?? (now() | dateAdd(-inputs.initial_lookback_days, 'DAYS') | date(\"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'\", timeZone='UTC')) }}"
+
+  - id: count_changes
+    type: io.kestra.plugin.core.http.Request
+    description: One aggregate SoQL call returns how many rows changed and the newest `:updated_at`. That value becomes the upper bound, so rows edited while the run pages are left for the next run.
+    uri: "https://{{ inputs.domain }}/resource/{{ inputs.dataset_id }}.json?$select={{ 'count(*) AS n, max(:updated_at) AS hw' | urlencode }}&$where={{ (\":updated_at > '\" ~ outputs.since.value ~ \"'\") | urlencode }}"
+    headers:
+      Accept: application/json
+      User-Agent: kestra-socrata-incremental-loader
+
+  - id: route
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{% set n = fromJson(outputs.count_changes.body)[0].n | number %}{{ n == 0 ? 'NONE' : (n > inputs.max_rows ? 'TOO_MANY' : 'LOAD') }}"
+    cases:
+      NONE:
+        - id: nothing_new
+          type: io.kestra.plugin.core.log.Log
+          message: "{{ inputs.domain }}/{{ inputs.dataset_id }}: no rows changed since {{ outputs.since.value }}. Cursor unchanged."
+
+      TOO_MANY:
+        - id: alert_bulk_rewrite
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          allowFailure: true
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: |
+            {"text": ":warning: Socrata {{ inputs.domain }}/{{ inputs.dataset_id }}: {{ fromJson(outputs.count_changes.body)[0].n }} rows changed since {{ outputs.since.value }}, above max_rows={{ inputs.max_rows }}. Likely a bulk re-publish or a window too large for one run; cursor NOT moved."}
+        - id: stop_bulk_rewrite
+          type: io.kestra.plugin.core.execution.Fail
+          errorMessage: "{{ fromJson(outputs.count_changes.body)[0].n }} changed rows exceed max_rows={{ inputs.max_rows }}. Raise max_rows or run a full reload; the cursor was not moved."
+
+      LOAD:
+        - id: fetch_changes
+          type: io.kestra.plugin.scripts.python.Script
+          description: |
+            Keyset pagination on (`:updated_at`, `:id`) between the cursor and the upper bound. Offsets
+            would skip rows when a record is edited mid-run and leaves the window; a keyset cannot.
+            Socrata returns many rows with the same millisecond, so the row id breaks ties.
+            CSV keeps every column on every row (JSON omits nulls). Standard library only.
+          containerImage: python:3.13-slim
+          env:
+            DOMAIN: "{{ inputs.domain }}"
+            DATASET: "{{ inputs.dataset_id }}"
+            SINCE: "{{ outputs.since.value }}"
+            UNTIL: "{{ fromJson(outputs.count_changes.body)[0].hw }}"
+            EXPECTED: "{{ fromJson(outputs.count_changes.body)[0].n }}"
+            PAGE_SIZE: "{{ inputs.page_size }}"
+            KEY_COLUMN: "{{ inputs.key_column }}"
+            TRACK_COLUMN: "{{ inputs.track_column }}"
+          outputFiles:
+            - changes.csv
+          script: |
+            import csv, io, json, os, time, urllib.error, urllib.parse, urllib.request
+
+            base = f"https://{os.environ['DOMAIN']}/resource/{os.environ['DATASET']}.csv"
+            since, until, size = os.environ["SINCE"], os.environ["UNTIL"], int(os.environ["PAGE_SIZE"])
+
+            def get(params):
+                url = base + "?" + urllib.parse.urlencode(params)
+                for attempt in range(5):
+                    try:
+                        req = urllib.request.Request(url, headers={"User-Agent": "kestra-socrata-incremental-loader"})
+                        with urllib.request.urlopen(req, timeout=60) as r:
+                            return list(csv.reader(io.StringIO(r.read().decode("utf-8"))))
+                    except urllib.error.HTTPError as e:
+                        if e.code not in (429, 500, 502, 503, 504) or attempt == 4:
+                            raise SystemExit(f"Socrata HTTP {e.code}: {e.read()[:300]!r}")
+                    time.sleep(2 ** attempt)
+
+            header, rows, pages, last = None, [], 0, None
+            while True:
+                where = f":updated_at <= '{until}' AND " + (
+                    f":updated_at > '{since}'" if last is None else
+                    f"(:updated_at > '{last[0]}' OR (:updated_at = '{last[0]}' AND :id > '{last[1]}'))")
+                page = get({"$select": ":*, *", "$where": where, "$order": ":updated_at, :id", "$limit": size})
+                pages += 1
+                header = header or page[0]
+                body = page[1:]
+                rows += body
+                if len(body) < size:
+                    break
+                last = (body[-1][header.index(":updated_at")], body[-1][header.index(":id")])
+                time.sleep(0.3)
+
+            # Socrata system fields start with ':' (":id", ":@computed_region_..."); DuckDB-safe names
+            columns = ["_row_id" if c == ":id" else "_" + c.lstrip(":@") if c.startswith(":") else c for c in header]
+            if os.environ["KEY_COLUMN"] not in columns:
+                raise SystemExit(f"key_column '{os.environ['KEY_COLUMN']}' not in dataset. Columns: {', '.join(columns)}")
+            track = os.environ["TRACK_COLUMN"] if os.environ["TRACK_COLUMN"] in columns else ""
+            if not track:
+                print(f"track_column '{os.environ['TRACK_COLUMN']}' not in dataset, transitions skipped")
+            with open("changes.csv", "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(columns)
+                w.writerows(rows)
+
+            print(f"{len(rows)} rows in {pages} page(s), expected {os.environ['EXPECTED']} (fewer means rows were edited again during the run; they are picked up next run)")
+            print("::" + json.dumps({"outputs": {"rows": len(rows), "pages": pages, "track": track}}) + "::")
+
+        - id: bootstrap
+          type: io.kestra.plugin.core.flow.If
+          description: First run only. Writes an empty Parquet table so the merge below has one code path.
+          condition: "{{ outputs.get_table.value is not defined or outputs.get_table.value is empty }}"
+          then:
+            - id: empty_table
+              type: io.kestra.plugin.jdbc.duckdb.Queries
+              url: "jdbc:duckdb:"
+              outputFiles:
+                - table
+              sql: |
+                COPY (SELECT CAST(NULL AS VARCHAR) AS "{{ inputs.key_column }}" WHERE false) TO '{{ outputFiles.table }}' (FORMAT PARQUET);
+
+        - id: upsert
+          type: io.kestra.plugin.jdbc.duckdb.Queries
+          description: |
+            Every column is read as VARCHAR (Socrata serialises all values as text) and tables are
+            combined with UNION ALL BY NAME, so a column added by the publisher does not break the
+            merge. The newest version of each key wins. Rows created after the cursor are INSERTED,
+            the rest UPDATED; for updated rows already in the table the old -> new value of
+            `track_column` is recorded.
+          url: "jdbc:duckdb:"
+          fetchType: FETCH_ONE
+          inputFiles:
+            changes.csv: "{{ outputs.fetch_changes.outputFiles['changes.csv'] }}"
+            previous.parquet: "{{ outputs.get_table.value ?? outputs.empty_table.outputFiles.table }}"
+          outputFiles:
+            - table
+            - changes
+          parameters:
+            since: "{{ outputs.since.value }}"
+          sql: |
+            CREATE TABLE fetched AS SELECT * FROM read_csv('changes.csv', header = true, all_varchar = true);
+
+            -- If the key is not unique in the source (several rows per permit, say) only the newest row per key survives; counted as duplicate_keys.
+            CREATE TABLE batch AS
+            SELECT * FROM fetched
+            QUALIFY row_number() OVER (PARTITION BY "{{ inputs.key_column }}" ORDER BY _updated_at DESC, _row_id DESC) = 1;
+
+            -- Batch columns first, so the bootstrap file or an older table still has every current column.
+            CREATE TABLE previous AS
+            SELECT * FROM (SELECT * FROM batch LIMIT 0) UNION ALL BY NAME SELECT * FROM read_parquet('previous.parquet');
+
+            CREATE TABLE changed AS
+            SELECT CASE WHEN b._created_at > :since THEN 'INSERTED' ELSE 'UPDATED' END AS change_type,
+                   b."{{ inputs.key_column }}" AS row_key,
+                   b._updated_at AS updated_at,
+                   {% if outputs.fetch_changes.vars.track is not empty %}p."{{ outputs.fetch_changes.vars.track }}"{% else %}CAST(NULL AS VARCHAR){% endif %} AS old_value,
+                   {% if outputs.fetch_changes.vars.track is not empty %}b."{{ outputs.fetch_changes.vars.track }}"{% else %}CAST(NULL AS VARCHAR){% endif %} AS new_value,
+                   p."{{ inputs.key_column }}" IS NOT NULL AS was_loaded
+            FROM batch b
+            LEFT JOIN previous p USING ("{{ inputs.key_column }}");
+
+            COPY (
+              SELECT * FROM previous WHERE "{{ inputs.key_column }}" NOT IN (SELECT "{{ inputs.key_column }}" FROM batch)
+              UNION ALL BY NAME
+              SELECT * FROM batch
+            ) TO '{{ outputFiles.table }}' (FORMAT PARQUET);
+
+            COPY (SELECT * FROM changed ORDER BY updated_at, row_key) TO '{{ outputFiles.changes }}' (HEADER, DELIMITER ',');
+
+            SELECT
+              (SELECT count(*) FROM previous) = 0 AS is_baseline,
+              count(*) AS rows_changed,
+              (SELECT count(*) FROM fetched) - count(*) AS duplicate_keys,
+              count(*) FILTER (WHERE change_type = 'INSERTED') AS inserted,
+              count(*) FILTER (WHERE change_type = 'UPDATED') AS updated,
+              count(*) FILTER (WHERE change_type = 'UPDATED' AND was_loaded) AS updated_known_rows,
+              (SELECT count(*) FROM previous WHERE "{{ inputs.key_column }}" NOT IN (SELECT "{{ inputs.key_column }}" FROM batch))
+                + count(*) AS table_rows,
+              coalesce((SELECT string_agg(t, '; ') FROM (
+                SELECT coalesce(old_value, '?') || ' -> ' || coalesce(new_value, '?') || ' x' || count(*) AS t
+                FROM changed WHERE was_loaded AND old_value IS DISTINCT FROM new_value
+                GROUP BY old_value, new_value ORDER BY count(*) DESC LIMIT 5)), '') AS top_transitions
+            FROM changed;
+
+        - id: save_table
+          type: io.kestra.plugin.core.kv.Set
+          key: "socrata_table_{{ inputs.domain }}_{{ inputs.dataset_id }}"
+          value: "{{ outputs.upsert.outputFiles.table }}"
+
+        - id: move_cursor
+          type: io.kestra.plugin.core.kv.Set
+          description: Moved only after the table is saved; a failed run re-reads the same window.
+          key: "socrata_cursor_{{ inputs.domain }}_{{ inputs.dataset_id }}"
+          value: "{{ fromJson(outputs.count_changes.body)[0].hw }}"
+
+        - id: notify
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          allowFailure: true
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          payload: |
+            {"text": "Socrata {{ inputs.domain }}/{{ inputs.dataset_id }}{{ outputs.upsert.outputs[0].row.is_baseline ? ' (baseline)' : '' }}: {{ outputs.upsert.outputs[0].row.inserted }} inserted, {{ outputs.upsert.outputs[0].row.updated }} updated since {{ outputs.since.value }}. Table now {{ outputs.upsert.outputs[0].row.table_rows }} rows, cursor {{ fromJson(outputs.count_changes.body)[0].hw }}.{{ outputs.upsert.outputs[0].row.top_transitions is empty ? '' : ' ' ~ outputs.fetch_changes.vars.track ~ ': ' ~ outputs.upsert.outputs[0].row.top_transitions }}"}
+
+        - id: summary
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            {{ inputs.domain }}/{{ inputs.dataset_id }} window ({{ outputs.since.value }}, {{ fromJson(outputs.count_changes.body)[0].hw }}]{{ outputs.upsert.outputs[0].row.is_baseline ? ', BASELINE' : '' }}
+            Fetched {{ outputs.fetch_changes.vars.rows }} rows in {{ outputs.fetch_changes.vars.pages }} page(s); {{ outputs.upsert.outputs[0].row.rows_changed }} keys: {{ outputs.upsert.outputs[0].row.inserted }} inserted, {{ outputs.upsert.outputs[0].row.updated }} updated ({{ outputs.upsert.outputs[0].row.updated_known_rows }} already in the table), {{ outputs.upsert.outputs[0].row.duplicate_keys }} duplicate key rows collapsed. Table rows: {{ outputs.upsert.outputs[0].row.table_rows }}.
+            {{ outputs.fetch_changes.vars.track is empty ? '' : outputs.fetch_changes.vars.track ~ ' transitions: ' ~ (outputs.upsert.outputs[0].row.top_transitions is empty ? 'none' : outputs.upsert.outputs[0].row.top_transitions) }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.upsert.outputs[0].row ?? {'rows_changed': 0} }}"
+  - id: table_parquet
+    type: STRING
+    value: "{{ outputs.upsert.outputFiles.table ?? outputs.get_table.value ?? '' }}"
+  - id: changes_csv
+    type: STRING
+    value: "{{ outputs.upsert.outputFiles.changes ?? '' }}"
+
+extend:
+  title: Incremental Socrata Loader with :updated_at Change Data Capture and DuckDB Upserts
+  metaTitle: Socrata :updated_at Incremental Loader with DuckDB Upserts | Kestra
+  shortDescription: Load only the rows that changed in any Socrata open data dataset, inserts and edits alike, by filtering on the `:updated_at` system field, paging with a keyset and upserting by key into a Parquet table.
+  metaDescription: Load inserts and edits from any Socrata dataset via the :updated_at system field, keyset paging, DuckDB upserts by key, a KV cursor and Slack.
+  description: |
+    Loaders that append unseen ids miss edits: a permit moving from ACTIVE to COMPLETE never reaches the warehouse. Socrata stamps every row with the system field `:updated_at`, which moves on inserts and on edits. This flow uses it as a change data capture cursor for any Socrata portal and dataset. In the Chicago Building Permits default, about 70% of a week's changed rows are edits to older permits.
+
+    ## How it works
+
+    1. An hourly `Schedule`; `concurrency.limit: 1` stops two runs moving one cursor.
+    2. `get_cursor` and `get_table` (KV Get) read the last `:updated_at` loaded and the Parquet table URI. With no cursor, `since` starts `initial_lookback_days` ago.
+    3. `count_changes` (HTTP Request) sends one SoQL aggregate, `count(*)` and `max(:updated_at)` where `:updated_at > since`. The max bounds this run.
+    4. `route` (Switch): `NONE` logs; `TOO_MANY` (above `max_rows`) posts to Slack and `Fail`s without moving the cursor; `LOAD` continues.
+    5. `fetch_changes` (Python, stdlib) pages the window as CSV with a keyset on (`:updated_at`, `:id`) instead of `$offset`: many rows share a millisecond, and offsets skip rows edited mid-run. It retries 429/5xx, renames `:id` to `_row_id` and checks `key_column` exists.
+    6. `bootstrap` (If) writes an empty table on the first run. `upsert` (DuckDB) reads all columns as text, keeps the newest row per key, labels rows created after the cursor `INSERTED` and the rest `UPDATED`, records old and new `track_column` values and merges with `UNION ALL BY NAME` (new columns are safe).
+    7. `save_table`, then `move_cursor`: a failed run re-reads the same window. `notify` posts counts to Slack.
+
+    ## What you get
+
+    - A Parquet table with the latest version of each key and a CSV of every run's changes.
+    - Inserts and updates counted apart, top status transitions, duplicate keys reported.
+    - A stop before a bulk re-publish reloads everything.
+
+    ## Who it's for
+
+    - Data engineers loading Socrata datasets (permits, 311, inspections) into a warehouse.
+    - Analysts who need current status, not the first value seen.
+
+    ## Why orchestrate this with Kestra
+
+    - Cursor and table live in KV per portal and dataset; one flow serves many datasets.
+    - Switch, If and Fail make the guard rails visible; retries and Slack `allowFailure` are declared.
+
+    ## Prerequisites
+
+    - A Docker task runner (`python:3.13-slim`, no packages) and the DuckDB and Slack plugins.
+    - HTTPS to the portal. No key is needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: webhook for summaries and bulk-change alerts (optional; without it the load still succeeds).
+
+    ## Quick start
+
+    1. Execute with defaults: a 7-day baseline of Chicago Building Permits, about 2,200 rows in 3 pages.
+    2. Execute again: `NONE` (Chicago publishes daily).
+    3. Try `domain=data.sf.gov`, `dataset_id=i98e-djp9`, `key_column=permit_number`, `track_column=status`: SF repeats permits (`duplicate_keys`); `_row_id` keeps every row.
+    4. Add the Slack secret and leave the schedule on.
+
+    ## How to extend
+
+    - Send an `X-App-Token` header from a secret for higher rate limits.
+    - Merge the changes CSV into Postgres, Snowflake or BigQuery.
+    - Deletes do not move `:updated_at`; reconcile with a weekly `$select=:id` scan.
+
+    ## Links
+
+    - [SoQL queries](https://dev.socrata.com/docs/queries/), [system fields](https://dev.socrata.com/docs/system-fields), [Chicago Building Permits](https://data.cityofchicago.org/d/ydr8-5enu), [app tokens](https://dev.socrata.com/docs/app-tokens)
+    - [Switch](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch), [HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request), [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script), [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries), [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Day 2 Operations
+  ee: false
+  demo: false
