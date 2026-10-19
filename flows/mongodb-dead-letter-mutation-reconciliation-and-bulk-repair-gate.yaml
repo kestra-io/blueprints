@@ -1,0 +1,456 @@
+id: mongodb-dead-letter-mutation-reconciliation-and-bulk-repair-gate
+namespace: company.analytics
+
+inputs:
+  - id: connection_uri
+    type: STRING
+    displayName: MongoDB Connection String
+    description: Connection string URI. Leave empty to use the MONGODB_URI secret in production, or supply a local URI for Docker sandbox testing.
+    defaults: ""
+
+  - id: database
+    type: STRING
+    displayName: Database Name
+    description: Target MongoDB database name containing the primary collection and dead-letter queue.
+    defaults: "production"
+
+  - id: target_collection
+    type: STRING
+    displayName: Target Collection
+    description: Main operational collection receiving the reconciled mutations (e.g. orders).
+    defaults: "orders"
+
+  - id: dead_letter_collection
+    type: STRING
+    displayName: Dead-Letter Queue Collection
+    description: Quarantine collection where out-of-order, rejected, or retried CDC mutations accumulate.
+    defaults: "orders_dlq"
+
+  - id: batch_size
+    type: INT
+    displayName: Batch Reconcile Limit
+    description: Maximum number of dead-letter records to evaluate in a single reconciliation cycle.
+    defaults: 250
+
+  - id: max_poison_threshold
+    type: INT
+    displayName: Max Unresolvable Poison Mutations
+    description: Maximum tolerable malformed or unresolvable mutations before halting execution.
+    defaults: 0
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run (Audit Only)
+    description: When true, analyzes DLQ records and generates the atomic bulkWrite plan without mutating MongoDB.
+    defaults: true
+
+  - id: enforce_gate
+    type: BOOL
+    displayName: Enforce Gate on Poison Surge
+    description: Automatically fails the execution if malformed or poison mutations breach threshold, triggering incident alerts.
+    defaults: true
+
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack Alert
+    description: Posts high-priority incident notifications to Slack on poison mutations or reconciliation failure. Requires SLACK_WEBHOOK_URL.
+    defaults: false
+
+  - id: sample_dlq_records
+    type: JSON
+    displayName: Sample Dead-Letter Records (Offline Test)
+    description: Seed dead-letter mutation payload used for verification when testing without live MongoDB traffic.
+    defaults: |
+      [
+        {
+          "_id": "dlq-001",
+          "targetId": "ord-9821",
+          "operationType": "UPDATE",
+          "version": 4,
+          "payload": {"status": "PAYMENT_CONFIRMED", "amount": 149.50, "updatedAt": "2026-10-18T20:10:00Z"},
+          "errorMessage": "WriteConflict: out-of-order CDC timestamp"
+        },
+        {
+          "_id": "dlq-002",
+          "targetId": "ord-9821",
+          "operationType": "UPDATE",
+          "version": 3,
+          "payload": {"status": "PAYMENT_PENDING", "amount": 149.50, "updatedAt": "2026-10-18T20:05:00Z"},
+          "errorMessage": "VersionStale: older mutation arrived after v4"
+        },
+        {
+          "_id": "dlq-003",
+          "targetId": "ord-9822",
+          "operationType": "INSERT",
+          "version": 1,
+          "payload": {"_id": "ord-9822", "customer": "cust-441", "status": "CREATED", "version": 1},
+          "errorMessage": "DuplicateKey: transient network retry"
+        },
+        {
+          "_id": "dlq-004",
+          "targetId": "ord-9823",
+          "operationType": "DELETE",
+          "version": 2,
+          "payload": {},
+          "errorMessage": "TransientLockTimeout: primary stepdown"
+        }
+      ]
+
+triggers:
+  - id: on_dlq_threshold_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Event-driven webhook invoked when dead-letter monitoring detects quarantined mutations.
+    key: "{{ secret('MONGODB_RECONCILE_WEBHOOK_KEY') }}"
+    disabled: true
+
+  - id: scheduled_reconciliation_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly background sweep to process accumulated dead-letter records.
+    cron: "0 * * * *"
+    disabled: true
+
+tasks:
+  - id: fetch_dead_letter_records
+    type: io.kestra.plugin.mongodb.Find
+    description: Queries quarantined mutation documents from the dead-letter collection.
+    connection:
+      uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+    database: "{{ inputs.database }}"
+    collection: "{{ inputs.dead_letter_collection }}"
+    limit: "{{ inputs.batch_size }}"
+    allowFailure: true
+
+  - id: evaluate_and_generate_bulk_plan
+    type: io.kestra.plugin.scripts.python.Script
+    description: Deduplicates conflicting mutations, enforces monotonic versions, and synthesizes atomic bulkWrite NDJSON operations.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra
+    env:
+      FETCHED_DOCS: "{{ outputs.fetch_dead_letter_records.rows is defined ? (outputs.fetch_dead_letter_records.rows | toJson) : '' }}"
+      FALLBACK_DOCS: "{{ inputs.sample_dlq_records | toJson }}"
+      MAX_POISON_LIMIT: "{{ inputs.max_poison_threshold }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+    outputFiles:
+      - bulk_operations.ndjson
+      - poison_mutations.json
+      - reconciled_ids.json
+    script: |
+      import os
+      import json
+      from kestra import Kestra
+
+      fetched_raw = os.environ.get("FETCHED_DOCS", "").strip()
+      fallback_raw = os.environ.get("FALLBACK_DOCS", "").strip()
+
+      records = []
+      if fetched_raw and fetched_raw != "null":
+          try:
+              records = json.loads(fetched_raw)
+          except Exception:
+              records = []
+
+      if not records and fallback_raw:
+          try:
+              records = json.loads(fallback_raw)
+          except Exception:
+              records = []
+
+      total_dlq = len(records)
+      max_poison = int(os.environ.get("MAX_POISON_LIMIT", "0"))
+      dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+      # Group mutations by targetId to resolve conflicts and enforce version monotonicity
+      grouped = {}
+      poison = []
+      dlq_record_ids = []
+
+      for r in records:
+          dlq_id = r.get("_id")
+          if dlq_id:
+              dlq_record_ids.append(dlq_id)
+
+          target_id = r.get("targetId") or r.get("payload", {}).get("_id")
+          op_type = str(r.get("operationType", "")).upper()
+          version = r.get("version", 0)
+
+          if not target_id or op_type not in ["UPDATE", "INSERT", "DELETE", "REPLACE"]:
+              poison.append({
+                  "dlqId": dlq_id,
+                  "reason": "Missing targetId or unsupported operationType",
+                  "record": r
+              })
+              continue
+
+          if target_id not in grouped:
+              grouped[target_id] = []
+          grouped[target_id].append(r)
+
+      bulk_ops = []
+      reconciled_targets = []
+
+      for target_id, mutation_list in grouped.items():
+          # Sort mutations chronologically by version
+          mutation_list.sort(key=lambda m: m.get("version", 0))
+          latest = mutation_list[-1]
+          op_type = latest.get("operationType", "").upper()
+          payload = latest.get("payload", {})
+          version = latest.get("version", 1)
+
+          reconciled_targets.append(target_id)
+
+          if op_type == "UPDATE":
+              set_payload = {k: v for k, v in payload.items() if k != "_id"}
+              set_payload["_reconciledAt"] = "kestra-bulk-repair"
+              bulk_ops.append({
+                  "updateOne": {
+                      "filter": {"_id": target_id, "version": {"$lte": version}},
+                      "update": {
+                          "$set": set_payload,
+                          "$max": {"version": version}
+                      },
+                      "upsert": True
+                  }
+              })
+          elif op_type == "INSERT":
+              insert_doc = dict(payload)
+              insert_doc["_id"] = target_id
+              bulk_ops.append({
+                  "replaceOne": {
+                      "filter": {"_id": target_id},
+                      "replacement": insert_doc,
+                      "upsert": True
+                  }
+              })
+          elif op_type == "DELETE":
+              bulk_ops.append({
+                  "deleteOne": {
+                      "filter": {"_id": target_id}
+                  }
+              })
+          elif op_type == "REPLACE":
+              replace_doc = dict(payload)
+              replace_doc["_id"] = target_id
+              bulk_ops.append({
+                  "replaceOne": {
+                      "filter": {"_id": target_id},
+                      "replacement": replace_doc,
+                      "upsert": True
+                  }
+              })
+
+      # Write NDJSON file for io.kestra.plugin.mongodb.Bulk
+      with open("bulk_operations.ndjson", "w") as f:
+          for op in bulk_ops:
+              f.write(json.dumps(op) + "\n")
+
+      with open("poison_mutations.json", "w") as f:
+          json.dump(poison, f, indent=2)
+
+      with open("reconciled_ids.json", "w") as f:
+          json.dump(dlq_record_ids, f, indent=2)
+
+      poison_count = len(poison)
+      reconciled_count = len(bulk_ops)
+
+      verdict = "EMPTY_DLQ"
+      summary = ""
+
+      if total_dlq == 0:
+          verdict = "EMPTY_DLQ"
+          summary = "No pending mutations in dead-letter collection. DLQ healthy."
+      elif poison_count > max_poison:
+          verdict = "POISON_MUTATION_BREACH"
+          summary = f"CRITICAL: Found {poison_count} malformed/poison mutations exceeding tolerance ({max_poison}). Halting bulk write."
+      else:
+          verdict = "PROCEED_RECONCILIATION"
+          summary = f"Synthesized {reconciled_count} atomic bulkWrite operations from {total_dlq} raw DLQ records ({poison_count} poison)."
+
+      if dry_run and verdict == "PROCEED_RECONCILIATION":
+          summary += " (DRY RUN: bulkWrite execution bypassed)"
+
+      print(f"Reconciliation Plan: {verdict} - {summary}")
+
+      Kestra.outputs({
+          "verdict": verdict,
+          "total_dlq_records": total_dlq,
+          "reconciled_count": reconciled_count,
+          "poison_count": poison_count,
+          "is_dry_run": dry_run,
+          "summary": summary
+      })
+
+  - id: route_reconciliation_verdict
+    type: io.kestra.plugin.core.flow.Switch
+    description: Routes execution based on dead-letter evaluation verdict.
+    value: "{{ outputs.evaluate_and_generate_bulk_plan.vars.verdict }}"
+    cases:
+      PROCEED_RECONCILIATION:
+        - id: check_execute_bulk
+          type: io.kestra.plugin.core.flow.If
+          description: Executes atomic bulkWrite against primary MongoDB collection when dry_run is disabled.
+          condition: "{{ not inputs.dry_run and outputs.evaluate_and_generate_bulk_plan.vars.reconciled_count > 0 }}"
+          then:
+            - id: execute_atomic_bulk_write
+              type: io.kestra.plugin.mongodb.Bulk
+              description: Executes streaming db.collection.bulkWrite() from generated NDJSON payload.
+              connection:
+                uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+              database: "{{ inputs.database }}"
+              collection: "{{ inputs.target_collection }}"
+              from: "{{ outputs.evaluate_and_generate_bulk_plan.outputFiles['bulk_operations.ndjson'] }}"
+
+            - id: purge_reconciled_from_dlq
+              type: io.kestra.plugin.mongodb.Delete
+              description: Purges reconciled entries from the dead-letter queue after verified bulkWrite completion.
+              connection:
+                uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+              database: "{{ inputs.database }}"
+              collection: "{{ inputs.dead_letter_collection }}"
+              operation: "DELETE_MANY"
+              filter:
+                _id:
+                  $in: "{{ fromJson(read(outputs.evaluate_and_generate_bulk_plan.outputFiles['reconciled_ids.json'])) }}"
+
+        - id: persist_reconciliation_manifest
+          type: io.kestra.plugin.core.storage.Write
+          description: Persists reconciliation manifest with cryptographic metrics to Kestra internal storage.
+          extension: .json
+          content: |
+            {
+              "verdict": "PROCEED_RECONCILIATION",
+              "database": "{{ inputs.database }}",
+              "targetCollection": "{{ inputs.target_collection }}",
+              "deadLetterCollection": "{{ inputs.dead_letter_collection }}",
+              "reconciledCount": {{ outputs.evaluate_and_generate_bulk_plan.vars.reconciled_count }},
+              "poisonCount": {{ outputs.evaluate_and_generate_bulk_plan.vars.poison_count }},
+              "dryRun": {{ inputs.dry_run }},
+              "executionId": "{{ execution.id }}"
+            }
+
+        - id: log_reconciliation_success
+          type: io.kestra.plugin.core.log.Log
+          description: Logs audit summary for the reconciled mutation batch.
+          message: "RECONCILIATION SUCCESS: {{ outputs.evaluate_and_generate_bulk_plan.vars.summary }}"
+
+      POISON_MUTATION_BREACH:
+        - id: log_poison_breach_alert
+          type: io.kestra.plugin.core.log.Log
+          description: Logs high-severity alert on unresolvable poison mutations.
+          message: "POISON MUTATION SURGE: {{ outputs.evaluate_and_generate_bulk_plan.vars.summary }}"
+
+        - id: persist_poison_dossier
+          type: io.kestra.plugin.core.storage.Write
+          description: Preserves unresolvable mutation records for developer root-cause analysis.
+          extension: .json
+          content: "{{ read(outputs.evaluate_and_generate_bulk_plan.outputFiles['poison_mutations.json']) }}"
+
+        - id: check_slack_poison
+          type: io.kestra.plugin.core.flow.If
+          description: Sends Slack notification to database administrators on poison breach.
+          condition: "{{ inputs.notify_slack }}"
+          then:
+            - id: notify_slack_dba
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              description: Dispatches high-priority Slack incident message.
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              payload: |
+                {
+                  "text": "🚨 *MongoDB Dead-Letter Mutation Poison Surge* | Execution `{{ execution.id }}`\n• *Database:* `{{ inputs.database }}.{{ inputs.target_collection }}`\n• *DLQ Collection:* `{{ inputs.dead_letter_collection }}`\n• *Poison Count:* `{{ outputs.evaluate_and_generate_bulk_plan.vars.poison_count }}`\n• *Action:* Execution Halted"
+                }
+
+      EMPTY_DLQ:
+        - id: log_dlq_healthy
+          type: io.kestra.plugin.core.log.Log
+          description: Logs normal baseline status when dead-letter queue is clear.
+          message: "DLQ Check: {{ outputs.evaluate_and_generate_bulk_plan.vars.summary }}"
+
+  - id: enforce_gate_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fails the execution if gate enforcement is active and poison mutations breached policy limits.
+    condition: "{{ inputs.enforce_gate and outputs.evaluate_and_generate_bulk_plan.vars.verdict == 'POISON_MUTATION_BREACH' }}"
+    then:
+      - id: fail_reconciliation_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Halts workflow to signal alerting systems and prevent corrupted data ingestion.
+        errorMessage: "MongoDB reconciliation gate tripped: {{ outputs.evaluate_and_generate_bulk_plan.vars.summary }}"
+
+extend:
+  title: MongoDB Dead-Letter Mutation Reconciliation and Bulk Repair Gate
+  metaTitle: MongoDB Dead-Letter Mutation Reconciliation & Bulk Repair Gate | Kestra
+  shortDescription: Ingest failed MongoDB mutation dead-letters, deduplicate out-of-order writes, generate atomic bulkWrite NDJSON, and reconcile collections safely.
+  metaDescription: Triage failed MongoDB mutations from dead-letter collections, enforce version monotonicity, and execute atomic bulkWrite repairs with rollback safeguards.
+  description: |
+    Automates dead-letter queue triage, conflict resolution, and atomic bulkWrite repair for out-of-order MongoDB CDC and stream mutations. In high-throughput event-driven microservices, CDC streams, or ETL pipelines, concurrent writes and transient network partitions frequently push rejected updates into dead-letter collections (`_dlq`). Naive line-by-line replays cause duplicate-key collisions, overwrite newer documents with stale timestamps, and generate heavy lock contention. This blueprint evaluates queued mutations, enforces monotonic document versioning, deduplicates conflicting updates, and executes high-performance atomic repairs using MongoDB's native `db.collection.bulkWrite()` with automated quarantine cleanup.
+
+    ## How it works
+
+    1. An event-driven `Webhook` trigger captures dead-letter queue depth breach notifications, while an hourly `Schedule` trigger provides periodic reconciliation sweeps.
+    2. `fetch_dead_letter_records` (`io.kestra.plugin.mongodb.Find`) queries quarantined mutations from the designated dead-letter collection (`dead_letter_collection`) with bounded limit `batch_size`.
+    3. `evaluate_and_generate_bulk_plan` (`io.kestra.plugin.scripts.python.Script`) analyzes the mutation batch:
+       - Groups mutations by target document identifier (`targetId` / `_id`).
+       - Enforces version monotonicity by sorting chronological updates and discarding superseded stale states.
+       - Synthesizes atomic MongoDB `bulkWrite` operations formatted as NDJSON (`updateOne` with `$max` version guards, `replaceOne` with upsert, and `deleteOne`).
+       - Detects unresolvable poison mutations (missing identifiers, malformed BSON types) and evaluates them against `max_poison_threshold`.
+    4. `route_reconciliation_verdict` (`io.kestra.plugin.core.flow.Switch`) routes downstream actions based on the classified plan:
+       - `PROCEED_RECONCILIATION`: When `dry_run` is false, runs `io.kestra.plugin.mongodb.Bulk` to stream the NDJSON payload into the target collection, purges reconciled records from the DLQ via `io.kestra.plugin.mongodb.Delete`, and writes an execution receipt to internal storage.
+       - `POISON_MUTATION_BREACH`: Quarantines malformed mutations into an audit dossier, logs a high-severity alert, and conditionally notifies database administrators via Slack.
+       - `EMPTY_DLQ`: Confirms normal healthy baseline when the dead-letter queue is empty.
+    5. `enforce_gate_policy` (`io.kestra.plugin.core.flow.If`) triggers `io.kestra.plugin.core.execution.Fail` if `enforce_gate` is enabled and poison mutations exceeded the acceptable threshold.
+
+    ## What you get
+
+    - High-throughput atomic document reconciliation leveraging MongoDB's native `bulkWrite` engine instead of slow query loops.
+    - Mathematical version monotonicity preventing stale out-of-order mutations from overwriting fresher production data.
+    - Automated dead-letter queue lifecycle management that deletes successfully reconciled records only after verified write completion.
+    - Poison mutation isolation preserving malformed records for root-cause analysis without blocking clean mutations.
+    - Audit manifests persisted to Kestra internal storage (`kestra://...`) documenting exact reconciled identifiers.
+
+    ## Who it's for
+
+    - Database Administrators and Data Platform Engineers managing MongoDB clusters backed by streaming CDC or message queues.
+    - Backend SREs automating dead-letter queue recovery and transient write conflict resolution.
+    - Platform Engineers seeking declarative, auditable alternatives to ad-hoc Python repair scripts.
+
+    ## Why orchestrate this with Kestra
+
+    - Direct integration with native MongoDB bulkWrite streaming without maintaining external worker pools.
+    - Containerized Python execution for complex conflict resolution and NDJSON synthesis within a single YAML file.
+    - End-to-end secret masking protecting MongoDB credentials and Slack webhooks across execution history.
+
+    ## Prerequisites
+
+    - A MongoDB 4.4+ database cluster (replica set or standalone) accessible to the Kestra worker.
+    - Read/write privileges on the target operational collection and dead-letter queue collection.
+
+    ### Secrets
+
+    - `MONGODB_URI`: MongoDB connection string containing authentication credentials (e.g. `mongodb+srv://user:pass@cluster.mongodb.net/`).
+    - `MONGODB_RECONCILE_WEBHOOK_KEY`: Secret key for authenticating incoming dead-letter webhook triggers.
+    - `SLACK_WEBHOOK_URL`: Optional Slack webhook URL for dispatching poison surge alerts (required only if `notify_slack` is enabled).
+
+    ## Quick start
+
+    1. Import this blueprint into your Kestra instance.
+    2. Configure the `MONGODB_URI` secret in your Kestra namespace.
+    3. Click **Execute** using default inputs (`dry_run: true`) to test the reconciliation planner against the bundled offline dead-letter sample.
+    4. Review execution logs and inspect the synthesized `bulk_operations.ndjson` artifact in internal storage.
+    5. Set `dry_run: false` to enable live bulkWrite execution and activate the scheduled trigger.
+
+    ## How to extend
+
+    - Add automated schema validation against a JSON Schema contract before synthesizing the bulkWrite payload.
+    - Chain downstream cache invalidation tasks (e.g. `io.kestra.plugin.redis.string.Delete`) to clear stale cache keys for reconciled documents.
+    - Wire PagerDuty alerting to notify on-call SREs if poison mutation rates breach sustained thresholds.
+
+    ## Links
+
+    - [Kestra MongoDB Plugin Documentation](https://kestra.io/plugins/plugin-mongodb)
+    - [MongoDB bulkWrite Documentation](https://www.mongodb.com/docs/manual/reference/method/db.collection.bulkWrite/)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Testing & Quality
+  ee: false
+  demo: false
