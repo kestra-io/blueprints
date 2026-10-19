@@ -1,0 +1,332 @@
+id: internetdb-external-attack-surface-drift
+namespace: company.team
+
+description: |
+  Daily passive check of your public IP addresses against Shodan InternetDB. Each IP is looked up once,
+  its open ports, CPEs, CVEs and tags are compared with the state kept in the KV store, and Slack is
+  alerted only when something new shows up (a newly exposed port, a new CVE, a new CPE or tag).
+  Only monitor IP addresses you own or are authorised to assess.
+
+inputs:
+  - id: ips
+    type: ARRAY
+    itemType: STRING
+    description: |
+      Public IPv4/IPv6 addresses you own or are authorised to assess. Duplicates are dropped; private,
+      loopback, link-local, reserved, multicast and malformed values are rejected before any API call.
+      The defaults are well-known public services (Cloudflare, Google and Quad9 DNS, and the Nmap project's
+      scanme.nmap.org, which the Nmap project publishes for testing) so the flow works out of the box.
+    defaults:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
+      - 45.33.32.156
+      - 2606:4700:4700::1111
+
+  - id: sensitive_ports
+    type: ARRAY
+    itemType: INT
+    description: A newly exposed port in this list is reported as HIGH (remote admin, databases, caches, Docker, Kubernetes).
+    defaults: [21, 22, 23, 445, 1433, 2375, 3306, 3389, 5432, 5900, 6379, 9200, 10250, 11211, 27017]
+
+  - id: forget_after_days
+    type: INT
+    defaults: 30
+    description: A port, CVE, CPE or tag that disappears is kept in state for this many days, so an item that flaps in and out of the Shodan crawl does not alert twice. After that it is pruned and would alert again if it comes back.
+
+  - id: reset_baseline
+    type: BOOL
+    defaults: false
+    description: Ignore the stored state and record a fresh baseline (no alerts are raised for a baseline).
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"
+
+tasks:
+  - id: get_state
+    type: io.kestra.plugin.core.kv.Get
+    key: internetdb_attack_surface_state
+    errorOnMissing: false
+
+  - id: validate_ips
+    type: io.kestra.plugin.scripts.python.Script
+    description: Normalises the IP list with Python's `ipaddress` module and keeps only globally routable addresses. InternetDB returns data for some private ranges (such as 10.0.0.1) that has nothing to do with your network, so those are rejected rather than looked up.
+    containerImage: python:3.13-slim
+    env:
+      IPS: "{{ inputs.ips | toJson }}"
+    script: |
+      import ipaddress, json, os
+      valid, rejected = [], []
+      for raw in json.loads(os.environ["IPS"]):
+          text = str(raw).strip()
+          try:
+              ip = ipaddress.ip_address(text)
+          except ValueError:
+              rejected.append(f"{text or '(empty)'}: not an IP address")
+              continue
+          if not ip.is_global:
+              rejected.append(f"{text}: not a public address (private, loopback, reserved or similar)")
+          elif ip.compressed in valid:
+              rejected.append(f"{text}: duplicate")
+          else:
+              valid.append(ip.compressed)
+      for reason in rejected:
+          print("Rejected", reason)
+      print("::" + json.dumps({"outputs": {"valid": valid, "rejected": rejected, "valid_count": len(valid)}}) + "::")
+
+  - id: lookup
+    type: io.kestra.plugin.core.flow.Loop
+    description: One keyless GET per IP, one at a time. A 404 means InternetDB has no data for the IP (nothing seen open); `allowFailed` keeps it, and any 429 or 5xx after retries, as a normal response that `compare` handles.
+    values: "{{ outputs.validate_ips.vars.valid }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: fetch
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://internetdb.shodan.io/{{ item.value }}"
+        method: GET
+        headers:
+          User-Agent: kestra-blueprint-internetdb-attack-surface-drift
+        options:
+          allowFailed: true
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+    outputs:
+      - id: ip
+        type: STRING
+        value: "{{ item.value }}"
+      - id: code
+        type: INT
+        value: "{{ outputs.fetch.code }}"
+      - id: body
+        type: STRING
+        value: "{{ outputs.fetch.body ?? '' }}"
+
+  - id: compare
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Compares each response with the KV state. State is one entry per (IP, kind, value) with first and last seen
+      dates. An IP seen for the first time is a BASELINE (recorded, not alerted). For a known IP, any port, CVE, CPE
+      or tag not in state is NEW; HIGH when it is a CVE, a sensitive port or the `compromised`/`malware` tag.
+      Items that disappear are reported once as CLOSED and pruned after `forget_after_days`. A 429/5xx leaves that
+      IP's state untouched and is reported as an ERROR.
+    containerImage: python:3.13-slim
+    inputFiles:
+      state.json: "{{ inputs.reset_baseline ? '{}' : (outputs.get_state.value ?? {}) | toJson }}"
+      responses.json: "{{ outputs.lookup.outputs ?? [] | toJson }}"
+    outputFiles:
+      - state.json
+      - findings.csv
+    env:
+      SENSITIVE_PORTS: "{{ inputs.sensitive_ports | toJson }}"
+      FORGET_AFTER_DAYS: "{{ inputs.forget_after_days }}"
+      TODAY: "{{ now() | date('yyyy-MM-dd') }}"
+    script: |
+      import csv, json, os
+      from datetime import date, timedelta
+      today = os.environ["TODAY"]
+      cutoff = (date.fromisoformat(today) - timedelta(days=int(os.environ["FORGET_AFTER_DAYS"]))).isoformat()
+      sensitive = set(json.loads(os.environ["SENSITIVE_PORTS"]))
+      state = json.load(open("state.json"))
+      responses = {r["outputs"]["ip"]: r["outputs"] for r in json.load(open("responses.json"))}
+      rows, counts = [], {"BASELINE": 0, "NEW": 0, "HIGH": 0, "CLOSED": 0, "NOT_INDEXED": 0, "ERROR": 0}
+
+      def row(ip, status, kind="", value="", severity=""):
+          rows.append({"ip": ip, "status": status, "severity": severity, "kind": kind, "value": value})
+
+      for ip, resp in responses.items():
+          code = int(resp.get("code", 0))
+          if code not in (200, 404):
+              counts["ERROR"] += 1
+              row(ip, "ERROR", value=f"HTTP {code}")
+              continue
+          body = json.loads(resp.get("body") or "{}") if code == 200 else {}
+          current = {f"port:{p}" for p in body.get("ports", [])} | {f"cve:{v}" for v in body.get("vulns", [])} \
+              | {f"cpe:{c}" for c in body.get("cpes", [])} | {f"tag:{t}" for t in body.get("tags", [])}
+          if code == 404:
+              counts["NOT_INDEXED"] += 1
+              row(ip, "NOT_INDEXED", value="InternetDB has no open ports on record")
+          known = state.get(ip)
+          items = known["items"] if known else {}
+          for key in sorted(current):
+              kind, value = key.split(":", 1)
+              if key in items:
+                  items[key]["last_seen"] = today
+                  items[key]["present"] = True
+                  continue
+              items[key] = {"first_seen": today, "last_seen": today, "present": True}
+              if known is None:
+                  counts["BASELINE"] += 1
+                  row(ip, "BASELINE", kind, value)
+              else:
+                  high = kind == "cve" or (kind == "port" and int(value) in sensitive) \
+                      or (kind == "tag" and value in ("compromised", "malware"))
+                  counts["NEW"] += 1
+                  counts["HIGH"] += high
+                  row(ip, "NEW", kind, value, "HIGH" if high else "MEDIUM")
+          for key in list(items):
+              if key in current:
+                  continue
+              if items[key]["present"]:
+                  items[key]["present"] = False
+                  counts["CLOSED"] += 1
+                  row(ip, "CLOSED", *key.split(":", 1))
+              if items[key]["last_seen"] < cutoff:
+                  del items[key]
+          state[ip] = {"items": items, "last_checked": today, "last_code": code}
+          print(f"{ip}: HTTP {code}, ports {body.get('ports', [])}, {len(body.get('vulns', []))} CVEs, "
+                f"cpes {body.get('cpes', [])}, tags {body.get('tags', [])}{' (baseline)' if known is None else ''}")
+
+      json.dump(state, open("state.json", "w"))
+      with open("findings.csv", "w", newline="") as f:
+          w = csv.DictWriter(f, fieldnames=["ip", "status", "severity", "kind", "value"])
+          w.writeheader()
+          w.writerows(rows)
+      new_rows = sorted((r for r in rows if r["status"] == "NEW"), key=lambda r: r["severity"] != "HIGH")
+      alerts = [f"{r['severity']} {r['ip']} new {r['kind']} {r['value']}" for r in new_rows]
+      errors = [f"{r['ip']} {r['value']}" for r in rows if r["status"] == "ERROR"]
+      print(f"Checked {len(responses)} IPs: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+      slack_text = "\n".join([f"*InternetDB attack surface drift*: {counts['NEW']} new item(s), {counts['HIGH']} HIGH"]
+                             + [f"- {a}" for a in alerts[:40]]
+                             + ["Details: https://internetdb.shodan.io/<ip>. Confirm each exposure is intended."])
+      print("::" + json.dumps({"outputs": {**{k.lower(): v for k, v in counts.items()},
+                                          "alerts": alerts[:40], "errors": errors, "slack_text": slack_text}}) + "::")
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: internetdb_attack_surface_state
+    kvType: JSON
+    value: "{{ read(outputs.compare.outputFiles['state.json']) }}"
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.compare.vars.new > 0 }}"
+    then:
+      - id: log_alerts
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.compare.vars.new }} new exposure item(s), {{ outputs.compare.vars.high }} HIGH: {{ outputs.compare.vars.alerts | join('; ') }}"
+
+      - id: slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: One message per run with up to 40 new items (the full list is in the CSV). allowFailure keeps the watch running when the webhook secret is not set.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: "{{ {'text': outputs.compare.vars.slack_text} | toJson }}"
+    else:
+      - id: no_drift
+        type: io.kestra.plugin.core.log.Log
+        message: "No new exposure. Baseline items {{ outputs.compare.vars.baseline }}, closed {{ outputs.compare.vars.closed }}, not indexed {{ outputs.compare.vars.not_indexed }}."
+
+  - id: warn_inputs
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.validate_ips.vars.rejected | length > 0 or outputs.compare.vars.error > 0 }}"
+    then:
+      - id: log_input_problems
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "Rejected inputs: {{ outputs.validate_ips.vars.rejected | join('; ') }}. Lookup errors (state kept as is): {{ outputs.compare.vars.errors | join('; ') }}"
+
+outputs:
+  - id: summary
+    type: JSON
+    value:
+      checked: "{{ outputs.validate_ips.vars.valid_count }}"
+      baseline: "{{ outputs.compare.vars.baseline }}"
+      new: "{{ outputs.compare.vars.new }}"
+      high: "{{ outputs.compare.vars.high }}"
+      closed: "{{ outputs.compare.vars.closed }}"
+      not_indexed: "{{ outputs.compare.vars.not_indexed }}"
+      errors: "{{ outputs.compare.vars.error }}"
+  - id: findings_csv
+    type: FILE
+    value: "{{ outputs.compare.outputFiles['findings.csv'] }}"
+
+extend:
+  title: Shodan InternetDB External Attack Surface Drift Alert
+  metaTitle: Shodan InternetDB Attack Surface Drift Alert | Kestra
+  shortDescription: Look up your public IPs in Shodan InternetDB every day and alert Slack when a new open port, CVE, CPE or tag appears compared with the KV baseline.
+  metaDescription: Daily Shodan InternetDB check of your public IPs that alerts Slack on newly exposed ports, CVEs, CPEs and tags against a KV baseline.
+  description: |
+    Shodan InternetDB is a free, keyless view of what Shodan's crawl has seen on an IP: open ports, CPEs, CVEs inferred
+    from those CPEs, and tags such as `self-signed` or `compromised`. This flow looks up your public IPs daily, keeps what
+    it has seen in the KV store and alerts only on drift: a new open port, CVE, CPE or tag. It is passive (it only reads
+    what Shodan already collected), but you should still **only monitor IP addresses you own or are
+    authorised to assess**.
+
+    The default IPs are well-known public services (Cloudflare 1.1.1.1 and its IPv6 address, Google 8.8.8.8, Quad9
+    9.9.9.9, and 45.33.32.156, the Nmap project's `scanme.nmap.org` test host) so the flow returns real data out of the
+    box. Replace them with your own addresses.
+
+    ## How it works
+
+    1. A daily `Schedule` starts the run; `get_state` reads the previous state from the KV store.
+    2. `validate_ips` (Python `ipaddress`) normalises the list and rejects malformed, duplicate and non-public addresses.
+       InternetDB returns data for some private addresses (such as 10.0.0.1) that has nothing to do with your network.
+    3. A `Loop` sends one GET per IP to `https://internetdb.shodan.io/{ip}`, one at a time, with retries. A 404 means
+       Shodan has nothing on record for the IP.
+    4. `compare` diffs each response with the state, keyed on (IP, kind, value). The first time an IP is seen its items
+       are recorded as BASELINE without alerting. Later, any unseen item is NEW, and HIGH when it is a CVE, a port from
+       `sensitive_ports` or the `compromised`/`malware` tag. Items that disappear are reported once as CLOSED and kept
+       for `forget_after_days`, so a port that flaps in and out of the crawl does not alert twice. A 429 or 5xx leaves
+       that IP's state untouched.
+    5. `save_state` writes the state back; `report` logs new items at WARN and posts one Slack message.
+
+    ## What you get
+
+    - A Slack alert listing new exposure, HIGH items first, only when something changed.
+    - A findings CSV (BASELINE, NEW, CLOSED, NOT_INDEXED, ERROR rows) and a JSON summary as flow outputs.
+    - Warnings for rejected inputs and failed lookups.
+
+    ## Who it's for
+
+    - Security and platform teams tracking the external attack surface of their own address space.
+    - Small teams that want an outside-in view without running scanners.
+
+    ## Why orchestrate this with Kestra
+
+    - State lives in the KV store, so re-runs only report what is new and a baseline can be reset with one input.
+    - Retries, the schedule, secret handling and the alert path are declared in YAML instead of a cron script.
+
+    ## Prerequisites
+
+    - A Docker task runner for the two `python:3.13-slim` script tasks (standard library only).
+    - Outbound HTTPS to `internetdb.shodan.io`. No API key is needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for drift alerts (optional; without it the alert is still logged at WARN).
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` to the namespace secrets.
+    2. Execute once with the defaults: the first run records the baseline.
+    3. Replace `ips` with addresses you own or are authorised to assess, run with `reset_baseline: true`, then enable the
+       schedule.
+
+    ## How to extend
+
+    - Feed `ips` from your cloud provider's list of elastic or public IPs instead of a static list.
+    - Enrich new CVEs with CISA KEV or EPSS and raise only exploited ones as HIGH.
+    - Open a ticket for each HIGH item instead of, or as well as, Slack.
+
+    ## Links
+
+    - [Shodan InternetDB API](https://internetdb.shodan.io/)
+    - [scanme.nmap.org](http://scanme.nmap.org/)
+    - [Loop task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [HTTP Request task](https://kestra.io/plugins/plugin-core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Python Script task](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [Slack Incoming Webhook task](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Incident Response
+  ee: false
+  demo: false
