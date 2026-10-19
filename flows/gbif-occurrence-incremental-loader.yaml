@@ -1,0 +1,656 @@
+id: gbif-occurrence-incremental-loader
+namespace: company.team
+
+description: |
+  Keep a local DuckDB table of GBIF species occurrence records up to date for a list of species
+  in a country or WKT polygon. Names are resolved to accepted GBIF taxon keys (synonyms merged,
+  genus-only fallbacks rejected), each taxon is pulled from the occurrence search API with a
+  per-taxon lastInterpreted watermark in the KV store, rows are upserted on gbifID into a DuckDB
+  file kept in internal storage, and new or changed records go through coordinate and eventDate
+  quality checks before a per-taxon summary is written.
+
+inputs:
+  - id: species
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - Vulpes lagopus
+      - Alopex lagopus
+      - Ovibos moschatus
+      - Ovibos imaginarius
+    description: Scientific names. The defaults include a synonym of the first name (merged into one taxon) and a name GBIF only matches at genus level (rejected rather than loading the whole genus).
+
+  - id: area
+    type: STRING
+    defaults: "NO"
+    description: Where the occurrences are. Either an ISO 3166-1 alpha-2 country code (GBIF `country` filter, `NO` is Norway) or a WKT POLYGON / MULTIPOLYGON in WGS84 longitude latitude, for example `POLYGON((4 58,12 58,12 62,4 62,4 58))` (GBIF `geometry` filter).
+
+  - id: event_date_from
+    type: STRING
+    required: false
+    description: Optional lower bound on the event date (`2020`, `2020-06` or `2020-06-01`). Records without an event date are excluded when this is set, so leave it empty to also check for missing dates.
+
+  - id: extra_filters
+    type: STRING
+    required: false
+    description: Optional extra occurrence search parameters as a query string, for example `basisOfRecord=HUMAN_OBSERVATION&basisOfRecord=MACHINE_OBSERVATION` or `datasetKey=...`.
+
+  - id: include_absences
+    type: BOOL
+    defaults: false
+    description: GBIF also publishes absence records (`occurrenceStatus=ABSENT`). Off by default, so only presences are loaded.
+
+  - id: min_match_confidence
+    type: INT
+    defaults: 90
+    description: Minimum confidence (0-100) of the species/match answer. Lower-confidence and fuzzy matches below it are reported as unresolved.
+
+  - id: max_records_per_taxon
+    type: INT
+    defaults: 100000
+    description: Soft limit on records pulled per taxon and run (100000 at most, the occurrence search paging limit). A bigger backlog is split by lastInterpreted day and finished over the next runs; a single day is never split, so one day above this limit is still loaded alone, and only a day above 100000 stops the taxon (CAPPED).
+
+  - id: coordinate_issue_flags
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - ZERO_COORDINATE
+      - COORDINATE_INVALID
+      - COORDINATE_OUT_OF_RANGE
+      - COUNTRY_COORDINATE_MISMATCH
+      - PRESUMED_SWAPPED_COORDINATE
+      - PRESUMED_NEGATED_LATITUDE
+      - PRESUMED_NEGATED_LONGITUDE
+      - COORDINATE_REPROJECTION_FAILED
+    description: GBIF interpretation issues that make a point unusable for mapping. Benign flags such as COORDINATE_ROUNDED are deliberately left out.
+
+  - id: max_coordinate_issue_pct
+    type: FLOAT
+    defaults: 2.0
+    description: Warn when more than this percentage of a taxon's new or changed records have a listed coordinate issue or no coordinates.
+
+  - id: max_missing_event_date_pct
+    type: FLOAT
+    defaults: 5.0
+    description: Warn when more than this percentage of a taxon's new or changed records have no eventDate.
+
+  - id: db_kv_key
+    type: STRING
+    defaults: gbif_occurrences_duckdb
+    description: KV key holding the internal-storage URI of the DuckDB file. Use another key for a separate database.
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 5 * * *"
+    description: GBIF re-interprets datasets continuously; a daily run picks up yesterday's new and corrected records.
+
+tasks:
+  - id: resolve_taxa
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Calls species/match once per name and keeps EXACT or FUZZY matches above the confidence threshold. Synonyms are
+      replaced by their accepted key, so two names for the same animal become one taxon; HIGHERRANK answers (GBIF only
+      found the genus) and unknown names are reported, not loaded. Builds the occurrence filter list once, checks it with
+      one `limit=0` search (a bad WKT or country fails here, before anything is written) and hashes it into a scope id so
+      a different area or filter set gets its own watermarks.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      SPECIES: "{{ inputs.species | toJson }}"
+      AREA: "{{ inputs.area }}"
+      EVENT_DATE_FROM: "{{ inputs.event_date_from ?? '' }}"
+      EXTRA_FILTERS: "{{ inputs.extra_filters ?? '' }}"
+      INCLUDE_ABSENCES: "{{ inputs.include_absences }}"
+      MIN_CONFIDENCE: "{{ inputs.min_match_confidence }}"
+    script: |
+      import hashlib, json, os, time, urllib.error, urllib.parse, urllib.request
+
+      UA = "kestra-blueprint gbif-occurrence-incremental-loader (https://kestra.io/blueprints)"
+
+      def get(url):
+          for attempt in range(6):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in (429, 500, 502, 503, 504) and attempt < 5:
+                      time.sleep(int(e.headers.get("Retry-After") or 0) or 2 ** attempt)
+                      continue
+                  raise SystemExit(f"GBIF HTTP {e.code} for {url}: {e.read()[:300].decode(errors='replace')}")
+              except (urllib.error.URLError, TimeoutError):
+                  if attempt == 5:
+                      raise
+                  time.sleep(2 ** attempt)
+
+      filters = []
+      area = " ".join(os.environ["AREA"].split())
+      if area.upper().startswith(("POLYGON", "MULTIPOLYGON")):
+          filters.append(["geometry", area])
+      elif len(area) == 2 and area.isalpha():
+          filters.append(["country", area.upper()])
+      else:
+          raise SystemExit(f"area must be a two-letter ISO country code or a WKT POLYGON/MULTIPOLYGON, got {area[:80]!r}")
+      if os.environ["EVENT_DATE_FROM"].strip():
+          filters.append(["eventDate", os.environ["EVENT_DATE_FROM"].strip() + ",*"])
+      if os.environ["INCLUDE_ABSENCES"].lower() != "true":
+          filters.append(["occurrenceStatus", "PRESENT"])
+      filters += [[k, v] for k, v in urllib.parse.parse_qsl(os.environ["EXTRA_FILTERS"].strip())]
+
+      probe = get("https://api.gbif.org/v1/occurrence/search?" + urllib.parse.urlencode([tuple(x) for x in filters] + [("limit", 0)]))
+      scope = hashlib.sha1(json.dumps(sorted(filters)).encode()).hexdigest()[:10]
+      print(f"Scope {scope}: {filters} matches {probe['count']} occurrences of all taxa")
+
+      min_conf = int(os.environ["MIN_CONFIDENCE"])
+      taxa, unresolved = {}, []
+      for name in dict.fromkeys(n.strip() for n in json.loads(os.environ["SPECIES"]) if n.strip()):
+          m = get("https://api.gbif.org/v1/species/match?" + urllib.parse.urlencode({"name": name}))
+          match_type, conf = m.get("matchType", "NONE"), m.get("confidence", 0)
+          if match_type == "NONE" or "usageKey" not in m:
+              unresolved.append({"name": name, "reason": "no match in the GBIF backbone"})
+          elif match_type == "HIGHERRANK":
+              unresolved.append({"name": name, "reason": f"only matched {m.get('rank', '').lower()} {m.get('scientificName')} (HIGHERRANK)"})
+          elif conf < min_conf:
+              unresolved.append({"name": name, "reason": f"{match_type} match {m.get('scientificName')} at confidence {conf} < {min_conf}"})
+          else:
+              key = str(m.get("acceptedUsageKey") or m["usageKey"])
+              accepted = m.get("scientificName")
+              if m.get("acceptedUsageKey"):
+                  accepted = get(f"https://api.gbif.org/v1/species/{key}").get("scientificName", accepted)
+              note = f"{name} -> {match_type} {m.get('status')} {m.get('scientificName')}, confidence {conf}"
+              t = taxa.setdefault(key, {"taxon_key": key, "scientific_name": accepted, "rank": m.get("rank"), "requested": [], "notes": []})
+              t["requested"].append(name)
+              t["notes"].append(note)
+              print(f"{note} -> taxonKey {key}" + (" (merged with an earlier name)" if len(t["requested"]) > 1 else ""))
+          time.sleep(0.1)
+
+      for u in unresolved:
+          print(f"UNRESOLVED {u['name']}: {u['reason']}")
+      print("::" + json.dumps({"outputs": {
+          "taxon_keys": list(taxa), "taxa": taxa, "unresolved": unresolved,
+          "filters": filters, "scope": scope, "scope_count": probe["count"],
+      }}) + "::")
+
+  - id: current_db
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.db_kv_key }}"
+    errorOnMissing: false
+    description: URI of the DuckDB file written by the last run; missing on the first run.
+
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Creates the DuckDB file with the occurrence and load-log tables and points the KV key at it.
+    condition: "{{ outputs.current_db.value is not defined or outputs.current_db.value is empty }}"
+    then:
+      - id: create_db
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        communityExtensions: []
+        outputDbFile: true
+        sql: |
+          CREATE TABLE occurrences (
+            gbif_id BIGINT PRIMARY KEY, dataset_key VARCHAR, publishing_country VARCHAR, basis_of_record VARCHAR,
+            occurrence_status VARCHAR, taxon_key BIGINT, accepted_taxon_key BIGINT, scientific_name VARCHAR,
+            accepted_scientific_name VARCHAR, taxon_rank VARCHAR, country_code VARCHAR, state_province VARCHAR,
+            locality VARCHAR, decimal_latitude DOUBLE, decimal_longitude DOUBLE, coordinate_uncertainty_m DOUBLE,
+            event_date VARCHAR, year INTEGER, month INTEGER, day INTEGER, individual_count INTEGER,
+            recorded_by VARCHAR, institution_code VARCHAR, catalog_number VARCHAR, license VARCHAR,
+            issues VARCHAR, last_interpreted TIMESTAMPTZ, record_hash VARCHAR,
+            requested_taxon_key BIGINT, scope VARCHAR, first_loaded_at TIMESTAMPTZ, last_changed_at TIMESTAMPTZ,
+            last_seen_at TIMESTAMPTZ, last_execution_id VARCHAR
+          );
+          CREATE TABLE load_log (
+            execution_id VARCHAR, loaded_at TIMESTAMPTZ, scope VARCHAR, taxon_key BIGINT, taxon_name VARCHAR,
+            requested_names VARCHAR, status VARCHAR, window_from VARCHAR, window_to VARCHAR, next_watermark VARCHAR,
+            expected INTEGER, fetched INTEGER, new_rows INTEGER, changed_rows INTEGER, unchanged_rows INTEGER,
+            coordinate_issue_rows INTEGER, missing_coordinate_rows INTEGER, missing_event_date_rows INTEGER, high_uncertainty_rows INTEGER,
+            coordinate_issue_pct DOUBLE, missing_event_date_pct DOUBLE, dq_breach BOOLEAN, top_issues VARCHAR,
+            taxon_rows_total INTEGER
+          );
+
+      - id: save_new_db
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ inputs.db_kv_key }}"
+        value: "{{ outputs.create_db.databaseUri }}"
+
+  - id: load_each_taxon
+    type: io.kestra.plugin.core.flow.Loop
+    description: One iteration per resolved taxon key, strictly sequential because every iteration opens the DuckDB file the previous one saved.
+    values: "{{ outputs.resolve_taxa.vars.taxon_keys }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: watermark
+        type: io.kestra.plugin.core.kv.Get
+        key: "gbif_wm_{{ outputs.resolve_taxa.vars.scope }}_{{ item.value }}"
+        errorOnMissing: false
+        description: First lastInterpreted day not yet loaded for this taxon and scope; missing on the baseline run.
+
+      - id: fetch
+        type: io.kestra.plugin.scripts.python.Script
+        description: |
+          Counts the records interpreted since the watermark (`lastInterpreted=<day>,*`, `limit=0`). If they fit under
+          `max_records_per_taxon` the whole window is paged; otherwise a binary search on the window end finds the latest
+          day that fits and only that window is paged, so the rest follows on the next run. Pages are 300 records (the API
+          maximum) with retries on 429 and 5xx, and every record is reduced to the columns of the table plus a content hash
+          that ignores lastInterpreted, so a re-interpretation that changed nothing is not counted as a change.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        outputFiles:
+          - occurrences.ndjson
+        env:
+          TAXON_KEY: "{{ item.value }}"
+          WATERMARK: "{{ outputs.watermark.value ?? '' }}"
+          FILTERS: "{{ outputs.resolve_taxa.vars.filters | toJson }}"
+          MAX_RECORDS: "{{ inputs.max_records_per_taxon }}"
+        script: |
+          import hashlib, json, os, time, urllib.error, urllib.parse, urllib.request
+          from datetime import date, datetime, timedelta, timezone
+
+          API = "https://api.gbif.org/v1/occurrence/search"
+          UA = "kestra-blueprint gbif-occurrence-incremental-loader (https://kestra.io/blueprints)"
+          PAGE, HARD_CAP = 300, 100000
+          taxon = os.environ["TAXON_KEY"]
+          lo = os.environ["WATERMARK"].strip() or None
+          cap = max(PAGE, min(int(os.environ["MAX_RECORDS"]), HARD_CAP))
+          filters = [tuple(f) for f in json.loads(os.environ["FILTERS"])]
+          today = datetime.now(timezone.utc).date()
+          calls = 0
+
+          def get(params):
+              global calls
+              url = API + "?" + urllib.parse.urlencode(params)
+              for attempt in range(6):
+                  try:
+                      calls += 1
+                      req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          return json.load(r)
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503, 504) and attempt < 5:
+                          time.sleep(int(e.headers.get("Retry-After") or 0) or 2 ** attempt)
+                          continue
+                      raise SystemExit(f"GBIF HTTP {e.code} for {url}: {e.read()[:300].decode(errors='replace')}")
+                  except (urllib.error.URLError, TimeoutError):
+                      if attempt == 5:
+                          raise
+                      time.sleep(2 ** attempt)
+
+          def params(hi):
+              p = [("taxonKey", taxon)] + filters
+              if lo or hi:
+                  p.append(("lastInterpreted", f"{lo or '*'},{hi or '*'}"))
+              return p
+
+          def count(hi):
+              return get(params(hi) + [("limit", 0)])["count"]
+
+          # The watermark is the first lastInterpreted day not loaded yet. GBIF filters on whole days (inclusive), so a
+          # window that ends today is re-read from today next time, and a window that ends on a past day resumes the day after.
+          total = count(None)
+          hi, status, expected, next_wm = None, "FULL", total, today.isoformat()
+          start = date.fromisoformat(lo) if lo else date(2007, 1, 1)
+          if total == 0:
+              status = "EMPTY"
+          elif total > cap and start < today:
+              first = count(start.isoformat())
+              if first > HARD_CAP:
+                  status, expected, next_wm = "CAPPED", first, lo or ""
+              elif first > cap:
+                  # One day is over the soft cap but still pageable: take that day alone rather than stall.
+                  hi, status, expected, next_wm = start.isoformat(), "NARROWED", first, (start + timedelta(days=1)).isoformat()
+              else:
+                  good, bad, expected = start, today, first
+                  while (bad - good).days > 1:
+                      mid = good + timedelta(days=(bad - good).days // 2)
+                      n = count(mid.isoformat())
+                      if n <= cap:
+                          good, expected = mid, n
+                      else:
+                          bad = mid
+                  hi, status, next_wm = good.isoformat(), "NARROWED", (good + timedelta(days=1)).isoformat()
+          elif total > HARD_CAP:
+              status, next_wm = "CAPPED", lo or ""
+
+          def project(r):
+              row = {
+                  "gbif_id": int(r["key"]), "dataset_key": r.get("datasetKey"), "publishing_country": r.get("publishingCountry"),
+                  "basis_of_record": r.get("basisOfRecord"), "occurrence_status": r.get("occurrenceStatus"),
+                  "taxon_key": r.get("taxonKey"), "accepted_taxon_key": r.get("acceptedTaxonKey"),
+                  "scientific_name": r.get("scientificName"), "accepted_scientific_name": r.get("acceptedScientificName"),
+                  "taxon_rank": r.get("taxonRank"), "country_code": r.get("countryCode"), "state_province": r.get("stateProvince"),
+                  "locality": r.get("locality"), "decimal_latitude": r.get("decimalLatitude"), "decimal_longitude": r.get("decimalLongitude"),
+                  "coordinate_uncertainty_m": r.get("coordinateUncertaintyInMeters"), "event_date": r.get("eventDate"),
+                  "year": r.get("year"), "month": r.get("month"), "day": r.get("day"), "individual_count": r.get("individualCount"),
+                  "recorded_by": r.get("recordedBy"), "institution_code": r.get("institutionCode"), "catalog_number": r.get("catalogNumber"),
+                  "license": r.get("license"), "issues": ";".join(sorted(r.get("issues") or [])),
+              }
+              row["record_hash"] = hashlib.sha1(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+              row["last_interpreted"] = r.get("lastInterpreted")
+              return row
+
+          fetched, pages, offset = 0, 0, 0
+          with open("occurrences.ndjson", "w", encoding="utf-8") as out:
+              while status in ("FULL", "NARROWED") and offset < HARD_CAP:
+                  page = get(params(hi) + [("limit", min(PAGE, HARD_CAP - offset)), ("offset", offset)])
+                  pages += 1
+                  for r in page["results"]:
+                      out.write(json.dumps(project(r)) + "\n")
+                      fetched += 1
+                  offset += PAGE
+                  if page.get("endOfRecords") or not page["results"]:
+                      break
+                  time.sleep(0.1)
+
+          window = f"lastInterpreted {lo or '*'} .. {hi or '*'}"
+          print(f"taxonKey {taxon}: {status}, {window}, {expected} expected, {fetched} fetched in {pages} pages ({calls} API calls), next watermark {next_wm or 'unchanged'}")
+          print("::" + json.dumps({"outputs": {
+              "status": status, "window_from": lo or "", "window_to": hi or "", "expected": expected,
+              "fetched": fetched, "pages": pages, "api_calls": calls, "next_watermark": next_wm,
+          }}) + "::")
+
+      - id: upsert
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: |
+          Opens the current DuckDB file, classifies each fetched record against the table as NEW, CHANGED (content hash
+          differs) or UNCHANGED, upserts NEW and CHANGED rows on gbif_id (keeping first_loaded_at), only bumps last_seen_at
+          and last_interpreted on UNCHANGED rows, runs the quality checks on the NEW and CHANGED rows and appends one row to
+          load_log. The saved file becomes the next database version.
+        communityExtensions: []
+        databaseUri: "{{ kv(inputs.db_kv_key) }}"
+        outputDbFile: true
+        fetchType: FETCH_ONE
+        inputFiles:
+          batch.ndjson: "{{ outputs.fetch.outputFiles['occurrences.ndjson'] }}"
+        parameters:
+          taxon_key: "{{ item.value }}"
+          taxon_name: "{{ outputs.resolve_taxa.vars.taxa[item.value].scientific_name }}"
+          requested_names: "{{ outputs.resolve_taxa.vars.taxa[item.value].requested | join(', ') }}"
+          scope: "{{ outputs.resolve_taxa.vars.scope }}"
+          execution_id: "{{ execution.id }}"
+          status: "{{ outputs.fetch.vars.status }}"
+          window_from: "{{ outputs.fetch.vars.window_from }}"
+          window_to: "{{ outputs.fetch.vars.window_to }}"
+          next_watermark: "{{ outputs.fetch.vars.next_watermark }}"
+          expected: "{{ outputs.fetch.vars.expected }}"
+          coord_flags: "{{ inputs.coordinate_issue_flags | toJson }}"
+          max_coord_pct: "{{ inputs.max_coordinate_issue_pct }}"
+          max_missing_date_pct: "{{ inputs.max_missing_event_date_pct }}"
+        sql: |
+          CREATE TEMP TABLE batch AS
+          SELECT * FROM read_json('batch.ndjson', format = 'newline_delimited', columns = {
+            'gbif_id': 'BIGINT', 'dataset_key': 'VARCHAR', 'publishing_country': 'VARCHAR', 'basis_of_record': 'VARCHAR',
+            'occurrence_status': 'VARCHAR', 'taxon_key': 'BIGINT', 'accepted_taxon_key': 'BIGINT', 'scientific_name': 'VARCHAR',
+            'accepted_scientific_name': 'VARCHAR', 'taxon_rank': 'VARCHAR', 'country_code': 'VARCHAR', 'state_province': 'VARCHAR',
+            'locality': 'VARCHAR', 'decimal_latitude': 'DOUBLE', 'decimal_longitude': 'DOUBLE', 'coordinate_uncertainty_m': 'DOUBLE',
+            'event_date': 'VARCHAR', 'year': 'INTEGER', 'month': 'INTEGER', 'day': 'INTEGER', 'individual_count': 'INTEGER',
+            'recorded_by': 'VARCHAR', 'institution_code': 'VARCHAR', 'catalog_number': 'VARCHAR', 'license': 'VARCHAR',
+            'issues': 'VARCHAR', 'record_hash': 'VARCHAR', 'last_interpreted': 'TIMESTAMPTZ'})
+          QUALIFY row_number() OVER (PARTITION BY gbif_id ORDER BY last_interpreted DESC) = 1;
+
+          CREATE TEMP TABLE classified AS
+          SELECT b.*,
+                 CASE WHEN o.gbif_id IS NULL THEN 'NEW' WHEN o.record_hash IS DISTINCT FROM b.record_hash THEN 'CHANGED' ELSE 'UNCHANGED' END AS change_type,
+                 o.first_loaded_at AS previous_first_loaded_at
+          FROM batch b LEFT JOIN occurrences o ON o.gbif_id = b.gbif_id;
+
+          INSERT OR REPLACE INTO occurrences BY NAME
+          SELECT * EXCLUDE (change_type, previous_first_loaded_at),
+                 CAST(:taxon_key AS BIGINT) AS requested_taxon_key, :scope AS scope,
+                 coalesce(previous_first_loaded_at, now()) AS first_loaded_at, now() AS last_changed_at, now() AS last_seen_at,
+                 :execution_id AS last_execution_id
+          FROM classified WHERE change_type <> 'UNCHANGED';
+
+          UPDATE occurrences o SET last_seen_at = now(), last_interpreted = c.last_interpreted
+          FROM classified c WHERE c.gbif_id = o.gbif_id AND c.change_type = 'UNCHANGED';
+
+          CREATE TEMP TABLE checked AS
+          SELECT *,
+                 decimal_latitude IS NULL OR decimal_longitude IS NULL
+                   OR list_has_any(string_split(issues, ';'), CAST(from_json(:coord_flags, '["VARCHAR"]') AS VARCHAR[])) AS coordinate_issue,
+                 coalesce(event_date, '') = '' AS missing_event_date,
+                 coordinate_uncertainty_m > 10000 AS high_uncertainty
+          FROM classified WHERE change_type <> 'UNCHANGED';
+
+          INSERT INTO load_log BY NAME
+          SELECT :execution_id AS execution_id, now() AS loaded_at, :scope AS scope, CAST(:taxon_key AS BIGINT) AS taxon_key,
+                 :taxon_name AS taxon_name, :requested_names AS requested_names, :status AS status,
+                 :window_from AS window_from, :window_to AS window_to, :next_watermark AS next_watermark,
+                 CAST(:expected AS INTEGER) AS expected,
+                 (SELECT count(*) FROM classified) AS fetched,
+                 (SELECT count(*) FILTER (WHERE change_type = 'NEW') FROM classified) AS new_rows,
+                 (SELECT count(*) FILTER (WHERE change_type = 'CHANGED') FROM classified) AS changed_rows,
+                 (SELECT count(*) FILTER (WHERE change_type = 'UNCHANGED') FROM classified) AS unchanged_rows,
+                 count(*) FILTER (WHERE coordinate_issue) AS coordinate_issue_rows,
+                 count(*) FILTER (WHERE decimal_latitude IS NULL OR decimal_longitude IS NULL) AS missing_coordinate_rows,
+                 count(*) FILTER (WHERE missing_event_date) AS missing_event_date_rows,
+                 count(*) FILTER (WHERE high_uncertainty) AS high_uncertainty_rows,
+                 coalesce(round(100.0 * count(*) FILTER (WHERE coordinate_issue) / nullif(count(*), 0), 2), 0) AS coordinate_issue_pct,
+                 coalesce(round(100.0 * count(*) FILTER (WHERE missing_event_date) / nullif(count(*), 0), 2), 0) AS missing_event_date_pct,
+                 coalesce(100.0 * count(*) FILTER (WHERE coordinate_issue) / nullif(count(*), 0) > CAST(:max_coord_pct AS DOUBLE)
+                       OR 100.0 * count(*) FILTER (WHERE missing_event_date) / nullif(count(*), 0) > CAST(:max_missing_date_pct AS DOUBLE), false) AS dq_breach,
+                 coalesce((SELECT string_agg(issue || ' ' || n, ', ' ORDER BY n DESC) FROM (
+                    SELECT issue, count(*) AS n FROM (SELECT unnest(string_split(issues, ';')) AS issue FROM checked)
+                    WHERE list_contains(CAST(from_json(:coord_flags, '["VARCHAR"]') AS VARCHAR[]), issue) GROUP BY issue)), '') AS top_issues,
+                 (SELECT count(*) FROM occurrences WHERE requested_taxon_key = CAST(:taxon_key AS BIGINT)) AS taxon_rows_total
+          FROM checked;
+
+          SELECT * FROM load_log WHERE execution_id = :execution_id AND taxon_key = CAST(:taxon_key AS BIGINT);
+
+      - id: save_db
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ inputs.db_kv_key }}"
+        value: "{{ outputs.upsert.databaseUri }}"
+        description: Points the KV key at the database version that now contains this taxon. Saved before the watermark, so a failure in between only means the same window is read again.
+
+      - id: advance_watermark
+        type: io.kestra.plugin.core.flow.If
+        description: A CAPPED taxon (one day of re-interpretation larger than the cap) keeps its watermark, so nothing is skipped silently.
+        condition: "{{ outputs.fetch.vars.status != 'CAPPED' }}"
+        then:
+          - id: save_watermark
+            type: io.kestra.plugin.core.kv.Set
+            key: "gbif_wm_{{ outputs.resolve_taxa.vars.scope }}_{{ item.value }}"
+            value: "{{ outputs.fetch.vars.next_watermark }}"
+
+      - id: quality_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.upsert.outputs[0].row.dq_breach or outputs.fetch.vars.status == 'CAPPED' }}"
+        then:
+          - id: warn_taxon
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: |
+              {{ outputs.upsert.outputs[0].row.taxon_name }} ({{ item.value }}): {{ outputs.fetch.vars.status == 'CAPPED' ? 'CAPPED, ' ~ outputs.fetch.vars.expected ~ ' records were re-interpreted on lastInterpreted day ' ~ (outputs.fetch.vars.window_from is empty ? 'one' : outputs.fetch.vars.window_from) ~ ', more than the 100000 the search API can page; watermark kept, load this backlog with the GBIF download API. ' : '' }}{{ outputs.upsert.outputs[0].row.coordinate_issue_rows }} of {{ outputs.upsert.outputs[0].row.new_rows + outputs.upsert.outputs[0].row.changed_rows }} new or changed records have unusable coordinates ({{ outputs.upsert.outputs[0].row.coordinate_issue_pct }}% vs {{ inputs.max_coordinate_issue_pct }}% allowed; {{ outputs.upsert.outputs[0].row.missing_coordinate_rows }} without coordinates{{ outputs.upsert.outputs[0].row.top_issues is empty ? '' : ', flagged ' ~ outputs.upsert.outputs[0].row.top_issues }}), {{ outputs.upsert.outputs[0].row.missing_event_date_rows }} have no eventDate ({{ outputs.upsert.outputs[0].row.missing_event_date_pct }}% vs {{ inputs.max_missing_event_date_pct }}% allowed).
+        else:
+          - id: taxon_ok
+            type: io.kestra.plugin.core.log.Log
+            message: "{{ outputs.upsert.outputs[0].row.taxon_name }} ({{ item.value }}): {{ outputs.upsert.outputs[0].row.new_rows }} new, {{ outputs.upsert.outputs[0].row.changed_rows }} changed, {{ outputs.upsert.outputs[0].row.unchanged_rows }} unchanged; quality within thresholds."
+
+  - id: previous_unresolved
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.db_kv_key }}_unresolved"
+    errorOnMissing: false
+    description: Names already reported unresolved by earlier runs, so a typo in the species list alerts once instead of every day.
+
+  - id: report
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Reads this execution's load_log rows from the final database, adds the unresolved names and writes the per-taxon summary CSV and one totals row.
+    communityExtensions: []
+    databaseUri: "{{ kv(inputs.db_kv_key) }}"
+    fetchType: FETCH_ONE
+    outputFiles:
+      - summary_csv
+    parameters:
+      execution_id: "{{ execution.id }}"
+      unresolved: "{{ outputs.resolve_taxa.vars.unresolved | toJson }}"
+      previous_unresolved: "{{ outputs.previous_unresolved.value ?? '' }}"
+      execution_url: "{{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+    sql: |
+      CREATE TEMP TABLE summary AS
+      SELECT taxon_key, taxon_name, requested_names, status, window_from, window_to, next_watermark, expected, fetched,
+             new_rows, changed_rows, unchanged_rows, coordinate_issue_rows, missing_coordinate_rows, coordinate_issue_pct, missing_event_date_rows,
+             missing_event_date_pct, high_uncertainty_rows, dq_breach, top_issues, taxon_rows_total, CAST(NULL AS VARCHAR) AS reason
+      FROM load_log WHERE execution_id = :execution_id
+      UNION ALL BY NAME
+      SELECT u->>'name' AS requested_names, 'UNRESOLVED' AS status, u->>'reason' AS reason
+      FROM (SELECT unnest(from_json(:unresolved, '["JSON"]')) AS u);
+
+      COPY (SELECT * FROM summary ORDER BY status = 'UNRESOLVED', taxon_name) TO '{{ outputFiles.summary_csv }}' (HEADER, DELIMITER ',');
+
+      CREATE TEMP TABLE known_unresolved AS
+      SELECT DISTINCT name FROM (
+        SELECT unnest(string_split(:previous_unresolved, '|')) AS name
+        UNION ALL SELECT requested_names FROM summary WHERE status = 'UNRESOLVED'
+      ) WHERE name <> '';
+
+      CREATE TEMP TABLE totals AS
+      SELECT
+        count(*) FILTER (WHERE status <> 'UNRESOLVED') AS taxa_loaded,
+        count(*) FILTER (WHERE status = 'UNRESOLVED') AS unresolved,
+        count(*) FILTER (WHERE status = 'UNRESOLVED' AND position('|' || requested_names || '|' IN :previous_unresolved) = 0) AS new_unresolved,
+        count(*) FILTER (WHERE status = 'CAPPED') AS capped,
+        count(*) FILTER (WHERE status = 'NARROWED') AS narrowed,
+        count(*) FILTER (WHERE dq_breach) AS dq_breaches,
+        coalesce(sum(fetched), 0) AS fetched,
+        coalesce(sum(new_rows), 0) AS new_rows,
+        coalesce(sum(changed_rows), 0) AS changed_rows,
+        coalesce(sum(unchanged_rows), 0) AS unchanged_rows,
+        (SELECT count(*) FROM occurrences) AS table_rows,
+        coalesce(string_agg(
+          CASE WHEN status = 'UNRESOLVED' THEN requested_names || ' UNRESOLVED (' || reason || ')'
+               ELSE taxon_name || ' [' || requested_names || '] ' || CASE WHEN window_from = '' THEN 'BASELINE ' ELSE '' END || status || CASE WHEN status = 'NARROWED' THEN ' to lastInterpreted ' || window_to || ', resumes ' || next_watermark
+                                    WHEN status = 'CAPPED' THEN ' at lastInterpreted ' || coalesce(nullif(window_from, ''), 'start') || ' (' || expected || ' records in one day)' ELSE '' END
+                    || ', ' || new_rows || ' new, ' || changed_rows || ' changed, '
+                    || unchanged_rows || ' unchanged, ' || taxon_rows_total || ' in table, coordinate issues ' || coordinate_issue_pct
+                    || '%, missing eventDate ' || missing_event_date_pct || '%' || CASE WHEN dq_breach THEN ' (DQ WARN)' ELSE '' END END,
+          chr(10) ORDER BY status = 'UNRESOLVED', taxon_name), '') AS per_taxon
+      FROM summary;
+
+      SELECT *, 'GBIF occurrence load needs attention, ' || dq_breaches || ' quality breach(es), ' || capped || ' capped, '
+                || new_unresolved || ' newly unresolved name(s)' || chr(10) || per_taxon || chr(10) || 'Execution ' || :execution_url AS alert_text,
+             '|' || coalesce((SELECT string_agg(name, '|' ORDER BY name) FROM known_unresolved), '') || '|' AS unresolved_set
+      FROM totals;
+
+  - id: alert
+    type: io.kestra.plugin.core.flow.If
+    description: Posts to Slack only when new or changed records breached a quality threshold, a taxon is capped, or a name stopped resolving since the last run.
+    condition: "{{ outputs.report.outputs[0].row.dq_breaches > 0 or outputs.report.outputs[0].row.capped > 0 or outputs.report.outputs[0].row.new_unresolved > 0 }}"
+    then:
+      - id: notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: allowFailure keeps the load green when the webhook secret is not configured.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": {{ outputs.report.outputs[0].row.alert_text | toJson }}}
+
+  - id: save_unresolved
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.db_kv_key }}_unresolved"
+    value: "{{ outputs.report.outputs[0].row.unresolved_set }}"
+    description: Every name ever reported unresolved for this database, so each one alerts once.
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      GBIF scope {{ outputs.resolve_taxa.vars.scope }} ({{ outputs.resolve_taxa.vars.filters | toJson }}, {{ outputs.resolve_taxa.vars.scope_count }} occurrences of all taxa){{ outputs.current_db.value is not defined or outputs.current_db.value is empty ? ', new database created' : '' }}.
+      {{ outputs.report.outputs[0].row.taxa_loaded }} taxa loaded, {{ outputs.report.outputs[0].row.unresolved }} unresolved: {{ outputs.report.outputs[0].row.fetched }} records fetched, {{ outputs.report.outputs[0].row.new_rows }} new, {{ outputs.report.outputs[0].row.changed_rows }} changed, {{ outputs.report.outputs[0].row.unchanged_rows }} unchanged; {{ outputs.report.outputs[0].row.table_rows }} rows in the table.
+      {{ outputs.report.outputs[0].row.per_taxon }}
+      Database: {{ kv(inputs.db_kv_key) }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.report.outputs[0].row }}"
+  - id: summary_csv
+    type: FILE
+    value: "{{ outputs.report.outputFiles.summary_csv }}"
+  - id: duckdb_file
+    type: FILE
+    value: "{{ kv(inputs.db_kv_key) }}"
+
+extend:
+  title: Incrementally Load GBIF Species Occurrences into DuckDB with Per-Taxon Watermarks and Quality Checks
+  metaTitle: GBIF Occurrence Incremental Loader with DuckDB and KV Watermarks | Kestra
+  shortDescription: Resolve species names to GBIF taxon keys, pull only the occurrence records GBIF re-interpreted since the last run for a country or WKT polygon, upsert them on gbifID into a DuckDB file kept in internal storage, and warn when new records have unusable coordinates or no event date.
+  metaDescription: Load GBIF species occurrences into DuckDB incrementally with per-taxon lastInterpreted watermarks, gbifID upserts and coordinate and eventDate checks.
+  description: |
+    Biodiversity dashboards, species distribution models and protected-area reports all start from GBIF occurrence records, and most teams reload the whole set every time because the occurrence search API has no change feed. That is slow, and it hides what changed. GBIF stamps every record with `lastInterpreted` when it is (re)processed, so this flow uses that date as a per-taxon watermark: each run pulls only the records interpreted since the last load, upserts them on `gbifID` into a DuckDB database file kept in Kestra's internal storage, tells new records from real changes with a content hash, and checks the new and changed rows for coordinate and date problems before they reach a map.
+
+    ## How it works
+
+    1. A daily `Schedule` trigger (05:30 UTC) starts the load.
+    2. `resolve_taxa` (Python) calls `species/match` once per name. EXACT and FUZZY matches above `min_match_confidence` are kept; synonyms are replaced by their accepted key, so `Alopex lagopus` and `Vulpes lagopus` become one taxon; HIGHERRANK answers (GBIF only found the genus) and unknown names are reported, never loaded as a whole genus. The `area` input becomes a `country` or `geometry` filter, absences are excluded unless `include_absences` is on, and one `limit=0` search validates the filters before anything is written. The filter list is hashed into a scope id, so another area gets its own watermarks.
+    3. `current_db` (KV Get) reads the URI of the DuckDB file; on the first run `bootstrap` (If) creates it with an `occurrences` table keyed on `gbif_id` and a `load_log` table.
+    4. `load_each_taxon` (Loop, one taxon at a time) runs per taxon key:
+       - `watermark` (KV Get) reads the first `lastInterpreted` day not loaded yet.
+       - `fetch` (Python) counts the window with `limit=0`. If it fits under `max_records_per_taxon` it pages the whole window, 300 records per request with retries on 429 and 5xx; otherwise it binary-searches the latest day that fits and loads up to there (NARROWED), and the next run resumes the day after. A single day above the 100000 records the search API can page is CAPPED: nothing is loaded and the watermark stays. Records are cut down to about 30 columns plus a hash that ignores `lastInterpreted`.
+       - `upsert` (DuckDB) opens the current file through `databaseUri`, classifies rows as NEW, CHANGED or UNCHANGED, upserts the first two (keeping `first_loaded_at`), only touches `last_seen_at` on the rest, checks the new and changed rows and appends one `load_log` row. `save_db` and `advance_watermark` (KV Set, skipped when CAPPED) save the new file and the next day.
+       - `quality_gate` (If) logs a WARN when the share of rows with no coordinates or a listed `coordinate_issue_flags` issue is above `max_coordinate_issue_pct`, when the share without `eventDate` is above `max_missing_event_date_pct`, or when the taxon is CAPPED.
+    5. `report` (DuckDB) writes the per-taxon summary CSV for this execution, unresolved names included. `alert` (If) posts to Slack only for quality breaches, CAPPED taxa or names that were not unresolved before; the webhook has `allowFailure`.
+
+    ## What you get
+
+    - A DuckDB file with one row per `gbifID`: taxon, basis of record, coordinates and uncertainty, event date, recorder, institution, licence, GBIF issue flags, `lastInterpreted` and load timestamps.
+    - A `load_log` table: window, expected and fetched counts, new, changed and unchanged rows and quality figures per taxon and run.
+    - A summary CSV and JSON per execution, and the database file as a flow output.
+    - Re-runs that fetch only what GBIF re-processed since the last run and report 0 new and 0 changed when nothing moved.
+    - Quality warnings that name the cause: records with no coordinates, `COUNTRY_COORDINATE_MISMATCH` and other flags, missing dates.
+
+    ## Who it's for
+
+    - Data engineers building biodiversity or ESG datasets on GBIF.
+    - Ecologists and conservation analysts who want a local, queryable copy of the records for their species and region.
+    - Teams feeding species distribution models who must keep bad coordinates out.
+
+    ## Why orchestrate this with Kestra
+
+    - KV watermarks and a database file in internal storage give incremental state with no server to run.
+    - `Loop` runs taxa one by one, each saving its data before its watermark, so a failure only means that window is read again.
+    - `If` keeps CAPPED taxa from advancing and alerts only on what needs a person.
+    - Inputs for area, filters, thresholds and the database key let one flow serve several regions.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the Python script, JDBC DuckDB and Slack plugins. The Python tasks use only the standard library and the `Process` runner; switch to a Docker runner with `containerImage: python:3.13-slim` if your workers run in containers.
+    - Outbound HTTPS to `api.gbif.org`. The search and species APIs need no account.
+    - The database file lives in the execution folder of the last run that changed it; keep that execution, or copy the `duckdb_file` output, if you purge executions.
+    - Do not run two loads with the same `db_kv_key` at the same time; the second would overwrite the first one's database version.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the alert (optional; without it the alert task fails softly and the load still succeeds).
+
+    ## Quick start
+
+    1. Import the flow and click **Execute** with the defaults: arctic fox (asked for twice, under its current and its old name), muskox and a name GBIF only knows at genus level, in Norway. The first run is a baseline: about 2,600 arctic fox and 8,800 muskox records, a quality warning for arctic fox (museum specimens without coordinates, tracking points outside Norway) and the genus-only name reported unresolved.
+    2. Execute again: only the records GBIF re-interpreted today are fetched, all UNCHANGED, and no alert.
+    3. Try a polygon in `area` and a small `max_records_per_taxon` to watch a backlog load over several runs.
+    4. Add `SLACK_WEBHOOK_URL` and leave the daily schedule on.
+
+    ## How to extend
+
+    - For backlogs above 100000 records per day, or global pulls, use the asynchronous GBIF occurrence download API (`/v1/occurrence/download/request`, requires GBIF account credentials as secrets) and load the resulting archive into the same table.
+    - GBIF deletes records when publishers drop them; the search API does not show deletions, so schedule a monthly reconciliation that compares `gbif_id` lists, or rebuild from a download.
+    - Export the table to Parquet or a warehouse (BigQuery, Snowflake, Postgres) after `report`.
+    - Add `basisOfRecord`, `datasetKey` or `year` filters through `extra_filters`, or `event_date_from` to load recent records only.
+    - Send the summary CSV to the team that curates the species list.
+
+    ## Links
+
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop) and [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [GBIF occurrence search API](https://techdocs.gbif.org/en/openapi/v1/occurrence) and [species API](https://techdocs.gbif.org/en/openapi/v1/species)
+    - [GBIF interpretation issues and flags](https://techdocs.gbif.org/en/data-use/occurrence-issues-and-flags)
+    - [GBIF occurrence downloads](https://techdocs.gbif.org/en/data-use/api-downloads)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Testing & Quality
+    - Monitoring & Alerting
+  ee: false
+  demo: false
