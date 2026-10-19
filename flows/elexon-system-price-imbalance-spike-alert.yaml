@@ -1,0 +1,334 @@
+id: elexon-system-price-imbalance-spike-alert
+namespace: company.team
+
+description: |
+  Alert a GB imbalance desk when a new settlement period's system price breaks out of its rolling
+  7-day range, or when the net imbalance volume is unusually large. Every 30 minutes the flow pulls
+  the Elexon BMRS system prices for the last eight settlement days, evaluates every period published
+  since the last run in DuckDB, and posts one Slack message per run with the periods that breached.
+  The last evaluated period is kept in the KV store, so each period is reported at most once.
+
+inputs:
+  - id: lookback_days
+    type: INT
+    displayName: Baseline window (days)
+    description: Each period is compared with the periods in the preceding N days. One Elexon request is made per settlement day, so a 7-day window means 8 small requests.
+    defaults: 7
+    min: 2
+    max: 28
+
+  - id: high_percentile
+    type: FLOAT
+    displayName: High-price percentile
+    description: A period whose system price is above this percentile of the baseline window is flagged as a price spike.
+    defaults: 0.95
+    min: 0.5
+    max: 0.999
+
+  - id: low_percentile
+    type: FLOAT
+    displayName: Low-price percentile
+    description: A period whose system price is below this percentile of the baseline window is flagged as a price slump (often a long, windy system with negative prices).
+    defaults: 0.05
+    min: 0.001
+    max: 0.5
+
+  - id: niv_threshold_mwh
+    type: FLOAT
+    displayName: Net imbalance volume threshold (MWh)
+    description: Flag a period when the absolute net imbalance volume reaches this value. Positive NIV means the system was short, negative means long.
+    defaults: 500
+
+  - id: max_catchup_periods
+    type: INT
+    displayName: Max periods evaluated per run
+    description: After downtime, at most this many unseen periods (the newest ones) are evaluated. The first run (BASELINE) evaluates only the latest period.
+    defaults: 6
+    min: 1
+    max: 48
+
+  - id: state_key
+    type: STRING
+    displayName: KV state key
+    description: Holds the start time (epoch seconds, UTC) of the newest period already evaluated.
+    defaults: elexon_system_price_last_period
+
+triggers:
+  - id: every_settlement_period
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Elexon publishes the system price about 15 to 20 minutes after a settlement period ends, so the flow runs at 20 and 50 minutes past the hour.
+    cron: "20,50 * * * *"
+    recoverMissedSchedules: LAST
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: last_period
+    type: io.kestra.plugin.core.kv.Get
+    description: Start time of the last evaluated period. Missing on the first run, which is the BASELINE run.
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+
+  - id: fetch_days
+    type: io.kestra.plugin.core.flow.Loop
+    description: |
+      `/balancing/settlement/system-prices/{settlementDate}` has no date range, so the flow makes one request per
+      UK settlement day: today and the previous `lookback_days` days, four at a time.
+    values: >-
+      [{% for i in range(0, inputs.lookback_days) %}"{{ now() | dateAdd(-i, 'DAYS') | date('yyyy-MM-dd', timeZone='Europe/London') }}"{% if not loop.last %},{% endif %}{% endfor %}]
+    concurrencyLimit: 4
+    tasks:
+      - id: fetch_day
+        type: io.kestra.plugin.core.http.Download
+        uri: "https://data.elexon.co.uk/bmrs/api/v1/balancing/settlement/system-prices/{{ item.value }}?format=json"
+        headers:
+          Accept: application/json
+          User-Agent: kestra-elexon-system-price-imbalance-spike-alert/1.0 (https://kestra.io)
+        retry:
+          type: exponential
+          interval: PT20S
+          maxInterval: PT2M
+          maxAttempts: 4
+    outputs:
+      - id: uri
+        type: STRING
+        value: "{{ outputs.fetch_day.uri }}"
+
+  - id: merge_days
+    type: io.kestra.plugin.core.storage.Concat
+    description: Each response is one JSON document on a single line, so joining them with newlines gives a newline-delimited JSON file.
+    files: "{{ outputs.fetch_days.outputs | jq('[.[].outputs.uri]') | first }}"
+    separator: "\n"
+    extension: .jsonl
+
+  - id: evaluate
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Periods are ordered by their UTC `startTime`, not by settlement period number, because clock-change days have
+      46 or 50 periods and early in the UK morning today has no data yet. Every period newer than the KV value
+      (capped at `max_catchup_periods`) is compared with the percentiles of the system price over the preceding
+      `lookback_days` days, excluding the period itself.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      days.jsonl: "{{ outputs.merge_days.uri }}"
+    outputFiles:
+      - periods_csv
+    sql: |
+      SET TimeZone = 'UTC';
+
+      CREATE TABLE raw AS
+      SELECT unnest(from_json(data, '["JSON"]')) AS r
+      FROM read_json('days.jsonl', columns = {'data': 'JSON'}, format = 'newline_delimited');
+
+      CREATE TABLE sp AS
+      SELECT DISTINCT ON (start_time) *
+      FROM (
+        SELECT CAST(r->>'$.startTime' AS TIMESTAMPTZ) AS start_time,
+               r->>'$.settlementDate' AS settlement_date,
+               CAST(r->>'$.settlementPeriod' AS INTEGER) AS period,
+               CAST(r->>'$.systemSellPrice' AS DOUBLE) AS ssp,
+               CAST(r->>'$.systemBuyPrice' AS DOUBLE) AS sbp,
+               CAST(r->>'$.netImbalanceVolume' AS DOUBLE) AS niv,
+               coalesce(CAST(r->>'$.reserveScarcityPrice' AS DOUBLE), 0) AS rsp,
+               CAST(r->>'$.createdDateTime' AS TIMESTAMPTZ) AS published_at
+        FROM raw
+      )
+      ORDER BY start_time, published_at DESC;
+
+      CREATE TABLE candidates AS
+      SELECT * FROM sp
+      WHERE epoch(start_time) > {{ outputs.last_period.value ?? 0 }}
+      ORDER BY start_time DESC
+      LIMIT {{ (outputs.last_period.value ?? '') == '' ? 1 : inputs.max_catchup_periods }};
+
+      CREATE TABLE eval AS
+      SELECT c.*, b.n_baseline, b.p_low, b.p_mid, b.p_high,
+             c.sbp > b.p_high AS price_high,
+             c.ssp < b.p_low AS price_low,
+             abs(c.niv) >= {{ inputs.niv_threshold_mwh }} AS niv_large,
+             c.rsp > 0 AS scarcity
+      FROM candidates c,
+      LATERAL (
+        SELECT count(*) AS n_baseline,
+               round(quantile_cont(h.ssp, {{ inputs.low_percentile }}), 2) AS p_low,
+               round(median(h.ssp), 2) AS p_mid,
+               round(quantile_cont(h.ssp, {{ inputs.high_percentile }}), 2) AS p_high
+        FROM sp h
+        WHERE h.start_time < c.start_time
+          AND h.start_time >= c.start_time - to_days({{ inputs.lookback_days }})
+      ) b;
+
+      CREATE TABLE flagged AS
+      SELECT *, (price_high OR price_low OR niv_large OR scarcity) AND n_baseline >= 48 AS alert,
+             concat_ws(', ',
+               CASE WHEN price_high THEN 'price above P' || printf('%g', {{ inputs.high_percentile }} * 100) END,
+               CASE WHEN price_low THEN 'price below P' || printf('%g', {{ inputs.low_percentile }} * 100) END,
+               CASE WHEN niv_large THEN 'large NIV' END,
+               CASE WHEN scarcity THEN 'reserve scarcity price ' || CAST(rsp AS VARCHAR) END) AS reasons
+      FROM eval;
+
+      COPY (
+        SELECT settlement_date, period, strftime(start_time, '%Y-%m-%dT%H%MZ') AS start_utc, ssp, sbp, round(niv, 1) AS niv_mwh, rsp,
+               n_baseline, p_low, p_mid, p_high, price_high, price_low, niv_large, scarcity, alert, reasons
+        FROM flagged ORDER BY start_time
+      ) TO '{{ outputFiles.periods_csv }}' (HEADER, DELIMITER ',');
+
+      SELECT
+        (SELECT count(*) FROM sp) AS periods_fetched,
+        (SELECT count(DISTINCT settlement_date) FROM sp) AS days_fetched,
+        (SELECT strftime(max(start_time), '%Y-%m-%dT%H%MZ') FROM sp) AS newest_start,
+        (SELECT CAST(epoch(max(start_time)) AS BIGINT) FROM sp) AS newest_epoch,
+        (SELECT date_diff('minute', max(start_time), now()) FROM sp) AS newest_age_min,
+        '{{ outputs.last_period.value ?? '' }}' = '' AS is_baseline,
+        (SELECT count(*) FROM flagged) AS evaluated,
+        (SELECT count(*) FROM flagged WHERE alert) AS alerts,
+        (SELECT coalesce(string_agg('SP' || period || ' ' || settlement_date || ' £' || printf('%.2f', ssp) || '/MWh NIV ' || printf('%+.0f', niv) || ' MWh', '; ' ORDER BY start_time), 'none') FROM flagged) AS evaluated_line,
+        (SELECT coalesce(string_agg(
+            '*SP' || period || ' ' || settlement_date || '* (starts ' || strftime(start_time AT TIME ZONE 'Europe/London', '%H.%M') || ' UK)'
+            || chr(10) || '  SSP £' || printf('%.2f', ssp) || ' / SBP £' || printf('%.2f', sbp) || ' per MWh vs ' || {{ inputs.lookback_days }} || '-day median £' || printf('%.2f', p_mid)
+            || ', range £' || printf('%.2f', p_low) || ' to £' || printf('%.2f', p_high)
+            || chr(10) || '  NIV ' || printf('%+.0f', niv) || ' MWh (' || CASE WHEN niv > 0 THEN 'system short' ELSE 'system long' END || ')'
+            || chr(10) || '  Flags - ' || reasons,
+            chr(10) ORDER BY start_time) FILTER (WHERE alert), '') FROM flagged) AS alert_text;
+
+  - id: warn_stale_feed
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.evaluate.outputs[0].row.newest_age_min > 120 }}"
+    level: WARN
+    message: "Newest Elexon system price starts {{ outputs.evaluate.outputs[0].row.newest_age_min }} minutes ago ({{ outputs.evaluate.outputs[0].row.newest_start }}). Elexon publication may be delayed."
+
+  - id: save_last_period
+    type: io.kestra.plugin.core.kv.Set
+    description: Moves the watermark to the newest published period, so the next run only evaluates periods published after it.
+    runIf: "{{ outputs.evaluate.outputs[0].row.newest_epoch is not null }}"
+    key: "{{ inputs.state_key }}"
+    value: "{{ outputs.evaluate.outputs[0].row.newest_epoch }}"
+
+  - id: alert_on_breach
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.outputs[0].row.alerts > 0 }}"
+    then:
+      - id: alert_message
+        type: io.kestra.plugin.core.debug.Return
+        format: |-
+          :zap: *GB imbalance price alert* - {{ outputs.evaluate.outputs[0].row.alerts }} of {{ outputs.evaluate.outputs[0].row.evaluated }} new settlement period(s) breached
+          {{ outputs.evaluate.outputs[0].row.alert_text }}
+          https://bmrs.elexon.co.uk/system-prices
+
+      - id: log_alert
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.alert_message.value }}"
+
+      - id: slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: allowFailure keeps the watermark moving when `SLACK_WEBHOOK_URL` is not set; the alert is still logged and in the CSV output.
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "{{ outputs.alert_message.value }}"
+    else:
+      - id: log_clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          {% if outputs.evaluate.outputs[0].row.evaluated == 0 %}No settlement period published since the last run.{% else %}No breach in
+          {{ outputs.evaluate.outputs[0].row.evaluated }} new period(s){{ outputs.evaluate.outputs[0].row.is_baseline ? ' (BASELINE run, latest period only)' : '' }}:
+          {{ outputs.evaluate.outputs[0].row.evaluated_line }}{% endif %}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Fetched {{ outputs.evaluate.outputs[0].row.periods_fetched }} periods over {{ outputs.evaluate.outputs[0].row.days_fetched }} settlement days,
+      newest starts {{ outputs.evaluate.outputs[0].row.newest_start }}. Evaluated {{ outputs.evaluate.outputs[0].row.evaluated }}
+      ({{ outputs.evaluate.outputs[0].row.evaluated_line }}), alerts {{ outputs.evaluate.outputs[0].row.alerts }}.
+
+outputs:
+  - id: alerts
+    type: INT
+    value: "{{ outputs.evaluate.outputs[0].row.alerts }}"
+  - id: evaluated_periods
+    type: STRING
+    value: "{{ outputs.evaluate.outputs[0].row.evaluated_line }}"
+  - id: periods_csv
+    type: FILE
+    value: "{{ outputs.evaluate.outputFiles.periods_csv }}"
+
+extend:
+  title: Elexon GB System Price and Imbalance Spike Alert
+  metaTitle: Elexon BMRS System Price Spike Alert to Slack | Kestra
+  shortDescription: Check every new GB settlement period's system price against its rolling 7-day percentiles and the net imbalance volume, and alert in Slack once per period.
+  metaDescription: Pull Elexon BMRS system prices every 30 minutes, flag settlement periods above P95 or below P5 of the last 7 days or with large NIV, alert in Slack.
+  description: |
+    Balance responsible parties pay or receive the system price on every MWh they are out of balance, so a single
+    half-hour at twice the usual price can wipe out a day's trading margin. This flow watches the Elexon BMRS
+    system prices for Great Britain and tells the imbalance desk in Slack as soon as a newly published settlement
+    period breaks out of its recent range, or the system is unusually long or short. All prices come from the live
+    Elexon Insights API; no API key is needed.
+
+    ## How it works
+
+    1. A Schedule trigger runs at 20 and 50 minutes past the hour, shortly after Elexon publishes each period.
+    2. `last_period` reads the KV watermark: the UTC start time of the newest period already evaluated.
+    3. A `Loop` downloads `/balancing/settlement/system-prices/{settlementDate}` for today and the previous
+       `lookback_days` UK settlement days (the endpoint has no date range), four at a time with retries.
+    4. `merge_days` concatenates the responses and DuckDB orders the periods by UTC start time, which keeps
+       46- and 50-period clock-change days and the empty start of a UK morning correct.
+    5. Every period newer than the watermark (at most `max_catchup_periods`, so a restart after downtime catches up)
+       is compared with the P5, median and P95 of the system price over the preceding `lookback_days` days. It is
+       flagged when the price is above the high percentile, below the low one, when |NIV| reaches
+       `niv_threshold_mwh`, or when a reserve scarcity price applies. A period needs at least 48 baseline periods.
+    6. The watermark moves to the newest period. An `If` sends one Slack message listing the breached periods with
+       SSP, SBP, the baseline range and NIV (system short or long); otherwise it logs the clean periods.
+
+    ## What you get
+
+    - One alert per breached period, never repeated on later runs.
+    - Both tails: price spikes when the system is short and price slumps (often negative) when it is long.
+    - A CSV flow output with every evaluated period, its baseline percentiles and flags.
+    - A warning when the newest published period is more than two hours old.
+
+    ## Who it's for
+
+    - GB energy traders and imbalance desks at suppliers, generators and battery operators.
+    - Risk analysts tracking imbalance cost exposure.
+
+    ## Why orchestrate this with Kestra
+
+    - Per-request retries, a single-run concurrency guard and missed-schedule recovery without custom code.
+    - KV state makes the dedupe survive restarts, and the catch-up cap keeps a long outage from flooding Slack.
+
+    ## Prerequisites
+
+    - Outbound HTTPS to `data.elexon.co.uk` (public, no key) and the DuckDB plugin.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the alert (optional; without it the alert is only logged).
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` to the namespace secrets.
+    2. Execute the flow once. The first run is the BASELINE: it evaluates only the latest period and sets the watermark.
+    3. Execute again to see that nothing is re-reported, then let the schedule run.
+    4. To replay the last few periods, set the `elexon_system_price_last_period` KV key to an earlier epoch second.
+
+    ## How to extend
+
+    - Add the market index price endpoint to alert on the spread between day-ahead and imbalance prices.
+    - Route `price_low` periods to a battery dispatch flow with a Flow trigger.
+
+    ## Links
+
+    - [Elexon Insights API: system prices](https://bmrs.elexon.co.uk/api-documentation/endpoint/balancing/settlement/system-prices/%7BsettlementDate%7D)
+    - [BMRS system prices dashboard](https://bmrs.elexon.co.uk/system-prices)
+    - [Kestra Loop task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [Kestra DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [Kestra Slack incoming webhook](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
