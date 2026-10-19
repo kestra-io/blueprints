@@ -1,0 +1,596 @@
+id: nats-jetstream-abandoned-consumer-retention-reclaim-guard
+namespace: company.streaming
+
+description: |
+  Continuously inspect NATS JetStream consumer topologies to detect abandoned ephemeral or durable
+  consumers pinning stream retention sequence floors, track consecutive inactive runs in Kestra KV,
+  gate destructive deletions behind a human approval Pause, safely delete dead consumers via native
+  JetStream management APIs, and verify storage retention headroom recovery.
+
+inputs:
+  - id: nats_url
+    type: STRING
+    displayName: NATS Server URL
+    description: URL of the target NATS broker with JetStream enabled.
+    defaults: "nats://localhost:4222"
+
+  - id: stream_name
+    type: STRING
+    displayName: Stream Name
+    description: Name of the NATS JetStream stream to audit for pinned message retention.
+    defaults: "ORDERS"
+
+  - id: inactivity_threshold_seconds
+    type: INT
+    displayName: Inactivity Threshold (Seconds)
+    description: Minimum time elapsed since consumer last active timestamp before considering it inactive.
+    defaults: 3600
+
+  - id: min_consecutive_inactive_runs
+    type: INT
+    displayName: Minimum Consecutive Inactive Runs
+    description: Number of consecutive audit executions a consumer must remain inactive and pinned before becoming eligible for deletion.
+    defaults: 2
+
+  - id: min_retention_lag_messages
+    type: INT
+    displayName: Retention Message Lag Floor
+    description: Minimum message sequence lag between stream last sequence and consumer ack floor required to classify retention pinning.
+    defaults: 100
+
+  - id: remediation_action
+    type: SELECT
+    displayName: Remediation Action
+    description: Corrective action to execute when abandoned consumers holding stream retention are identified.
+    values:
+      - DELETE_CONSUMER
+      - AUDIT_ONLY
+    defaults: DELETE_CONSUMER
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, identifies abandoned consumers and logs planned actions without issuing deletion API calls.
+    defaults: true
+
+triggers:
+  - id: periodic_retention_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Run automated NATS JetStream abandoned consumer and retention pinning audit every 2 hours.
+    cron: "0 */2 * * *"
+    disabled: true
+
+  - id: on_demand_retention_guard_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by JetStream storage alerts or SRE incident runbooks.
+    key: "{{ secret('NATS_RETENTION_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy threshold and sanity constraints.
+    conditions:
+      - "{{ inputs.stream_name | length > 0 }}"
+      - "{{ inputs.inactivity_threshold_seconds >= 60 }}"
+      - "{{ inputs.min_consecutive_inactive_runs >= 1 }}"
+      - "{{ inputs.min_retention_lag_messages >= 0 }}"
+    errorMessage: "Invalid configuration inputs. Provide a valid stream name, inactivity threshold >= 60s, consecutive runs >= 1, and lag floor >= 0."
+
+  - id: get_stream_info
+    type: io.kestra.plugin.nats.core.Request
+    description: Query NATS JetStream management API for stream retention policy, current sequence bounds, and byte usage.
+    url: "{{ inputs.nats_url }}"
+    subject: "$JS.API.STREAM.INFO.{{ inputs.stream_name }}"
+    from:
+      data: "{}"
+    requestTimeout: PT5S
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: list_consumers
+    type: io.kestra.plugin.nats.core.Request
+    description: Query NATS JetStream management API for all registered consumers and their operational states on the target stream.
+    url: "{{ inputs.nats_url }}"
+    subject: "$JS.API.CONSUMER.LIST.{{ inputs.stream_name }}"
+    from:
+      data: "{}"
+    requestTimeout: PT5S
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: get_previous_audit_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve historical consumer activity tracker from Kestra KV store to identify consecutive inactive runs.
+    key: "nats_retention_guard_{{ inputs.stream_name }}"
+    errorOnMissing: false
+
+  - id: inspect_abandoned_consumers
+    type: io.kestra.plugin.scripts.python.Script
+    description: Correlate active subscriptions, ack floors, and historical KV state to isolate consumers pinning stream retention.
+    containerImage: python:3.11-slim
+    env:
+      STREAM_INFO: "{{ outputs.get_stream_info.response }}"
+      CONSUMER_LIST: "{{ outputs.list_consumers.response }}"
+      PREVIOUS_STATE: "{{ (outputs.get_previous_audit_state.value ?? {}) | toJson }}"
+      INACTIVITY_THRESHOLD_SECONDS: "{{ inputs.inactivity_threshold_seconds }}"
+      MIN_CONSECUTIVE_RUNS: "{{ inputs.min_consecutive_inactive_runs }}"
+      MIN_RETENTION_LAG: "{{ inputs.min_retention_lag_messages }}"
+      REMEDIATION_ACTION: "{{ inputs.remediation_action }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+    script: |
+      import os
+      import json
+      import datetime
+
+      stream_info_raw = os.getenv("STREAM_INFO", "{}")
+      consumer_list_raw = os.getenv("CONSUMER_LIST", "{}")
+      previous_state_raw = os.getenv("PREVIOUS_STATE", "{}")
+      inactivity_threshold_sec = int(os.getenv("INACTIVITY_THRESHOLD_SECONDS", "3600"))
+      min_consecutive_runs = int(os.getenv("MIN_CONSECUTIVE_RUNS", "2"))
+      min_retention_lag = int(os.getenv("MIN_RETENTION_LAG", "100"))
+      remediation_action = os.getenv("REMEDIATION_ACTION", "DELETE_CONSUMER")
+      dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+
+      try:
+          stream_info = json.loads(stream_info_raw)
+          if not isinstance(stream_info, dict):
+              stream_info = None
+      except Exception:
+          stream_info = None
+
+      try:
+          consumer_list = json.loads(consumer_list_raw)
+          if not isinstance(consumer_list, dict):
+              consumer_list = None
+      except Exception:
+          consumer_list = None
+
+      try:
+          previous_state = json.loads(previous_state_raw) if isinstance(previous_state_raw, str) else previous_state_raw
+          if not isinstance(previous_state, dict):
+              previous_state = {}
+      except Exception:
+          previous_state = {}
+
+      # A NATS request/reply call returns a null response on timeout or "no responder" rather
+      # than raising -- treat a missing/malformed reply as an honest probe failure instead of
+      # silently falling through to an empty "0 consumers, HEALTHY" result, and never overwrite
+      # the KV consecutive-inactive-run tracker with empty data from a failed probe.
+      probe_failed = stream_info is None or consumer_list is None
+
+      if probe_failed:
+          overall_status = "PROBE_FAILED"
+          has_abandoned = False
+          abandoned_candidates = []
+          abandoned_consumer_names = []
+          total_pinned_bytes = 0
+          pinned_formatted = "0 B"
+          summary_text = (
+              "PROBE_FAILED: NATS JetStream did not return a valid reply for stream "
+              "'{{ inputs.stream_name }}'. Stream info or consumer list request timed out or had no "
+              "responder. Preserving prior KV tracking state unchanged; check broker reachability and "
+              "JetStream API permissions."
+          )
+          new_state_snapshot = previous_state if previous_state else {"stream_name": "{{ inputs.stream_name }}", "last_audit": now_iso, "consumers": {}}
+
+          print("::" + json.dumps({
+              "outputs": {
+                  "overall_status": overall_status,
+                  "has_abandoned": has_abandoned,
+                  "abandoned_count": 0,
+                  "abandoned_consumers": abandoned_candidates,
+                  "abandoned_consumer_names": abandoned_consumer_names,
+                  "total_pinned_bytes": total_pinned_bytes,
+                  "pinned_bytes_formatted": pinned_formatted,
+                  "new_state_json": json.dumps(new_state_snapshot),
+                  "audit_manifest": {"status": overall_status, "summary": summary_text},
+                  "summary_text": summary_text
+              }
+          }) + "::")
+          raise SystemExit(0)
+
+      stream_state = stream_info.get("state", {})
+      stream_last_seq = stream_state.get("last_seq", 0)
+      stream_first_seq = stream_state.get("first_seq", 0)
+      stream_bytes = stream_state.get("bytes", 0)
+      total_messages = stream_state.get("messages", 0)
+      avg_bytes_per_msg = (stream_bytes / total_messages) if total_messages > 0 else 0
+
+      consumers = consumer_list.get("consumers", [])
+      if not isinstance(consumers, list):
+          consumers = []
+
+      now = datetime.datetime.now(datetime.timezone.utc)
+      now_iso = now.isoformat()
+
+      prev_consumers = previous_state.get("consumers", {})
+      new_consumers_tracker = {}
+
+      abandoned_candidates = []
+      abandoned_consumer_names = []
+      total_pinned_bytes = 0
+
+      for c in consumers:
+          c_name = c.get("name", "unknown")
+          c_created = c.get("created", "")
+          c_ack_floor = c.get("ack_floor", {})
+          c_ack_seq = c_ack_floor.get("stream_seq", 0)
+          c_waiting = c.get("num_waiting", 0)
+          c_push_bound = c.get("push_bound", False)
+          c_num_ack_pending = c.get("num_ack_pending", 0)
+          c_num_redelivered = c.get("num_redelivered", 0)
+          is_durable = bool(c.get("config", {}).get("durable_name"))
+
+          last_active_str = c_ack_floor.get("last_active") or c_created
+          is_time_stale = False
+          time_inactive_seconds = 0
+
+          if last_active_str:
+              try:
+                  cleaned_ts = last_active_str.replace("Z", "+00:00")
+                  dt_active = datetime.datetime.fromisoformat(cleaned_ts)
+                  time_inactive_seconds = max(0, int((now - dt_active).total_seconds()))
+                  if time_inactive_seconds >= inactivity_threshold_sec:
+                      is_time_stale = True
+              except Exception:
+                  is_time_stale = True
+
+          has_active_subscription = (c_waiting > 0) or c_push_bound
+          is_inactive = (not has_active_subscription) and is_time_stale
+          retention_lag = max(0, stream_last_seq - c_ack_seq)
+
+          prev_entry = prev_consumers.get(c_name, {})
+          prev_inactive_count = prev_entry.get("consecutive_inactive_runs", 0)
+          prev_seq = prev_entry.get("last_ack_stream_seq", -1)
+
+          if is_inactive:
+              if prev_seq == -1 or prev_seq == c_ack_seq:
+                  consecutive_inactive_runs = prev_inactive_count + 1
+              else:
+                  consecutive_inactive_runs = 1
+          else:
+              consecutive_inactive_runs = 0
+
+          new_consumers_tracker[c_name] = {
+              "consecutive_inactive_runs": consecutive_inactive_runs,
+              "last_ack_stream_seq": c_ack_seq,
+              "last_evaluated": now_iso
+          }
+
+          if is_inactive and consecutive_inactive_runs >= min_consecutive_runs and retention_lag >= min_retention_lag:
+              estimated_pinned_bytes = int(retention_lag * avg_bytes_per_msg)
+              total_pinned_bytes += estimated_pinned_bytes
+              abandoned_candidates.append({
+                  "name": c_name,
+                  "created": c_created,
+                  "is_durable": is_durable,
+                  "ack_floor_stream_seq": c_ack_seq,
+                  "retention_lag": retention_lag,
+                  "num_ack_pending": c_num_ack_pending,
+                  "num_redelivered": c_num_redelivered,
+                  "consecutive_inactive_runs": consecutive_inactive_runs,
+                  "time_inactive_seconds": time_inactive_seconds,
+                  "estimated_pinned_bytes": estimated_pinned_bytes
+              })
+              abandoned_consumer_names.append(c_name)
+
+      new_state_snapshot = {
+          "stream_name": stream_info.get("config", {}).get("name", "unknown"),
+          "last_audit": now_iso,
+          "consumers": new_consumers_tracker
+      }
+
+      has_abandoned = len(abandoned_candidates) > 0
+      overall_status = "RETENTION_PINNED" if has_abandoned else "HEALTHY"
+
+      def format_bytes(b):
+          if b >= 1073741824:
+              return f"{b / 1073741824:.2f} GB"
+          if b >= 1048576:
+              return f"{b / 1048576:.2f} MB"
+          if b >= 1024:
+              return f"{b / 1024:.2f} KB"
+          return f"{b} B"
+
+      pinned_formatted = format_bytes(total_pinned_bytes)
+
+      if has_abandoned:
+          summary_text = (
+              f"Detected {len(abandoned_candidates)} abandoned consumer(s) pinning retention sequence floors "
+              f"on stream '{stream_info.get('config', {}).get('name', 'unknown')}'. "
+              f"Estimated pinned storage: {pinned_formatted}. "
+              f"Remediation action: {'DRY RUN' if dry_run else remediation_action}."
+          )
+      else:
+          summary_text = (
+              f"Stream '{stream_info.get('config', {}).get('name', 'unknown')}' is healthy. "
+              f"Audited {len(consumers)} consumer(s); zero abandoned retention pins detected."
+          )
+
+      audit_manifest = {
+          "status": overall_status,
+          "stream_first_seq": stream_first_seq,
+          "stream_last_seq": stream_last_seq,
+          "stream_bytes": stream_bytes,
+          "total_consumers": len(consumers),
+          "abandoned_count": len(abandoned_candidates),
+          "abandoned_consumers": abandoned_candidates,
+          "total_pinned_bytes": total_pinned_bytes,
+          "pinned_bytes_formatted": pinned_formatted,
+          "evaluated_at": now_iso,
+          "summary": summary_text
+      }
+
+      print("::" + json.dumps({
+          "outputs": {
+              "overall_status": overall_status,
+              "has_abandoned": has_abandoned,
+              "abandoned_count": len(abandoned_candidates),
+              "abandoned_consumers": abandoned_candidates,
+              "abandoned_consumer_names": abandoned_consumer_names,
+              "total_pinned_bytes": total_pinned_bytes,
+              "pinned_bytes_formatted": pinned_formatted,
+              "new_state_json": json.dumps(new_state_snapshot),
+              "audit_manifest": audit_manifest,
+              "summary_text": summary_text
+          }
+      }) + "::")
+
+  - id: save_audit_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist updated consecutive inactive run tracking in Kestra KV store for cross-run trend analysis.
+    key: "nats_retention_guard_{{ inputs.stream_name }}"
+    kvType: JSON
+    value: "{{ outputs.inspect_abandoned_consumers.vars.new_state_json }}"
+
+  - id: remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Execute guarded consumer deletion when abandoned consumers are confirmed and remediation is set to DELETE_CONSUMER.
+    condition: "{{ outputs.inspect_abandoned_consumers.vars.has_abandoned and inputs.remediation_action == 'DELETE_CONSUMER' }}"
+    then:
+      - id: dry_run_check
+        type: io.kestra.plugin.core.flow.If
+        description: Enforce human approval gate and issue deletion requests when dry_run is disabled.
+        condition: "{{ not inputs.dry_run }}"
+        then:
+          - id: pause_for_reclaim_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause execution for operator verification before deleting abandoned consumers. Review consumer names and unacknowledged message counts before resuming.
+
+          - id: delete_abandoned_consumers
+            type: io.kestra.plugin.core.flow.Loop
+            description: Safely iterate over each identified abandoned consumer and send deletion request to NATS JetStream API.
+            values: "{{ outputs.inspect_abandoned_consumers.vars.abandoned_consumer_names }}"
+            tasks:
+              - id: delete_consumer_request
+                type: io.kestra.plugin.nats.core.Request
+                description: Send JetStream consumer deletion command over NATS management subject.
+                url: "{{ inputs.nats_url }}"
+                subject: "$JS.API.CONSUMER.DELETE.{{ inputs.stream_name }}.{{ item.value }}"
+                from:
+                  data: "{}"
+                requestTimeout: PT5S
+                retry:
+                  type: exponential
+                  interval: PT2S
+                  maxInterval: PT30S
+                  maxAttempts: 3
+
+          - id: verify_consumer_list
+            type: io.kestra.plugin.nats.core.Request
+            description: Re-query consumer list from JetStream API to verify deleted consumers are completely deregistered.
+            url: "{{ inputs.nats_url }}"
+            subject: "$JS.API.CONSUMER.LIST.{{ inputs.stream_name }}"
+            from:
+              data: "{}"
+            requestTimeout: PT5S
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+
+          - id: verify_stream_retention
+            type: io.kestra.plugin.nats.core.Request
+            description: Re-query stream information to confirm retention sequence floor progression and reclaimed storage.
+            url: "{{ inputs.nats_url }}"
+            subject: "$JS.API.STREAM.INFO.{{ inputs.stream_name }}"
+            from:
+              data: "{}"
+            requestTimeout: PT5S
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+
+          - id: log_remediation_summary
+            type: io.kestra.plugin.core.log.Log
+            description: Record verified post-remediation storage and sequence metrics.
+            message: >-
+              Successfully deleted {{ outputs.inspect_abandoned_consumers.vars.abandoned_count }} abandoned consumer(s)
+              for stream '{{ inputs.stream_name }}'.
+              Stream first sequence advanced to {{ (outputs.verify_stream_retention.response | fromJson).state.first_seq }},
+              and current message count is {{ (outputs.verify_stream_retention.response | fromJson).state.messages }}.
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Record dry-run detection summary without modifying broker consumer state.
+            message: >-
+              DRY RUN: Detected {{ outputs.inspect_abandoned_consumers.vars.abandoned_count }} abandoned consumer(s)
+              pinning retention on stream '{{ inputs.stream_name }}'.
+              Consumers eligible for deletion: {{ outputs.inspect_abandoned_consumers.vars.abandoned_consumer_names }}.
+              Set inputs.dry_run to false to execute automated deletion behind operator approval.
+
+  - id: notify_slack_audit
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch structured Slack notification with abandoned consumer inventory and storage reclamation metrics.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "{{ outputs.inspect_abandoned_consumers.vars.overall_status == 'HEALTHY' ? '#2EB67D' : '#E01E5A' }}",
+            "title": ":satellite: NATS JetStream Consumer Retention Guard — {{ inputs.stream_name }}",
+            "text": "{{ outputs.inspect_abandoned_consumers.vars.summary_text }}",
+            "fields": [
+              {
+                "title": "Stream",
+                "value": "`{{ inputs.stream_name }}`",
+                "short": true
+              },
+              {
+                "title": "Status",
+                "value": "*{{ outputs.inspect_abandoned_consumers.vars.overall_status }}*",
+                "short": true
+              },
+              {
+                "title": "Abandoned Consumers",
+                "value": "{{ outputs.inspect_abandoned_consumers.vars.abandoned_count }}",
+                "short": true
+              },
+              {
+                "title": "Estimated Pinned Bytes",
+                "value": "{{ outputs.inspect_abandoned_consumers.vars.pinned_bytes_formatted }}",
+                "short": true
+              },
+              {
+                "title": "Remediation Mode",
+                "value": "`{{ inputs.dry_run ? 'DRY_RUN (Audit Only)' : inputs.remediation_action }}`",
+                "short": true
+              },
+              {
+                "title": "Execution ID",
+                "value": "`{{ execution.id }}`",
+                "short": true
+              }
+            ]
+          }
+        ]
+      }
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert when retention guard execution encounters an unexpected failure.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "#E01E5A",
+            "title": ":rotating_light: NATS JetStream Retention Guard Failed",
+            "text": "Execution `{{ execution.id }}` failed while inspecting or reclaiming consumers for stream `{{ inputs.stream_name }}` on `{{ inputs.nats_url }}`.\nCheck broker connectivity, JetStream account permissions, or Kestra worker logs."
+          }
+        ]
+      }
+
+extend:
+  title: NATS JetStream Abandoned Consumer Retention Reclaim Guard
+  metaTitle: NATS JetStream Abandoned Consumer Retention Reclaim Guard | Kestra
+  shortDescription: Detect abandoned NATS JetStream consumers pinning stream retention, pause for operator approval, reclaim storage by deleting stale consumers, and verify headroom recovery.
+  metaDescription: Detect abandoned NATS JetStream consumers pinning retention, pause for approval, delete stale consumers to reclaim storage, and verify headroom in Kestra.
+  description: |
+    In high-throughput NATS JetStream streaming architectures, streams configured with `Interest` or
+    `Limits` retention policies enforce that messages cannot be pruned until every registered consumer
+    has acknowledged them. When microservice pods, dynamic test suites, or ephemeral worker processes crash
+    or disconnect without deregistering their consumers, those abandoned consumers leave an unacknowledged
+    sequence floor (`ack_floor`) pinned at an old stream position.
+
+    As upstream publishers continue pushing new messages, the gap between the stream's highest sequence
+    and the abandoned consumer's acknowledgment floor expands. Because JetStream honors the consumer's
+    retention interest, the broker cannot trim expired messages from disk or memory. Eventually, the stream
+    hits its storage ceiling (`max_bytes`), causing the NATS cluster to reject incoming writes and halt
+    business pipelines.
+
+    This blueprint provides an automated retention reclaim guard. It queries JetStream management APIs
+    for consumer subscription status and acknowledgment floors, tracks consecutive inactive observations
+    across runs in Kestra KV to avoid false positives, gates destructive deletions behind a human approval
+    Pause, executes targeted `$JS.API.CONSUMER.DELETE` commands, verifies sequence advancement and storage
+    reclamation, and dispatches detailed Slack audit reports.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: Validates operational inputs (`io.kestra.plugin.core.execution.Assert`), verifying valid stream names, positive inactivity intervals, and non-negative lag thresholds.
+    2. **Stream Telemetry Collection**: `get_stream_info` (`io.kestra.plugin.nats.core.Request`) queries `$JS.API.STREAM.INFO.<stream>` to retrieve retention mode, current byte usage, and first/last sequence numbers.
+    3. **Consumer Topology Discovery**: `list_consumers` (`io.kestra.plugin.nats.core.Request`) queries `$JS.API.CONSUMER.LIST.<stream>` to inspect all durable and ephemeral consumers, pulling their acknowledgment floors (`ack_floor`), active subscriptions (`num_waiting`), push bindings (`push_bound`), and pending message counts.
+    4. **Historical State Retrieval**: `get_previous_audit_state` (`io.kestra.plugin.core.kv.Get`) retrieves the previous audit manifest from Kestra KV store under `nats_retention_guard_{stream_name}`.
+    5. **Triage and Abandonment Classification**: A Python inspection script (`inspect_abandoned_consumers`) cross-references consumer activity against historical records. A consumer is classified as `ABANDONED_RETENTION_PINNED` only when it has zero active subscriptions, an inactive duration exceeding `inactivity_threshold_seconds`, stationary acknowledgment sequence across `min_consecutive_inactive_runs`, and sequence lag exceeding `min_retention_lag_messages`.
+    6. **Cross-Run State Tracking**: `save_audit_state` (`io.kestra.plugin.core.kv.Set`) updates the Kestra KV store with consecutive inactive run counters for each consumer, enabling trend-based detection.
+    7. **Human Approval Gate**: When abandoned consumers are detected and `dry_run` is disabled, the workflow halts at `pause_for_reclaim_approval` (`io.kestra.plugin.core.flow.Pause`), presenting operators with candidate consumer names, pinned sequence floors, and estimated storage footprints.
+    8. **Write-Path Consumer Deletion**: Upon operator approval, `delete_abandoned_consumers` (`io.kestra.plugin.core.flow.Loop`) iterates through each abandoned consumer and sends `$JS.API.CONSUMER.DELETE.<stream>.<consumer>` requests to the NATS broker.
+    9. **Post-Remediation Verification**: The flow re-queries `$JS.API.CONSUMER.LIST.<stream>` and `$JS.API.STREAM.INFO.<stream>` to prove consumer deregistration and confirm that stream retention sequence floors advanced.
+    10. **Incident and Audit Alerting**: Structured Slack alerts are dispatched (`notify_slack_audit`) with recovery metrics, while execution errors trigger dedicated triage notifications.
+
+    ## What you get
+
+    - Automated discovery of abandoned ephemeral and durable consumers pinning stream retention.
+    - Protection against broker disk and memory saturation caused by dead consumer sequence floors.
+    - Differential trend analysis via Kestra KV preventing premature deletion of restarting workers.
+    - Operator approval gates and dry-run simulation to review deletion candidates safely.
+    - Post-remediation verification confirming that consumers were deleted and storage headroom recovered.
+    - Structured Slack notifications detailing reclaimed bytes and updated stream sequence bounds.
+
+    ## Who it's for
+
+    - Platform Engineers and SREs maintaining production NATS JetStream messaging clusters.
+    - Streaming Data Engineers operating microservice event buses and pub/sub pipelines.
+    - DevOps Teams automating infrastructure hygiene, resource cleanup, and day-2 operations.
+
+    ## Why orchestrate this with Kestra
+
+    NATS CLI commands like `nats consumer rm` require manual terminal execution and cannot track consecutive inactive observations across time, enforce approval gates, or verify storage recovery automatically.
+    Custom shell scripts and cron jobs lack cross-run state persistence, secret masking, and centralized audit trails.
+
+    Orchestrating this guard with Kestra provides native NATS request/reply integration, built-in KV store state tracking, human-in-the-loop pause gates, comprehensive execution logging, and automated multi-channel alerting.
+
+    ## Prerequisites
+
+    - A reachable NATS server (version 2.9 or higher) with JetStream enabled.
+    - Target stream created with `Interest` or `Limits` retention policy.
+    - NATS user credentials (if authentication is enabled) with permissions to query `$JS.API.>` subjects.
+    - A Slack Incoming Webhook URL to receive audit notifications and failure alerts.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL used to dispatch audit summaries and emergency incident alerts.
+    - `NATS_RETENTION_GUARD_WEBHOOK_KEY`: Secret authentication key protecting the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `SLACK_WEBHOOK_URL` and `NATS_RETENTION_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `nats_url` and `stream_name` to match your target NATS environment.
+    3. Run a manual execution with `dry_run: true` to record an initial baseline and review identified consumer candidates.
+    4. Enable the `periodic_retention_guard` schedule trigger to run automated retention audits every 2 hours.
+    5. When ready for automated remediation, set `dry_run: false` to allow operator-approved consumer deletions.
+
+    ## How to extend
+
+    - **Kubernetes Pod Lifecycle Correlation**: Add an `io.kestra.plugin.kubernetes.pod.List` task to check whether consumer names correspond to terminated Kubernetes pods before deletion.
+    - **PagerDuty High-Priority Incident Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` to page on-call engineers when stream storage usage exceeds 90%.
+    - **Dead-Letter Replay Queue**: Publish consumer acknowledgment floor metadata to a dedicated quarantine stream prior to deletion for compliance auditing.
+
+    ## Links
+
+    - [NATS JetStream Architecture & Retention](https://docs.nats.io/nats-concepts/jetstream/retention)
+    - [NATS JetStream Management API Reference](https://docs.nats.io/reference/jetstream/api)
+    - [Kestra NATS Plugin Documentation](https://kestra.io/plugins/plugin-nats)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+    - [Kestra Pause & Resume Flow Control](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Approval Gates
+    - Day 2 Operations
+  ee: false
+  demo: false
