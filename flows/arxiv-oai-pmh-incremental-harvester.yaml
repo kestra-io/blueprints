@@ -1,0 +1,361 @@
+id: arxiv-oai-pmh-incremental-harvester
+namespace: company.team
+
+description: |
+  Incremental harvest of arXiv metadata over OAI-PMH. Each run asks for the records of one set whose
+  datestamp is on or after the stored cursor, follows resumption tokens to the end of the list, parses
+  the `arXiv` metadata format and upserts by arXiv id into a Parquet table. Records come back when a
+  paper gets a new version, a DOI or a journal reference, so every record is classified against the
+  table (NEW, NEW_VERSION, PUBLISHED, METADATA, UNCHANGED) instead of being counted as new.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: set_spec
+    type: STRING
+    defaults: "cs:cs:DB"
+    validator: "^[a-z-]+(:[a-zA-Z-]+(:[A-Z]{2})?)?$"
+    description: OAI-PMH set. Archive (`cs`, `math`, `stat`), archive group (`physics:hep-th`) or category (`cs:cs:DB`, `cs:cs:LG`). The full list is at https://oaipmh.arxiv.org/oai?verb=ListSets.
+
+  - id: primary_only
+    type: BOOL
+    defaults: false
+    description: Keep only papers whose primary category belongs to the set. arXiv sets include cross-lists, so `cs:cs:DB` also returns cs.CL or cs.LG papers that merely list cs.DB.
+
+  - id: initial_lookback_days
+    type: INT
+    defaults: 7
+    description: First run only (no cursor yet). Harvests records with a datestamp in the last N days.
+
+  - id: until
+    type: STRING
+    required: false
+    validator: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    description: Optional upper datestamp (YYYY-MM-DD) for a bounded backfill. Leave empty for scheduled runs.
+
+  - id: max_pages
+    type: INT
+    defaults: 30
+    description: Safety limit on resumption-token pages (arXiv returns up to about 1,300 records per page). If the list is longer the run fails without moving the cursor.
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: arXiv assigns datestamps when it announces, Sunday to Thursday evenings US Eastern time. 06:00 UTC picks up the previous announcement.
+    cron: "0 6 * * *"
+
+tasks:
+  - id: get_cursor
+    type: io.kestra.plugin.core.kv.Get
+    key: "arxiv_oai_cursor_{{ inputs.set_spec | replace({':': '_'}) }}"
+    errorOnMissing: false
+
+  - id: get_table
+    type: io.kestra.plugin.core.kv.Get
+    key: "arxiv_oai_table_{{ inputs.set_spec | replace({':': '_'}) }}"
+    errorOnMissing: false
+
+  - id: since
+    type: io.kestra.plugin.core.debug.Return
+    description: The `from` date of this run. arXiv datestamps are day granular, so the cursor day is harvested again and the upsert drops the records already loaded.
+    format: "{{ outputs.get_cursor.value ?? (now() | dateAdd(-inputs.initial_lookback_days, 'DAYS') | date('yyyy-MM-dd', timeZone='UTC')) }}"
+
+  - id: harvest
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      ListRecords with `metadataPrefix=arXiv` (structured authors, categories, DOI, journal-ref, licence),
+      then resumptionToken pages until the token is empty. Sleeps 3 s between pages as arXiv asks and honours
+      `Retry-After` on 503. `noRecordsMatch` is an empty result, any other OAI error (for example an unknown
+      set) fails the task. Standard library only.
+    containerImage: python:3.13-slim
+    env:
+      SET_SPEC: "{{ inputs.set_spec }}"
+      SINCE: "{{ outputs.since.value }}"
+      PRIMARY_ONLY: "{{ inputs.primary_only }}"
+      MAX_PAGES: "{{ inputs.max_pages }}"
+      UNTIL: "{{ inputs.until ?? '' }}"
+    outputFiles:
+      - records.jsonl
+    script: |
+      import json, os, time, urllib.error, urllib.parse, urllib.request
+      import xml.etree.ElementTree as ET
+
+      BASE = "https://oaipmh.arxiv.org/oai"
+      NS = {"o": "http://www.openarchives.org/OAI/2.0/", "a": "http://arxiv.org/OAI/arXiv/"}
+      set_spec, since = os.environ["SET_SPEC"], os.environ["SINCE"]
+      parts = set_spec.split(":")
+      wanted = parts[1] + "." + parts[2] if len(parts) == 3 else parts[-1]  # cs:cs:DB -> cs.DB, physics:hep-th -> hep-th
+
+      def fetch(params):
+          url = BASE + "?" + urllib.parse.urlencode(params)
+          for attempt in range(6):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "kestra-arxiv-oai-harvester (https://kestra.io)"})
+                  with urllib.request.urlopen(req, timeout=120) as r:
+                      return ET.fromstring(r.read())
+              except urllib.error.HTTPError as e:
+                  if e.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                      raise SystemExit(f"arXiv OAI HTTP {e.code}")
+                  wait = int(e.headers.get("Retry-After") or 0) or 5 * 2 ** attempt
+                  print(f"HTTP {e.code}, retrying in {wait}s")
+                  time.sleep(wait)
+
+      def text(el, path):
+          node = el.find(path, NS)
+          return " ".join(node.text.split()) if node is not None and node.text else None
+
+      params = {"verb": "ListRecords", "metadataPrefix": "arXiv", "set": set_spec, "from": since}
+      if os.environ["UNTIL"]:
+          params["until"] = os.environ["UNTIL"]
+      rows, pages, deleted, cross_lists, max_ds = [], 0, 0, 0, None
+      while True:
+          root = fetch(params)
+          pages += 1
+          err = root.find("o:error", NS)
+          if err is not None:
+              if err.get("code") == "noRecordsMatch":
+                  break
+              raise SystemExit(f"OAI-PMH error {err.get('code')}: {err.text}")
+          for rec in root.iterfind("o:ListRecords/o:record", NS):
+              head = rec.find("o:header", NS)
+              ds = text(head, "o:datestamp")
+              max_ds = max(max_ds or ds, ds)
+              if head.get("status") == "deleted":
+                  deleted += 1
+                  continue
+              m = rec.find("o:metadata/a:arXiv", NS)
+              cats = (text(m, "a:categories") or "").split()
+              primary = cats[0] if cats else None
+              if primary and primary != wanted and not primary.startswith(wanted + "."):
+                  cross_lists += 1
+                  if os.environ["PRIMARY_ONLY"] == "true":
+                      continue
+              authors = [" ".join(filter(None, [text(a, "a:forenames"), text(a, "a:keyname")]))
+                         for a in m.iterfind("a:authors/a:author", NS)]
+              rows.append({
+                  "arxiv_id": text(m, "a:id"), "datestamp": ds, "created": text(m, "a:created"),
+                  "updated": text(m, "a:updated"), "title": text(m, "a:title"),
+                  "authors": "; ".join(authors), "n_authors": len(authors),
+                  "primary_category": primary, "categories": " ".join(cats),
+                  "doi": text(m, "a:doi"), "journal_ref": text(m, "a:journal-ref"),
+                  "license": text(m, "a:license"), "abstract": text(m, "a:abstract")})
+          token = root.find("o:ListRecords/o:resumptionToken", NS)
+          if token is None or not (token.text or "").strip():
+              break
+          if pages >= int(os.environ["MAX_PAGES"]):
+              raise SystemExit(f"More than max_pages={pages} pages since {since}; raise max_pages or shorten the window. Cursor not moved.")
+          params = {"verb": "ListRecords", "resumptionToken": token.text.strip()}
+          time.sleep(3)
+
+      with open("records.jsonl", "w", encoding="utf-8") as f:
+          for r in rows:
+              f.write(json.dumps(r, ensure_ascii=False) + "\n")
+      print(f"{len(rows)} records in {pages} page(s) since {since}; {cross_lists} cross-lists, {deleted} deleted")
+      print("::" + json.dumps({"outputs": {"rows": len(rows), "pages": pages, "deleted": deleted,
+                                           "cross_lists": cross_lists, "max_datestamp": max_ds or since}}) + "::")
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.harvest.vars.rows > 0 }}"
+    then:
+      - id: bootstrap
+        type: io.kestra.plugin.core.flow.If
+        description: First run only. Writes an empty table so the merge below has one code path.
+        condition: "{{ outputs.get_table.value is not defined or outputs.get_table.value is empty }}"
+        then:
+          - id: empty_table
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            url: "jdbc:duckdb:"
+            outputFiles:
+              - table
+            sql: |
+              COPY (SELECT CAST(NULL AS VARCHAR) AS arxiv_id, CAST(NULL AS VARCHAR) AS created, CAST(NULL AS VARCHAR) AS doi,
+                           CAST(NULL AS VARCHAR) AS journal_ref, CAST(NULL AS VARCHAR) AS title, CAST(NULL AS VARCHAR) AS abstract,
+                           CAST(NULL AS VARCHAR) AS categories, CAST(NULL AS VARCHAR) AS license, CAST(NULL AS VARCHAR) AS first_seen
+                    WHERE false) TO '{{ outputFiles.table }}' (FORMAT PARQUET);
+
+      - id: upsert
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: |
+          In the arXiv format `created` is the date of the LATEST version and `updated` is just the
+          announcement date, so versions are inferred. Not in the table and submitted within 7 days of the
+          datestamp: NEW when the id was minted in the month of `created` (a first submission), otherwise
+          NEW_VERSION. Older submissions are METADATA (re-announced, usually for a DOI or journal-ref).
+          In the table: PUBLISHED when a DOI or journal-ref appears, NEW_VERSION when `created` moved,
+          METADATA for other edits, UNCHANGED for records on the overlap day.
+        url: "jdbc:duckdb:"
+        fetchType: FETCH_ONE
+        inputFiles:
+          records.jsonl: "{{ outputs.harvest.outputFiles['records.jsonl'] }}"
+          previous.parquet: "{{ outputs.get_table.value ?? outputs.empty_table.outputFiles.table }}"
+        outputFiles:
+          - table
+          - changes
+        parameters:
+          today: "{{ now() | date('yyyy-MM-dd', timeZone='UTC') }}"
+          since: "{{ outputs.since.value }}"
+        sql: |
+          CREATE TABLE batch AS
+          SELECT * FROM read_json('records.jsonl', format = 'newline_delimited', columns = {
+            arxiv_id: 'VARCHAR', datestamp: 'VARCHAR', created: 'VARCHAR', updated: 'VARCHAR', title: 'VARCHAR',
+            authors: 'VARCHAR', n_authors: 'INTEGER', primary_category: 'VARCHAR', categories: 'VARCHAR',
+            doi: 'VARCHAR', journal_ref: 'VARCHAR', license: 'VARCHAR', abstract: 'VARCHAR'})
+          QUALIFY row_number() OVER (PARTITION BY arxiv_id ORDER BY datestamp DESC) = 1;
+
+          -- A submission announced within a week; older records were re-announced for a metadata change.
+          ALTER TABLE batch ADD COLUMN fresh BOOLEAN;
+          UPDATE batch SET fresh = date_diff('day', CAST(created AS DATE), CAST(datestamp AS DATE)) <= 7;
+
+          CREATE TABLE previous AS SELECT * FROM read_parquet('previous.parquet');
+
+          CREATE TABLE changed AS
+          SELECT CASE
+                   WHEN p.arxiv_id IS NULL AND b.fresh AND left(b.arxiv_id, 4) = substr(b.created, 3, 2) || substr(b.created, 6, 2) THEN 'NEW'
+                   WHEN p.arxiv_id IS NULL AND b.fresh THEN 'NEW_VERSION'
+                   WHEN p.arxiv_id IS NULL THEN 'METADATA'
+                   WHEN (p.doi IS NULL AND b.doi IS NOT NULL) OR (p.journal_ref IS NULL AND b.journal_ref IS NOT NULL) THEN 'PUBLISHED'
+                   WHEN b.created > p.created THEN 'NEW_VERSION'
+                   WHEN b.title IS DISTINCT FROM p.title OR b.abstract IS DISTINCT FROM p.abstract
+                     OR b.categories IS DISTINCT FROM p.categories OR b.license IS DISTINCT FROM p.license
+                     OR b.doi IS DISTINCT FROM p.doi OR b.journal_ref IS DISTINCT FROM p.journal_ref THEN 'METADATA'
+                   ELSE 'UNCHANGED' END AS change_type,
+                 b.*, coalesce(p.first_seen, :today) AS first_seen, p.arxiv_id IS NOT NULL AS was_loaded
+          FROM batch b LEFT JOIN previous p USING (arxiv_id);
+
+          COPY (
+            SELECT * FROM previous WHERE arxiv_id NOT IN (SELECT arxiv_id FROM changed)
+            UNION ALL BY NAME
+            SELECT * EXCLUDE (change_type, was_loaded, fresh) FROM changed
+          ) TO '{{ outputFiles.table }}' (FORMAT PARQUET);
+
+          COPY (SELECT change_type, arxiv_id, datestamp, primary_category, doi, journal_ref, title, authors
+                FROM changed WHERE change_type <> 'UNCHANGED' ORDER BY change_type, arxiv_id)
+            TO '{{ outputFiles.changes }}' (HEADER, DELIMITER ',');
+
+          SELECT (SELECT count(*) FROM previous) = 0 AS is_baseline,
+                 count(*) AS harvested,
+                 count(*) FILTER (WHERE change_type = 'NEW') AS new_papers,
+                 count(*) FILTER (WHERE change_type = 'NEW_VERSION') AS new_versions,
+                 count(*) FILTER (WHERE change_type = 'PUBLISHED') AS published,
+                 count(*) FILTER (WHERE change_type = 'METADATA') AS metadata_edits,
+                 count(*) FILTER (WHERE change_type = 'UNCHANGED') AS unchanged,
+                 count(*) FILTER (WHERE was_loaded AND change_type <> 'UNCHANGED') AS changed_known,
+                 (SELECT count(*) FROM previous WHERE arxiv_id NOT IN (SELECT arxiv_id FROM changed)) + count(*) AS table_rows,
+                 coalesce((SELECT string_agg(arxiv_id || ' ' || title, ' | ') FROM (
+                   SELECT arxiv_id, title FROM changed WHERE change_type = 'NEW' ORDER BY n_authors DESC, arxiv_id LIMIT 5)), '') AS sample_new,
+                 coalesce((SELECT string_agg(arxiv_id || ' -> ' || coalesce(doi, journal_ref), ' | ') FROM (
+                   SELECT arxiv_id, doi, journal_ref FROM changed WHERE change_type = 'PUBLISHED' ORDER BY arxiv_id LIMIT 5)), '') AS sample_published
+          FROM changed;
+
+      - id: save_table
+        type: io.kestra.plugin.core.kv.Set
+        key: "arxiv_oai_table_{{ inputs.set_spec | replace({':': '_'}) }}"
+        value: "{{ outputs.upsert.outputFiles.table }}"
+
+      - id: move_cursor
+        type: io.kestra.plugin.core.kv.Set
+        description: Moved to the newest datestamp only after the table is saved; a failed run harvests the same window again.
+        key: "arxiv_oai_cursor_{{ inputs.set_spec | replace({':': '_'}) }}"
+        value: "{{ outputs.harvest.vars.max_datestamp }}"
+
+      - id: notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Skipped when every harvested record was already loaded (the overlap day on a re-run).
+        runIf: "{{ outputs.upsert.outputs[0].row.unchanged < outputs.upsert.outputs[0].row.harvested }}"
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'arXiv ' ~ inputs.set_spec ~ (outputs.upsert.outputs[0].row.is_baseline ? ' (baseline)' : '') ~ ' since ' ~ outputs.since.value ~ ': ' ~ outputs.upsert.outputs[0].row.new_papers ~ ' new, ' ~ outputs.upsert.outputs[0].row.new_versions ~ ' new versions, ' ~ outputs.upsert.outputs[0].row.published ~ ' got a DOI or journal-ref. Table ' ~ outputs.upsert.outputs[0].row.table_rows ~ ' papers.' ~ (outputs.upsert.outputs[0].row.sample_published is empty ? '' : ' Published: ' ~ outputs.upsert.outputs[0].row.sample_published)} | json }}
+    else:
+      - id: nothing_new
+        type: io.kestra.plugin.core.log.Log
+        message: "arXiv {{ inputs.set_spec }}: no records since {{ outputs.since.value }} ({{ outputs.harvest.vars.deleted }} deleted, {{ outputs.harvest.vars.cross_lists }} cross-lists skipped). Cursor unchanged."
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.harvest.vars.rows > 0 }}"
+    message: |
+      arXiv {{ inputs.set_spec }} from {{ outputs.since.value }} to {{ outputs.harvest.vars.max_datestamp }}{{ outputs.upsert.outputs[0].row.is_baseline ? ', BASELINE' : '' }}: {{ outputs.harvest.vars.rows }} records in {{ outputs.harvest.vars.pages }} page(s), {{ outputs.harvest.vars.cross_lists }} cross-lists{{ inputs.primary_only ? ' skipped' : ' kept' }}.
+      NEW {{ outputs.upsert.outputs[0].row.new_papers }}, NEW_VERSION {{ outputs.upsert.outputs[0].row.new_versions }}, PUBLISHED {{ outputs.upsert.outputs[0].row.published }}, METADATA {{ outputs.upsert.outputs[0].row.metadata_edits }}, UNCHANGED {{ outputs.upsert.outputs[0].row.unchanged }}; {{ outputs.upsert.outputs[0].row.changed_known }} changes hit papers already in the table. Table: {{ outputs.upsert.outputs[0].row.table_rows }} papers.
+      Sample new: {{ outputs.upsert.outputs[0].row.sample_new is empty ? 'none' : outputs.upsert.outputs[0].row.sample_new }}
+      Published: {{ outputs.upsert.outputs[0].row.sample_published is empty ? 'none' : outputs.upsert.outputs[0].row.sample_published }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.upsert.outputs[0].row ?? {'harvested': 0} }}"
+  - id: table_parquet
+    type: STRING
+    value: "{{ outputs.upsert.outputFiles.table ?? outputs.get_table.value ?? '' }}"
+  - id: changes_csv
+    type: STRING
+    value: "{{ outputs.upsert.outputFiles.changes ?? '' }}"
+
+extend:
+  title: Incremental arXiv OAI-PMH Metadata Harvester with Version and DOI Detection
+  metaTitle: arXiv OAI-PMH Incremental Harvester with DuckDB Upserts | Kestra
+  shortDescription: Harvest arXiv metadata for one subject set over OAI-PMH, follow resumption tokens, upsert by arXiv id into Parquet and report new papers, new versions and papers that just got a DOI.
+  metaDescription: Harvest arXiv metadata over OAI-PMH with resumption tokens, a KV date cursor and DuckDB upserts, flagging new papers, new versions and new DOIs.
+  description: |
+    arXiv publishes its metadata over OAI-PMH. A record comes back each time a paper gets a new version, a DOI or a journal reference, so appending every response counts papers many times. This flow harvests one set incrementally, upserts by arXiv id and labels each record. No API key is needed.
+
+    ## How it works
+
+    1. A daily `Schedule`; `concurrency.limit: 1` stops two runs moving one cursor.
+    2. `get_cursor` and `get_table` (KV Get) read the last datestamp loaded and the Parquet table URI for the set. With no cursor, `since` starts `initial_lookback_days` ago.
+    3. `harvest` (Python, standard library) calls `ListRecords` on `https://oaipmh.arxiv.org/oai` with `metadataPrefix=arXiv` (structured authors, categories, DOI, journal-ref, licence) and follows `resumptionToken` pages, 3 s apart as arXiv asks, honouring `Retry-After` on 503. `noRecordsMatch` is an empty result; other OAI errors (an unknown set) fail the run, as does exceeding `max_pages`. `primary_only` drops cross-listed papers.
+    4. `route` (If) logs and stops when nothing came back. Otherwise `bootstrap` (If) writes an empty table on the first run.
+    5. `upsert` (DuckDB) classifies each record. In the arXiv format `created` is the date of the latest version, so a paper not yet in the table and submitted within 7 days of its datestamp is `NEW` (id minted that month) or `NEW_VERSION`; older ones are `METADATA`. For papers already loaded: `PUBLISHED` when a DOI or journal-ref appears, `NEW_VERSION` when `created` moves, `METADATA` for other edits, `UNCHANGED` otherwise.
+    6. `save_table`, then `move_cursor` to the newest datestamp. Datestamps are day granular, so the cursor day is harvested again and shows up as `UNCHANGED`. `notify` posts counts and the new DOIs to Slack, only when something changed.
+
+    ## What you get
+
+    - A Parquet table with the latest metadata of every paper in the set, plus `first_seen`.
+    - A CSV of each run's changes and a JSON summary as flow outputs.
+    - Re-runs that report nothing twice; `until` for bounded backfills.
+
+    ## Who it's for
+
+    - Research data engineers feeding a search index, recommender or catalogue.
+    - Research offices tracking when preprints get published.
+
+    ## Why orchestrate this with Kestra
+
+    - Cursor and table live in KV per set; one flow serves many sets.
+    - The cursor moves only after the table is saved, so a failed run re-reads the same window.
+
+    ## Prerequisites
+
+    - A Docker task runner (`python:3.13-slim`) and the DuckDB and Slack plugins.
+    - HTTPS to oaipmh.arxiv.org. arXiv permits metadata harvesting, not full texts.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: incoming webhook for run summaries (optional; without it the load still succeeds).
+
+    ## Quick start
+
+    1. Execute with defaults: a 7-day baseline of `cs:cs:DB` (Databases), about 80 papers in one page.
+    2. Execute again: the cursor day comes back as `UNCHANGED` and no Slack message is sent.
+    3. Try `set_spec=cs` with `initial_lookback_days=3` and `primary_only=true`: about 2,500 papers in 3 pages.
+    4. Add the Slack secret and leave the schedule on.
+
+    ## How to extend
+
+    - Reuse the paging loop for other OAI-PMH repositories (Zenodo, PubMed Central) with an `oai_dc` parser.
+    - Embed new abstracts into a vector store, or merge the changes CSV into a warehouse.
+    - Alert a team when papers by its authors get `PUBLISHED`.
+
+    ## Links
+
+    - [arXiv OAI-PMH](https://info.arxiv.org/help/oa/index.html), [metadata policy](https://info.arxiv.org/help/oa/metadataPolicy.html), [OAI-PMH 2.0 specification](https://www.openarchives.org/OAI/openarchivesprotocol.html)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script), [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries), [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store), [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Day 2 Operations
+  ee: false
+  demo: false
