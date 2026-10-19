@@ -1,0 +1,574 @@
+id: openstreetmap-poi-change-detector-overpass
+namespace: company.team
+
+description: |
+  Track the OpenStreetMap points of interest you care about (charging stations, supermarkets,
+  pharmacies, anything you can express as a tag filter) in a set of areas, and find out what
+  changed since the last run: POIs added, removed, moved by more than N metres, redrawn from a
+  point to a building outline, or retagged on the tags that matter (opening_hours, operator,
+  capacity, socket:*). One combined Overpass API query per run, a Parquet snapshot in
+  Kestra's internal storage with its URI in the KV store, a DuckDB diff, per-area and per-tag
+  counts, GeoJSON and CSV outputs and a Slack digest. Data is (c) OpenStreetMap contributors, ODbL.
+
+inputs:
+  - id: tag_filters
+    type: STRING
+    defaults: "amenity=charging_station;shop=supermarket"
+    description: OSM tag filters separated by semicolons. `key=value` matches one value, `key` or `key=*` matches any value. Each filter becomes one `nwr[...]` statement, so nodes, ways and relations are all found. Malformed filters are reported and skipped.
+
+  - id: areas
+    type: JSON
+    defaults: |
+      [
+        {"label": "Amsterdam Centrum", "bbox": [52.365, 4.875, 52.385, 4.915]},
+        {"label": "Monaco", "name": "Monaco"},
+        {"label": "Zandvoort", "name": "Zandvoort", "admin_level": 8}
+      ]
+    description: |
+      Areas to watch, as a JSON array. Each area has a unique `label` and either a `bbox` as
+      [south, west, north, east] in decimal degrees, or a `name` of an administrative boundary
+      (resolved with `area["boundary"="administrative"]["name"=...]`) with an optional `admin_level`
+      to pick one when several boundaries share the name. Invalid areas are reported and skipped.
+
+  - id: key_tags
+    type: STRING
+    defaults: "name,brand,operator,opening_hours,capacity,socket:*,fee,access"
+    description: Tags whose value changes are reported as RETAGGED, separated by commas. A trailing `*` matches a prefix, so `socket:*` covers `socket:type2`, `socket:type2:output` and so on. Edits to other tags are counted but not reported.
+
+  - id: move_threshold_m
+    type: INT
+    defaults: 25
+    description: A POI whose position (node coordinates, or the centre of a way or relation) moves more than this many metres is reported as MOVED.
+
+  - id: remap_radius_m
+    type: INT
+    defaults: 50
+    description: A POI that disappears and reappears as a different OSM object (typically a shop node redrawn as a building way) within this radius, with the same name and a shared filter, is reported once as REMAPPED instead of as one REMOVED and one ADDED.
+
+  - id: overpass_url
+    type: URI
+    defaults: https://overpass-api.de/api/interpreter
+    description: Overpass API interpreter endpoint. The public instance is keyless; for daily or large runs prefer your own instance.
+
+  - id: mirror_url
+    type: STRING
+    defaults: ""
+    description: Optional mirror, for example `https://overpass.private.coffee/api/interpreter`. When set, attempts 4 and 5 go to the mirror after three failures on `overpass_url`.
+
+  - id: query_timeout_s
+    type: INT
+    defaults: 120
+    description: Server-side `[timeout:...]` of the query in seconds. Overpass schedules queries by their declared timeout, so keep it close to what the query needs.
+
+  - id: contact
+    type: STRING
+    defaults: ""
+    description: Contact (email or URL) added to the User-Agent, as the Overpass usage policy asks for automated clients.
+
+  - id: snapshot_key
+    type: STRING
+    defaults: osm_poi_snapshot
+    description: KV key holding the snapshot URI; the area and filter coverage uses the same key with a `_coverage` suffix. Use one key per watchlist.
+
+triggers:
+  - id: weekly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 5 * * 1"
+    description: Weekly, Monday 05:30 UTC. POI data changes slowly and the public Overpass instance asks automated users to keep the load low.
+
+tasks:
+  - id: plan
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Validates the areas and tag filters and builds ONE Overpass QL query for all of them. Before each area the query
+      emits a `make area_marker` element so the response can be split back per area, and for named areas it outputs the
+      matched area ids (`.aN out ids`), which tells a boundary name that matched nothing (NOT_FOUND) from one that matched
+      several (AMBIGUOUS). Fails with a clear message when no valid area or filter is left.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    parameters:
+      areas: "{{ inputs.areas | toJson }}"
+      filters: "{{ inputs.tag_filters }}"
+      timeout_s: "{{ inputs.query_timeout_s }}"
+    sql: |
+      CREATE TABLE filters_in AS
+      SELECT DISTINCT trim(f) AS raw,
+             trim(split_part(trim(f), '=', 1)) AS k,
+             CASE WHEN strpos(trim(f), '=') = 0 OR trim(substr(trim(f), strpos(trim(f), '=') + 1)) IN ('', '*') THEN NULL
+                  ELSE trim(substr(trim(f), strpos(trim(f), '=') + 1)) END AS v,
+             regexp_matches(trim(split_part(trim(f), '=', 1)), '^[A-Za-z0-9_.' || chr(58) || '-]+$') AS ok
+      FROM unnest(string_split(replace(:filters, chr(10), ';'), ';')) AS t(f) WHERE trim(f) <> '';
+
+      CREATE TABLE filters AS
+      SELECT k || coalesce('=' || v, '=*') AS filter, k, v,
+             '["' || k || '"' || coalesce('="' || replace(replace(v, '\', '\\'), '"', '\"') || '"', '') || ']' AS ql
+      FROM filters_in WHERE ok;
+
+      CREATE TABLE areas_in AS
+      SELECT CAST(o - 1 AS INTEGER) AS idx, trim(a->>'$.label') AS label, a->>'$.name' AS admin_name,
+             TRY_CAST(a->>'$.admin_level' AS INTEGER) AS admin_level,
+             TRY_CAST(a->'$.bbox' AS DOUBLE[]) AS bbox
+      FROM (SELECT unnest(l) AS a, unnest(range(1, len(l) + 1)) AS o FROM (SELECT from_json(CAST(:areas AS JSON), '["JSON"]') AS l));
+
+      CREATE TABLE areas_checked AS
+      SELECT *, CASE
+          WHEN label IS NULL OR label = '' THEN 'missing label'
+          WHEN count(*) OVER (PARTITION BY label) > 1 THEN 'duplicate label'
+          WHEN (bbox IS NULL) = (admin_name IS NULL) THEN 'needs exactly one of bbox or name'
+          WHEN bbox IS NOT NULL AND len(bbox) <> 4 THEN 'bbox needs 4 numbers [south, west, north, east]'
+          WHEN bbox IS NOT NULL AND NOT (bbox[1] BETWEEN -90 AND 90 AND bbox[3] BETWEEN -90 AND 90 AND bbox[1] < bbox[3]) THEN 'bbox latitudes must satisfy -90 <= south < north <= 90'
+          WHEN bbox IS NOT NULL AND NOT (bbox[2] BETWEEN -180 AND 180 AND bbox[4] BETWEEN -180 AND 180 AND bbox[2] < bbox[4]) THEN 'bbox longitudes must satisfy west < east (split boxes crossing the antimeridian)'
+          WHEN admin_name IS NOT NULL AND trim(admin_name) = '' THEN 'empty name'
+        END AS problem
+      FROM areas_in;
+
+      CREATE TABLE areas AS
+      SELECT idx, label, admin_name, admin_level, bbox,
+             CASE WHEN bbox IS NOT NULL THEN 'bbox ' || array_to_string(bbox, ',')
+                  ELSE 'admin area "' || admin_name || '"' || coalesce(' level ' || admin_level, '') END AS spec,
+             CASE WHEN bbox IS NOT NULL THEN '(' || array_to_string(bbox, ',') || ')' ELSE '(area.a' || idx || ')' END AS geo
+      FROM areas_checked WHERE problem IS NULL;
+
+      SELECT
+        (SELECT count(*) FROM areas) AS areas,
+        (SELECT count(*) FROM filters) AS filters,
+        CASE WHEN (SELECT count(*) FROM areas) = 0 THEN error('No valid area in the areas input. ' || (SELECT coalesce(string_agg(coalesce(label, '?') || ' (' || problem || ')', '; '), 'The list is empty.') FROM areas_checked))
+             WHEN (SELECT count(*) FROM filters) = 0 THEN error('No valid tag filter. Use key=value or key, separated by semicolons.')
+             ELSE '[out' || chr(58) || 'json][timeout' || chr(58) || CAST(:timeout_s AS INTEGER) || '];' || chr(10) || (
+               SELECT string_agg(
+                 'make area_marker idx=' || idx || '; out;' || chr(10)
+                 || CASE WHEN admin_name IS NOT NULL THEN
+                      'area["boundary"="administrative"]["name"="' || replace(replace(admin_name, '\', '\\'), '"', '\"') || '"]'
+                      || coalesce('["admin_level"="' || admin_level || '"]', '') || '->.a' || idx || '; .a' || idx || ' out ids;' || chr(10)
+                    ELSE '' END
+                 || '(' || (SELECT string_agg('nwr' || f.ql || a.geo || ';', ' ' ORDER BY f.filter) FROM filters f) || ');' || chr(10)
+                 || 'out center tags;', chr(10) ORDER BY idx)
+               FROM areas a)
+        END AS query,
+        (SELECT CAST(to_json(list({'idx': idx, 'label': label, 'spec': spec, 'named': admin_name IS NOT NULL} ORDER BY idx)) AS VARCHAR) FROM areas) AS areas_json,
+        (SELECT CAST(to_json(list(filter ORDER BY filter)) AS VARCHAR) FROM filters) AS filters_json,
+        (SELECT coalesce(string_agg(coalesce(label, 'area ' || (idx + 1)) || ' (' || problem || ')', '; ' ORDER BY idx), '') FROM areas_checked WHERE problem IS NOT NULL) AS invalid_areas,
+        (SELECT coalesce(string_agg(raw, '; '), '') FROM filters_in WHERE NOT ok) AS invalid_filters;
+
+  - id: previous_snapshot
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.snapshot_key }}"
+    errorOnMissing: false
+    description: URI of the Parquet snapshot written by the last run; missing on the first run, which is then a BASELINE.
+
+  - id: previous_coverage
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.snapshot_key }}_coverage"
+    errorOnMissing: false
+    description: URI of the Parquet list of (area, filter) pairs the last snapshot covered, so a newly added area or filter is a baseline for that pair instead of a flood of ADDED.
+
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Writes an empty snapshot and coverage with the right schema so the diff has one code path.
+    condition: "{{ outputs.previous_snapshot.value is not defined or outputs.previous_snapshot.value is empty or outputs.previous_coverage.value is not defined or outputs.previous_coverage.value is empty }}"
+    then:
+      - id: empty_state
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        fetchType: NONE
+        outputFiles:
+          - snapshot
+          - coverage
+        sql: |
+          CREATE TABLE snapshot (area VARCHAR, osm_type VARCHAR, osm_id BIGINT, lat DOUBLE, lon DOUBLE, name VARCHAR,
+            filters VARCHAR[], key_tags VARCHAR[], tags VARCHAR, osm_base TIMESTAMP, snapshot_at TIMESTAMP);
+          CREATE TABLE coverage (area VARCHAR, filter VARCHAR, osm_base TIMESTAMP);
+          COPY snapshot TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+          COPY coverage TO '{{ outputFiles.coverage }}' (FORMAT PARQUET);
+
+  - id: fetch_overpass
+    type: io.kestra.plugin.core.http.Download
+    description: |
+      The single Overpass request of the run, POSTed as form data `data=<query>` with a descriptive User-Agent. Overpass
+      answers 429 when your IP has no free slot and 502/504 when it is overloaded. The HTTP client's immediate retry is
+      off (`retryOnStatusCodes: []`); instead the task retry backs off exponentially (1, 2, 4 and 8 minutes), and when
+      `mirror_url` is set attempts 4 and 5 go to the mirror.
+    uri: "{{ inputs.mirror_url is not empty and taskrun.attemptsCount >= 3 ? inputs.mirror_url : inputs.overpass_url }}"
+    method: POST
+    contentType: application/x-www-form-urlencoded
+    formData:
+      data: "{{ outputs.plan.outputs[0].row.query }}"
+    headers:
+      User-Agent: "kestra-openstreetmap-poi-change-detector/1.0 (+https://kestra.io/blueprints{{ inputs.contact is not empty ? '; ' ~ inputs.contact : '' }})"
+      Accept: application/json
+    options:
+      retryOnStatusCodes: []
+      timeout:
+        readIdleTimeout: PT6M
+    retry:
+      type: exponential
+      interval: PT1M
+      maxInterval: PT8M
+      maxAttempts: 5
+      warningOnRetry: false
+
+  - id: diff
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Fails the run when the 200 response carries a `remark` with a runtime error (timeout or out of memory: the element
+      list is then partial and would look like mass removals). Otherwise splits the elements per area with the markers,
+      takes node coordinates or the `center` of ways and relations, matches each POI to the filters it satisfies, and
+      compares with the previous snapshot. Named areas that resolve to nothing keep their previous POIs (no false
+      removals). Old key tags are recomputed from the stored tags with the current `key_tags`, so editing that list
+      does not produce retags. Writes the new snapshot and coverage as Parquet, the changes as CSV and GeoJSON, the per-area and
+      per-filter counts as CSV, and returns counts plus a ready-to-send Slack payload.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      overpass.json: "{{ outputs.fetch_overpass.uri }}"
+      previous.parquet: "{{ outputs.previous_snapshot.value ?? outputs.empty_state.outputFiles.snapshot }}"
+      coverage.parquet: "{{ outputs.previous_coverage.value ?? outputs.empty_state.outputFiles.coverage }}"
+    outputFiles:
+      - snapshot
+      - coverage
+      - changes_csv
+      - counts_csv
+      - changes_geojson
+    parameters:
+      areas: "{{ outputs.plan.outputs[0].row.areas_json }}"
+      filters: "{{ outputs.plan.outputs[0].row.filters_json }}"
+      key_tags: "{{ inputs.key_tags }}"
+      move_m: "{{ inputs.move_threshold_m }}"
+      remap_m: "{{ inputs.remap_radius_m }}"
+      run_at: "{{ execution.startDate }}"
+      execution_url: "{{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+    sql: |
+      SET TimeZone = 'UTC';
+      CREATE MACRO metres(lat1, lon1, lat2, lon2) AS
+        2 * 6371008.8 * asin(sqrt(pow(sin(radians(lat2 - lat1) / 2), 2) + cos(radians(lat1)) * cos(radians(lat2)) * pow(sin(radians(lon2 - lon1) / 2), 2)));
+      CREATE TABLE key_tag_def AS SELECT DISTINCT trim(t) AS t FROM unnest(string_split(:key_tags, ',')) AS x(t) WHERE trim(t) <> '';
+
+      CREATE TABLE resp AS SELECT CAST(content AS JSON) AS j FROM read_text('overpass.json');
+      CREATE TABLE remark_check AS
+      SELECT CASE WHEN j->>'$.remark' ILIKE '%error%'
+                  THEN error('Overpass returned HTTP 200 with a runtime error, the result is incomplete and was not used. Remark was ' || (j->>'$.remark')) END AS failed
+      FROM resp;
+
+      CREATE TABLE area_def AS
+      SELECT CAST(a->>'$.idx' AS INTEGER) AS idx, a->>'$.label' AS area, a->>'$.spec' AS spec, CAST(a->>'$.named' AS BOOLEAN) AS named
+      FROM (SELECT unnest(from_json(CAST(:areas AS JSON), '["JSON"]')) AS a);
+      CREATE TABLE filter_def AS
+      SELECT f AS filter, split_part(f, '=', 1) AS k, CASE WHEN f LIKE '%=*' THEN NULL ELSE substr(f, strpos(f, '=') + 1) END AS v
+      FROM (SELECT unnest(from_json(CAST(:filters AS JSON), '["VARCHAR"]')) AS f);
+
+      CREATE TABLE el_raw AS
+      SELECT unnest(l) AS e, unnest(range(1, len(l) + 1)) AS ord FROM (SELECT from_json(j->'$.elements', '["JSON"]') AS l FROM resp);
+      CREATE TABLE el AS
+      SELECT ord, e->>'$.type' AS osm_type, CAST(e->>'$.id' AS BIGINT) AS osm_id,
+             CAST(coalesce(e->>'$.lat', e->>'$.center.lat') AS DOUBLE) AS lat,
+             CAST(coalesce(e->>'$.lon', e->>'$.center.lon') AS DOUBLE) AS lon,
+             coalesce(CAST(e->'$.tags' AS VARCHAR), '{}') AS tags,
+             max(CASE WHEN e->>'$.type' = 'area_marker' THEN CAST(e->>'$.tags.idx' AS INTEGER) END) OVER (ORDER BY ord) AS idx
+      FROM el_raw;
+
+      CREATE TABLE area_status AS
+      SELECT d.*, count(e.osm_id) AS boundaries,
+             CASE WHEN NOT d.named THEN 'OK' WHEN count(e.osm_id) = 0 THEN 'NOT_FOUND' WHEN count(e.osm_id) > 1 THEN 'AMBIGUOUS' ELSE 'OK' END AS status,
+             string_agg(CASE WHEN e.osm_id >= 3600000000 THEN 'relation ' || (e.osm_id - 3600000000) ELSE 'way ' || (e.osm_id - 2400000000) END, ', ') AS boundary_ids
+      FROM area_def d LEFT JOIN el e ON e.idx = d.idx AND e.osm_type = 'area'
+      GROUP BY d.idx, d.area, d.spec, d.named;
+
+      CREATE TABLE prev AS SELECT * FROM read_parquet('previous.parquet');
+      CREATE TABLE prev_cov AS SELECT * FROM read_parquet('coverage.parquet');
+      CREATE TABLE meta AS SELECT
+        CAST((SELECT j->>'$.osm3s.timestamp_osm_base' FROM resp) AS TIMESTAMP) AS osm_base,
+        (SELECT max(osm_base) FROM prev_cov) AS prev_osm_base,
+        (SELECT j->>'$.osm3s.copyright' FROM resp) AS copyright,
+        (SELECT count(*) FROM prev_cov) = 0 AS is_baseline;
+
+      CREATE TABLE cur AS
+      SELECT s.area, e.osm_type, e.osm_id, e.lat, e.lon, e.tags->>'$.name' AS name,
+             (SELECT list(f.filter ORDER BY f.filter) FROM filter_def f
+               WHERE (f.v IS NULL AND json_exists(e.tags, '$."' || f.k || '"')) OR json_extract_string(e.tags, '$."' || f.k || '"') = f.v) AS filters,
+             (SELECT coalesce(list(key || '=' || (value->>'$') ORDER BY key), []) FROM json_each(e.tags)
+               WHERE EXISTS (SELECT 1 FROM key_tag_def d WHERE d.t = key OR (ends_with(d.t, '*') AND starts_with(key, rtrim(d.t, '*'))))) AS key_tags,
+             e.tags, (SELECT osm_base FROM meta) AS osm_base, CAST(:run_at AS TIMESTAMP) AS snapshot_at
+      FROM el e JOIN area_status s ON s.idx = e.idx
+      WHERE e.osm_type IN ('node', 'way', 'relation') AND e.lat IS NOT NULL AND s.status <> 'NOT_FOUND'
+      QUALIFY row_number() OVER (PARTITION BY s.area, e.osm_type, e.osm_id ORDER BY e.ord) = 1;
+
+      CREATE TABLE cov AS
+      SELECT s.area, f.filter, (SELECT osm_base FROM meta) AS osm_base FROM area_status s, filter_def f WHERE s.status <> 'NOT_FOUND'
+      UNION ALL
+      SELECT c.* FROM prev_cov c JOIN area_status s ON s.area = c.area WHERE s.status = 'NOT_FOUND';
+
+      CREATE TABLE added AS
+      SELECT c.* FROM cur c ANTI JOIN prev p ON p.area = c.area AND p.osm_type = c.osm_type AND p.osm_id = c.osm_id
+      WHERE EXISTS (SELECT 1 FROM prev_cov pc WHERE pc.area = c.area AND list_contains(c.filters, pc.filter));
+      CREATE TABLE removed AS
+      SELECT p.* FROM prev p ANTI JOIN cur c ON p.area = c.area AND p.osm_type = c.osm_type AND p.osm_id = c.osm_id
+      WHERE p.area IN (SELECT area FROM area_status WHERE status <> 'NOT_FOUND')
+        AND EXISTS (SELECT 1 FROM filter_def f WHERE list_contains(p.filters, f.filter));
+
+      CREATE TABLE remapped AS
+      SELECT * FROM (
+        SELECT r.area, r.osm_type AS old_type, r.osm_id AS old_id, a.osm_type, a.osm_id, a.lat, a.lon, a.name, a.filters,
+               metres(r.lat, r.lon, a.lat, a.lon) AS dist_m,
+               row_number() OVER (PARTITION BY r.area, r.osm_type, r.osm_id ORDER BY metres(r.lat, r.lon, a.lat, a.lon)) AS rn_old,
+               row_number() OVER (PARTITION BY a.area, a.osm_type, a.osm_id ORDER BY metres(r.lat, r.lon, a.lat, a.lon)) AS rn_new
+        FROM removed r JOIN added a ON a.area = r.area AND len(list_intersect(a.filters, r.filters)) > 0
+          AND a.name IS NOT DISTINCT FROM r.name AND metres(r.lat, r.lon, a.lat, a.lon) <= CAST(:remap_m AS DOUBLE))
+      WHERE rn_old = 1 AND rn_new = 1;
+
+      CREATE TABLE pairs AS
+      SELECT c.area, c.osm_type, c.osm_id, c.name, c.lat, c.lon, c.filters, p.lat AS old_lat, p.lon AS old_lon,
+             metres(p.lat, p.lon, c.lat, c.lon) AS dist_m, c.key_tags, p.tags <> c.tags AS tags_edited,
+             (SELECT coalesce(list(key || '=' || (value->>'$') ORDER BY key), []) FROM json_each(p.tags)
+               WHERE EXISTS (SELECT 1 FROM key_tag_def d WHERE d.t = key OR (ends_with(d.t, '*') AND starts_with(key, rtrim(d.t, '*'))))) AS old_key_tags
+      FROM cur c JOIN prev p ON p.area = c.area AND p.osm_type = c.osm_type AND p.osm_id = c.osm_id;
+
+      CREATE TABLE kt_old AS
+      SELECT area, osm_type, osm_id, split_part(x, '=', 1) AS k, substr(x, strpos(x, '=') + 1) AS v
+      FROM (SELECT area, osm_type, osm_id, unnest(old_key_tags) AS x FROM pairs WHERE old_key_tags <> key_tags);
+      CREATE TABLE kt_new AS
+      SELECT area, osm_type, osm_id, split_part(x, '=', 1) AS k, substr(x, strpos(x, '=') + 1) AS v
+      FROM (SELECT area, osm_type, osm_id, unnest(key_tags) AS x FROM pairs WHERE old_key_tags <> key_tags);
+      CREATE TABLE retag_detail AS
+      SELECT area, osm_type, osm_id,
+             string_agg(k || ' "' || coalesce(o.v, '(none)') || '" -> "' || coalesce(n.v, '(none)') || '"', '; ' ORDER BY k) AS detail
+      FROM kt_old o FULL OUTER JOIN kt_new n USING (area, osm_type, osm_id, k)
+      WHERE o.v IS DISTINCT FROM n.v
+      GROUP BY area, osm_type, osm_id;
+
+      CREATE TABLE changes AS
+      SELECT 'ADDED' AS change_type, area, osm_type, osm_id, name, lat, lon, filters, NULL AS distance_m,
+             array_to_string(key_tags, '; ') AS detail
+      FROM added a WHERE NOT EXISTS (SELECT 1 FROM remapped m WHERE m.area = a.area AND m.osm_type = a.osm_type AND m.osm_id = a.osm_id)
+      UNION ALL
+      SELECT 'REMOVED', area, osm_type, osm_id, name, lat, lon, filters, NULL, array_to_string(key_tags, '; ')
+      FROM removed r WHERE NOT EXISTS (SELECT 1 FROM remapped m WHERE m.area = r.area AND m.old_type = r.osm_type AND m.old_id = r.osm_id)
+      UNION ALL
+      SELECT 'REMAPPED', area, osm_type, osm_id, name, lat, lon, filters, round(dist_m, 1), 'was ' || old_type || ' ' || old_id FROM remapped
+      UNION ALL
+      SELECT 'MOVED', area, osm_type, osm_id, name, lat, lon, filters, round(dist_m, 1), 'from ' || round(old_lat, 6) || ',' || round(old_lon, 6)
+      FROM pairs WHERE dist_m > CAST(:move_m AS DOUBLE)
+      UNION ALL
+      SELECT 'RETAGGED', p.area, p.osm_type, p.osm_id, p.name, p.lat, p.lon, p.filters, NULL, d.detail
+      FROM pairs p JOIN retag_detail d USING (area, osm_type, osm_id);
+
+      COPY (SELECT * FROM cov ORDER BY area, filter) TO '{{ outputFiles.coverage }}' (FORMAT PARQUET);
+      INSERT INTO cur SELECT p.* FROM prev p JOIN area_status s ON s.area = p.area WHERE s.status = 'NOT_FOUND';
+      COPY (SELECT * FROM cur ORDER BY area, osm_type, osm_id) TO '{{ outputFiles.snapshot }}' (FORMAT PARQUET);
+
+      COPY (SELECT change_type, area, array_to_string(filters, '; ') AS filters, osm_type, osm_id, name, lat, lon, distance_m, detail,
+                   'https://www.openstreetmap.org/' || osm_type || '/' || osm_id AS osm_url
+            FROM changes ORDER BY area, change_type, name, osm_id) TO '{{ outputFiles.changes_csv }}' (HEADER, DELIMITER ',');
+
+      CREATE TABLE counts AS
+      SELECT s.area, f.filter, s.status,
+             (SELECT count(*) FROM cur c WHERE c.area = s.area AND list_contains(c.filters, f.filter)) AS current_pois,
+             (SELECT count(*) FROM prev p WHERE p.area = s.area AND list_contains(p.filters, f.filter)) AS previous_pois,
+             count(ch.change_type) FILTER (WHERE ch.change_type = 'ADDED') AS added,
+             count(ch.change_type) FILTER (WHERE ch.change_type = 'REMOVED') AS removed,
+             count(ch.change_type) FILTER (WHERE ch.change_type = 'MOVED') AS moved,
+             count(ch.change_type) FILTER (WHERE ch.change_type = 'RETAGGED') AS retagged,
+             count(ch.change_type) FILTER (WHERE ch.change_type = 'REMAPPED') AS remapped
+      FROM area_status s CROSS JOIN filter_def f
+      LEFT JOIN changes ch ON ch.area = s.area AND list_contains(ch.filters, f.filter)
+      GROUP BY s.idx, s.area, f.filter, s.status;
+      COPY (SELECT * EXCLUDE (status), status FROM counts ORDER BY area, filter) TO '{{ outputFiles.counts_csv }}' (HEADER, DELIMITER ',');
+
+      COPY (SELECT 'FeatureCollection' AS type,
+                   (SELECT copyright FROM meta) || ' (c) OpenStreetMap contributors, https://www.openstreetmap.org/copyright' AS attribution,
+                   CAST((SELECT osm_base FROM meta) AS VARCHAR) AS osm_base,
+                   coalesce((SELECT list(json_object('type', 'Feature', 'id', osm_type || '/' || osm_id || '/' || lower(change_type),
+                      'geometry', json_object('type', 'Point', 'coordinates', json_array(lon, lat)),
+                      'properties', json_object('change_type', change_type, 'area', area, 'filters', filters, 'name', name,
+                                                'distance_m', distance_m, 'detail', detail,
+                                                'osm_url', 'https://www.openstreetmap.org/' || osm_type || '/' || osm_id))
+                      ORDER BY area, change_type, osm_id) FROM changes), []) AS features)
+      TO '{{ outputFiles.changes_geojson }}' (FORMAT JSON);
+
+      CREATE TABLE digest AS
+      SELECT count(*) AS n, string_agg(line, chr(10)) AS lines FROM (
+        SELECT '- ' || change_type || ' [' || area || '] ' || coalesce(name, '(no name)') || ' (' || array_to_string(filters, ', ') || ')'
+               || coalesce(' ' || distance_m || ' m', '') || coalesce(' - ' || detail, '') || ' https://www.openstreetmap.org/' || osm_type || '/' || osm_id AS line
+        FROM changes ORDER BY CASE change_type WHEN 'REMOVED' THEN 0 WHEN 'ADDED' THEN 1 WHEN 'RETAGGED' THEN 2 WHEN 'MOVED' THEN 3 ELSE 4 END, area, name
+        LIMIT 25);
+
+      SELECT
+        (SELECT is_baseline FROM meta) AS is_baseline,
+        CAST((SELECT osm_base FROM meta) AS VARCHAR) AS osm_base,
+        coalesce((SELECT prev_osm_base > osm_base FROM meta), false) AS data_older_than_last_run,
+        (SELECT count(*) FROM el WHERE osm_type IN ('node', 'way', 'relation')) AS elements,
+        (SELECT count(*) FROM cur) AS pois,
+        (SELECT count(*) FROM prev) AS previous_pois,
+        (SELECT count(*) FROM changes) AS changes,
+        (SELECT count(*) FILTER (WHERE change_type = 'ADDED') FROM changes) AS added,
+        (SELECT count(*) FILTER (WHERE change_type = 'REMOVED') FROM changes) AS removed,
+        (SELECT count(*) FILTER (WHERE change_type = 'MOVED') FROM changes) AS moved,
+        (SELECT count(*) FILTER (WHERE change_type = 'RETAGGED') FROM changes) AS retagged,
+        (SELECT count(*) FILTER (WHERE change_type = 'REMAPPED') FROM changes) AS remapped,
+        (SELECT count(*) FILTER (WHERE tags_edited AND old_key_tags = key_tags) FROM pairs) AS objects_edited,
+        (SELECT string_agg(area || ' / ' || filter || ' ' || current_pois || coalesce(' (+' || nullif(added, 0) || ')', '') || coalesce(' (-' || nullif(removed, 0) || ')', ''), ', ' ORDER BY area, filter) FROM counts) AS counts_line,
+        (SELECT coalesce(string_agg(area || ' ' || status || ' (' || spec || CASE WHEN status = 'AMBIGUOUS' THEN ' matched ' || boundary_ids || ', set admin_level to pick one' WHEN status = 'NOT_FOUND' THEN ' matched no boundary, previous POIs kept' ELSE '' END || ')', '; '), '')
+           FROM area_status WHERE status <> 'OK') AS area_warnings,
+        (SELECT remark IS NOT NULL FROM (SELECT j->>'$.remark' AS remark FROM resp)) AS has_remark,
+        coalesce((SELECT j->>'$.remark' FROM resp), '') AS remark,
+        CAST(json_object('text',
+          'OpenStreetMap POI changes since the last run - ' || (SELECT n FROM digest) || ' change(s) ('
+          || (SELECT string_agg(change_type || ' ' || n, ', ') FROM (SELECT change_type, count(*) AS n FROM changes GROUP BY 1 ORDER BY 1)) || ')'
+          || CASE WHEN (SELECT count(*) FROM changes) > 25 THEN ', first 25 shown, all in the CSV and GeoJSON' ELSE '' END || chr(10)
+          || coalesce((SELECT lines FROM digest), '') || chr(10)
+          || 'Data (c) OpenStreetMap contributors, ODbL, as of ' || CAST((SELECT osm_base FROM meta) AS VARCHAR) || ' UTC. Execution ' || :execution_url) AS VARCHAR) AS slack_payload;
+
+  - id: save_snapshot
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.snapshot_key }}"
+    value: "{{ outputs.diff.outputFiles.snapshot }}"
+    description: Points the KV key at the new Parquet snapshot. Older snapshot files stay with their executions until purged.
+
+  - id: save_coverage
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ inputs.snapshot_key }}_coverage"
+    value: "{{ outputs.diff.outputFiles.coverage }}"
+
+  - id: report_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.diff.outputs[0].row.changes > 0 }}"
+    then:
+      - id: notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        description: One digest per run. allowFailure keeps the snapshot saved and the run green-with-warning when the webhook is not configured.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: "{{ outputs.diff.outputs[0].row.slack_payload }}"
+
+      - id: log_changes
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ fromJson(outputs.diff.outputs[0].row.slack_payload).text }}"
+    else:
+      - id: nothing_to_report
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ outputs.diff.outputs[0].row.is_baseline ? 'BASELINE run: ' ~ outputs.diff.outputs[0].row.pois ~ ' POIs recorded, changes are reported from the next run on.' : 'No POI changes: ' ~ outputs.diff.outputs[0].row.pois ~ ' POIs, ' ~ outputs.diff.outputs[0].row.objects_edited ~ ' edited on tags outside key_tags.' }}"
+
+  - id: warn_inputs
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.plan.outputs[0].row.invalid_areas is not empty or outputs.plan.outputs[0].row.invalid_filters is not empty or outputs.diff.outputs[0].row.area_warnings is not empty or outputs.diff.outputs[0].row.has_remark or outputs.diff.outputs[0].row.data_older_than_last_run }}"
+    level: WARN
+    message: |-
+      Inputs or data that need attention:
+      {%- if outputs.plan.outputs[0].row.invalid_areas is not empty %}
+      Skipped areas: {{ outputs.plan.outputs[0].row.invalid_areas }}
+      {%- endif %}
+      {%- if outputs.plan.outputs[0].row.invalid_filters is not empty %}
+      Skipped tag filters: {{ outputs.plan.outputs[0].row.invalid_filters }}
+      {%- endif %}
+      {%- if outputs.diff.outputs[0].row.area_warnings is not empty %}
+      Areas: {{ outputs.diff.outputs[0].row.area_warnings }}
+      {%- endif %}
+      {%- if outputs.diff.outputs[0].row.has_remark %}
+      Overpass remark: {{ outputs.diff.outputs[0].row.remark }}
+      {%- endif %}
+      {%- if outputs.diff.outputs[0].row.data_older_than_last_run %}
+      The server data ({{ outputs.diff.outputs[0].row.osm_base }}) is older than the previous run; a lagging mirror can make recent edits look reverted.
+      {%- endif %}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.diff.outputs[0].row.pois }} POIs in {{ outputs.plan.outputs[0].row.areas }} area(s) x {{ outputs.plan.outputs[0].row.filters }} filter(s), OSM data as of {{ outputs.diff.outputs[0].row.osm_base }} UTC{{ outputs.diff.outputs[0].row.is_baseline ? ', BASELINE run' : '' }}.
+      Per area and filter: {{ outputs.diff.outputs[0].row.counts_line }}
+      Changes: {{ outputs.diff.outputs[0].row.added }} added, {{ outputs.diff.outputs[0].row.removed }} removed, {{ outputs.diff.outputs[0].row.moved }} moved, {{ outputs.diff.outputs[0].row.retagged }} retagged, {{ outputs.diff.outputs[0].row.remapped }} remapped; {{ outputs.diff.outputs[0].row.objects_edited }} POIs edited on tags outside key_tags only.
+      Changes CSV {{ outputs.diff.outputFiles.changes_csv }}, GeoJSON {{ outputs.diff.outputFiles.changes_geojson }}
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.diff.outputs[0].row }}"
+  - id: changes_csv
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.changes_csv }}"
+  - id: changes_geojson
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.changes_geojson }}"
+  - id: counts_csv
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.counts_csv }}"
+  - id: snapshot_parquet
+    type: FILE
+    value: "{{ outputs.diff.outputFiles.snapshot }}"
+
+extend:
+  title: Detect OpenStreetMap POI Changes per Area with the Overpass API and DuckDB
+  metaTitle: OpenStreetMap POI Change Detector with Overpass, DuckDB and Slack | Kestra
+  shortDescription: Query OpenStreetMap points of interest for your tag filters and areas with one Overpass API request a week, keep a Parquet snapshot, and report POIs added, removed, moved, remapped or retagged on key tags such as opening_hours, operator, capacity and socket:*, with per-area counts, GeoJSON, CSV and a Slack digest.
+  metaDescription: Weekly OpenStreetMap POI diff via one Overpass query - added, removed, moved and retagged POIs per area, Parquet state, GeoJSON, CSV and Slack.
+  description: |
+    Site-selection, location-intelligence and mobility teams watch a few kinds of places in a few areas: charging stations along a corridor, supermarkets around a candidate site. This flow asks the Overpass API for all your tag filters in all your areas with one query, keeps a Parquet snapshot and diffs it in DuckDB against the previous run, so you only see what changed in OpenStreetMap: new and closed POIs, moves, point-to-building redraws and edits to the tags you care about.
+
+    ## How it works
+
+    1. A weekly `Schedule` (Monday 05:30 UTC) starts the run. `tag_filters` holds filters such as `amenity=charging_station;shop=supermarket`; `areas` is a JSON list of `bbox` [south, west, north, east] or administrative boundary `name` (plus optional `admin_level`) entries.
+    2. `plan` (DuckDB) validates both inputs and builds ONE Overpass QL query: `[out:json][timeout:...]`, then per area a `make area_marker` element, for named areas `area["boundary"="administrative"]["name"=...]` plus `.aN out ids`, and a union of `nwr[...]` statements with `out center tags`, so ways and relations come back with a centre point. Invalid areas and filters are skipped and reported.
+    3. `previous_snapshot` and `previous_coverage` (KV Get) read the URIs of the last snapshot and of the (area, filter) pairs it covered; on the first run `bootstrap` (If) writes empty files (BASELINE).
+    4. `fetch_overpass` (HTTP Download) POSTs the query with a descriptive User-Agent. On 429, 502 or 504 the task retry backs off for 1, 2, 4 and 8 minutes; the last two attempts go to `mirror_url` when set.
+    5. `diff` (DuckDB) fails the run if the HTTP 200 body carries a `remark` with a runtime error (timeout, out of memory): the element list is then truncated and would look like mass removals. It splits elements per area by marker and classifies changes. ADDED and REMOVED only count for (area, filter) pairs already covered, so a new area or filter is a baseline for that pair. MOVED compares node coordinates or way centres with `move_threshold_m`. REMAPPED pairs a removed and an added object with the same name within `remap_radius_m` (node redrawn as a building). RETAGGED lists each changed `key_tags` value, `socket:*` prefixes included. A named area that resolves to no boundary keeps its previous POIs; one that matches several is flagged AMBIGUOUS.
+    6. `save_snapshot` and `save_coverage` (KV Set) point the keys at the new Parquet files.
+    7. `report_changes` (If) sends one Slack digest (`allowFailure`) and logs it at WARN, or logs BASELINE / no changes.
+    8. `warn_inputs` lists skipped inputs, area problems and stale server data; `summary` logs counts per area and filter.
+
+    ## What you get
+
+    - `changes_csv` and `changes_geojson`: one row or Point feature per change with type, area, filters, name, distance, tag diff and openstreetmap.org link; the GeoJSON carries the ODbL attribution and data timestamp.
+    - `counts_csv`: current and previous POIs plus added, removed, moved, retagged and remapped per area and filter.
+    - A Parquet snapshot of every POI with its tags.
+    - REMOVED means no longer matching a filter: deleted, retagged, or moved to a lifecycle prefix like `disused:shop`.
+
+    ## Who it's for
+
+    - Retail and real-estate site-selection analysts tracking competitors around candidate sites.
+    - EV charging and mobility teams monitoring charger coverage, operators and sockets.
+    - GIS engineers maintaining POI layers derived from OpenStreetMap.
+
+    ## Why orchestrate this with Kestra
+
+    - The snapshot lives in internal storage with its pointer in the KV store: no database or state file to manage.
+    - Task retries with exponential backoff and a mirror switch follow the Overpass usage policy without custom code.
+    - DuckDB reads the JSON and Parquet directly, so the diff is readable SQL in the flow.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB plugin and the Slack plugin.
+    - Outbound HTTPS to `overpass-api.de` (keyless) or your own instance. On the public instance keep areas city-sized and runs weekly, and set `contact`.
+    - Licence: OpenStreetMap data is under the ODbL. Anything that shows it must credit "(c) OpenStreetMap contributors" with a link to https://www.openstreetmap.org/copyright, and a database you publish from it must stay under the ODbL. The Slack digest and GeoJSON carry this attribution; keep it downstream.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the digest (optional; without it the run ends with a warning and changes stay in the logs and outputs).
+
+    ## Quick start
+
+    1. Import the flow and **Execute** with the defaults: a bbox over central Amsterdam, Monaco by name (AMBIGUOUS: country and commune share the name) and Zandvoort at `admin_level` 8. The first run is a BASELINE.
+    2. Execute again: no changes unless a mapper edited one of the POIs.
+    3. Set your own areas and filters, `SLACK_WEBHOOK_URL` and `contact`, and keep the weekly schedule. Use one `snapshot_key` per watchlist; delete its two KV keys for a new baseline.
+
+    ## How to extend
+
+    - Append the changes to a warehouse table to keep each POI's history.
+    - Route REMOVED competitors to a CRM task, or open a ticket when charger capacity drops.
+    - Point `overpass_url` at a self-hosted Overpass instance to run daily or cover whole regions.
+
+    ## Links
+
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Overpass API](https://wiki.openstreetmap.org/wiki/Overpass_API), [Overpass QL](https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL) and [usage policy](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html)
+    - [OpenStreetMap copyright and licence (ODbL)](https://www.openstreetmap.org/copyright)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+    - ELT & Data Landing
+    - Day 2 Operations
+  ee: false
+  demo: false
