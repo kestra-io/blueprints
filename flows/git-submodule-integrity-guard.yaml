@@ -1,0 +1,417 @@
+id: git-submodule-integrity-guard
+namespace: company.supplychain
+description: |
+  Audit a public GitHub repository's Git submodule configuration before building or promoting a release.
+  The workflow parses .gitmodules, validates submodule URL policy, checks every declared path through
+  GitHub's Contents API, and verifies each configured submodule points to a full immutable commit SHA. It detects missing gitlinks, unverified declared submodule paths, duplicate paths, unsafe URLs, and incomplete
+  tree responses. It writes machine-readable evidence and can archive it to S3. This validates superproject
+  metadata; it does not clone submodules or audit their own transitive dependencies.
+
+inputs:
+  - id: repository
+    type: STRING
+    displayName: GitHub repository
+    defaults: obsproject/obs-studio
+    description: Public GitHub repository in owner/name format.
+  - id: default_branch
+    type: STRING
+    displayName: Branch or ref
+    defaults: master
+    description: Branch, tag or commit ref of the superproject.
+  - id: gitmodules_path
+    type: STRING
+    displayName: Git submodule configuration path
+    defaults: .gitmodules
+    description: Repository-relative path to the submodule configuration file.
+  - id: require_https_urls
+    type: BOOL
+    displayName: Require HTTPS submodule URLs
+    defaults: true
+    description: Block URLs that are not explicit HTTPS URLs.
+  - id: require_gitlink_match
+    type: BOOL
+    displayName: Require configuration and tree match
+    defaults: true
+    description: Block submodule path declarations that do not match a gitlink in the selected Git tree, or vice versa.
+  - id: reject_duplicate_paths
+    type: BOOL
+    displayName: Reject duplicate submodule paths
+    defaults: true
+    description: Block repeated submodule path declarations.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON audit report in S3. AWS secrets are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: Evidence bucket
+    defaults: my-supply-chain-evidence
+    description: Existing S3 bucket used when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: Evidence prefix
+    defaults: git-submodule-audits
+    description: Prefix for repository-specific submodule audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region of the evidence bucket.
+
+triggers:
+  - id: weekly_submodule_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck submodule URL configuration and commit pins weekly. Enable after reviewing the first report.
+    cron: "0 9 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate repository, ref and path before calling the public GitHub API.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      REPOSITORY: "{{ inputs.repository }}"
+      DEFAULT_BRANCH: "{{ inputs.default_branch }}"
+      GITMODULES_PATH: "{{ inputs.gitmodules_path }}"
+    script: |
+      import os
+      import re
+
+      repository = os.environ.get("REPOSITORY", "").strip()
+      ref = os.environ.get("DEFAULT_BRANCH", "").strip()
+      path = os.environ.get("GITMODULES_PATH", "").strip()
+      if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+          raise ValueError("repository must be a public GitHub owner/name pair")
+      if not ref or any(char in ref for char in "\r\n"):
+          raise ValueError("default_branch must be a non-empty single-line ref")
+      if not path or path.startswith("/") or ".." in path.split("/"):
+          raise ValueError("gitmodules_path must be a repository-relative path")
+      print(f"Validated Git submodule audit request for {repository}:{ref}/{path}")
+
+  - id: fetch_gitmodules
+    type: io.kestra.plugin.core.http.Request
+    description: Fetch the real .gitmodules file from the selected public GitHub ref.
+    uri: "https://raw.githubusercontent.com/{{ inputs.repository }}/{{ inputs.default_branch }}/{{ inputs.gitmodules_path }}"
+    method: GET
+    headers:
+      User-Agent: Kestra-Git-Submodule-Integrity-Guard/1.0
+      Accept: text/plain
+    timeout: PT30S
+
+  - id: audit_submodule_pins
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse .gitmodules, check URL scheme and duplicate paths, verify each declaration resolves to a GitHub submodule object, and require an immutable 40- or 64-character commit SHA.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install kestra
+    inputFiles:
+      gitmodules.ini: "{{ outputs.fetch_gitmodules.body }}"
+    env:
+      REPOSITORY: "{{ inputs.repository }}"
+      DEFAULT_BRANCH: "{{ inputs.default_branch }}"
+      GITMODULES_PATH: "{{ inputs.gitmodules_path }}"
+      REQUIRE_HTTPS: "{{ inputs.require_https_urls }}"
+      REQUIRE_MATCH: "{{ inputs.require_gitlink_match }}"
+      REJECT_DUPLICATE_PATHS: "{{ inputs.reject_duplicate_paths }}"
+    outputFiles:
+      - git-submodule-audit.json
+    script: |
+      import configparser
+      import json
+      import os
+      import re
+      import time
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from collections import Counter
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      repository = os.environ["REPOSITORY"].strip()
+      ref = os.environ["DEFAULT_BRANCH"].strip()
+      gitmodules_path = os.environ["GITMODULES_PATH"].strip()
+      require_https = os.environ.get("REQUIRE_HTTPS", "true").lower() == "true"
+      require_match = os.environ.get("REQUIRE_MATCH", "true").lower() == "true"
+      reject_duplicates = os.environ.get("REJECT_DUPLICATE_PATHS", "true").lower() == "true"
+
+      with open("gitmodules.ini", encoding="utf-8") as source:
+          gitmodules_text = source.read()
+
+      parser = configparser.ConfigParser(interpolation=None, strict=True)
+      try:
+          parser.read_string(gitmodules_text)
+      except configparser.Error as exc:
+          raise ValueError(f".gitmodules could not be parsed: {exc}") from exc
+
+      findings = []
+      def add(code, severity, message, path=None):
+          findings.append({"code": code, "severity": severity, "path": path, "message": message})
+
+      submodules = []
+      for section in parser.sections():
+          if not section.lower().startswith("submodule "):
+              continue
+          path = parser.get(section, "path", fallback="").strip()
+          url = parser.get(section, "url", fallback="").strip()
+          branch = parser.get(section, "branch", fallback="").strip() or None
+          if not path:
+              add("SUBMODULE_PATH_MISSING", "BLOCK", f"Section {section!r} has no path.")
+              continue
+          if path.startswith("/") or ".." in path.split("/"):
+              add("SUBMODULE_PATH_INVALID", "BLOCK", f"Submodule path is absolute or traverses parent directories: {path!r}.", path)
+          if not url:
+              add("SUBMODULE_URL_MISSING", "BLOCK", f"Submodule {path!r} has no URL.", path)
+          elif require_https and not url.lower().startswith("https://"):
+              add("SUBMODULE_URL_NOT_HTTPS", "BLOCK", f"Submodule URL must use HTTPS, got {url!r}.", path)
+          elif re.search(r"\s|[\r\n]", url):
+              add("SUBMODULE_URL_INVALID", "BLOCK", f"Submodule URL contains whitespace or a newline: {url!r}.", path)
+          submodules.append({"name": section, "path": path, "url": url, "branchOverride": branch})
+
+      paths = [item["path"] for item in submodules]
+      duplicates = sorted(path for path, count in Counter(paths).items() if count > 1)
+      for path in duplicates:
+          severity = "BLOCK" if reject_duplicates else "WARN"
+          add("DUPLICATE_SUBMODULE_PATH", severity, f"Submodule path {path!r} is declared more than once.", path)
+
+      # Query per path. GitHub's recursive tree endpoint can exceed Kestra's
+      # worker result-message limit on large repositories.
+      gitlinks = {}
+      missing_gitlinks = []
+      for item in submodules:
+          path = item["path"]
+          encoded_path = urllib.parse.quote(path, safe="/")
+          encoded_ref = urllib.parse.quote(ref, safe="")
+          url = f"https://api.github.com/repos/{repository}/contents/{encoded_path}?ref={encoded_ref}"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "Kestra-Git-Submodule-Integrity-Guard/1.0",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              missing_gitlinks.append(path)
+              add("SUBMODULE_LOOKUP_FAILED", "BLOCK", f"GitHub Contents API returned HTTP {exc.code} for declared submodule path.", path)
+              time.sleep(0.15)
+              continue
+          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+              missing_gitlinks.append(path)
+              add("SUBMODULE_LOOKUP_FAILED", "BLOCK", f"Unable to verify declared submodule path through GitHub API: {exc}", path)
+              time.sleep(0.15)
+              continue
+
+          if not isinstance(payload, dict) or payload.get("type") != "submodule":
+              missing_gitlinks.append(path)
+              actual_type = payload.get("type") if isinstance(payload, dict) else type(payload).__name__
+              add("DECLARED_SUBMODULE_NOT_GITLINK", "BLOCK", f"Expected a GitHub submodule object at this path, found type {actual_type!r}.", path)
+              time.sleep(0.15)
+              continue
+
+          sha = str(payload.get("sha") or "")
+          if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
+              missing_gitlinks.append(path)
+              add("GITLINK_SHA_INVALID", "BLOCK", f"GitHub returned an invalid commit object ID {sha!r}.", path)
+          gitlinks[path] = {
+              "sha": sha,
+              "mode": "160000",
+              "type": "submodule",
+              "url": payload.get("submodule_git_url"),
+          }
+          time.sleep(0.15)
+
+      missing_gitlinks = sorted(set(missing_gitlinks))
+      branch_overrides = sorted(item["path"] for item in submodules if item["branchOverride"])
+      if branch_overrides:
+          add("SUBMODULE_BRANCH_OVERRIDE", "WARN", "Submodule branch overrides were found. The superproject still pins each checked-out gitlink, but branch tracking can surprise update workflows: " + ", ".join(branch_overrides[:50]))
+
+      blocking = [finding for finding in findings if finding["severity"] == "BLOCK"]
+      warnings = [finding for finding in findings if finding["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "repository": repository,
+          "ref": ref,
+          "gitmodulesPath": gitmodules_path,
+          "gitmodulesSections": len(submodules),
+          "verifiedSubmoduleCount": len(gitlinks) - len(missing_gitlinks),
+          "gitmodulesPaths": paths,
+          "verifiedSubmodulePaths": sorted(gitlinks),
+          "unverifiedSubmodulePaths": missing_gitlinks,
+          "submoduleObjectIds": gitlinks,
+          "branchOverrides": branch_overrides,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "The gate audits .gitmodules and superproject gitlink metadata. It does not clone the submodules or inspect their dependency trees.",
+      }
+      with open("git-submodule-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"Git submodule integrity audit: {repository}@{ref} verdict={verdict}; declared={len(submodules)}, verified={len(gitlinks) - len(missing_gitlinks)}, unverified={len(missing_gitlinks)}, blocking={len(blocking)}")
+      Kestra.outputs({
+          "repository": repository,
+          "ref": ref,
+          "gitmodules_path": gitmodules_path,
+          "declared_submodule_count": len(submodules),
+          "verified_submodule_count": len(gitlinks) - len(missing_gitlinks),
+          "unverified_submodule_count": len(missing_gitlinks),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "findings": findings,
+          "verdict": verdict,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the JSON submodule evidence in S3 for a release or software bill of materials review.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_submodule_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the submodule audit report without copying submodule repositories.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_submodule_pins.outputFiles['git-submodule-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.repository | replace('/', '_') }}/git-submodule-audit.json"
+
+  - id: enforce_submodule_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when repository submodule configuration does not match immutable Git tree pins or URL policy.
+    condition: "{{ outputs.audit_submodule_pins.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_blocked_submodules
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert maintainers when submodule paths or URLs violate policy.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: Git submodule integrity gate BLOCKED\\nRepository: " ~ outputs.audit_submodule_pins.vars.repository ~
+                "\\nRef: " ~ outputs.audit_submodule_pins.vars.ref ~
+                "\\nFindings: " ~ (outputs.audit_submodule_pins.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nReview git-submodule-audit.json for details."
+            } | toJson
+          }}
+      - id: fail_submodule_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Block downstream build or release when submodule metadata violates policy.
+        errorMessage: "Git submodule policy failed for {{ outputs.audit_submodule_pins.vars.repository }} at {{ outputs.audit_submodule_pins.vars.ref }}."
+    else:
+      - id: log_submodule_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Git submodule audit {{ outputs.audit_submodule_pins.vars.verdict }} for {{ outputs.audit_submodule_pins.vars.repository }}; declared={{ outputs.audit_submodule_pins.vars.declared_submodule_count }}, verified={{ outputs.audit_submodule_pins.vars.verified_submodule_count }}, unverified={{ outputs.audit_submodule_pins.vars.unverified_submodule_count }}."
+
+errors:
+  - id: alert_submodule_audit_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert on API, parsing or orchestration failure so an incomplete audit is not interpreted as a pass.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: Git submodule audit execution failed\\nRepository: " ~ inputs.repository ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect Kestra logs; incomplete GitHub responses must not be interpreted as PASS."
+        } | toJson
+      }}
+
+outputs:
+  - id: submodule_audit
+    type: JSON
+    description: Machine-readable declaration-to-gitlink comparison, commit object IDs, URL findings and final policy verdict.
+    value: "{{ outputs.audit_submodule_pins.vars | toJson }}"
+
+extend:
+  title: Git Submodule URL and Commit Integrity Gate
+  metaTitle: Git Submodule URL and Commit Integrity Gate | Kestra
+  shortDescription: Verify .gitmodules declarations match GitHub tree gitlinks, submodule URLs follow HTTPS policy, and every selected submodule is pinned to a full commit object ID.
+  metaDescription: Gate Git submodule usage on valid .gitmodules paths, HTTPS source URLs, matching Git tree entries, and full immutable commit pins before build or release.
+  description: |
+    Audit the submodule definitions of a public GitHub repository before building or releasing it. The workflow parses .gitmodules, compares its declared paths with the superproject's recursive Git tree, validates URL policy, and confirms that submodule gitlinks carry full commit object IDs. It reports missing and unverified declared submodule paths, duplicate paths and truncated API responses, then supports optional evidence retention and a blocking release path.
+
+    ## How it works
+
+    1. Validate the repository, ref and .gitmodules path.
+    2. Fetch the real .gitmodules file and recursive Git tree from the same public GitHub ref.
+    3. Parse submodule names, paths, URLs and optional branch overrides.
+    4. Match every declared path with a Git tree gitlink, identify unverified declared submodule paths, and verify commit object IDs and URL policy.
+    5. Optionally archive the JSON report to S3; block downstream work if the repository metadata violates the selected policy.
+
+    ## What you get
+
+    - A JSON report of submodule declarations and pinned gitlink commit IDs.
+    - Detection of declared paths that are missing or do not resolve to a submodule object and duplicate paths.
+    - Detection of non-HTTPS URLs and invalid commit object IDs.
+    - Fail-closed behavior when GitHub returns a truncated tree response.
+    - Optional S3 evidence archiving without cloning dependent repositories.
+
+    ## Who it's for
+
+    - Platform engineers maintaining repositories with vendored submodules.
+    - Release engineers validating reproducibility before creating build artifacts.
+    - Supply-chain security teams looking for mutable or untracked repository inputs.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes repository policy repeatable, records the selected ref and audit result, supports scheduled drift checks, and provides a clear failed execution when submodule metadata no longer matches the repository tree.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script task runner.
+    - Public access to api.github.com and raw.githubusercontent.com.
+    - A Slack incoming webhook for alerts; S3 archival is optional.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for a blocking policy result or execution error.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with repository obsproject/obs-studio, ref master and the default .gitmodules path.
+    2. Execute once and inspect git-submodule-audit.json and the submodule_audit output.
+    3. Review the submodule URL and path matches, then decide whether HTTPS is mandatory for your organization.
+    4. Configure Slack before relying on blocking alerts.
+    5. Enable weekly_submodule_audit after verifying the policy and optional S3 configuration.
+
+    ## How to extend
+
+    - Query each gitlink SHA against the submodule repository to ensure the object still exists and is accessible.
+    - Add an allowlist for internal Git hosts while keeping relative or credential-embedded URLs blocked.
+    - Recursively audit submodule repositories' own dependency and submodule graphs.
+    - Require a passing report before CI builds or release publication.
+
+    ## Links
+
+    - [Git submodule documentation](https://git-scm.com/book/en/v2/Git-Tools-Submodules)
+    - [GitHub Contents API](https://docs.github.com/en/rest/git/trees#get-a-tree)
+    - [GitHub raw file access](https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files)
+    - [Kestra HTTP Request plugin](https://kestra.io/plugins/plugin-core/http/io.kestra.plugin.core.http.request)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - CI/CD & Deployment
+  ee: false
+  demo: false
