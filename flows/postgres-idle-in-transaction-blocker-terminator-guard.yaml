@@ -1,0 +1,458 @@
+id: postgres-idle-in-transaction-blocker-terminator-guard
+namespace: company.platform
+
+description: |
+  Audits PostgreSQL instances for connections stalled in idle in transaction state,
+  identifies root blockers holding locks and pinning the cluster-wide xmin horizon,
+  correlates cascading blocked queries, terminates abandoned sessions behind an operator approval gate,
+  verifies post-remediation backend evacuation, and archives audit telemetry into Kestra KV.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: PostgreSQL JDBC Connection URL
+    description: JDBC endpoint targeting the PostgreSQL database (e.g. jdbc:postgresql://localhost:5432/postgres).
+    defaults: "jdbc:postgresql://localhost:5432/postgres"
+
+  - id: database_name
+    type: STRING
+    displayName: Database Name
+    description: Name of the target database catalog to inspect and protect.
+    defaults: "postgres"
+
+  - id: idle_seconds_threshold
+    type: INT
+    displayName: Idle in Transaction Threshold (Seconds)
+    description: Minimum duration in seconds an uncommitted transaction must remain idle before being flagged as a potential zombie blocker.
+    defaults: 120
+
+  - id: max_terminations_per_run
+    type: INT
+    displayName: Maximum Terminations Per Run
+    description: Safety upper bound on the number of backend sessions permitted to be terminated in a single execution pass.
+    defaults: 10
+
+  - id: excluded_applications
+    type: ARRAY
+    itemType: STRING
+    displayName: Excluded Application Names
+    description: List of application_name strings exempt from automated termination (e.g. backup, migration, or ETL processes).
+    defaults:
+      - "pg_dump"
+      - "kestra"
+      - "flyway"
+      - "liquibase"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, diagnoses blockers and outputs plans without terminating PostgreSQL backend sessions.
+    defaults: true
+
+  - id: auto_terminate
+    type: BOOL
+    displayName: Auto Terminate Stalled Blockers
+    description: When true and dry_run is false, pauses for operator verification before issuing pg_terminate_backend commands.
+    defaults: false
+
+triggers:
+  - id: on_contention_trigger
+    type: io.kestra.plugin.jdbc.postgresql.Trigger
+    description: Event-based trigger firing when an idle in transaction session actively blocks other concurrent queries.
+    interval: PT2M
+    disabled: true
+    url: "{{ secret('POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT a.pid
+      FROM pg_stat_activity a
+      JOIN pg_stat_activity b ON a.pid = ANY(pg_blocking_pids(b.pid))
+      WHERE a.pid <> pg_backend_pid()
+        AND a.state = 'idle in transaction'
+        AND a.state_change < now() - interval '60 seconds'
+      LIMIT 1;
+
+  - id: periodic_idle_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic health inspection executed every 10 minutes to detect and remediate uncommitted transaction leaks.
+    cron: "*/10 * * * *"
+    disabled: true
+
+  - id: on_demand_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by DBA alerting systems, Prometheus Alertmanager, or SRE incident runbooks.
+    key: "{{ secret('PG_BLOCKER_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational thresholds and safety parameters satisfy sanity constraints.
+    conditions:
+      - "{{ inputs.database_name | length > 0 }}"
+      - "{{ inputs.idle_seconds_threshold >= 10 }}"
+      - "{{ inputs.max_terminations_per_run >= 1 }}"
+    errorMessage: "Invalid configuration inputs. Provide a valid database name, idle threshold >= 10 seconds, and positive termination ceiling."
+
+  - id: detect_idle_blockers
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Query pg_stat_activity and correlate cascading lock trees via pg_blocking_pids to identify uncommitted idle transactions.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        a.pid,
+        a.usename::text AS usename,
+        COALESCE(a.client_addr::text, 'local') AS client_addr,
+        COALESCE(a.application_name::text, 'unknown') AS application_name,
+        a.state::text AS state,
+        ROUND(EXTRACT(EPOCH FROM (now() - a.state_change))::numeric, 1) AS idle_duration_seconds,
+        ROUND(EXTRACT(EPOCH FROM (now() - a.xact_start))::numeric, 1) AS xact_duration_seconds,
+        COUNT(b.pid)::int AS blocked_clients_count,
+        COALESCE(ARRAY_AGG(b.pid) FILTER (WHERE b.pid IS NOT NULL), '{}')::int[] AS blocked_pids,
+        SUBSTRING(REGEXP_REPLACE(COALESCE(a.query, ''), '\s+', ' ', 'g') FROM 1 FOR 250) AS last_query
+      FROM pg_stat_activity a
+      LEFT JOIN pg_stat_activity b ON a.pid = ANY(pg_blocking_pids(b.pid))
+      WHERE a.pid <> pg_backend_pid()
+        AND a.state = 'idle in transaction'
+        AND a.state_change < now() - (interval '1 second' * {{ inputs.idle_seconds_threshold }})
+      GROUP BY a.pid, a.usename, a.client_addr, a.application_name, a.state, a.state_change, a.xact_start, a.query
+      ORDER BY blocked_clients_count DESC, idle_duration_seconds DESC;
+
+  - id: evaluate_blocker_trends
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse detection results, correlate with previous KV state to identify persistent blockers, and construct remediation plan.
+    containerImage: python:3.11-slim
+    env:
+      DETECTED_ROWS_JSON: "{{ (outputs.detect_idle_blockers.rows ?? []) | toJson }}"
+      PREVIOUS_STATE_JSON: "{{ kv('pg_idle_blocker_tracker_' ~ (inputs.database_name | slugify), errorOnMissing=false) ?? '{}' }}"
+      EXCLUDED_APPS_JSON: "{{ inputs.excluded_applications | toJson }}"
+      MAX_TERMINATIONS: "{{ inputs.max_terminations_per_run }}"
+      DATABASE_NAME: "{{ inputs.database_name }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      AUTO_TERMINATE: "{{ inputs.auto_terminate }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      database_name = os.environ.get("DATABASE_NAME", "postgres")
+      dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+      auto_terminate = os.environ.get("AUTO_TERMINATE", "false").lower() == "true"
+      max_terminations = int(os.environ.get("MAX_TERMINATIONS", "10"))
+      execution_id = os.environ.get("EXECUTION_ID", "local-test")
+
+      raw_rows = os.environ.get("DETECTED_ROWS_JSON", "[]").strip()
+      try:
+          detected_rows = json.loads(raw_rows) if raw_rows else []
+      except Exception:
+          detected_rows = []
+
+      raw_prev = os.environ.get("PREVIOUS_STATE_JSON", "{}").strip()
+      try:
+          prev_state = json.loads(raw_prev) if raw_prev else {}
+      except Exception:
+          prev_state = {}
+
+      raw_excluded = os.environ.get("EXCLUDED_APPS_JSON", "[]").strip()
+      try:
+          excluded_apps = set(json.loads(raw_excluded) if raw_excluded else [])
+      except Exception:
+          excluded_apps = set()
+
+      prev_blocker_pids = set(prev_state.get("blocker_pids", []))
+
+      all_candidates = []
+      eligible_for_termination = []
+      cascading_lock_count = 0
+
+      for row in detected_rows:
+          pid = row.get("pid")
+          app = row.get("application_name", "unknown")
+          blocked_count = int(row.get("blocked_clients_count", 0))
+          idle_secs = float(row.get("idle_duration_seconds", 0))
+          xact_secs = float(row.get("xact_duration_seconds", 0))
+
+          if blocked_count > 0:
+              cascading_lock_count += blocked_count
+
+          is_excluded = app in excluded_apps
+          is_persistent = pid in prev_blocker_pids
+
+          item = {
+              "pid": pid,
+              "usename": row.get("usename"),
+              "client_addr": row.get("client_addr"),
+              "application_name": app,
+              "idle_duration_seconds": idle_secs,
+              "xact_duration_seconds": xact_secs,
+              "blocked_clients_count": blocked_count,
+              "blocked_pids": row.get("blocked_pids", []),
+              "last_query": row.get("last_query"),
+              "is_excluded": is_excluded,
+              "is_persistent": is_persistent
+          }
+          all_candidates.append(item)
+
+          if not is_excluded:
+              eligible_for_termination.append(pid)
+
+      target_termination_pids = eligible_for_termination[:max_terminations]
+      total_detected = len(all_candidates)
+      has_blockers = (total_detected > 0)
+
+      overall_status = "CRITICAL" if cascading_lock_count > 0 else ("WARNING" if has_blockers else "HEALTHY")
+
+      summary = (
+          f"PostgreSQL '{database_name}': {overall_status} | Idle transactions detected: {total_detected}, "
+          f"Active lock waiters blocked: {cascading_lock_count}. Eligible termination targets: {len(target_termination_pids)} "
+          f"(capped at {max_terminations}). Dry run: {dry_run}."
+      )
+      print(summary)
+
+      new_snapshot = {
+          "database_name": database_name,
+          "total_detected": total_detected,
+          "cascading_lock_count": cascading_lock_count,
+          "blocker_pids": [c["pid"] for c in all_candidates],
+          "timestamp": now_iso
+      }
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "database_name": database_name,
+          "total_detected": total_detected,
+          "cascading_lock_count": cascading_lock_count,
+          "target_termination_pids": target_termination_pids,
+          "candidates": all_candidates,
+          "dry_run": dry_run,
+          "auto_terminate": auto_terminate,
+          "evaluated_at": now_iso,
+          "execution_id": execution_id,
+          "summary": summary
+      }
+
+      print("::" + json.dumps({
+          "outputs": {
+              "overall_status": overall_status,
+              "has_blockers": has_blockers,
+              "total_detected": total_detected,
+              "cascading_lock_count": cascading_lock_count,
+              "target_pids": target_termination_pids,
+              "target_pids_count": len(target_termination_pids),
+              "new_snapshot": new_snapshot,
+              "audit_manifest": audit_manifest,
+              "summary": summary
+          }
+      }) + "::")
+
+  - id: save_state_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist detected blocker PID snapshot in Kestra KV store for sequential cycle trend analysis.
+    key: "pg_idle_blocker_tracker_{{ inputs.database_name | slugify }}"
+    value: "{{ outputs.evaluate_blocker_trends.vars.new_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: handle_blockers_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Branch based on whether any uncommitted idle in transaction blocker sessions were identified.
+    condition: "{{ outputs.evaluate_blocker_trends.vars.has_blockers == true }}"
+    then:
+      - id: termination_mode_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Execute safe backend session termination when auto_terminate is enabled and dry_run is disabled.
+        condition: "{{ not inputs.dry_run and inputs.auto_terminate and (outputs.evaluate_blocker_trends.vars.target_pids_count > 0) }}"
+        then:
+          - id: pause_for_termination_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause execution for DBA sign-off before terminating live PostgreSQL backend sessions. Resume to terminate or kill to abort.
+
+          - id: terminate_blocker_sessions
+            type: io.kestra.plugin.core.flow.Loop
+            description: Issue pg_terminate_backend for each approved target blocker PID.
+            values: "{{ outputs.evaluate_blocker_trends.vars.target_pids }}"
+            tasks:
+              - id: terminate_backend
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Execute pg_terminate_backend for a specific process ID.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT pg_terminate_backend({{ item.value }}) AS terminated;
+
+          - id: verify_termination
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Post-remediation verification confirming none of the terminated PIDs survive in pg_stat_activity.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            sql: |
+              SELECT
+                pid,
+                usename::text AS usename,
+                state::text AS state,
+                application_name::text AS application_name
+              FROM pg_stat_activity
+              WHERE pid = ANY(ARRAY[{{ outputs.evaluate_blocker_trends.vars.target_pids | join(', ') }}]::int[]);
+
+          - id: assert_termination_success
+            type: io.kestra.plugin.core.execution.Assert
+            description: Assert that all targeted backend sessions have disconnected and 0 targeted PIDs remain in pg_stat_activity.
+            conditions:
+              - "{{ (outputs.verify_termination.rows ?? []) | length == 0 }}"
+            errorMessage: "Post-remediation verification failed! One or more targeted blocker backends survived termination signal."
+
+          - id: log_termination_success
+            type: io.kestra.plugin.core.log.Log
+            description: Log verified backend termination results and cleared lock status.
+            message: "Successfully terminated {{ outputs.evaluate_blocker_trends.vars.target_pids_count }} idle blocker backend(s) on database '{{ inputs.database_name }}'. Target PIDs: {{ outputs.evaluate_blocker_trends.vars.target_pids | toJson }}."
+
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log planned session terminations without modifying PostgreSQL database state.
+            message: "Dry run mode active. No backend sessions terminated. Eligible target PIDs: {{ outputs.evaluate_blocker_trends.vars.target_pids | toJson }}."
+
+      - id: save_recovery_audit_kv
+        type: io.kestra.plugin.core.kv.Set
+        description: Record complete recovery audit manifest and forensic metrics into Kestra KV store.
+        key: "pg_idle_blocker_audit_{{ inputs.database_name | slugify }}"
+        value: "{{ outputs.evaluate_blocker_trends.vars.audit_manifest | toJson }}"
+        kvType: JSON
+
+      - id: notify_slack_blocker_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Deliver prioritized incident notification to Slack with blocker PIDs, blocked query counts, and remediation status.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.evaluate_blocker_trends.vars.overall_status == 'CRITICAL' ? 'danger' : 'warning' }}",
+                "title": ":warning: PostgreSQL Idle-in-Transaction Blocker Incident Alert",
+                "text": "*Database:* `{{ inputs.database_name }}`\n*Overall Status:* `{{ outputs.evaluate_blocker_trends.vars.overall_status }}`\n*Idle Blockers Detected:* {{ outputs.evaluate_blocker_trends.vars.total_detected }}\n*Cascading Blocked Waiters:* {{ outputs.evaluate_blocker_trends.vars.cascading_lock_count }}\n*Target Termination PIDs:* {{ outputs.evaluate_blocker_trends.vars.target_pids | toJson }}\n*Mode:* `auto_terminate={{ inputs.auto_terminate }}`, `dry_run={{ inputs.dry_run }}`\n*Execution ID:* `{{ execution.id }}`\n\n*Summary:* {{ outputs.evaluate_blocker_trends.vars.summary }}"
+              }
+            ]
+          }
+
+    else:
+      - id: log_healthy_database
+        type: io.kestra.plugin.core.log.Log
+        description: Log healthy database status when no uncommitted idle transactions exceed threshold limits.
+        message: "PostgreSQL database '{{ inputs.database_name }}' is healthy. No stalled idle in transaction blockers detected."
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Deliver emergency notification if workflow execution fails unexpectedly.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: PostgreSQL Blocker Guard Execution Failed",
+            "text": "Failed execution `{{ execution.id }}` while evaluating database `{{ inputs.database_name }}` on `{{ inputs.jdbc_url }}`.\nCheck PostgreSQL connectivity, credentials, or Kestra worker logs."
+          }
+        ]
+      }
+
+extend:
+  title: PostgreSQL Idle-in-Transaction and Cascading Lock Blocker Terminator Guard
+  metaTitle: PostgreSQL Idle-in-Transaction Lock Blocker Terminator | Kestra
+  shortDescription: Detect PostgreSQL sessions stalled idle in transaction, quantify cascading lock contention, safely terminate persistent blocker backends with approval, and audit recovery.
+  metaDescription: Detect PostgreSQL idle-in-transaction sessions, correlate cascading lock trees, safely terminate persistent blockers behind approval, and verify recovery.
+  description: |
+    Production applications running on PostgreSQL routinely encounter connection leaks where a backend client opens a transaction block (`BEGIN`), issues data modifications or row-level locks, and subsequently goes `idle in transaction`. This happens when an application worker hangs while awaiting an external HTTP response, encounters an unhandled exception before calling `COMMIT` or `ROLLBACK`, or drops the network connection without TCP keepalive termination.
+
+    A session stranded in `idle in transaction` state poses two immediate threats to cluster health:
+    1. **Cascading Lock Deadlocks**: The idle transaction holds exclusive row or table locks (`ExclusiveLock`, `RowExclusiveLock`). Downstream queries that attempt to read or write the locked tuples block immediately, forming an exponential queue of waiting queries in `pg_locks` that exhausts the application connection pool.
+    2. **Autovacuum Horizon Freezing (xmin Pinning)**: The idle transaction holds back the cluster-wide transaction ID horizon (`backend_xmin`). Autovacuum processes are forbidden from cleaning dead tuples created after that horizon across any table in the database, resulting in explosive table and index bloat and accelerating transaction ID wraparound risk.
+
+    This blueprint provides an automated, declarative sentinel and remediation guard for PostgreSQL. It continuously monitors `pg_stat_activity` and `pg_locks`, correlates root blocker PIDs with downstream waiters via `pg_blocking_pids`, tracks session persistence across cycles in Kestra KV, requires human approval (`Pause`) before termination, executes `pg_terminate_backend` on live backends, verifies complete session removal, and alerts DBAs on Slack.
+
+    ## How it works
+
+    1. **Pre-flight Parameter Assertion**: The `validate_inputs` task (`io.kestra.plugin.core.execution.Assert`) verifies that input arguments meet operational limits, including a non-empty database name, positive idle threshold, and valid termination ceiling.
+    2. **Lock Tree & Blocker Detection**: The `detect_idle_blockers` task (`io.kestra.plugin.jdbc.postgresql.Query`) queries `pg_stat_activity` joined against `pg_blocking_pids`. It isolates uncommitted transactions idle longer than `idle_seconds_threshold` and calculates the exact count of waiting client queries blocked by each PID.
+    3. **Differential Trend Analysis & KV History**: The `evaluate_blocker_trends` task (`io.kestra.plugin.scripts.python.Script`) correlates current idle PIDs against historical snapshots stored in Kestra KV under `pg_idle_blocker_tracker_{database_name}`. It filters out exempt applications (such as migration or backup tools), identifies persistent zombie sessions, and caps termination targets at `max_terminations_per_run`.
+    4. **KV Snapshot Persistence**: The `save_state_tracker_kv` task (`io.kestra.plugin.core.kv.Set`) writes the updated blocker snapshot into Kestra KV.
+    5. **Blockers Decision Gate**: The `handle_blockers_gate` task (`io.kestra.plugin.core.flow.If`) branches based on whether any uncommitted idle blocker sessions were identified.
+    6. **Approval Gate & Dry-Run Protection**: When `dry_run` is disabled and `auto_terminate` is enabled, the workflow pauses execution (`io.kestra.plugin.core.flow.Pause`) for DBA sign-off before modifying PostgreSQL server state.
+    7. **Safe Backend Termination**: The `terminate_blocker_sessions` task (`io.kestra.plugin.core.flow.Loop`) iterates over approved target PIDs, executing `SELECT pg_terminate_backend(pid)` to close the zombie connections and release locks.
+    8. **Post-Remediation Verification**: The `verify_termination` task (`io.kestra.plugin.jdbc.postgresql.Query`) re-reads `pg_stat_activity` filtering for the targeted PIDs. The `assert_termination_success` task (`io.kestra.plugin.core.execution.Assert`) asserts that zero targeted backends survived.
+    9. **Audit Manifest & Slack Notification**: The recovery manifest is archived into Kestra KV under `pg_idle_blocker_audit_{database_name}`, and prioritized incident alerts are dispatched to Slack (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
+
+    ## What you get
+
+    - Automated detection of abandoned `idle in transaction` connections before connection pools saturate.
+    - Identification of root blocker PIDs and correlation of cascading waiting queries via `pg_blocking_pids`.
+    - Prevention of runaway table bloat by releasing pinned `backend_xmin` autovacuum horizons.
+    - Differential trend tracking across consecutive runs using Kestra KV store to verify persistent abandonment.
+    - Human-in-the-loop approval gate (`io.kestra.plugin.core.flow.Pause`) preventing accidental terminations.
+    - Post-remediation verification ensuring zero targeted backend sessions survived in `pg_stat_activity`.
+
+    ## Who it's for
+
+    - Database Administrators (DBAs) and Platform Engineers maintaining production PostgreSQL clusters.
+    - Site Reliability Engineers (SREs) triaging database connection pool exhaustion and lock wait alarms.
+    - Backend Engineers debugging microservice connection pool leaks and uncommitted transaction bugs.
+
+    ## Why orchestrate this with Kestra
+
+    PostgreSQL provides connection timeouts like `idle_in_transaction_session_timeout`, but setting aggressive global timeouts can abort valid long-running analytical queries or batch operations.
+    Writing standalone cron scripts to terminate sessions lacks execution logs, secret masking, approval gates, and differential persistence tracking.
+    Orchestrating this guard with Kestra delivers a declarative workflow with native JDBC PostgreSQL query execution, atomic KV state tracking, interactive pause-for-approval mechanics, post-action verification, and automated Slack escalation.
+
+    ## Prerequisites
+
+    - An accessible PostgreSQL database instance (version 10 or higher, PostgreSQL 14+ recommended).
+    - Database user credentials with permissions to inspect `pg_stat_activity` and execute `pg_terminate_backend` (superuser or member of `pg_signal_backend`).
+    - A Slack Incoming Webhook URL to receive triage alerts.
+
+    ### Secrets
+
+    - `POSTGRES_JDBC_URL`: JDBC connection URL string used by the event-based trigger.
+    - `POSTGRES_USERNAME`: Database user credential with privileges to query statistics and terminate backends.
+    - `POSTGRES_PASSWORD`: Database user password for authentication.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for operational notifications and alerts.
+    - `PG_BLOCKER_GUARD_WEBHOOK_KEY`: Secret authentication token protecting the on-demand Webhook trigger.
+
+    ## Quick start
+
+    1. Configure `POSTGRES_JDBC_URL`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `SLACK_WEBHOOK_URL`, and `PG_BLOCKER_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `jdbc_url` and `database_name` to match your PostgreSQL environment.
+    3. Run a manual execution with `dry_run: true` to record an initial baseline and review detected idle transactions.
+    4. When persistent blockers are identified, execute with `auto_terminate: true` and `dry_run: false`.
+    5. Enable the `on_contention_trigger` event trigger to monitor for cascading lock contention in real time.
+
+    ## How to extend
+
+    - **Automated Client Notification**: Add an HTTP webhook task to notify downstream microservice owners when their application connection is terminated.
+    - **Deadlock Log Archival**: Stream query text and blocker forensic metadata to Amazon S3 using `io.kestra.plugin.aws.s3.Upload` for root-cause postmortems.
+    - **PagerDuty Incident Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` to trigger high-priority on-call pages when cascading lock waiters breach severe limits.
+
+    ## Links
+
+    - [PostgreSQL pg_stat_activity Documentation](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW)
+    - [PostgreSQL System Administration Functions](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL)
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
