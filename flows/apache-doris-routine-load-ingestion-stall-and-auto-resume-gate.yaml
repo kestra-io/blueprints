@@ -1,0 +1,408 @@
+id: apache-doris-routine-load-ingestion-stall-and-auto-resume-gate
+namespace: company.analytics
+
+description: |
+  Inspect Apache Doris Kafka Routine Load ingestion status via MySQL JDBC queries, detect stalled or paused
+  streaming jobs and poison pill error rows against historical KV snapshots, pause for operator approval,
+  safely alter error tolerances, resume the Routine Load job, and verify ingestion recovery.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: Doris Frontend MySQL JDBC URL
+    description: JDBC connection string to the Apache Doris Frontend (FE) query port (default 9030).
+    defaults: "jdbc:mysql://localhost:9030"
+
+  - id: database_name
+    type: STRING
+    displayName: Doris Database Name
+    description: Target database containing the target table and Routine Load job.
+    defaults: "analytics_dw"
+
+  - id: job_name
+    type: STRING
+    displayName: Routine Load Job Name
+    description: Name of the target Apache Doris Kafka Routine Load job to monitor and guard.
+    defaults: "orders_kafka_load"
+
+  - id: doris_username
+    type: STRING
+    displayName: Doris Username
+    description: Database user with ADMIN or OPERATOR privileges to SHOW and ALTER ROUTINE LOAD.
+    defaults: "root"
+
+  - id: max_error_tolerance
+    type: INT
+    displayName: Maximum Error Row Tolerance
+    description: New max_error_number property value applied when auto-remediating paused poison-pill jobs.
+    defaults: 100
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, diagnoses stalled jobs and drafts remediation commands without executing ALTER or RESUME statements.
+    defaults: true
+
+triggers:
+  - id: periodic_routine_load_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Run automated Apache Doris Routine Load streaming health check every 10 minutes.
+    cron: "*/10 * * * *"
+    disabled: true
+
+  - id: on_demand_routine_load_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by Kafka lag monitors, Prometheus Alertmanager, or SRE runbooks.
+    key: "{{ secret('DORIS_ROUTINE_LOAD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert configuration parameters satisfy operational bounds.
+    conditions:
+      - "{{ inputs.jdbc_url | length > 0 }}"
+      - "{{ inputs.database_name | length > 0 }}"
+      - "{{ inputs.job_name | length > 0 }}"
+      - "{{ inputs.doris_username | length > 0 }}"
+      - "{{ inputs.max_error_tolerance >= 1 }}"
+    errorMessage: "Invalid inputs. Provide valid JDBC endpoints, database, job names, and positive error tolerances."
+
+  - id: query_routine_load_status
+    type: io.kestra.plugin.jdbc.mysql.Query
+    description: Query Apache Doris Frontend for current Routine Load job state, partition progress, and error diagnostics.
+    url: "{{ inputs.jdbc_url }}/{{ inputs.database_name }}"
+    username: "{{ inputs.doris_username }}"
+    password: "{{ secret('DORIS_PASSWORD') }}"
+    sql: "SHOW ROUTINE LOAD FOR `{{ inputs.database_name }}`.`{{ inputs.job_name }}`"
+    fetchType: FETCH_ONE
+
+  - id: inspect_and_classify_routine_load
+    type: io.kestra.plugin.scripts.python.Script
+    description: Analyze Routine Load state, parse partition offset progress, and formulate recovery SQL against historical KV state.
+    containerImage: python:3.11-slim
+    env:
+      DATABASE_NAME: "{{ inputs.database_name }}"
+      JOB_NAME: "{{ inputs.job_name }}"
+      MAX_ERROR_TOLERANCE: "{{ inputs.max_error_tolerance }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      ROW_DATA_JSON: "{{ outputs.query_routine_load_status.row | toJson }}"
+      PREVIOUS_STATE_JSON: "{{ kv('doris_routine_load_tracker_' ~ (inputs.job_name | slugify), errorOnMissing=false) ?? '{}' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+
+      now_utc = datetime.now(timezone.utc)
+      now_iso = now_utc.isoformat()
+
+      db_name = os.environ.get("DATABASE_NAME", "analytics_dw").strip()
+      job_name = os.environ.get("JOB_NAME", "orders_kafka_load").strip()
+      max_error_tol = int(os.environ.get("MAX_ERROR_TOLERANCE", "100"))
+      dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+      execution_id = os.environ.get("EXECUTION_ID", "local-test")
+
+      row_raw = os.environ.get("ROW_DATA_JSON", "{}")
+      try:
+          row = json.loads(row_raw) if row_raw.strip() else {}
+      except Exception:
+          row = {}
+
+      state = str(row.get("State", "UNKNOWN")).upper()
+      reason = str(row.get("ReasonOfStateChanged", ""))
+      error_log_url = str(row.get("ErrorLogUrls", ""))
+
+      stats_raw = row.get("Statistic", "{}")
+      try:
+          stats = json.loads(stats_raw) if isinstance(stats_raw, str) and stats_raw.strip() else (stats_raw if isinstance(stats_raw, dict) else {})
+      except Exception:
+          stats = {}
+
+      progress_raw = row.get("Progress", "{}")
+      try:
+          progress = json.loads(progress_raw) if isinstance(progress_raw, str) and progress_raw.strip() else (progress_raw if isinstance(progress_raw, dict) else {})
+      except Exception:
+          progress = {}
+
+      # Doris's Statistic JSON uses camelCase keys (errorRows/totalRows/loadedRows), not snake_case.
+      error_rows = int(stats.get("errorRows", 0))
+      received_rows = int(stats.get("totalRows", 0))
+      loaded_rows = int(stats.get("loadedRows", 0))
+
+      # Parse historical KV tracker
+      prev_state_raw = os.environ.get("PREVIOUS_STATE_JSON", "{}")
+      try:
+          prev_state = json.loads(prev_state_raw) if prev_state_raw.strip() else {}
+      except Exception:
+          prev_state = {}
+
+      prev_offsets = prev_state.get("progress", {})
+      prev_error_rows = int(prev_state.get("error_rows", 0))
+      error_delta = error_rows - prev_error_rows
+
+      # Check if partition offsets are stalled
+      offsets_frozen = (progress == prev_offsets) if (progress and prev_offsets) else False
+      is_paused = (state == "PAUSED")
+      is_stopped = (state in ["STOPPED", "CANCELLED"])
+
+      # Formulate remediation SQL. Doris's MySQL JDBC connection does not allow multiple
+      # semicolon-separated statements in a single query, so ALTER and RESUME are kept as
+      # two distinct statements to be run as two separate tasks.
+      needs_remediation = is_paused or (offsets_frozen and state != "RUNNING")
+      alter_sql = ""
+      resume_sql = ""
+
+      if is_paused:
+          resume_sql = f"RESUME ROUTINE LOAD FOR `{db_name}`.`{job_name}`;"
+          if "too many error rows" in reason.lower() or error_rows > 0:
+              alter_sql = f"ALTER ROUTINE LOAD FOR `{db_name}`.`{job_name}` PROPERTIES ('max_error_number' = '{max_error_tol}');"
+
+      status = "CRITICAL" if is_paused else ("WARNING" if (offsets_frozen and error_delta > 0) else "HEALTHY")
+
+      summary = (
+          f"Doris Routine Load Audit: {status} | Job '{db_name}.{job_name}' is {state}. "
+          f"Received rows: {received_rows}, Loaded: {loaded_rows}, Error rows: {error_rows} (delta: {error_delta:+d}). "
+          f"Offsets frozen: {offsets_frozen}. Needs remediation: {needs_remediation}. Dry run: {dry_run}."
+      )
+      print(summary)
+
+      new_state_snapshot = {
+          "job_name": job_name,
+          "database_name": db_name,
+          "state": state,
+          "error_rows": error_rows,
+          "received_rows": received_rows,
+          "progress": progress,
+          "reason": reason,
+          "error_log_url": error_log_url,
+          "last_evaluated_at": now_iso,
+          "execution_id": execution_id
+      }
+
+      print("::" + json.dumps({
+          "outputs": {
+              "status": status,
+              "state": state,
+              "error_rows": error_rows,
+              "error_delta": error_delta,
+              "received_rows": received_rows,
+              "loaded_rows": loaded_rows,
+              "progress": progress,
+              "offsets_frozen": offsets_frozen,
+              "is_paused": is_paused,
+              "needs_remediation": needs_remediation,
+              "alter_sql": alter_sql,
+              "resume_sql": resume_sql,
+              "reason": reason,
+              "error_log_url": error_log_url,
+              "new_state_snapshot": new_state_snapshot,
+              "summary": summary
+          }
+      }) + "::")
+
+  - id: save_routine_load_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist Routine Load job state and Kafka partition offsets in Kestra KV for differential stall tracking.
+    key: "doris_routine_load_tracker_{{ inputs.job_name | slugify }}"
+    value: "{{ outputs.inspect_and_classify_routine_load.vars.new_state_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: evaluate_routine_load_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Branch execution when Routine Load job is paused, stalled, or encountering poison pills.
+    condition: "{{ outputs.inspect_and_classify_routine_load.vars.needs_remediation == true }}"
+    then:
+      - id: notify_data_platform
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch incident alert detailing job pause reason, error rows, and proposed recovery SQL.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#analytics-ops",
+            "attachments": [
+              {
+                "color": "{{ outputs.inspect_and_classify_routine_load.vars.status == 'CRITICAL' ? 'danger' : 'warning' }}",
+                "title": ":warning: Apache Doris Routine Load Ingestion Stall Triggered",
+                "text": "*Job:* `{{ inputs.database_name }}.{{ inputs.job_name }}`\n*State:* `{{ outputs.inspect_and_classify_routine_load.vars.state }}`\n*Error Rows:* `{{ outputs.inspect_and_classify_routine_load.vars.error_rows }}` (Delta: `{{ outputs.inspect_and_classify_routine_load.vars.error_delta }}`)\n*Pause Reason:* `{{ outputs.inspect_and_classify_routine_load.vars.reason }}`\n*Error Log URL:* `{{ outputs.inspect_and_classify_routine_load.vars.error_log_url }}`\n*Dry Run:* `{{ inputs.dry_run }}`",
+                "footer": "Kestra Doris Routine Load Gate • Execution {{ execution.id }}"
+              }
+            ]
+          }
+
+      - id: execute_remediation_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Execute Routine Load property adjustment and resume commands when dry_run is disabled.
+        condition: "{{ not inputs.dry_run and (outputs.inspect_and_classify_routine_load.vars.resume_sql | length > 0) }}"
+        then:
+          - id: pause_for_remediation_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for data engineer review before modifying error limits and resuming Routine Load ingestion. Resume to apply or kill to abort.
+
+          - id: execute_alter_error_tolerance
+            type: io.kestra.plugin.core.flow.If
+            description: Raise the max_error_number tolerance before resuming, only when the job paused due to poison-pill error rows.
+            condition: "{{ outputs.inspect_and_classify_routine_load.vars.alter_sql | length > 0 }}"
+            then:
+              - id: execute_alter_sql
+                type: io.kestra.plugin.jdbc.mysql.Query
+                description: Raise the Routine Load job's error row tolerance via MySQL JDBC connection.
+                url: "{{ inputs.jdbc_url }}/{{ inputs.database_name }}"
+                username: "{{ inputs.doris_username }}"
+                password: "{{ secret('DORIS_PASSWORD') }}"
+                sql: "{{ outputs.inspect_and_classify_routine_load.vars.alter_sql }}"
+
+          - id: execute_resume_sql
+            type: io.kestra.plugin.jdbc.mysql.Query
+            description: Resume the paused Routine Load job via MySQL JDBC connection.
+            url: "{{ inputs.jdbc_url }}/{{ inputs.database_name }}"
+            username: "{{ inputs.doris_username }}"
+            password: "{{ secret('DORIS_PASSWORD') }}"
+            sql: "{{ outputs.inspect_and_classify_routine_load.vars.resume_sql }}"
+
+          - id: verify_post_remediation_status
+            type: io.kestra.plugin.jdbc.mysql.Query
+            description: Post-remediation verification re-querying Routine Load state to confirm job transitioned back to RUNNING.
+            url: "{{ inputs.jdbc_url }}/{{ inputs.database_name }}"
+            username: "{{ inputs.doris_username }}"
+            password: "{{ secret('DORIS_PASSWORD') }}"
+            sql: "SHOW ROUTINE LOAD FOR `{{ inputs.database_name }}`.`{{ inputs.job_name }}`"
+            fetchType: FETCH_ONE
+
+          - id: assert_job_running
+            type: io.kestra.plugin.core.execution.Assert
+            description: Assert post-remediation Routine Load state is RUNNING.
+            conditions:
+              - "{{ outputs.verify_post_remediation_status.row.State == 'RUNNING' }}"
+            errorMessage: "Post-remediation verification failed: Routine Load job did not transition back to RUNNING."
+
+          - id: log_remediation_success
+            type: io.kestra.plugin.core.log.Log
+            description: Log verified Routine Load resumption telemetry.
+            message: "Successfully resumed Routine Load job '{{ inputs.database_name }}.{{ inputs.job_name }}'. Verified State: {{ outputs.verify_post_remediation_status.row.State }}."
+
+        else:
+          - id: log_dry_run_summary
+            type: io.kestra.plugin.core.log.Log
+            description: Log planned Routine Load recovery SQL in dry-run mode.
+            message: "Dry run mode active. No SQL statements executed. Planned SQL: {{ outputs.inspect_and_classify_routine_load.vars.alter_sql }} {{ outputs.inspect_and_classify_routine_load.vars.resume_sql }}."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch failure notification if Doris Routine Load guard workflow fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "#analytics-ops",
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: Doris Routine Load Guard Workflow Failed",
+            "text": "Execution `{{ execution.id }}` failed while inspecting job `{{ inputs.database_name }}.{{ inputs.job_name }}` on `{{ inputs.jdbc_url }}`. Check database credentials and FE connectivity."
+          }
+        ]
+      }
+
+extend:
+  title: Apache Doris Routine Load Ingestion Stall and Auto-Resume Gate
+  metaTitle: Apache Doris Routine Load Ingestion Stall & Auto-Resume Gate | Kestra
+  shortDescription: Audit Apache Doris Kafka Routine Load streaming jobs, safely alter error tolerances with approval gates, resume ingestion, and verify recovery.
+  metaDescription: Audit Apache Doris Kafka Routine Load streaming jobs, safely alter error limits with approval gates, resume ingestion, and verify recovery in Kestra.
+  description: |
+    Production analytical platforms powered by Apache Doris rely heavily on Kafka Routine Load
+    jobs for real-time data ingestion. A Routine Load continuously streams events from Apache Kafka
+    topics directly into Doris tables using Frontend (FE) coordinator scheduling and Backend (BE)
+    execution tasks.
+
+    However, when upstream microservices publish malformed payloads, unparseable JSON rows, or schema
+    incompatibilities, Doris increments its internal `error_rows` counter. If `error_rows` exceeds the
+    configured `max_error_number` threshold, Doris automatically pauses the Routine Load job.
+
+    When a Routine Load enters the `PAUSED` state, ingestion halts completely. Kafka consumer partition
+    lag accumulates exponentially, dashboards serve stale analytics, and real-time reporting SLAs are
+    breached. Furthermore, blindly resuming the job without adjusting error thresholds causes Doris to
+    immediately re-pause on the next batch of error rows.
+
+    This blueprint provides an automated Apache Doris Routine Load guard. It queries the Doris Frontend
+    via MySQL JDBC to inspect Routine Load job states and Kafka partition offsets, tracks progress against
+    historical snapshots in Kestra KV, detects poison pill stalls, alerts the data platform team, halts
+    for operator approval, dynamically adjusts `max_error_number` tolerances, executes `RESUME ROUTINE LOAD`,
+    and verifies that the job transitions back to `RUNNING`.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: The workflow asserts that JDBC connection URLs, database names, job identifiers, and error thresholds satisfy operational sanity limits.
+    2. **Job Telemetry Query**: `io.kestra.plugin.jdbc.mysql.Query` queries `SHOW ROUTINE LOAD FOR db.job_name` via MySQL wire protocol to fetch `State`, `Statistic`, `Progress`, and `ReasonOfStateChanged`.
+    3. **Differential Progress Classification**: An isolated Python script compares current partition offsets and error counts against historical snapshots in Kestra KV (`doris_routine_load_tracker_{job_name}`). It detects if offsets are frozen and parses error log diagnostics.
+    4. **State Tracking**: `io.kestra.plugin.core.kv.Set` persists current job state, partition offsets, and error statistics in Kestra KV for longitudinal stall detection.
+    5. **Team Escalation**: `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` delivers a structured alert summarizing job state, error row deltas, pause reason, and rejected row URLs.
+    6. **Safe Remediation with Approval Gate**: When `dry_run` is disabled:
+       - Workflow execution pauses (`io.kestra.plugin.core.flow.Pause`) for data engineer sign-off.
+       - `io.kestra.plugin.jdbc.mysql.Query` executes `ALTER ROUTINE LOAD` to increase error tolerance (`max_error_number`) in one task, then `RESUME ROUTINE LOAD` in a second task (MySQL JDBC connections don't support multiple semicolon-separated statements in a single query).
+    7. **Post-Remediation Verification**: The workflow re-queries `SHOW ROUTINE LOAD` and executes `io.kestra.plugin.core.execution.Assert` to verify that `State == 'RUNNING'`.
+
+    ## What you get
+
+    - Automated detection of stalled or paused Apache Doris Kafka Routine Load streaming jobs.
+    - Elimination of silent Kafka partition lag accumulation caused by poison pill records.
+    - Safe adjustment of error row tolerances (`max_error_number`) to bypass rejected records.
+    - Operator approval gates and dry-run preview to prevent unintended job configuration updates.
+    - Longitudinal partition offset tracking stored across runs in Kestra KV.
+    - Post-remediation assertions confirming that Routine Load ingestion is active.
+
+    ## Who it's for
+
+    - Data Platform Engineers and Analytics Engineers operating Apache Doris data warehouses.
+    - Streaming Infrastructure Engineers managing real-time Kafka-to-Doris ingestion pipelines.
+    - Site Reliability Engineers (SREs) monitoring analytical freshness and database health.
+
+    ## Why orchestrate this with Kestra
+
+    Apache Doris provides SQL commands to inspect and alter Routine Load jobs, but lacks native mechanisms to diff partition offsets across runs, store historical error progression, enforce human approval gates, or dispatch multi-channel alerts.
+    Writing unmanaged cron scripts creates unmonitored failure points without execution audit trails, retry policies, or credential masking.
+
+    Orchestrating this recovery gate with Kestra provides a declarative workflow with integrated KV state tracking, native MySQL JDBC execution, pause-and-resume approval gates, structured Slack notifications, and post-action verification.
+
+    ## Prerequisites
+
+    - An accessible Apache Doris cluster (version 1.2 or higher) with Frontend (FE) query port accessible (port 9030).
+    - Database user credentials with privileges to execute `SHOW` and `ALTER ROUTINE LOAD`.
+    - A Slack Incoming Webhook URL to receive triage alerts.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for analytics operations alerts.
+    - `DORIS_PASSWORD`: Database user password for Apache Doris Frontend authentication.
+    - `DORIS_ROUTINE_LOAD_WEBHOOK_KEY`: Secret authentication key protecting the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `SLACK_WEBHOOK_URL`, `DORIS_PASSWORD`, and `DORIS_ROUTINE_LOAD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and configure `jdbc_url`, `database_name`, and `job_name` to match your Doris environment.
+    3. Run a manual execution with `dry_run: true` to record an initial baseline and review identified offsets.
+    4. When ready to alter properties and resume stalled jobs, run with `dry_run: false` and approve the paused execution.
+    5. Enable the `periodic_routine_load_audit` schedule trigger to monitor Routine Load health automatically every 10 minutes.
+
+    ## How to extend
+
+    - **Error Log Harvester**: Add an `io.kestra.plugin.core.http.Request` task to download the rejected row snippet from `ErrorLogUrl` and archive it to Amazon S3 or Google Cloud Storage.
+    - **Kafka Lag Cross-Check**: Add an `io.kestra.plugin.kafka.ConsumerGroupDescribe` task to cross-reference Doris Routine Load committed offsets with Kafka broker high-watermark offsets.
+    - **PagerDuty Emergency Escalation**: Add `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` if the Routine Load job enters `CANCELLED` or fails repeatedly.
+
+    ## Links
+
+    - [Apache Doris Routine Load Documentation](https://doris.apache.org/docs/data-operate/import/routine-load-manual/)
+    - [Apache Doris ALTER ROUTINE LOAD Reference](https://doris.apache.org/docs/sql-manual/sql-statements/Data-Manipulation-Statements/Load/ALTER-ROUTINE-LOAD/)
+    - [Kestra MySQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-mysql)
+    - [Kestra KV Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Monitoring & Alerting
+  ee: false
+  demo: false
