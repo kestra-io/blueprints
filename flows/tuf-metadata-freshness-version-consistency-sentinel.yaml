@@ -1,0 +1,509 @@
+id: tuf-metadata-freshness-version-consistency-sentinel
+namespace: company.infrastructure
+description: |
+  Monitor a public TUF repository for expired metadata, timestamp/snapshot version
+  mismatches, rollback below a configured baseline, and parent-advertised hash or
+  length mismatches. The report explicitly distinguishes structural freshness checks
+  from cryptographic signature verification; it is not a replacement for a TUF client
+  that validates signatures against a separately trusted root.
+
+inputs:
+  - id: metadata_base_url
+    type: STRING
+    displayName: TUF metadata base URL
+    defaults: https://tuf-repo-cdn.sigstore.dev
+    description: HTTPS base URL serving timestamp.json and versioned metadata files.
+  - id: consistent_snapshot
+    type: BOOL
+    displayName: Repository uses consistent snapshots
+    defaults: true
+    description: Prefix snapshot and delegated role filenames with versions named by parent metadata.
+  - id: minimum_accepted_timestamp_version
+    type: INT
+    displayName: Minimum accepted timestamp version
+    defaults: 0
+    description: Optional anti-rollback floor learned through a trusted process. Zero disables this comparison.
+  - id: minimum_expiry_hours
+    type: INT
+    displayName: Minimum remaining metadata validity
+    defaults: 24
+    description: Block if timestamp, snapshot, or inspected role metadata is expired or expires within this many hours.
+  - id: inspect_role_metadata
+    type: BOOL
+    displayName: Inspect metadata roles referenced by snapshot
+    defaults: false
+    description: Optionally fetch role metadata listed in snapshot metadata and verify advertised versions, lengths and hashes. Enable after confirming your metadata mirror publishes each referenced role file.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace. When false, the flow records findings without attempting Slack requests.
+  - id: maximum_role_metadata_files
+    type: INT
+    displayName: Maximum metadata role files to inspect
+    defaults: 20
+    description: Safety limit on referenced metadata files fetched in one execution.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive audit report to S3
+    defaults: false
+    description: Store the JSON report in S3. AWS secrets are only required when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-tuf-metadata-evidence
+    description: Existing S3 bucket used when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: tuf-metadata-audits
+    description: Prefix for JSON audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: metadata_freshness_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck repository metadata every four hours after configuring the policy and alert channel.
+    cron: "0 */4 * * *"
+    disabled: true
+
+tasks:
+  - id: validate_configuration
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the HTTPS metadata endpoint and policy bounds before making network requests.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      METADATA_BASE_URL: "{{ inputs.metadata_base_url }}"
+      MIN_TIMESTAMP_VERSION: "{{ inputs.minimum_accepted_timestamp_version }}"
+      MINIMUM_EXPIRY_HOURS: "{{ inputs.minimum_expiry_hours }}"
+      MAX_ROLE_FILES: "{{ inputs.maximum_role_metadata_files }}"
+    script: |
+      import os
+      from urllib.parse import urlsplit
+
+      raw = os.environ.get("METADATA_BASE_URL", "").strip()
+      parsed = urlsplit(raw)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("metadata_base_url must be an HTTPS URL without embedded credentials")
+      if parsed.query or parsed.fragment:
+          raise ValueError("metadata_base_url must not contain a query string or fragment")
+      try:
+          minimum_version = int(os.environ.get("MIN_TIMESTAMP_VERSION", "0"))
+          expiry_hours = int(os.environ.get("MINIMUM_EXPIRY_HOURS", "24"))
+          maximum_files = int(os.environ.get("MAX_ROLE_FILES", "20"))
+      except ValueError as exc:
+          raise ValueError("Version, expiry, and role-file limits must be integers") from exc
+      if minimum_version < 0:
+          raise ValueError("minimum_accepted_timestamp_version cannot be negative")
+      if expiry_hours < 0:
+          raise ValueError("minimum_expiry_hours cannot be negative")
+      if not 1 <= maximum_files <= 100:
+          raise ValueError("maximum_role_metadata_files must be between 1 and 100")
+      print(f"Validated TUF metadata endpoint {parsed.scheme}://{parsed.netloc}; role file limit={maximum_files}")
+
+  - id: inspect_tuf_metadata
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch timestamp and snapshot metadata by default; optionally inspect referenced role metadata. Check expiry, version links, and advertised hashes/lengths where present. This monitor does not cryptographically verify signatures or a trusted-root chain.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      METADATA_BASE_URL: "{{ inputs.metadata_base_url }}"
+      CONSISTENT_SNAPSHOT: "{{ inputs.consistent_snapshot }}"
+      MIN_TIMESTAMP_VERSION: "{{ inputs.minimum_accepted_timestamp_version }}"
+      MINIMUM_EXPIRY_HOURS: "{{ inputs.minimum_expiry_hours }}"
+      INSPECT_ROLE_METADATA: "{{ inputs.inspect_role_metadata }}"
+      MAX_ROLE_FILES: "{{ inputs.maximum_role_metadata_files }}"
+    outputFiles:
+      - tuf-metadata-audit.json
+    script: |
+      import hashlib
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from urllib.parse import quote, urlsplit
+      from urllib.request import Request, urlopen
+      from kestra import Kestra
+
+      base_url = os.environ["METADATA_BASE_URL"].strip().rstrip("/")
+      consistent_snapshot = os.environ.get("CONSISTENT_SNAPSHOT", "true").lower() == "true"
+      minimum_timestamp_version = int(os.environ.get("MIN_TIMESTAMP_VERSION", "0"))
+      minimum_expiry_hours = int(os.environ.get("MINIMUM_EXPIRY_HOURS", "24"))
+      inspect_roles = os.environ.get("INSPECT_ROLE_METADATA", "true").lower() == "true"
+      max_role_files = int(os.environ.get("MAX_ROLE_FILES", "20"))
+      now = datetime.now(timezone.utc)
+      minimum_expiry_seconds = minimum_expiry_hours * 3600
+      findings = []
+      checks = []
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def fetch_metadata(filename):
+          if not isinstance(filename, str) or not filename or filename.startswith("/") or ".." in filename.split("/"):
+              raise ValueError(f"Unsafe metadata filename: {filename!r}")
+          if not re.fullmatch(r"[A-Za-z0-9._/-]+", filename):
+              raise ValueError(f"Unexpected characters in metadata filename: {filename!r}")
+          url = base_url + "/" + quote(filename, safe="/.-_")
+          req = Request(url, headers={
+              "Accept": "application/json",
+              "User-Agent": "Kestra-TUF-Metadata-Freshness-Sentinel/1.0",
+          })
+          with urlopen(req, timeout=30) as response:
+              raw = response.read(5 * 1024 * 1024 + 1)
+              final_url = response.geturl()
+          if len(raw) > 5 * 1024 * 1024:
+              raise ValueError(f"Metadata file exceeds 5 MiB limit: {filename}")
+          if urlsplit(final_url).scheme != "https":
+              raise ValueError(f"Metadata fetch redirected away from HTTPS: {filename}")
+          try:
+              document = json.loads(raw.decode("utf-8"))
+          except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+              raise ValueError(f"Invalid JSON metadata file {filename}: {exc}") from exc
+          if not isinstance(document, dict) or not isinstance(document.get("signed"), dict):
+              raise ValueError(f"Metadata file has no signed object: {filename}")
+          signatures = document.get("signatures")
+          if not isinstance(signatures, list) or not signatures:
+              add("SIGNATURE_LIST_EMPTY", "BLOCK", f"{filename} contains no signature entries.")
+          return raw, document
+
+      def parse_expiry(value, filename):
+          if not isinstance(value, str) or not value.strip():
+              add("EXPIRY_MISSING", "BLOCK", f"{filename} has no signed.expires timestamp.")
+              return None
+          try:
+              parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=timezone.utc)
+              return parsed.astimezone(timezone.utc)
+          except ValueError:
+              add("EXPIRY_INVALID", "BLOCK", f"{filename} has an invalid expiry timestamp.")
+              return None
+
+      def check_expiry(document, filename):
+          expiry = parse_expiry(document["signed"].get("expires"), filename)
+          if expiry is None:
+              return
+          seconds_left = int((expiry - now).total_seconds())
+          if seconds_left <= 0:
+              add("METADATA_EXPIRED", "BLOCK", f"{filename} expired at {expiry.isoformat()}.")
+          elif seconds_left < minimum_expiry_seconds:
+              add("METADATA_EXPIRING_SOON", "BLOCK", f"{filename} expires in {round(seconds_left / 3600, 2)} hour(s), below the configured {minimum_expiry_hours}-hour minimum.")
+          checks.append({
+              "file": filename,
+              "type": document["signed"].get("_type"),
+              "version": document["signed"].get("version"),
+              "expires": expiry.isoformat(),
+              "hoursUntilExpiry": round(seconds_left / 3600, 2),
+              "signatureEntries": len(document.get("signatures") or []),
+          })
+
+      def versioned_filename(name, version):
+          if not consistent_snapshot:
+              return name
+          # TUF consistent snapshots prefix the metadata basename while keeping
+          # delegated-role directories, e.g. targets/3.role.json.
+          directory, separator, basename = name.rpartition("/")
+          prefixed = f"{int(version)}.{basename}"
+          return f"{directory}/{prefixed}" if separator else prefixed
+
+      try:
+          timestamp_raw, timestamp_doc = fetch_metadata("timestamp.json")
+          timestamp_signed = timestamp_doc["signed"]
+          if timestamp_signed.get("_type") != "timestamp":
+              add("TIMESTAMP_TYPE_INVALID", "BLOCK", "timestamp.json signed._type is not timestamp.")
+          timestamp_version = timestamp_signed.get("version")
+          if not isinstance(timestamp_version, int) or timestamp_version < 1:
+              add("TIMESTAMP_VERSION_INVALID", "BLOCK", "timestamp.json has no positive integer version.")
+              timestamp_version = 0
+          elif minimum_timestamp_version and timestamp_version < minimum_timestamp_version:
+              add("TIMESTAMP_ROLLBACK_BELOW_BASELINE", "BLOCK", f"Timestamp version {timestamp_version} is below the configured minimum {minimum_timestamp_version}.")
+          check_expiry(timestamp_doc, "timestamp.json")
+
+          timestamp_meta = timestamp_signed.get("meta") or {}
+          snapshot_entries = [(name, entry) for name, entry in timestamp_meta.items()
+                              if isinstance(name, str) and name.endswith("snapshot.json") and isinstance(entry, dict)]
+          if len(snapshot_entries) != 1:
+              raise ValueError("timestamp.json must reference exactly one snapshot metadata file")
+          snapshot_name, snapshot_entry = snapshot_entries[0]
+          snapshot_version = snapshot_entry.get("version")
+          if not isinstance(snapshot_version, int) or snapshot_version < 1:
+              raise ValueError("Timestamp metadata does not advertise a positive snapshot version")
+          snapshot_path = versioned_filename(snapshot_name, snapshot_version)
+          snapshot_raw, snapshot_doc = fetch_metadata(snapshot_path)
+          snapshot_signed = snapshot_doc["signed"]
+          if snapshot_signed.get("_type") != "snapshot":
+              add("SNAPSHOT_TYPE_INVALID", "BLOCK", f"{snapshot_path} signed._type is not snapshot.")
+          if snapshot_signed.get("version") != snapshot_version:
+              add("SNAPSHOT_VERSION_MISMATCH", "BLOCK", f"{snapshot_path} content version {snapshot_signed.get('version')} does not match timestamp reference {snapshot_version}.")
+          check_expiry(snapshot_doc, snapshot_path)
+
+          if isinstance(snapshot_entry.get("length"), int) and len(snapshot_raw) != snapshot_entry["length"]:
+              add("SNAPSHOT_LENGTH_MISMATCH", "BLOCK", f"{snapshot_path} length differs from timestamp metadata.")
+          for algorithm, expected in (snapshot_entry.get("hashes") or {}).items():
+              if algorithm in {"sha256", "sha512"} and hashlib.new(algorithm, snapshot_raw).hexdigest() != expected:
+                  add("SNAPSHOT_HASH_MISMATCH", "BLOCK", f"{snapshot_path} does not match timestamp's {algorithm} digest.")
+          if not snapshot_entry.get("hashes") and "length" not in snapshot_entry:
+              checks.append({"file": snapshot_path, "note": "Timestamp metadata advertises a version but no hash or length; snapshot identity was checked by version only."})
+
+          role_entries = []
+          if inspect_roles:
+              role_meta = snapshot_signed.get("meta") or {}
+              for name, entry in role_meta.items():
+                  if name in {"snapshot.json", "root.json"}:
+                      continue
+                  if isinstance(name, str) and name.endswith(".json") and isinstance(entry, dict):
+                      role_entries.append((name, entry))
+              if len(role_entries) > max_role_files:
+                  add("ROLE_METADATA_LIMIT_REACHED", "WARN", f"Snapshot references {len(role_entries)} role files; only the first {max_role_files} will be inspected.")
+                  role_entries = role_entries[:max_role_files]
+
+          for role_name, entry in role_entries:
+              expected_version = entry.get("version")
+              if not isinstance(expected_version, int) or expected_version < 1:
+                  add("ROLE_VERSION_INVALID", "BLOCK", f"Snapshot entry for {role_name} has no positive integer version.")
+                  continue
+              filename = versioned_filename(role_name, expected_version)
+              try:
+                  try:
+                      raw, document = fetch_metadata(filename)
+                  except Exception as versioned_error:
+                      # Some deployed TUF mirrors publish versioned timestamp/snapshot
+                      # files but serve delegated metadata by its unversioned name.
+                      # Only allow fallback when the parent advertises hash or length.
+                      if not consistent_snapshot or not (entry.get("hashes") or isinstance(entry.get("length"), int)):
+                          raise
+                      if "404" not in str(versioned_error):
+                          raise
+                      fallback_name = role_name
+                      add("UNVERSIONED_ROLE_METADATA_FALLBACK", "WARN",
+                          f"{filename} was not found; checking {fallback_name} against the snapshot's advertised version/hash/length.")
+                      raw, document = fetch_metadata(fallback_name)
+                      filename = fallback_name
+                  signed = document["signed"]
+                  if signed.get("version") != expected_version:
+                      add("ROLE_VERSION_MISMATCH", "BLOCK", f"{filename} content version does not match snapshot version {expected_version}.")
+                  check_expiry(document, filename)
+                  if isinstance(entry.get("length"), int) and len(raw) != entry["length"]:
+                      add("ROLE_LENGTH_MISMATCH", "BLOCK", f"{filename} length differs from snapshot metadata.")
+                  expected_hashes = entry.get("hashes") or {}
+                  for algorithm, expected_hash in expected_hashes.items():
+                      if algorithm in {"sha256", "sha512"} and hashlib.new(algorithm, raw).hexdigest() != expected_hash:
+                          add("ROLE_HASH_MISMATCH", "BLOCK", f"{filename} does not match snapshot's {algorithm} digest.")
+                  if not expected_hashes and not isinstance(entry.get("length"), int):
+                      add("ROLE_IDENTITY_UNVERIFIABLE", "BLOCK", f"{filename} has no parent-advertised hash or length to verify downloaded bytes.")
+              except Exception as exc:
+                  add("ROLE_METADATA_FETCH_FAILED", "BLOCK", f"{filename}: {exc}")
+
+          blocking = [item for item in findings if item["severity"] == "BLOCK"]
+          warnings = [item for item in findings if item["severity"] == "WARN"]
+          verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+          report = {
+              "schemaVersion": 1,
+              "checkedAt": now.isoformat(),
+              "metadataBaseUrl": base_url,
+              "timestampVersion": timestamp_version,
+              "snapshotVersion": snapshot_version,
+              "minimumAcceptedTimestampVersion": minimum_timestamp_version,
+              "minimumExpiryHours": minimum_expiry_hours,
+              "consistentSnapshot": consistent_snapshot,
+              "inspectedRoleMetadataCount": len(role_entries),
+              "metadataChecks": checks,
+              "findings": findings,
+              "blockingFindingCount": len(blocking),
+              "warningCount": len(warnings),
+              "verdict": verdict,
+              "scopeNote": "Checks JSON structure, expiry, version linkage, and parent-advertised hashes/lengths where present. It does not cryptographically verify signatures, validate a trusted root, or implement a complete TUF client update chain.",
+          }
+      except Exception as exc:
+          add("AUDIT_EXECUTION_ERROR", "BLOCK", str(exc))
+          blocking = [item for item in findings if item["severity"] == "BLOCK"]
+          warnings = [item for item in findings if item["severity"] == "WARN"]
+          verdict = "FAIL"
+          report = {
+              "schemaVersion": 1,
+              "checkedAt": now.isoformat(),
+              "metadataBaseUrl": base_url,
+              "metadataChecks": checks,
+              "findings": findings,
+              "blockingFindingCount": len(blocking),
+              "warningCount": len(warnings),
+              "verdict": verdict,
+              "scopeNote": "Checks JSON structure, expiry, version linkage and advertised hashes/lengths; no cryptographic signature verification is performed.",
+          }
+
+      with open("tuf-metadata-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      timestamp_version = report.get("timestampVersion", 0)
+      snapshot_version = report.get("snapshotVersion", 0)
+      print(f"TUF metadata audit: timestamp={timestamp_version}, snapshot={snapshot_version}, inspected_roles={report.get('inspectedRoleMetadataCount', 0)}, verdict={verdict}, blocking={report['blockingFindingCount']}, warnings={report['warningCount']}")
+      print("TUF audit findings: " + json.dumps(report.get("findings", []), ensure_ascii=False))
+      Kestra.outputs({
+          "metadata_base_url": base_url,
+          "timestamp_version": timestamp_version,
+          "snapshot_version": snapshot_version,
+          "inspected_role_metadata_count": report.get("inspectedRoleMetadataCount", 0),
+          "blocking_finding_count": report["blockingFindingCount"],
+          "warning_count": report["warningCount"],
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the freshness evidence report to S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_tuf_metadata_audit
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the JSON audit report; target artifacts are not downloaded.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.inspect_tuf_metadata.outputFiles['tuf-metadata-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/tuf-metadata-audit-{{ execution.id }}.json"
+
+  - id: enforce_freshness_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when metadata is expired, version-inconsistent, or fails an advertised hash/length check.
+    condition: "{{ outputs.inspect_tuf_metadata.vars.verdict == 'FAIL' }}"
+    then:
+      - id: optionally_alert_blocked_metadata
+        type: io.kestra.plugin.core.flow.If
+        description: Send Slack only when explicitly enabled and its webhook secret is configured.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: alert_blocked_metadata
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert the repository owner that metadata needs investigation.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |-
+              {{
+                {
+                  "text": ":rotating_light: TUF metadata audit BLOCKED\nRepository: " ~ inputs.metadata_base_url ~
+                    "\nTimestamp version: " ~ (outputs.inspect_tuf_metadata.vars.timestamp_version | string) ~
+                    "\nSnapshot version: " ~ (outputs.inspect_tuf_metadata.vars.snapshot_version | string) ~
+                    "\nFindings: " ~ (outputs.inspect_tuf_metadata.vars.findings | toJson) ~
+                    "\nExecution: " ~ execution.id ~
+                    "\nReview tuf-metadata-audit.json and verify metadata with a standards-compliant TUF client."
+                } | toJson
+              }}
+      - id: fail_freshness_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream promotion after recording blocked metadata findings.
+        errorMessage: "TUF metadata freshness/version policy failed for {{ inputs.metadata_base_url }}. Review tuf-metadata-audit.json."
+    else:
+      - id: log_metadata_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "TUF metadata audit {{ outputs.inspect_tuf_metadata.vars.verdict }} for {{ inputs.metadata_base_url }}; timestamp={{ outputs.inspect_tuf_metadata.vars.timestamp_version }}, snapshot={{ outputs.inspect_tuf_metadata.vars.snapshot_version }}."
+errors:
+  - id: optionally_alert_execution_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send failure notifications only when explicitly enabled.
+    condition: "{{ inputs.notify_slack }}"
+    then:
+      - id: alert_audit_execution_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert when network, parsing, or orchestration failures prevent an audit.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: TUF metadata audit execution failed\\nRepository: " ~ inputs.metadata_base_url ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nInspect Kestra logs; execution failures are not a passing freshness result."
+            } | toJson
+          }}
+outputs:
+  - id: metadata_audit
+    type: JSON
+    description: Machine-readable metadata versions, expiry checks, advertised hash/length comparisons, findings, and verdict.
+    value: "{{ outputs.inspect_tuf_metadata.vars | toJson }}"
+
+extend:
+  title: TUF Metadata Freshness and Version-Consistency Sentinel
+  metaTitle: TUF Metadata Freshness Sentinel | Kestra
+  shortDescription: Monitor TUF timestamp, snapshot, and role metadata for expiry, version drift, and parent-advertised hash or length mismatches.
+  metaDescription: Monitor TUF metadata expiry, timestamp/snapshot version consistency, role versions, and advertised hashes or lengths before software updates.
+  description: |
+    Detect stale or structurally inconsistent The Update Framework (TUF) metadata before downstream software-update workflows proceed. The flow reads timestamp metadata, follows its snapshot version, optionally inspects role metadata referenced by the snapshot, and checks expiry, version links, and parent-advertised hashes or lengths where provided. It creates a machine-readable JSON report, alerts Slack on a blocking result, and can archive evidence to S3.
+
+    ## How it works
+
+    1. Validate the HTTPS metadata endpoint and safety limits.
+    2. Fetch timestamp.json, check its expiry and version floor, and resolve the referenced snapshot version.
+    3. Fetch the referenced snapshot metadata, compare its version with the timestamp reference, and check expiry.
+    4. Optionally fetch role metadata referenced by the snapshot, compare advertised versions, and verify advertised SHA-256/SHA-512 hashes and lengths when those fields exist. Enable this only after confirming the configured mirror publishes all referenced role files.
+    5. Archive the report if configured, then route a blocking verdict to Slack and a failed task.
+
+    ## What you get
+
+    - JSON evidence for timestamp/snapshot versions, role metadata versions, expiry times and findings.
+    - Detection of expired or soon-to-expire metadata and a timestamp version below a trusted baseline.
+    - Version-link, byte-length and checksum checks against fields advertised by parent metadata.
+    - Optional S3 audit retention and Slack alerts.
+
+    ## Who it's for
+
+    - Platform and release engineers operating TUF-enabled update repositories.
+    - Security teams monitoring metadata freshness and repository availability.
+    - Build and deployment pipelines that need a visible freshness gate before a standards-compliant TUF client performs a trusted update.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra gives the metadata checks a repeatable schedule, explicit inputs and policy thresholds, task-level observability, machine-readable reports and consistent alerting. Downstream workflows can depend on the audit result while a real TUF client remains responsible for cryptographic trust decisions.
+
+    ## Prerequisites
+
+    - Kestra 2.x with Docker enabled for the Python Script task runner.
+    - Network access from workers to the public TUF metadata endpoint.
+    - Optional Slack incoming webhook (set notify_slack to true) and optional S3 bucket with write access.
+    - A trusted, out-of-band timestamp version baseline if rollback comparison is desired.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for blocked metadata and task failures; only required when notify_slack is true.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow and keep metadata_base_url as https://tuf-repo-cdn.sigstore.dev for the public Sigstore TUF metadata example.
+    2. Execute the flow and review the metadata_audit output and tuf-metadata-audit.json file.
+    3. Keep inspect_role_metadata disabled for the first run if the metadata mirror publishes timestamp and snapshot files but not every delegated role. Enable it once you confirm the full role inventory is available. Keep minimum_accepted_timestamp_version at zero until you have a trusted baseline; set it from trusted state to detect rollback below that number.
+    4. Adjust minimum_expiry_hours for your operating cadence and configure SLACK_WEBHOOK_URL before relying on alerts.
+    5. Enable the schedule after reviewing the initial report. Enable S3 archival only after configuring the bucket and AWS secrets.
+
+    ## How to extend
+
+    - Maintain a trusted timestamp-version baseline in a protected store and compare it with each execution.
+    - Include target metadata files or target artifact checks once the repository-specific delegated-role layout is understood.
+    - Add signature verification by using a standards-compliant TUF client with a separately trusted root and verified root-rotation chain.
+    - Route a passing freshness report into a release workflow that separately performs cryptographic TUF verification before downloading targets.
+
+    ## Links
+
+    - [The Update Framework metadata roles](https://theupdateframework.org/docs/metadata/)
+    - [TUF specification](https://theupdateframework.github.io/specification/v1.0.36/)
+    - [Sigstore TUF metadata repository](https://tuf-repo-cdn.sigstore.dev/timestamp.json)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack Incoming Webhook plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Policy & Compliance
+  ee: false
+  demo: false
