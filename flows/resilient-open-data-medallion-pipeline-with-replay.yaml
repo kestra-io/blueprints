@@ -1,0 +1,682 @@
+id: resilient-open-data-medallion-pipeline-with-replay
+namespace: company.team
+
+description: |
+  Bronze, silver and gold layers in DuckDB over the public NYC TLC trip record Parquet
+  files, one month per partition. The same flow is both the orchestrator and the partition
+  job: in orchestrate or replay mode it plans the months to load and calls itself once per
+  month through a Subflow; in partition mode it loads one month through a Dag. Bad months
+  are parked in a KV dead-letter list instead of failing the batch, and replay mode retries
+  them.
+
+labels:
+  pipeline: nyc-tlc-medallion
+
+# Not 1: the children are executions of this flow and would queue behind their parent
+# forever. 3 = one orchestrator + two months; acquire_lease prevents overlapping orchestrators.
+concurrency:
+  limit: 3
+  behavior: QUEUE
+
+# A hung run fails after 1 hour and its in-flight children are killed. finally is skipped
+# in that case, which is why the lease has a ttl; afterExecution still reports it.
+sla:
+  - id: max_runtime
+    type: MAX_DURATION
+    duration: PT1H
+    behavior: FAIL
+    labels:
+      sla: breached
+
+checks:
+  - when: "{{ inputs.mode != 'partition' or (inputs.month ?? '') != '' }}"
+    message: "mode=partition needs the month input (YYYY-MM), for example 2026-07."
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ ((inputs.month ?? inputs.start_month) | replace({'-': ''}) | number) >= (inputs.taxi_type == 'green' ? 201308 : 200901) }}"
+    message: "The month is before the first published file for this taxi type (green starts 2013-08, yellow 2009-01)."
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ ((inputs.month ?? inputs.start_month) | replace({'-': ''}) | number) < (now() | date('yyyyMM') | number) }}"
+    message: "The month must be in the past; TLC publishes a month about two months after it ends."
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.max_quarantine_ratio > 0 and inputs.max_quarantine_ratio < 1 }}"
+    message: "max_quarantine_ratio is a share of rows between 0 and 1, for example 0.08 for 8 percent."
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+inputs:
+  - id: mode
+    type: SELECT
+    displayName: Mode
+    description: orchestrate = load new months since the watermark; replay = new months plus the dead-letter list; partition = load one month (used by the orchestrator, also handy for a manual re-run).
+    values: [orchestrate, replay, partition]
+    defaults: orchestrate
+
+  - id: taxi_type
+    type: SELECT
+    displayName: Taxi type
+    description: green files are about 1 MB a month, yellow about 60 MB. Each type has its own watermark, dead-letter list and lake folder.
+    values: [green, yellow]
+    defaults: green
+
+  - id: start_month
+    type: STRING
+    displayName: First month (first run only)
+    description: Where to start when no watermark exists yet. Later runs continue from the watermark.
+    defaults: "2026-06"
+    validator: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+
+  - id: month
+    type: STRING
+    displayName: Month (partition mode)
+    required: false
+    validator: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+
+  - id: max_partitions
+    type: INT
+    displayName: Months per run
+    description: Cap on months planned in one run, so a long gap is caught up over several runs instead of one huge one.
+    defaults: 4
+    min: 1
+    max: 24
+
+  - id: max_quarantine_ratio
+    type: FLOAT
+    displayName: Max quarantine ratio
+    description: A month fails its quality gate when more than this share of rows is quarantined. Real green months sit around 3.5 to 5 percent.
+    defaults: 0.08
+
+  - id: source_url
+    type: STRING
+    displayName: Trip data base URL
+    description: The TLC CloudFront distribution (keyless), or your own mirror with the same trip-data/ and misc/ layout.
+    defaults: https://d37ci6vzurychx.cloudfront.net
+
+variables:
+  state_prefix: "nyc_tlc_{{ inputs.taxi_type }}"
+  ts_prefix: "{{ inputs.taxi_type == 'green' ? 'lpep' : 'tpep' }}"
+  lake_dir: "nyc_tlc/{{ inputs.taxi_type }}"
+
+triggers:
+  - id: daily_catch_up
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: TLC publishes each month with a lag of about two months, on no fixed day. A daily run costs one HEAD request when nothing is new and loads a month within a day of its publication.
+    cron: "0 7 * * *"
+
+tasks:
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: One file, two roles. Partition mode loads one month; the other modes plan and fan out.
+    condition: "{{ inputs.mode == 'partition' }}"
+    then:
+      - id: probe_month
+        type: io.kestra.plugin.core.http.Request
+        description: |
+          HEAD request for the month's file. CloudFront answers 403 (sometimes 404) for a month
+          that is not published yet; those two codes are allowed so they can be told apart from
+          real failures. Any other code or a network error raises and is retried with backoff.
+        method: HEAD
+        uri: "{{ inputs.source_url }}/trip-data/{{ inputs.taxi_type }}_tripdata_{{ inputs.month }}.parquet"
+        options:
+          allowedResponseCodes: [200, 403, 404]
+        timeout: PT1M
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT1M
+          maxAttempts: 4
+
+      - id: availability
+        type: io.kestra.plugin.core.flow.If
+        description: A month that is not published yet is a normal state, not a failure. It is recorded and the orchestrator tries it again on a later run.
+        condition: "{{ outputs.probe_month.code != 200 }}"
+        then:
+          - id: record_not_yet_available
+            type: io.kestra.plugin.core.kv.Set
+            description: Only this child writes this key, so parallel partitions never overwrite each other's status.
+            key: "{{ render(vars.state_prefix) }}_partition_{{ inputs.month | replace({'-': '_'}) }}"
+            kvType: JSON
+            value: |
+              {"month": "{{ inputs.month }}", "status": "NOT_YET_AVAILABLE", "http_code": {{ outputs.probe_month.code }}, "execution_id": "{{ execution.id }}", "checked_at": "{{ now() }}"}
+
+          - id: log_not_yet_available
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: "{{ inputs.taxi_type }} {{ inputs.month }} is not published yet (HTTP {{ outputs.probe_month.code }} from CloudFront). Recorded as NOT_YET_AVAILABLE; the watermark stays before it."
+        else:
+          - id: medallion
+            type: io.kestra.plugin.core.flow.Dag
+            description: |
+              Kestra derives the order from dependsOn. The two downloads run in parallel; bronze is
+              landed as soon as it arrives; silver waits for both files; gold waits for the quality
+              gate, so a bad month never reaches gold.
+            tasks:
+              - task:
+                  id: download_trips
+                  type: io.kestra.plugin.core.http.Download
+                  description: The raw month. Hard fail after retries; the orchestrator dead-letters the month.
+                  uri: "{{ inputs.source_url }}/trip-data/{{ inputs.taxi_type }}_tripdata_{{ inputs.month }}.parquet"
+                  timeout: PT5M
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT2M
+                    maxAttempts: 4
+
+              - task:
+                  id: download_zones
+                  type: io.kestra.plugin.core.http.Download
+                  description: Taxi zone lookup (LocationID to borough and zone), needed to build silver.
+                  uri: "{{ inputs.source_url }}/misc/taxi_zone_lookup.csv"
+                  timeout: PT1M
+                  retry:
+                    type: exponential
+                    interval: PT5S
+                    maxInterval: PT1M
+                    maxAttempts: 4
+
+              - task:
+                  id: land_bronze
+                  type: io.kestra.plugin.core.namespace.UploadFiles
+                  description: The raw file exactly as published, kept even when the month later fails its quality gate, so a failure can be investigated. OVERWRITE makes re-runs idempotent.
+                  namespace: "{{ flow.namespace }}"
+                  conflict: OVERWRITE
+                  filesMap:
+                    "{{ render(vars.lake_dir) }}/bronze/month={{ inputs.month }}/trips.parquet": "{{ outputs.download_trips.uri }}"
+                dependsOn: [download_trips]
+
+              - task:
+                  id: build_silver
+                  type: io.kestra.plugin.jdbc.duckdb.Queries
+                  description: |
+                    Typed, cleaned rows. The contract file is an empty Parquet file with the expected columns
+                    and types; reading it together with the raw file using union_by_name gives NULL
+                    for columns a year does not have, and the explicit casts absorb type changes
+                    between years (VendorID INT32 or INT64, passenger_count INT64 or DOUBLE).
+                    Each invalid row gets one reject reason and goes to quarantine.
+                  timeZoneId: UTC
+                  inputFiles:
+                    bronze.parquet: "{{ outputs.download_trips.uri }}"
+                    zones.csv: "{{ outputs.download_zones.uri }}"
+                  outputFiles:
+                    - contract
+                    - silver
+                    - quarantine
+                  fetchType: FETCH_ONE
+                  sql: |
+                    SET TimeZone = 'UTC';
+                    COPY (
+                      SELECT CAST(NULL AS BIGINT) AS VendorID,
+                             CAST(NULL AS TIMESTAMP) AS {{ render(vars.ts_prefix) }}_pickup_datetime,
+                             CAST(NULL AS TIMESTAMP) AS {{ render(vars.ts_prefix) }}_dropoff_datetime,
+                             CAST(NULL AS VARCHAR) AS store_and_fwd_flag, CAST(NULL AS DOUBLE) AS RatecodeID,
+                             CAST(NULL AS BIGINT) AS PULocationID, CAST(NULL AS BIGINT) AS DOLocationID,
+                             CAST(NULL AS DOUBLE) AS passenger_count, CAST(NULL AS DOUBLE) AS trip_distance,
+                             CAST(NULL AS DOUBLE) AS fare_amount, CAST(NULL AS DOUBLE) AS extra, CAST(NULL AS DOUBLE) AS mta_tax,
+                             CAST(NULL AS DOUBLE) AS tip_amount, CAST(NULL AS DOUBLE) AS tolls_amount,
+                             CAST(NULL AS DOUBLE) AS improvement_surcharge, CAST(NULL AS DOUBLE) AS total_amount,
+                             CAST(NULL AS DOUBLE) AS payment_type, CAST(NULL AS DOUBLE) AS congestion_surcharge,
+                             CAST(NULL AS DOUBLE) AS cbd_congestion_fee,
+                             {% if inputs.taxi_type == 'green' %}CAST(NULL AS DOUBLE) AS ehail_fee, CAST(NULL AS DOUBLE) AS trip_type{% else %}CAST(NULL AS DOUBLE) AS Airport_fee{% endif %}
+                      LIMIT 0
+                    ) TO '{{ outputFiles.contract }}' (FORMAT PARQUET);
+
+                    CREATE TABLE zones AS
+                    SELECT CAST(LocationID AS INTEGER) AS location_id, Borough AS borough, Zone AS zone
+                    FROM read_csv('{{ workingDir }}/zones.csv', header = true);
+
+                    CREATE TABLE typed AS
+                    SELECT
+                      TRY_CAST(VendorID AS SMALLINT) AS vendor_id,
+                      TRY_CAST({{ render(vars.ts_prefix) }}_pickup_datetime AS TIMESTAMP) AS pickup_at,
+                      TRY_CAST({{ render(vars.ts_prefix) }}_dropoff_datetime AS TIMESTAMP) AS dropoff_at,
+                      TRY_CAST(passenger_count AS SMALLINT) AS passenger_count,
+                      TRY_CAST(trip_distance AS DOUBLE) AS trip_distance_mi,
+                      TRY_CAST(RatecodeID AS SMALLINT) AS ratecode_id,
+                      TRY_CAST(PULocationID AS INTEGER) AS pu_location_id,
+                      TRY_CAST(DOLocationID AS INTEGER) AS do_location_id,
+                      TRY_CAST(payment_type AS SMALLINT) AS payment_type,
+                      TRY_CAST(fare_amount AS DECIMAL(10, 2)) AS fare_amount,
+                      TRY_CAST(tip_amount AS DECIMAL(10, 2)) AS tip_amount,
+                      TRY_CAST(tolls_amount AS DECIMAL(10, 2)) AS tolls_amount,
+                      TRY_CAST(congestion_surcharge AS DECIMAL(10, 2)) AS congestion_surcharge,
+                      TRY_CAST(cbd_congestion_fee AS DECIMAL(10, 2)) AS cbd_congestion_fee,
+                      TRY_CAST(total_amount AS DECIMAL(10, 2)) AS total_amount
+                    FROM read_parquet(['{{ workingDir }}/bronze.parquet', '{{ outputFiles.contract }}'], union_by_name = true);
+
+                    CREATE TABLE checked AS
+                    SELECT t.*, pz.borough AS pickup_borough, pz.zone AS pickup_zone, dz.borough AS dropoff_borough,
+                      CASE
+                        WHEN pickup_at IS NULL OR dropoff_at IS NULL THEN 'MISSING_TIMESTAMP'
+                        WHEN pickup_at < CAST(DATE '{{ inputs.month }}-01' AS TIMESTAMP)
+                          OR pickup_at >= CAST(DATE '{{ inputs.month }}-01' + INTERVAL 1 MONTH AS TIMESTAMP) THEN 'OUT_OF_MONTH'
+                        WHEN dropoff_at <= pickup_at THEN 'PICKUP_NOT_BEFORE_DROPOFF'
+                        WHEN dropoff_at - pickup_at > INTERVAL 24 HOUR THEN 'DURATION_OVER_24H'
+                        WHEN fare_amount < 0 OR total_amount < 0 THEN 'NEGATIVE_AMOUNT'
+                        WHEN trip_distance_mi IS NULL OR trip_distance_mi <= 0 THEN 'ZERO_DISTANCE'
+                      END AS reject_reason
+                    FROM typed t
+                    LEFT JOIN zones pz ON pz.location_id = t.pu_location_id
+                    LEFT JOIN zones dz ON dz.location_id = t.do_location_id;
+
+                    COPY (SELECT * EXCLUDE (reject_reason), '{{ inputs.month }}' AS source_month FROM checked WHERE reject_reason IS NULL) TO '{{ outputFiles.silver }}' (FORMAT PARQUET);
+                    COPY (SELECT *, '{{ inputs.month }}' AS source_month FROM checked WHERE reject_reason IS NOT NULL) TO '{{ outputFiles.quarantine }}' (FORMAT PARQUET);
+
+                    SELECT
+                      count(*) AS bronze_rows,
+                      count(*) FILTER (WHERE reject_reason IS NULL) AS silver_rows,
+                      count(*) FILTER (WHERE reject_reason IS NOT NULL) AS quarantined_rows,
+                      round(count(*) FILTER (WHERE reject_reason IS NOT NULL) / greatest(count(*), 1), 4) AS quarantine_ratio,
+                      coalesce((SELECT string_agg(reject_reason || '=' || n, ', ' ORDER BY n DESC)
+                                FROM (SELECT reject_reason, count(*) AS n FROM checked WHERE reject_reason IS NOT NULL GROUP BY 1)), '') AS reject_reasons,
+                      coalesce((SELECT string_agg(name, ', ' ORDER BY name) FROM parquet_schema('{{ workingDir }}/bronze.parquet')
+                                WHERE num_children IS NULL AND lower(name) NOT IN (SELECT lower(name) FROM parquet_schema('{{ outputFiles.contract }}'))), '') AS new_columns,
+                      coalesce((SELECT string_agg(name, ', ' ORDER BY name) FROM parquet_schema('{{ outputFiles.contract }}')
+                                WHERE num_children IS NULL AND lower(name) NOT IN (SELECT lower(name) FROM parquet_schema('{{ workingDir }}/bronze.parquet'))), '') AS missing_columns
+                    FROM checked;
+                dependsOn: [download_trips, download_zones]
+
+              - task:
+                  id: land_quarantine
+                  type: io.kestra.plugin.core.namespace.UploadFiles
+                  description: Rejected rows with their reason, published whether or not the gate passes, because they are the evidence when it does not.
+                  namespace: "{{ flow.namespace }}"
+                  conflict: OVERWRITE
+                  filesMap:
+                    "{{ render(vars.lake_dir) }}/quarantine/month={{ inputs.month }}/rejected.parquet": "{{ outputs.build_silver.outputFiles.quarantine }}"
+                dependsOn: [build_silver]
+
+              - task:
+                  id: quality_gate
+                  type: io.kestra.plugin.core.execution.Assert
+                  description: Hard fail on purpose. A month with too many rejected rows, or none at all, must not reach gold; the orchestrator dead-letters it for replay.
+                  errorMessage: "{{ inputs.month }} failed the quality gate: {{ outputs.build_silver.outputs[0].row.quarantined_rows }} of {{ outputs.build_silver.outputs[0].row.bronze_rows }} rows quarantined (ratio {{ outputs.build_silver.outputs[0].row.quarantine_ratio }}, max {{ inputs.max_quarantine_ratio }}). Reasons: {{ outputs.build_silver.outputs[0].row.reject_reasons }}"
+                  conditions:
+                    - "{{ outputs.build_silver.outputs[0].row.silver_rows > 0 }}"
+                    - "{{ outputs.build_silver.outputs[0].row.quarantine_ratio <= inputs.max_quarantine_ratio }}"
+                dependsOn: [build_silver]
+
+              - task:
+                  id: build_gold
+                  type: io.kestra.plugin.jdbc.duckdb.Queries
+                  description: Daily KPIs per pickup borough from silver. Tip rate uses card payments only, because cash tips are not recorded.
+                  timeZoneId: UTC
+                  inputFiles:
+                    silver.parquet: "{{ outputs.build_silver.outputFiles.silver }}"
+                  outputFiles:
+                    - gold
+                  fetchType: FETCH_ONE
+                  sql: |
+                    SET TimeZone = 'UTC';
+                    CREATE TABLE gold AS
+                    SELECT
+                      CAST(pickup_at AS DATE) AS trip_date,
+                      coalesce(pickup_borough, 'Unknown') AS pickup_borough,
+                      count(*) AS trips,
+                      CAST(sum(total_amount) AS DECIMAL(14, 2)) AS revenue_usd,
+                      round(avg(fare_amount), 2) AS avg_fare_usd,
+                      round(avg(trip_distance_mi), 2) AS avg_distance_mi,
+                      round(avg(date_diff('second', pickup_at, dropoff_at)) / 60.0, 1) AS avg_minutes,
+                      round(sum(tip_amount) FILTER (WHERE payment_type = 1) / nullif(sum(fare_amount) FILTER (WHERE payment_type = 1), 0), 3) AS card_tip_rate
+                    FROM read_parquet('{{ workingDir }}/silver.parquet')
+                    GROUP BY ALL
+                    ORDER BY trip_date, pickup_borough;
+                    COPY gold TO '{{ outputFiles.gold }}' (FORMAT PARQUET);
+                    SELECT count(*) AS gold_rows, count(DISTINCT trip_date) AS days, CAST(sum(trips) AS BIGINT) AS trips,
+                           CAST(round(sum(revenue_usd)) AS BIGINT) AS revenue_usd,
+                           (SELECT pickup_borough FROM gold GROUP BY 1 ORDER BY sum(trips) DESC LIMIT 1) AS top_borough
+                    FROM gold;
+                dependsOn: [quality_gate]
+
+              - task:
+                  id: publish_silver_gold
+                  type: io.kestra.plugin.core.namespace.UploadFiles
+                  description: Silver and gold are published together, only after the gate, under Hive-style month= folders that DuckDB, Spark or Athena can read as one table.
+                  namespace: "{{ flow.namespace }}"
+                  conflict: OVERWRITE
+                  filesMap:
+                    "{{ render(vars.lake_dir) }}/silver/month={{ inputs.month }}/trips.parquet": "{{ outputs.build_silver.outputFiles.silver }}"
+                    "{{ render(vars.lake_dir) }}/gold/daily_borough_kpis/month={{ inputs.month }}/kpis.parquet": "{{ outputs.build_gold.outputFiles.gold }}"
+                dependsOn: [build_gold, land_bronze]
+
+          - id: record_success
+            type: io.kestra.plugin.core.kv.Set
+            description: The partition manifest. The orchestrator reads it to move the watermark.
+            key: "{{ render(vars.state_prefix) }}_partition_{{ inputs.month | replace({'-': '_'}) }}"
+            kvType: JSON
+            value: |
+              {"month": "{{ inputs.month }}", "status": "SUCCESS", "execution_id": "{{ execution.id }}", "loaded_at": "{{ now() }}",
+               "bronze_rows": {{ outputs.build_silver.outputs[0].row.bronze_rows }}, "silver_rows": {{ outputs.build_silver.outputs[0].row.silver_rows }},
+               "quarantined_rows": {{ outputs.build_silver.outputs[0].row.quarantined_rows }}, "quarantine_ratio": {{ outputs.build_silver.outputs[0].row.quarantine_ratio }},
+               "reject_reasons": {{ outputs.build_silver.outputs[0].row.reject_reasons | toJson }}, "new_columns": {{ outputs.build_silver.outputs[0].row.new_columns | toJson }},
+               "missing_columns": {{ outputs.build_silver.outputs[0].row.missing_columns | toJson }}, "gold_rows": {{ outputs.build_gold.outputs[0].row.gold_rows }},
+               "trips": {{ outputs.build_gold.outputs[0].row.trips }}, "revenue_usd": {{ outputs.build_gold.outputs[0].row.revenue_usd }}}
+
+          - id: log_partition
+            type: io.kestra.plugin.core.log.Log
+            message: |
+              {{ inputs.taxi_type }} {{ inputs.month }}: {{ outputs.build_silver.outputs[0].row.bronze_rows }} bronze rows, {{ outputs.build_silver.outputs[0].row.silver_rows }} silver, {{ outputs.build_silver.outputs[0].row.quarantined_rows }} quarantined (ratio {{ outputs.build_silver.outputs[0].row.quarantine_ratio }}: {{ outputs.build_silver.outputs[0].row.reject_reasons }}).
+              Gold: {{ outputs.build_gold.outputs[0].row.gold_rows }} borough-days, {{ outputs.build_gold.outputs[0].row.trips }} trips, {{ outputs.build_gold.outputs[0].row.revenue_usd }} USD.
+              Schema drift: new columns [{{ outputs.build_silver.outputs[0].row.new_columns }}] kept in bronze only; missing columns [{{ outputs.build_silver.outputs[0].row.missing_columns }}] set to NULL.
+
+    else:
+      - id: acquire_lease
+        type: io.kestra.plugin.core.kv.Set
+        description: |
+          Overlap guard. Flow concurrency cannot be 1 here, because the children are executions of
+          this same flow and would queue behind their parent forever. overwrite false makes this
+          an atomic "set if absent"; the ttl frees the lease if the run dies without reaching
+          finally (an SLA breach skips finally).
+        key: "{{ render(vars.state_prefix) }}_orchestrator_lease"
+        value: "{{ execution.id }}"
+        overwrite: false
+        ttl: PT2H
+
+      - id: plan
+        type: io.kestra.plugin.graalvm.js.Eval
+        description: Months after the watermark (or from start_month on the first run) up to last month, minus dead-lettered months, oldest first, capped at max_partitions. Replay mode puts the dead-letter months first.
+        outputs:
+          - items_json
+          - count
+          - watermark
+          - summary
+        script: |
+          (function () {
+            const mode = {{ inputs.mode | toJson }};
+            const watermark = {{ kv(render(vars.state_prefix) ~ '_watermark', errorOnMissing=false) | toJson }};
+            const deadLetter = {{ (kv(render(vars.state_prefix) ~ '_dead_letter', errorOnMissing=false) ?? []) | toJson }};
+            const cap = {{ inputs.max_partitions }};
+            const lastMonth = {{ now() | dateAdd(-1, 'MONTHS') | date('yyyy-MM') | toJson }};
+            const next = (m) => { const [y, mo] = m.split('-').map(Number); return mo === 12 ? (y + 1) + '-01' : y + '-' + String(mo + 1).padStart(2, '0'); };
+            const parked = new Set(deadLetter.map((d) => d.month));
+            const fresh = [];
+            for (let m = watermark ? next(watermark) : {{ inputs.start_month | toJson }}; m <= lastMonth; m = next(m)) {
+              if (!parked.has(m)) fresh.push({ month: m, reason: 'NEW' });
+            }
+            const replay = mode === 'replay' ? deadLetter.map((d) => ({ month: d.month, reason: 'REPLAY' })) : [];
+            const items = replay.concat(fresh).slice(0, cap);
+            const summary = mode + ': watermark ' + (watermark || 'none') + ', ' + deadLetter.length + ' month(s) in dead-letter, planned ' +
+              (items.map((i) => i.month + ' ' + i.reason).join(', ') || 'nothing');
+            logger.info(summary);
+            return { items_json: JSON.stringify(items), count: items.length, watermark: watermark || '', summary: summary };
+          })()
+
+      - id: has_work
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.plan.outputs.count > 0 }}"
+        then:
+          - id: fan_out
+            type: io.kestra.plugin.core.flow.Loop
+            description: |
+              One child execution per month, two at a time. transmitFailed false on the Subflow and
+              on the Loop means a failed month is reported as data (its state) instead of failing
+              the batch; the loop outputs carry each child's state and outputs back.
+            values: "{{ outputs.plan.outputs.items_json }}"
+            concurrencyLimit: 2
+            transmitFailed: false
+            fetchType: FETCH
+            outputs:
+              - id: result
+                type: JSON
+                value: |
+                  {"month": "{{ fromJson(item.value).month }}", "reason": "{{ fromJson(item.value).reason }}", "state": "{{ outputs.load_month.state ?? 'NOT_STARTED' }}", "execution_id": "{{ outputs.load_month.executionId ?? '' }}"}
+            tasks:
+              - id: load_month
+                type: io.kestra.plugin.core.flow.Subflow
+                namespace: "{{ flow.namespace }}"
+                flowId: "{{ flow.id }}"
+                wait: true
+                transmitFailed: false
+                inputs:
+                  mode: partition
+                  month: "{{ fromJson(item.value).month }}"
+                  taxi_type: "{{ inputs.taxi_type }}"
+                  max_quarantine_ratio: "{{ inputs.max_quarantine_ratio }}"
+                  source_url: "{{ inputs.source_url }}"
+                labels:
+                  partition: "{{ fromJson(item.value).month }}"
+                  reason: "{{ fromJson(item.value).reason }}"
+
+      - id: collect_results
+        type: io.kestra.plugin.graalvm.js.Eval
+        description: |
+          Joins each child's final state with the partition status that same child wrote to KV
+          (a status left by an older run is ignored). The watermark
+          only moves to a month that succeeded, and never past a month that is not published yet
+          or did not finish; failed months go to the dead-letter list, so they do not block later
+          months. A month that succeeds on replay leaves the list.
+        outputs:
+          - watermark
+          - dead_letter_json
+          - failed_count
+          - failed_brief
+          - loaded_count
+          - summary_json
+          - partitions_json
+          - message
+        script: |
+          (function () {
+            const byMonth = {};
+            for (const r of {{ (outputs.fan_out is defined ? loopOutputs(outputs.fan_out.outputs, 'result') : []) | toJson }}) byMonth[r.month] = r;
+            const results = Object.values(byMonth);
+            const status = { {% for r in (outputs.fan_out is defined ? loopOutputs(outputs.fan_out.outputs, 'result') : []) %}{{ r.month | toJson }}: {{ kv(render(vars.state_prefix) ~ '_partition_' ~ (r.month | replace({'-': '_'})), errorOnMissing=false) | toJson }},{% endfor %} };
+            const oldDeadLetter = {{ (kv(render(vars.state_prefix) ~ '_dead_letter', errorOnMissing=false) ?? []) | toJson }};
+            let watermark = {{ outputs.plan.outputs.watermark | toJson }};
+            const rows = results.map((r) => {
+              const s = (status[r.month] || {}).execution_id === r.execution_id ? status[r.month] : {};
+              const outcome = r.state === 'SUCCESS' && s.status === 'SUCCESS' ? 'SUCCESS'
+                : r.state === 'SUCCESS' && s.status === 'NOT_YET_AVAILABLE' ? 'NOT_YET_AVAILABLE'
+                : (r.state === 'FAILED' ? 'FAILED' : 'INCOMPLETE');
+              return { month: r.month, reason: r.reason, outcome: outcome, child_state: r.state, execution_id: r.execution_id,
+                       failed_task: s.status === 'FAILED' ? s.failed_task : '', error: s.status === 'FAILED' ? String(s.error || '').replace(/^[0-9]+ assertions? failed!\s*/, '') : '',
+                       silver_rows: s.silver_rows || 0, quarantine_ratio: s.quarantine_ratio, new_columns: s.new_columns || '' };
+            }).sort((a, b) => a.month.localeCompare(b.month));
+            for (const r of rows) {
+              if (watermark && r.month <= watermark) continue;
+              if (r.outcome === 'SUCCESS') watermark = r.month;
+              else if (r.outcome !== 'FAILED') break;
+            }
+            const failed = rows.filter((r) => r.outcome === 'FAILED');
+            const retried = new Set(rows.map((r) => r.month));
+            const deadLetter = oldDeadLetter.filter((d) => !retried.has(d.month)).concat(failed.map((r) => ({
+              month: r.month, failed_task: r.failed_task, error: String(r.error || '').slice(0, 300), execution_id: r.execution_id,
+              attempts: ((oldDeadLetter.find((d) => d.month === r.month) || {}).attempts || 0) + 1, failed_at: new Date().toISOString()
+            }))).sort((a, b) => a.month.localeCompare(b.month));
+            const count = (o) => rows.filter((r) => r.outcome === o).length;
+            const summary = { planned: rows.length, success: count('SUCCESS'), not_yet_available: count('NOT_YET_AVAILABLE'),
+                              failed: failed.length, incomplete: count('INCOMPLETE'), watermark_before: {{ outputs.plan.outputs.watermark | toJson }},
+                              watermark_after: watermark, dead_letter: deadLetter.map((d) => d.month), partitions: rows };
+            const message = rows.map((r) => r.month + ' ' + r.outcome + (r.outcome === 'SUCCESS' ? ' (' + r.silver_rows + ' silver rows, quarantine ' + r.quarantine_ratio + ')' : '') +
+              (r.failed_task ? ' in ' + r.failed_task + ': ' + String(r.error).slice(0, 160) : '')).join('\n');
+            logger.info('Watermark ' + (summary.watermark_before || 'none') + ' -> ' + (watermark || 'none') + '; dead-letter: ' + (summary.dead_letter.join(', ') || 'empty') + '\n' + message);
+            return { watermark: watermark || '', dead_letter_json: JSON.stringify(deadLetter), failed_count: failed.length, loaded_count: summary.success,
+                     failed_brief: failed.map((r) => r.month + ' (' + r.failed_task + ')').join(', '),
+                     summary_json: JSON.stringify(summary), partitions_json: JSON.stringify(rows), message: message || 'nothing planned' };
+          })()
+
+      - id: run_report
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: One CSV row per planned month (outcome, rows, quarantine ratio, failed task, child execution), exposed as a flow output.
+        inputFiles:
+          partitions.json: "{{ outputs.collect_results.outputs.partitions_json }}"
+        outputFiles:
+          - run_report
+        sql: |
+          COPY (SELECT * FROM read_json('{{ workingDir }}/partitions.json', format = 'array') ORDER BY month) TO '{{ outputFiles.run_report }}' (HEADER);
+
+      - id: batch_verdict
+        type: io.kestra.plugin.core.execution.Fail
+        description: The batch finishes every month first, then fails if any month was dead-lettered, so the errors alert fires once with the whole list. finally still saves the watermark for the months that succeeded.
+        condition: "{{ outputs.collect_results.outputs.failed_count > 0 }}"
+        errorMessage: "{{ outputs.collect_results.outputs.failed_count }} month(s) dead-lettered. Run again with mode=replay after fixing the cause. {{ outputs.collect_results.outputs.message }}"
+
+errors:
+  - id: record_partition_failure
+    type: io.kestra.plugin.core.kv.Set
+    description: Partition mode only. Stores which task failed and why, for the orchestrator's dead-letter entry. Slack is left to the orchestrator, so one bad batch sends one alert.
+    runIf: "{{ inputs.mode == 'partition' }}"
+    key: "{{ render(vars.state_prefix) }}_partition_{{ (inputs.month ?? 'unknown') | replace({'-': '_'}) }}"
+    kvType: JSON
+    value: |
+      {"month": "{{ inputs.month ?? '' }}", "status": "FAILED", "execution_id": "{{ execution.id }}", "failed_at": "{{ now() }}",
+       "failed_task": {{ ((errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown') | toJson }},
+       "error": {{ ((errorLogs() | length) > 0 ? errorLogs() | last : {'message': 'see execution logs'}).message | toJson }}}
+
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Orchestrate and replay modes. allowFailure, so a missing webhook does not hide the original error.
+    runIf: "{{ inputs.mode != 'partition' }}"
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      :rotating_light: NYC TLC {{ inputs.taxi_type }} medallion ({{ inputs.mode }}) failed in task `{{ (errorLogs() | length) > 0 and errorLogs()[0].taskId is not empty ? errorLogs()[0].taskId : 'none (flow-level SLA)' }}`.
+      {% if (outputs.collect_results.outputs.failed_count ?? 0) > 0 %}Dead-lettered: {{ outputs.collect_results.outputs.failed_brief }}. Fix the cause, then run with mode=replay.{% else %}{{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'See the execution logs.' }}{% endif %}
+      Execution: {{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+finally:
+  - id: save_watermark
+    type: io.kestra.plugin.core.kv.Set
+    description: Runs even when batch_verdict failed the run, so successful months are never re-loaded because a sibling failed.
+    runIf: "{{ outputs.collect_results is defined and outputs.collect_results.outputs.watermark != '' }}"
+    key: "{{ render(vars.state_prefix) }}_watermark"
+    value: "{{ outputs.collect_results.outputs.watermark ?? '' }}"
+
+  - id: save_dead_letter
+    type: io.kestra.plugin.core.kv.Set
+    runIf: "{{ outputs.collect_results is defined }}"
+    key: "{{ render(vars.state_prefix) }}_dead_letter"
+    kvType: JSON
+    value: "{{ outputs.collect_results.outputs.dead_letter_json ?? '[]' }}"
+
+  - id: save_run_summary
+    type: io.kestra.plugin.core.kv.Set
+    description: One summary per run, kept for 30 days by ttl, so the KV store holds a short run history without a cleanup job.
+    runIf: "{{ outputs.collect_results is defined }}"
+    key: "{{ render(vars.state_prefix) }}_run_{{ execution.startDate | date('yyyyMMdd_HHmmss', timeZone='UTC') }}"
+    kvType: JSON
+    value: "{{ outputs.collect_results.outputs.summary_json ?? '{}' }}"
+    ttl: P30D
+
+  - id: release_lease
+    type: io.kestra.plugin.core.kv.Delete
+    description: Releases the lease only when this run holds it, so a run that lost the race never frees another run's lease.
+    runIf: "{{ inputs.mode != 'partition' and kv(render(vars.state_prefix) ~ '_orchestrator_lease', errorOnMissing=false) == execution.id }}"
+    key: "{{ render(vars.state_prefix) }}_orchestrator_lease"
+
+  - id: purge_partition_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+    description: Partition mode. The layers are already in namespace files, so the execution's copies (up to 60 MB a month for yellow) are deleted, whatever the outcome.
+    runIf: "{{ inputs.mode == 'partition' }}"
+
+afterExecution:
+  - id: report_final_state
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Runs after the execution has its final state, including runs ended by the SLA, which skip finally. Silent for partition runs and for successful runs that loaded nothing (a month that is still unpublished is not news).
+    runIf: "{{ inputs.mode != 'partition' and (execution.state != 'SUCCESS' or (outputs.collect_results.outputs.loaded_count ?? 0) > 0) }}"
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      NYC TLC {{ inputs.taxi_type }} medallion ({{ inputs.mode }}) finished {{ execution.state }}{{ (labels.sla ?? '') == 'breached' ? ' after breaching its 1 hour SLA; in-flight months were killed and finally was skipped, the lease expires by ttl' : '' }}.
+      {{ outputs.collect_results.outputs.message ?? outputs.plan.outputs.summary ?? 'No plan was made.' }}
+      Execution: {{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: run_summary
+    type: JSON
+    displayName: Run summary (orchestrate and replay)
+    value: "{{ outputs.collect_results.outputs.summary_json ?? '{}' }}"
+  - id: run_report_csv
+    type: STRING
+    displayName: Run report CSV (orchestrate and replay)
+    description: Internal-storage URI of the CSV. STRING rather than FILE, because a FILE output cannot be empty and partition runs have no report.
+    value: "{{ outputs.run_report.outputFiles.run_report ?? '' }}"
+  - id: partition
+    type: JSON
+    displayName: Partition result (partition mode)
+    value: "{{ (outputs.build_silver.outputs[0].row ?? {}) | merge(outputs.build_gold.outputs[0].row ?? {}) }}"
+
+extend:
+  title: Resilient Medallion Pipeline over NYC Taxi Open Data with Self-Calling Subflows, a DAG and Dead-Letter Replay
+  metaTitle: Resilient Bronze, Silver and Gold Pipeline with Dead-Letter Replay in DuckDB | Kestra
+  shortDescription: Load the public NYC TLC trip Parquet files month by month into bronze, silver and gold layers with DuckDB. One flow orchestrates and loads, a Dag orders each month, bad months go to a dead-letter list and a replay mode retries them.
+  metaDescription: NYC taxi open data into bronze, silver and gold with DuckDB. Self-calling Subflow fan-out, a Dag, quality gate, watermark, dead-letter replay and SLA.
+  description: |
+    A batch pipeline over open data must survive months not published yet, schemas that changed between years, a bad month that should not stop the others, and a run that hangs. This blueprint loads the NYC Taxi and Limousine Commission (TLC) trip records, monthly Parquet files on a keyless CloudFront distribution, into bronze, silver and gold layers with DuckDB and handles each case on purpose. All data is live TLC data; nothing is sample data.
+
+    ## How it works
+
+    1. `daily_catch_up` runs the flow in `orchestrate` mode. `acquire_lease` takes a KV lease so orchestrations never overlap. `plan` lists the months after the KV watermark (or from `start_month`) up to last month, skips months in the dead-letter list and caps at `max_partitions`. In `replay` mode the dead-letter months come first.
+    2. `fan_out` (Loop, two at a time) calls this same flow once per month through `load_month` (Subflow) with `mode=partition`.
+    3. In partition mode `probe_month` sends a HEAD request. 403 or 404 means not published yet: `record_not_yet_available` notes it and nothing fails. Otherwise the `medallion` Dag runs `download_trips` and `download_zones` in parallel, `land_bronze`, `build_silver`, `land_quarantine` and `quality_gate`, `build_gold`, then `publish_silver_gold`.
+    4. `build_silver` reads the file with an empty contract file (`union_by_name`) and casts every column, so a year without `cbd_congestion_fee` gets NULLs and INT32 or DOUBLE columns land as one type. Rows with missing timestamps, a pickup outside the month, pickup not before dropoff, trips over 24 hours, negative amounts or zero distance go to quarantine with a reason. New columns (`request_source` in 2026) are reported.
+    5. `quality_gate` fails the month if no rows survive or the quarantine ratio exceeds `max_quarantine_ratio`. `build_gold` computes daily KPIs per pickup borough: trips, revenue, average fare, distance, minutes and card tip rate.
+    6. Each month writes its own KV status (`record_success`, or `record_partition_failure` in `errors`), so parallel months never overwrite each other. `collect_results` joins them with each child's state, `run_report` writes a CSV, `batch_verdict` fails the run if a month was dead-lettered, and `finally` saves the watermark and dead-letter list.
+
+    Layers are namespace files under `nyc_tlc/<taxi_type>/{bronze,silver,quarantine,gold/daily_borough_kpis}/month=YYYY-MM/`.
+
+    ## What this blueprint teaches
+
+    - **Self-calling Subflow** (`route`, `load_month`): one file is both parent and child, so their contract cannot drift. `transmitFailed: false` on the Subflow and on `fan_out` turns a failed month into data (its state) instead of a failed batch; Loop `outputs` and `loopOutputs()` bring the results back.
+    - **Dag** (`medallion`): `dependsOn` states the real dependencies and Kestra derives the parallelism. Silver needs the zone lookup; bronze lands even if the month fails its gate; gold waits for the gate.
+    - **Flow `checks`**: four rules (partition mode needs `month`; no month before the dataset or in the future; a ratio between 0 and 1) refuse a bad request before an execution exists.
+    - **Flow `finally`** (`save_watermark`, `save_dead_letter`, `save_run_summary`, `release_lease`, `purge_partition_files`): runs after `batch_verdict` failed the run, so successful months are kept. The watermark only moves to a month that succeeded and never past one that is unpublished or unfinished.
+    - **Flow `sla`** (`max_runtime`, MAX_DURATION 1 hour, FAIL): stops a hung run, kills its in-flight children and adds the label `sla: breached`. Tested: an SLA breach skips `finally`.
+    - **Flow `afterExecution`** (`report_final_state`): runs once the execution has its final state (`execution.state`), even after an SLA breach. `errors` (`alert_failure`) runs before that and names the failed task.
+    - **KV `ttl` and `overwrite: false`** (`acquire_lease`, `save_run_summary`): an atomic set-if-absent lease that expires by itself after 2 hours, because `finally` cannot release it after an SLA breach; run summaries expire after 30 days.
+    - **`concurrency` limit 3, not 1**: the children are executions of this flow. With limit 1 they queue behind their own parent forever (tested); 3 is the orchestrator plus two months, and the lease guards against overlap.
+
+    ## What you get
+
+    - Bronze (raw), silver (typed, clean), quarantine (rejected rows with reason) and gold (daily borough KPIs) Parquet per month, overwritten on re-run, so re-runs are idempotent. A failed reload never removes the last good silver or gold.
+    - Every network call has a `timeout` and exponential `retry`; downloads and the gate fail hard on purpose, and only Slack uses `allowFailure`.
+    - KV state per taxi type: watermark, dead-letter list (month, failed task, error, attempts), per-month status and the lease.
+    - `run_summary` and `run_report_csv` outputs, a Slack alert with the failed task and execution link, and a final-state report.
+
+    ## Who it's for
+
+    - Data engineers building incremental loads over public or partner files.
+    - Analytics engineers who want a medallion layout with explicit quality rules.
+    - Platform teams standardising failure handling and replay.
+
+    ## Why orchestrate this with Kestra
+
+    A cron script stops at the first bad month or hides it. Here each month is an execution with its own logs, labels and state, failures become dead-letter entries, replay is an input, the order inside a month is declared, and the guards (checks, lease, SLA, finally) are a few lines of YAML.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the DuckDB, GraalVM and Slack plugins.
+    - Outbound HTTPS to `d37ci6vzurychx.cloudfront.net`. No TLC account or API key is needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the failure alert and the final-state report (optional; without it both tasks end in WARNING and the run state is unchanged).
+
+    ## Quick start
+
+    1. Import the flow and **Execute** with the defaults: green 2026-06 to 2026-08 load and 2026-09 is NOT_YET_AVAILABLE (as of October 2026).
+    2. Execute again: only the unpublished month is probed.
+    3. Delete the KV watermark and run with `max_quarantine_ratio` 0.04: months above 4 percent are dead-lettered and the run fails with one alert. Run `mode=replay` with the default ratio to load them.
+    4. Run `mode=partition` with a `month` to reload one month.
+    5. Add `SLACK_WEBHOOK_URL` and leave the daily schedule on.
+
+    ## How to extend
+
+    - Swap the namespace-file uploads for S3, GCS or Azure Blob, and query gold with `read_parquet(..., hive_partitioning = true)`.
+    - Add rules to the `CASE` in `build_silver` or a second gate on trip counts.
+    - Add the for-hire vehicle files with their own contract.
+
+    ## Links
+
+    - [Subflow](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.subflow), [Dag](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.dag) and [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [SLA](https://kestra.io/docs/workflow-components/sla), [Checks](https://kestra.io/docs/workflow-components/checks), [Finally](https://kestra.io/docs/workflow-components/finally) and [afterExecution](https://kestra.io/docs/workflow-components/afterexecution)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store) and [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [NYC TLC trip record data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) and [data dictionaries](https://www.nyc.gov/site/tlc/about/data-dictionaries-and-metadata.page)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Testing & Quality
+  ee: false
+  demo: false
