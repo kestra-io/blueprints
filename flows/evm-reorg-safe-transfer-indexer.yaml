@@ -1,0 +1,546 @@
+id: evm-reorg-safe-transfer-indexer
+namespace: company.team
+description: |
+  Index ERC-20 Transfer events into Postgres close to the chain head, and stay
+  correct through chain reorganizations. Every run first compares the block
+  hashes it stored with the chain, rewinds to the fork point if they differ
+  (deleting the orphaned transfers), then catches up in batches. Each batch
+  is written atomically together with the cursor.
+
+triggers:
+  - id: new_block
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from a new-block notification (Alchemy, QuickNode, your node) to index right away.
+    key: transfer-indexer-change-me
+  - id: every_minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: tokens
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    description: Token contracts to index. The default is USDC on Ethereum mainnet.
+  - id: start_block
+    type: INT
+    defaults: 21000000
+    description: First block to index when the indexer has never run.
+  - id: batch_blocks
+    type: INT
+    defaults: 500
+    description: Blocks per eth_getLogs call. Lower it if the provider limits ranges or result sizes.
+  - id: reorg_window
+    type: INT
+    defaults: 64
+    description: Number of recent block hashes kept and re-checked on each run. Ethereum mainnet finalizes in about 64 blocks.
+  - id: deep_reorg_depth
+    type: INT
+    defaults: 1000
+    description: When a reorg reaches past the window, how far back to re-verify stored transfers against the chain, using their recorded block hashes.
+  - id: confirmations
+    type: INT
+    defaults: 0
+    description: Stay this many blocks behind the head. 0 indexes up to the head and relies on reorg repair.
+
+variables:
+  transfer_topic: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+  # One cursor per token set, so several copies of the flow can share the tables.
+  index_key: "{{ inputs.tokens | jq('map(ascii_downcase) | sort | join(\",\")') | first }}"
+
+tasks:
+  - id: validate_tokens
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.tokens | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | length') | first > 0 or inputs.tokens | length == 0 }}"
+    then:
+      - id: invalid_tokens
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "List at least one token address. Not valid: {{ inputs.tokens | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | join(\", \")') | first }}"
+
+  - id: ensure_tables
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS token_transfers (
+        chain_id      BIGINT NOT NULL,
+        block_number  BIGINT NOT NULL,
+        block_hash    TEXT NOT NULL,
+        tx_hash       TEXT NOT NULL,
+        log_index     INT NOT NULL,
+        token         TEXT NOT NULL,
+        from_address  TEXT NOT NULL,
+        to_address    TEXT NOT NULL,
+        value         NUMERIC(78, 0) NOT NULL,
+        PRIMARY KEY (chain_id, tx_hash, log_index)
+      );
+      CREATE INDEX IF NOT EXISTS token_transfers_block ON token_transfers (chain_id, block_number);
+      CREATE TABLE IF NOT EXISTS indexed_blocks (
+        chain_id   BIGINT NOT NULL,
+        index_key  TEXT NOT NULL,
+        number     BIGINT NOT NULL,
+        hash       TEXT NOT NULL,
+        PRIMARY KEY (chain_id, index_key, number)
+      );
+      CREATE TABLE IF NOT EXISTS indexer_cursor (
+        chain_id    BIGINT NOT NULL,
+        index_key   TEXT NOT NULL,
+        last_block  BIGINT NOT NULL,
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (chain_id, index_key)
+      );
+      CREATE TABLE IF NOT EXISTS indexer_reorgs (
+        id                BIGSERIAL PRIMARY KEY,
+        at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+        chain_id          BIGINT NOT NULL,
+        index_key         TEXT NOT NULL,
+        fork_block        BIGINT NOT NULL,
+        depth             INT NOT NULL,
+        removed_transfers INT NOT NULL,
+        beyond_window     BOOLEAN NOT NULL
+      );
+
+  - id: hex_function
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Token amounts are 256-bit integers; NUMERIC(78,0) holds them exactly.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE OR REPLACE FUNCTION evm_hex_to_numeric(h text) RETURNS numeric LANGUAGE sql IMMUTABLE AS $$
+        SELECT coalesce(sum(CAST(position(substr(lower(h), i, 1) IN '0123456789abcdef') - 1 AS numeric)
+                            * power(CAST(16 AS numeric), length(h) - i)), 0)
+        FROM generate_series(3, length(h)) i
+      $$
+
+  - id: stored_window
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: The block hashes recorded by earlier runs, to compare with the chain.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters:
+      index_key: "{{ render(vars.index_key) }}"
+    sql: |
+      SELECT CAST(coalesce(jsonb_agg(jsonb_build_object('jsonrpc', '2.0', 'id', 'b' || number, 'method', 'eth_getBlockByNumber',
+                                                        'params', jsonb_build_array('0x' || to_hex(number), false)) ORDER BY number), '[]') AS TEXT) AS calls
+      FROM indexed_blocks WHERE index_key = :index_key
+
+  - id: chain_state
+    type: io.kestra.plugin.core.http.Request
+    description: Chain id, head, and the current hash of every stored block, in one batch.
+    uri: "{{ secret('EVM_RPC_URL') }}"
+    method: POST
+    contentType: application/json
+    body: >-
+      {{ fromJson(outputs.stored_window.row.calls) | jq('[{jsonrpc: "2.0", id: "chain", method: "eth_chainId", params: []},
+                                                         {jsonrpc: "2.0", id: "head", method: "eth_blockNumber", params: []}] + .') | first | toJson }}
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: rpc_ok
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.chain_state.body | jq('[.[] | select(.error != null)] | length') | first > 0 }}"
+    then:
+      - id: rpc_error
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "The RPC endpoint returned an error: {{ outputs.chain_state.body | jq('[.[] | select(.error != null) | .error.message] | first') | first }}. Nothing was changed"
+
+  - id: repair
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: |
+      Find the lowest stored block whose hash changed. Delete its transfers and everything above it,
+      and move the cursor back below it, in one statement. If even the oldest stored block changed,
+      the reorg is deeper than the window: rewind the whole window and flag it.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters:
+      response: "{{ outputs.chain_state.body }}"
+      index_key: "{{ render(vars.index_key) }}"
+      tokens: "{{ inputs.tokens | jq('map(ascii_downcase) | join(\",\")') | first }}"
+      start_block: "{{ inputs.start_block }}"
+    sql: |
+      WITH r AS (
+        SELECT e->>'id' AS id, e->'result' AS result FROM jsonb_array_elements(CAST(:response AS jsonb)) e
+      ), meta AS (
+        SELECT CAST(CAST('x' || lpad(substr((SELECT result #>> '{}' FROM r WHERE id = 'chain'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS chain_id,
+               CAST(CAST('x' || lpad(substr((SELECT result #>> '{}' FROM r WHERE id = 'head'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS head
+      ), cmp AS (
+        SELECT b.number, b.hash AS stored, r.result->>'hash' AS current
+        FROM indexed_blocks b JOIN meta ON b.chain_id = meta.chain_id
+        LEFT JOIN r ON r.id = 'b' || b.number
+        WHERE b.index_key = :index_key
+      ), fork AS (
+        SELECT min(number) AS fork_block, min(number) = (SELECT min(number) FROM cmp) AS beyond_window
+        FROM cmp WHERE current IS DISTINCT FROM stored
+      ), cur AS (
+        INSERT INTO indexer_cursor (chain_id, index_key, last_block)
+        SELECT chain_id, :index_key, CAST(:start_block AS BIGINT) - 1 FROM meta
+        ON CONFLICT (chain_id, index_key) DO NOTHING
+        RETURNING last_block
+      ), removed AS (
+        DELETE FROM token_transfers t
+        USING fork, meta
+        WHERE fork.fork_block IS NOT NULL AND t.chain_id = meta.chain_id AND t.block_number >= fork.fork_block
+          AND t.token = ANY(string_to_array(:tokens, ','))
+        RETURNING 1
+      ), dropped_blocks AS (
+        DELETE FROM indexed_blocks b USING fork, meta
+        WHERE fork.fork_block IS NOT NULL AND b.chain_id = meta.chain_id AND b.index_key = :index_key AND b.number >= fork.fork_block
+        RETURNING 1
+      ), rewind AS (
+        UPDATE indexer_cursor c SET last_block = least(c.last_block, fork.fork_block - 1), updated_at = now()
+        FROM fork, meta
+        WHERE fork.fork_block IS NOT NULL AND c.chain_id = meta.chain_id AND c.index_key = :index_key
+        RETURNING c.last_block
+      ), logged AS (
+        INSERT INTO indexer_reorgs (chain_id, index_key, fork_block, depth, removed_transfers, beyond_window)
+        SELECT meta.chain_id, :index_key, fork.fork_block, CAST((SELECT max(number) FROM cmp) - fork.fork_block + 1 AS INT),
+               CAST((SELECT count(*) FROM removed) AS INT), fork.beyond_window
+        FROM fork, meta WHERE fork.fork_block IS NOT NULL
+      )
+      SELECT meta.chain_id, meta.head, fork.fork_block, coalesce(fork.beyond_window, false) AS beyond_window,
+             CAST((SELECT max(number) FROM cmp) - fork.fork_block + 1 AS INT) AS depth,
+             (SELECT count(*) FROM removed) AS removed_transfers,
+             coalesce((SELECT last_block FROM rewind), (SELECT last_block FROM cur),
+                      (SELECT last_block FROM indexer_cursor c WHERE c.chain_id = meta.chain_id AND c.index_key = :index_key)) AS cursor
+      FROM meta, fork
+
+  - id: deep_check
+    type: io.kestra.plugin.core.flow.If
+    description: The oldest stored hash changed too, so the fork point may be lower. Every stored transfer carries its block hash; check those below the fork against the chain.
+    condition: "{{ outputs.repair.row.beyond_window }}"
+    then:
+      - id: deep_blocks
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        parameters:
+          chain_id: "{{ outputs.repair.row.chain_id }}"
+          tokens: "{{ inputs.tokens | jq('map(ascii_downcase) | join(\",\")') | first }}"
+          fork: "{{ outputs.repair.row.fork_block }}"
+          depth: "{{ inputs.deep_reorg_depth }}"
+        sql: |
+          SELECT CAST(coalesce(jsonb_agg(DISTINCT jsonb_build_object('jsonrpc', '2.0', 'id', 'b' || block_number, 'method', 'eth_getBlockByNumber',
+                                                              'params', jsonb_build_array('0x' || to_hex(block_number), false))), '[]')
+                      || jsonb_build_array(jsonb_build_object('jsonrpc', '2.0', 'id', 'head', 'method', 'eth_blockNumber', 'params', jsonb_build_array()))
+                      AS TEXT) AS calls
+          FROM token_transfers
+          WHERE chain_id = CAST(:chain_id AS BIGINT) AND token = ANY(string_to_array(:tokens, ','))
+            AND block_number < CAST(:fork AS BIGINT) AND block_number >= CAST(:fork AS BIGINT) - CAST(:depth AS BIGINT)
+
+      - id: deep_state
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVM_RPC_URL') }}"
+        method: POST
+        contentType: application/json
+        body: "{{ outputs.deep_blocks.row.calls }}"
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+      - id: deep_repair
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        parameters:
+          response: "{{ outputs.deep_state.body }}"
+          chain_id: "{{ outputs.repair.row.chain_id }}"
+          index_key: "{{ render(vars.index_key) }}"
+          tokens: "{{ inputs.tokens | jq('map(ascii_downcase) | join(\",\")') | first }}"
+          fork: "{{ outputs.repair.row.fork_block }}"
+          depth: "{{ inputs.deep_reorg_depth }}"
+        sql: |
+          WITH r AS (
+            SELECT e->>'id' AS id, e->'result'->>'hash' AS hash FROM jsonb_array_elements(CAST(:response AS jsonb)) e
+          ), bad AS (
+            SELECT min(t.block_number) AS fork_block
+            FROM token_transfers t JOIN r ON r.id = 'b' || t.block_number
+            WHERE t.chain_id = CAST(:chain_id AS BIGINT) AND t.token = ANY(string_to_array(:tokens, ','))
+              AND t.block_number < CAST(:fork AS BIGINT) AND t.block_number >= CAST(:fork AS BIGINT) - CAST(:depth AS BIGINT)
+              AND r.hash IS DISTINCT FROM t.block_hash
+          ), removed AS (
+            DELETE FROM token_transfers t USING bad
+            WHERE bad.fork_block IS NOT NULL AND t.chain_id = CAST(:chain_id AS BIGINT)
+              AND t.token = ANY(string_to_array(:tokens, ',')) AND t.block_number >= bad.fork_block
+            RETURNING 1
+          ), rewind AS (
+            UPDATE indexer_cursor c SET last_block = least(c.last_block, bad.fork_block - 1), updated_at = now()
+            FROM bad WHERE bad.fork_block IS NOT NULL AND c.chain_id = CAST(:chain_id AS BIGINT) AND c.index_key = :index_key
+            RETURNING c.last_block
+          ), logged AS (
+            INSERT INTO indexer_reorgs (chain_id, index_key, fork_block, depth, removed_transfers, beyond_window)
+            SELECT CAST(:chain_id AS BIGINT), :index_key, bad.fork_block, CAST(CAST(:fork AS BIGINT) - bad.fork_block AS INT),
+                   CAST((SELECT count(*) FROM removed) AS INT), true
+            FROM bad WHERE bad.fork_block IS NOT NULL
+          )
+          SELECT bad.fork_block, (SELECT count(*) FROM removed) AS removed_transfers
+          FROM bad
+
+  - id: catch_up
+    type: io.kestra.plugin.core.flow.LoopUntil
+    description: Index batch after batch until the cursor reaches the head seen at the start of the run.
+    condition: "{{ outputs.plan.row.caught_up or (outputs.store is defined and outputs.store.row.moved_under_us) }}"
+    checkFrequency:
+      interval: PT1S
+      maxIterations: 200
+    failOnMaxReached: false
+    tasks:
+      - id: plan
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        parameters:
+          chain_id: "{{ outputs.repair.row.chain_id }}"
+          index_key: "{{ render(vars.index_key) }}"
+          target: "{{ outputs.repair.row.head - inputs.confirmations }}"
+          batch: "{{ inputs.batch_blocks }}"
+          window: "{{ inputs.reorg_window }}"
+          tokens: "{{ inputs.tokens | toJson }}"
+          topic: "{{ vars.transfer_topic }}"
+        sql: |
+          WITH c AS (
+            SELECT last_block + 1 AS from_block,
+                   least(CAST(:target AS BIGINT), last_block + CAST(:batch AS BIGINT)) AS to_block,
+                   last_block >= CAST(:target AS BIGINT) AS caught_up
+            FROM indexer_cursor WHERE chain_id = CAST(:chain_id AS BIGINT) AND index_key = :index_key
+          )
+          SELECT from_block, to_block, caught_up,
+                 -- eth_getLogs for the range, plus the headers of its last reorg_window blocks for later reorg checks
+                 CAST(jsonb_build_array(jsonb_build_object('jsonrpc', '2.0', 'id', 'logs', 'method', 'eth_getLogs', 'params',
+                        jsonb_build_array(jsonb_build_object('address', CAST(:tokens AS jsonb), 'topics', jsonb_build_array(CAST(:topic AS text)),
+                                                             'fromBlock', '0x' || to_hex(from_block), 'toBlock', '0x' || to_hex(to_block)))))
+                      || coalesce((SELECT jsonb_agg(jsonb_build_object('jsonrpc', '2.0', 'id', 'h' || n, 'method', 'eth_getBlockByNumber',
+                                                                       'params', jsonb_build_array('0x' || to_hex(n), false)))
+                                   FROM generate_series(greatest(from_block, to_block - CAST(:window AS BIGINT) + 1), to_block) n), '[]')
+                   AS TEXT) AS request
+          FROM c
+
+      - id: work_left
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ not outputs.plan.row.caught_up }}"
+        then:
+          - id: fetch
+            type: io.kestra.plugin.core.http.Request
+            description: The logs of the batch and the headers of its last reorg_window blocks, in one JSON-RPC batch.
+            uri: "{{ secret('EVM_RPC_URL') }}"
+            method: POST
+            contentType: application/json
+            body: "{{ outputs.plan.row.request }}"
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+
+          - id: fetch_ok
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.fetch.body | jq('[.[] | select(.error != null)] | length') | first > 0 }}"
+            then:
+              - id: fetch_error
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "eth_getLogs for blocks {{ outputs.plan.row.from_block }}-{{ outputs.plan.row.to_block }} failed: {{ outputs.fetch.body | jq('[.[] | select(.error != null) | .error.message] | first') | first }}. If the provider limits ranges or results, lower batch_blocks. The cursor did not move"
+
+          - id: store
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: |
+              Insert the transfers and headers and move the cursor in one statement.
+              If a log's block hash differs from the header fetched in the same batch, the chain reorganized
+              during the fetch: nothing is stored and the next run repairs from the stored hashes.
+            url: "{{ secret('POSTGRES_URL') }}"
+            username: "{{ secret('POSTGRES_USER') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            parameters:
+              response: "{{ outputs.fetch.body }}"
+              chain_id: "{{ outputs.repair.row.chain_id }}"
+              index_key: "{{ render(vars.index_key) }}"
+              to_block: "{{ outputs.plan.row.to_block }}"
+              window: "{{ inputs.reorg_window }}"
+            sql: |
+              WITH r AS (
+                SELECT e->>'id' AS id, e->'result' AS result FROM jsonb_array_elements(CAST(:response AS jsonb)) e
+              ), logs AS (
+                SELECT CAST(CAST('x' || lpad(substr(l->>'blockNumber', 3), 16, '0') AS BIT(64)) AS BIGINT) AS block_number,
+                       l->>'blockHash' AS block_hash, l->>'transactionHash' AS tx_hash,
+                       CAST(CAST('x' || lpad(substr(l->>'logIndex', 3), 8, '0') AS BIT(32)) AS INT) AS log_index,
+                       lower(l->>'address') AS token,
+                       '0x' || right(l->'topics'->>1, 40) AS from_address, '0x' || right(l->'topics'->>2, 40) AS to_address,
+                       evm_hex_to_numeric(l->>'data') AS value
+                FROM r, jsonb_array_elements(r.result) l
+                WHERE r.id = 'logs' AND jsonb_array_length(l->'topics') = 3 AND coalesce(CAST(l->>'removed' AS boolean), false) = false
+              ), headers AS (
+                SELECT CAST(CAST('x' || lpad(substr(result->>'number', 3), 16, '0') AS BIT(64)) AS BIGINT) AS number, result->>'hash' AS hash
+                FROM r WHERE id LIKE 'h%' AND result IS NOT NULL AND jsonb_typeof(result) = 'object'
+              ), conflict AS (
+                SELECT count(*) AS n FROM logs JOIN headers h ON h.number = logs.block_number WHERE h.hash <> logs.block_hash
+              ), ins AS (
+                INSERT INTO token_transfers (chain_id, block_number, block_hash, tx_hash, log_index, token, from_address, to_address, value)
+                SELECT CAST(:chain_id AS BIGINT), block_number, block_hash, tx_hash, log_index, token, from_address, to_address, value
+                FROM logs WHERE (SELECT n FROM conflict) = 0
+                ON CONFLICT (chain_id, tx_hash, log_index) DO UPDATE SET block_number = EXCLUDED.block_number, block_hash = EXCLUDED.block_hash
+                RETURNING 1
+              ), hdr AS (
+                INSERT INTO indexed_blocks (chain_id, index_key, number, hash)
+                SELECT CAST(:chain_id AS BIGINT), :index_key, number, hash FROM headers WHERE (SELECT n FROM conflict) = 0
+                ON CONFLICT (chain_id, index_key, number) DO UPDATE SET hash = EXCLUDED.hash
+              ), prune AS (
+                DELETE FROM indexed_blocks
+                WHERE chain_id = CAST(:chain_id AS BIGINT) AND index_key = :index_key AND (SELECT n FROM conflict) = 0
+                  AND number <= CAST(:to_block AS BIGINT) - CAST(:window AS BIGINT)
+              ), cur AS (
+                UPDATE indexer_cursor SET last_block = CAST(:to_block AS BIGINT), updated_at = now()
+                WHERE chain_id = CAST(:chain_id AS BIGINT) AND index_key = :index_key AND (SELECT n FROM conflict) = 0
+                RETURNING last_block
+              )
+              SELECT (SELECT count(*) FROM ins) AS transfers, (SELECT n FROM conflict) > 0 AS moved_under_us,
+                     (SELECT last_block FROM cur) AS cursor
+
+  - id: progress
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters:
+      chain_id: "{{ outputs.repair.row.chain_id }}"
+      index_key: "{{ render(vars.index_key) }}"
+      tokens: "{{ inputs.tokens | jq('map(ascii_downcase) | join(\",\")') | first }}"
+    sql: |
+      SELECT c.last_block AS cursor, CAST(:chain_id AS BIGINT) AS chain_id,
+             (SELECT count(*) FROM token_transfers t WHERE t.chain_id = c.chain_id AND t.token = ANY(string_to_array(:tokens, ','))) AS transfers
+      FROM indexer_cursor c WHERE c.chain_id = CAST(:chain_id AS BIGINT) AND c.index_key = :index_key
+
+  - id: report_reorg
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs.repair.row.fork_block ?? '') != '' }}"
+    then:
+      - id: notify_reorg
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: >-
+          REORG on chain {{ outputs.repair.row.chain_id }}: blocks from {{ outputs.repair.row.fork_block }} were replaced
+          (depth {{ outputs.repair.row.depth }}{% if outputs.repair.row.beyond_window %} or more: even the oldest of the {{ inputs.reorg_window }} stored block hashes changed{% endif %}).
+          Removed {{ outputs.repair.row.removed_transfers }} orphaned transfer(s) and re-indexed from block {{ outputs.repair.row.fork_block }}.{% if outputs.repair.row.beyond_window %} {% if (outputs.deep_repair.row.fork_block ?? '') != '' %}Stored transfers below the window were re-verified: the fork was at block {{ outputs.deep_repair.row.fork_block }}; {{ outputs.deep_repair.row.removed_transfers }} more orphaned transfer(s) removed and re-indexed.{% else %}Stored transfers up to {{ inputs.deep_reorg_depth }} blocks below were re-verified and still match the chain.{% endif %}{% endif %}
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Transfer indexer failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      Each batch is written atomically with the cursor, so the next run resumes where this one stopped.
+
+outputs:
+  - id: progress
+    type: JSON
+    description: Cursor (last indexed block) and number of transfers stored for these tokens.
+    value: "{{ outputs.progress is defined ? outputs.progress.row : {} }}"
+  - id: reorg
+    type: JSON
+    description: Fork block, depth and removed transfers when this run repaired a reorg.
+    value: "{{ outputs.repair is defined ? outputs.repair.row : {} }}"
+
+extend:
+  title: Index ERC-20 Transfers into Postgres and Survive Chain Reorganizations
+  shortDescription: Incrementally index token Transfer events into Postgres near the chain head, detect reorgs from stored block hashes, delete orphaned rows, and re-index from the fork point.
+  metaTitle: Reorg-Safe EVM Transfer Indexer with Kestra
+  metaDescription: Index ERC-20 transfers into Postgres in atomic batches, detect chain reorgs and repair the data automatically.
+  description: |
+    Teams that need token transfers in their own database (deposit crediting, accounting, analytics, compliance) usually write a loop around `eth_getLogs`. It works until the chain reorganizes. Blocks near the head get replaced, the transfers in them disappear or change, and the database keeps rows that never happened on the final chain. Balances drift and nobody notices. This blueprint indexes close to the head and repairs reorgs itself. Every batch is written atomically with its cursor, so a crash never loses or duplicates data.
+
+    ## How it works
+
+    1. `every_minute` (`Schedule`) or `new_block` (`Webhook`, for new-block notifications) starts a run; `concurrency` cancels overlapping runs.
+    2. `stored_window` and `chain_state` fetch, in one JSON-RPC batch, the chain id, the head, and the current hash of each of the last `reorg_window` blocks this indexer stored.
+    3. `repair` (Postgres) finds the lowest stored block whose hash changed, deletes the transfers and stored hashes from there, and moves the cursor back below it, all in one statement. Each repair is logged in `indexer_reorgs`.
+    4. `deep_check` (`If`) handles reorgs deeper than the window, when even the oldest stored hash changed. Every stored transfer carries its block hash, so the flow re-verifies transfers up to `deep_reorg_depth` blocks back against the chain and rewinds to the real fork point.
+    5. `catch_up` (`LoopUntil`) indexes batch after batch until the cursor reaches the head seen at the start:
+       - `plan` builds the next `eth_getLogs` range and the header requests for its last `reorg_window` blocks;
+       - `fetch` sends them in one batch;
+       - `store` inserts the transfers (256-bit amounts kept exactly in `NUMERIC(78,0)`), records the hashes, prunes old ones, and moves the cursor, in one statement.
+    6. `report_reorg` posts every repair: fork block, depth, transfers removed.
+
+    ## Error handling
+
+    - **Atomic batches.** Transfers, block hashes and the cursor move together in one statement. A failure at any point leaves the cursor where it was, and the next run resumes there; inserts are idempotent on `(chain_id, tx_hash, log_index)`.
+    - **A reorg during a fetch is caught.** If a log's block hash differs from the header fetched in the same batch, nothing is stored and the loop stops; the next run repairs from the stored hashes.
+    - **JSON-RPC errors arrive with HTTP 200.** `rpc_ok` and `fetch_ok` fail with the provider's message, for example a range or result-size limit, which tells you to lower `batch_blocks`. "The cursor did not move."
+    - **Clear failures.** Malformed token addresses fail before any RPC call, RPC calls retry with backoff, and the `errors` alert names the task and cause.
+
+    ## What this blueprint teaches about Kestra
+
+    - `LoopUntil` as a catch-up loop with a SQL planner, so a backlog of thousands of blocks is indexed in one run.
+    - Letting Postgres build JSON-RPC requests (`jsonb_build_object`, `to_hex`), so Pebble only passes them along.
+    - Exactly-once ingestion with data-modifying CTEs: insert, prune and cursor move in one atomic statement.
+    - Self-healing state: the flow verifies its own earlier output against the source before adding more.
+
+    ## Prerequisites
+
+    - An EVM JSON-RPC endpoint that serves `eth_getLogs` for the range you index.
+    - A Postgres database (four tables and one helper function are created on the first run).
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    - `EVM_RPC_URL`: JSON-RPC endpoint.
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: index database.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `tokens` (ARRAY): token contracts to index. The default is USDC on Ethereum mainnet.
+    - `start_block` (INT): where a new index starts.
+    - `batch_blocks` (INT, default 500): blocks per `eth_getLogs`.
+    - `reorg_window` (INT, default 64), `deep_reorg_depth` (INT, default 1000): how far back to check.
+    - `confirmations` (INT, default 0): stay this far behind the head.
+
+    ### Outputs
+
+    - `progress` (JSON): last indexed block and number of transfers stored.
+    - `reorg` (JSON): fork block, depth and transfers removed when this run repaired a reorg.
+
+    ## Quick start
+
+    1. Add the secrets, set `tokens` and a recent `start_block`, and run the flow: it indexes up to the head in batches.
+    2. Query `token_transfers`, for example for net balances: `sum(CASE WHEN to_address = $1 THEN value ELSE -value END)`.
+    3. Point a new-block webhook at `new_block` for lower latency, and change its key.
+    4. Use a copy of the flow per chain; tables are keyed by chain id and token set.
+
+    ## Plugins used
+
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Business
+  subTags:
+    - ELT & Data Landing
+    - Realtime Events
+  ctaText: Read the LoopUntil task documentation
+  ctaLink: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil
+  demo: false
+  ee: false

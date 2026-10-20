@@ -1,0 +1,539 @@
+id: k8s-stuck-terminating-pod-finalizer-reaper
+namespace: company.team
+description: >-
+  Find pods that Kubernetes marked for deletion but cannot remove because a
+  finalizer never cleared, report which finalizer is blocking each one, strip it
+  behind an approval gate, then re-read the API and fail the run if the pod is
+  still there.
+
+labels:
+  project: k8s-stuck-terminating-pod-finalizer-reaper
+  team: platform
+
+inputs:
+  - id: k8s_master_url
+    type: STRING
+    displayName: Kubernetes API server URL
+    defaults: "{{ secret('K8S_MASTER_URL') }}"
+    description: API server URL reachable from the Kestra worker.
+
+  - id: k8s_oauth_token
+    type: STRING
+    displayName: Kubernetes bearer token
+    defaults: "{{ secret('K8S_OAUTH_TOKEN') }}"
+    description: >-
+      Token for a ServiceAccount that can list pods cluster-wide plus patch pod
+      metadata in the namespaces on the allowlist.
+
+  - id: k8s_ca_cert_data
+    type: STRING
+    displayName: Kubernetes CA bundle
+    defaults: "{{ secret('K8S_CA_CERT_DATA') }}"
+    description: Base64 encoded PEM CA bundle for the API server.
+
+  - id: scan_namespace
+    type: STRING
+    displayName: Namespace to scan
+    defaults: ""
+    description: >-
+      Namespace the detector reads. Leave empty to scan every namespace in the
+      cluster. This only decides what is READ, never what is written.
+
+  - id: reapable_namespaces
+    type: ARRAY
+    itemType: STRING
+    displayName: Namespaces where a finalizer may be stripped
+    defaults: ["default"]
+    description: >-
+      Write allowlist. A stuck pod outside these namespaces is reported in full
+      but never patched, so kube-system and any other namespace you did not list
+      is out of reach even in live mode.
+
+  - id: grace_minutes
+    type: INT
+    displayName: Grace window (minutes)
+    defaults: 15
+    description: >-
+      A pod counts as stuck only once its deletionTimestamp is older than this.
+      Normal pod shutdown clears its finalizers in seconds, so the window keeps
+      the reaper away from pods that are simply mid-termination.
+
+  - id: protected_finalizers
+    type: ARRAY
+    itemType: STRING
+    displayName: Finalizers that are never stripped
+    defaults:
+      - kubernetes.io/pv-protection
+      - kubernetes.io/pvc-protection
+      - external-attacher/csi-driver
+      - foregroundDeletion
+    description: >-
+      Denylist. A pod carrying any of these is refused and reported for a human,
+      because the cleanup behind these finalizers is storage or ordering work
+      that really does need to finish.
+
+  - id: max_pods_per_run
+    type: INT
+    displayName: Per-run ceiling
+    defaults: 3
+    description: >-
+      At most this many pods are stripped in one run, oldest first. A cluster
+      with fifty stuck pods is an incident, not a cleanup job.
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    defaults: true
+    description: >-
+      When true the flow reports every stuck pod plus the finalizer blocking it
+      and writes nothing.
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Allow remediation
+    defaults: false
+    description: >-
+      When false the flow only reports. A patch needs this true, dry_run false
+      plus an explicit approval on the pause.
+
+  - id: slack_channel
+    type: STRING
+    displayName: Slack channel
+    defaults: "#platform-alerts"
+    description: Channel the findings and the failure alert are posted to.
+
+triggers:
+  - id: hourly_scan
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    description: >-
+      Enable this to scan every hour in report-only mode. It forces dry_run true
+      plus auto_remediate false, so turning the schedule on can never strip a
+      finalizer on its own.
+    cron: "0 * * * *"
+    timezone: UTC
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: list_pods
+    type: io.kestra.plugin.kubernetes.kubectl.Get
+    description: >-
+      Read pod metadata through the Kubernetes plugin. An empty namespace reads
+      every namespace, which is what the cluster-wide default does.
+    connection:
+      masterUrl: "{{ inputs.k8s_master_url }}"
+      oauthToken: "{{ inputs.k8s_oauth_token }}"
+      caCertData: "{{ inputs.k8s_ca_cert_data }}"
+    namespace: "{{ inputs.scan_namespace }}"
+    resourceType: pods
+    fetchType: FETCH
+
+  - id: classify_stuck
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Keep the pods that carry both a deletionTimestamp older than the grace
+      window and a non-empty metadata.finalizers list, then sort each one into
+      reapable, within_grace, namespace_not_allowed, protected_finalizer or
+      over_ceiling. A pod with no deletionTimestamp is running normally and a
+      pod with a deletionTimestamp but no finalizer is already on its way out,
+      so neither is ever a candidate.
+    containerImage: python:3.13-slim
+    inputFiles:
+      pods.json: "{{ outputs.list_pods | toJson }}"
+    env:
+      GRACE_MINUTES: "{{ inputs.grace_minutes }}"
+      MAX_PODS: "{{ inputs.max_pods_per_run }}"
+      REAPABLE_NAMESPACES: "{{ inputs.reapable_namespaces | toJson }}"
+      PROTECTED_FINALIZERS: "{{ inputs.protected_finalizers | toJson }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      with open("pods.json") as handle:
+          payload = json.load(handle)
+
+      grace_minutes = int(os.environ["GRACE_MINUTES"])
+      max_pods = int(os.environ["MAX_PODS"])
+      reapable = set(json.loads(os.environ["REAPABLE_NAMESPACES"]))
+      protected = set(json.loads(os.environ["PROTECTED_FINALIZERS"]))
+      now = datetime.now(timezone.utc)
+
+      def age_minutes(stamp):
+          deleted = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+          return (now - deleted).total_seconds() / 60.0
+
+      stuck = []
+      for meta in payload.get("metadataItems") or []:
+          deletion_stamp = meta.get("deletionTimestamp")
+          finalizers = meta.get("finalizers") or []
+          if not deletion_stamp or not finalizers:
+              continue
+          blocked_by = sorted(f for f in finalizers if f in protected)
+          entry = {
+              "namespace": meta.get("namespace"),
+              "name": meta.get("name"),
+              "finalizers": finalizers,
+              "ageMinutes": round(age_minutes(deletion_stamp), 1),
+              "deletionTimestamp": deletion_stamp,
+              "protectedFinalizers": blocked_by,
+          }
+          if entry["ageMinutes"] < grace_minutes:
+              entry["verdict"] = "within_grace"
+              entry["note"] = (f"Deleted {entry['ageMinutes']}m ago, under the {grace_minutes}m "
+                               "grace window. Normal termination still has time to finish.")
+          elif entry["namespace"] not in reapable:
+              entry["verdict"] = "namespace_not_allowed"
+              entry["note"] = (f"Namespace {entry['namespace']} is not on the write allowlist, "
+                               "so this pod is reported only.")
+          elif blocked_by:
+              entry["verdict"] = "protected_finalizer"
+              entry["note"] = ("Refused. " + ", ".join(blocked_by) + " is on the denylist because "
+                               "the cleanup behind it has to finish. Fix the controller instead.")
+          else:
+              entry["verdict"] = "reapable"
+              entry["note"] = ("Blocking finalizer(s): " + ", ".join(finalizers) +
+                               ". No controller is clearing them.")
+          stuck.append(entry)
+
+      stuck.sort(key=lambda row: row["ageMinutes"], reverse=True)
+      reapable_rows = [row for row in stuck if row["verdict"] == "reapable"]
+      targets = reapable_rows[:max_pods]
+      for row in reapable_rows[max_pods:]:
+          row["verdict"] = "over_ceiling"
+          row["note"] = (f"Held back by the {max_pods} pod per-run ceiling. "
+                         "It is picked up by the next run.")
+
+      counts = {}
+      for row in stuck:
+          counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+
+      lines = []
+      for row in stuck:
+          lines.append(f"{row['verdict']}: {row['namespace']}/{row['name']} "
+                       f"stuck {row['ageMinutes']}m, finalizers [{', '.join(row['finalizers'])}]. "
+                       f"{row['note']}")
+      for line in lines:
+          print(line)
+      print(f"stuck={len(stuck)} targets={len(targets)} buckets={json.dumps(counts, sort_keys=True)}")
+
+      print("::" + json.dumps({"outputs": {
+          "stuck": stuck,
+          "stuckCount": len(stuck),
+          "targets": targets,
+          "targetCount": len(targets),
+          "targetKeys": [f"{row['namespace']}/{row['name']}" for row in targets],
+          "withinGrace": counts.get("within_grace", 0),
+          "namespaceNotAllowed": counts.get("namespace_not_allowed", 0),
+          "protectedFinalizer": counts.get("protected_finalizer", 0),
+          "overCeiling": counts.get("over_ceiling", 0),
+          "report": "\n".join(lines) if lines else "No pod is stuck on a finalizer.",
+      }}) + "::")
+
+  - id: log_findings
+    type: io.kestra.plugin.core.log.Log
+    description: One line per stuck pod, naming the finalizer that is holding it.
+    message: |
+      Scanned namespace '{{ inputs.scan_namespace }}'.
+      stuck={{ outputs.classify_stuck.vars.stuckCount }} reapable={{ outputs.classify_stuck.vars.targetCount }} within_grace={{ outputs.classify_stuck.vars.withinGrace }} namespace_not_allowed={{ outputs.classify_stuck.vars.namespaceNotAllowed }} protected_finalizer={{ outputs.classify_stuck.vars.protectedFinalizer }} over_ceiling={{ outputs.classify_stuck.vars.overCeiling }}
+      {{ outputs.classify_stuck.vars.report }}
+
+  - id: handle_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Everything below runs only when at least one pod is stuck.
+    condition: "{{ outputs.classify_stuck.vars.stuckCount > 0 }}"
+    then:
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: >-
+          One message per scan listing every stuck pod, its age, the finalizers
+          holding it plus why the flow will or will not touch it.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ inputs.slack_channel }}",
+            "text": ":wastebasket: {{ outputs.classify_stuck.vars.stuckCount }} pod(s) stuck Terminating on a finalizer.{% for row in outputs.classify_stuck.vars.stuck %}\n• `{{ row.namespace }}/{{ row.name }}` {{ row.ageMinutes }}m, finalizers `{{ row.finalizers | join(' ') }}`, verdict *{{ row.verdict }}*. {{ row.note }}{% endfor %}"
+          }
+
+  - id: route_remediation
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      A write needs three things true at once. auto_remediate allows
+      remediation to be considered, dry_run false allows it to be written plus
+      there has to be a pod that cleared the grace window, the namespace
+      allowlist, the finalizer denylist and the per-run ceiling. Miss one and
+      the run stays a report.
+    condition: "{{ inputs.auto_remediate == true and inputs.dry_run == false and outputs.classify_stuck.vars.targetCount > 0 }}"
+    then:
+      - id: approve_strip
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          Stripping a finalizer tells Kubernetes the cleanup it stands
+          for is done. Read the finalizer names in the findings before
+          approving: a volume may still be attached, a cloud load
+          balancer entry may still exist, buffered data may not be
+          flushed.
+        onResume:
+          - id: approved
+            type: BOOL
+            defaults: false
+            description: >-
+              Set true to clear the listed finalizers. Anything else
+              leaves every pod untouched.
+
+      - id: apply_if_approved
+        type: io.kestra.plugin.core.flow.If
+        description: An unanswered pause reads as a refusal, never as approval.
+        condition: "{{ (outputs.approve_strip.onResume.approved ?? false) == true }}"
+        then:
+          - id: strip_remediation
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One pod at a time, so a refused patch never hides behind
+              a sibling iteration.
+            values: "{{ outputs.classify_stuck.vars.targets }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: clear_pod_finalizers
+                type: io.kestra.plugin.kubernetes.kubectl.Patch
+                description: >-
+                  JSON merge patch emptying metadata.finalizers. Every
+                  finalizer on this pod was already checked against the
+                  denylist, the pod already carries a deletionTimestamp
+                  older than the grace window plus its namespace is on
+                  the write allowlist.
+                connection:
+                  masterUrl: "{{ inputs.k8s_master_url }}"
+                  oauthToken: "{{ inputs.k8s_oauth_token }}"
+                  caCertData: "{{ inputs.k8s_ca_cert_data }}"
+                namespace: "{{ fromJson(item.value).namespace }}"
+                resourceType: pods
+                resourceName: "{{ fromJson(item.value).name }}"
+                patchStrategy: JSON_MERGE
+                patch: |
+                  {
+                    "metadata": {
+                      "finalizers": []
+                    }
+                  }
+
+          - id: reread_pods
+            type: io.kestra.plugin.kubernetes.kubectl.Get
+            description: >-
+              Read the API again. A patch that returned 200 proves
+              nothing: this read decides whether the pods are gone.
+            connection:
+              masterUrl: "{{ inputs.k8s_master_url }}"
+              oauthToken: "{{ inputs.k8s_oauth_token }}"
+              caCertData: "{{ inputs.k8s_ca_cert_data }}"
+            namespace: "{{ inputs.scan_namespace }}"
+            resourceType: pods
+            fetchType: FETCH
+
+          - id: verify_gone
+            type: io.kestra.plugin.scripts.python.Script
+            description: >-
+              Exit non-zero when any pod the flow claimed to free is
+              still present, which fails the run.
+            containerImage: python:3.13-slim
+            inputFiles:
+              pods.json: "{{ outputs.reread_pods | toJson }}"
+            env:
+              TARGET_KEYS: "{{ outputs.classify_stuck.vars.targetKeys | toJson }}"
+            script: |
+              import json
+              import os
+              import sys
+
+              with open("pods.json") as handle:
+                  payload = json.load(handle)
+
+              targets = json.loads(os.environ["TARGET_KEYS"])
+              present = {}
+              for meta in payload.get("metadataItems") or []:
+                  key = f"{meta.get('namespace')}/{meta.get('name')}"
+                  present[key] = meta.get("finalizers") or []
+
+              survivors = [key for key in targets if key in present]
+              for key in targets:
+                  state = "STILL PRESENT" if key in present else "gone"
+                  extra = f" finalizers={present[key]}" if key in present else ""
+                  print(f"{key}: {state}{extra}")
+
+              print("::" + json.dumps({"outputs": {
+                  "survivors": survivors,
+                  "survivorCount": len(survivors),
+                  "freed": [k for k in targets if k not in present],
+                  "freedCount": len([k for k in targets if k not in present]),
+              }}) + "::")
+
+              if survivors:
+                  print(f"re-verify failed: {len(survivors)} of {len(targets)} "
+                        f"pod(s) survived the patch: {', '.join(survivors)}",
+                        file=sys.stderr)
+                  sys.exit(1)
+
+          - id: log_remediated
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Cleared finalizers on {{ outputs.verify_gone.vars.freedCount }} pod(s)
+              and the re-read confirms every one is gone:
+              {{ outputs.verify_gone.vars.freed | join(' ') }}
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Approval declined or left unanswered, so nothing was patched.
+              {{ outputs.classify_stuck.vars.targetCount }} pod(s) are still
+              stuck on a finalizer.
+    else:
+      - id: log_report_only
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          Report only, nothing was written. stuck={{ outputs.classify_stuck.vars.stuckCount }}
+          reapable={{ outputs.classify_stuck.vars.targetCount }}
+          auto_remediate={{ inputs.auto_remediate }} dry_run={{ inputs.dry_run }}.
+          Set auto_remediate true with dry_run false to be offered the approval gate.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: >-
+      Fires on any failure, including a re-verify that found a pod still
+      present after the patch reported success.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "{{ inputs.slack_channel }}",
+        "text": ":rotating_light: k8s-stuck-terminating-pod-finalizer-reaper failed on `{{ inputs.scan_namespace == '' ? 'all namespaces' : inputs.scan_namespace }}`. Execution {{ execution.id }}. If the re-verify step failed, the finalizers were cleared but at least one pod is still in the API, so check it by hand before the next run."
+      }
+
+extend:
+  title: Reap Kubernetes pods stuck Terminating on a dead finalizer
+  shortDescription: Find pods stuck Terminating because a finalizer never cleared, name the blocking finalizer, strip it behind an approval gate then re-read the API.
+  metaTitle: Reap Kubernetes pods stuck Terminating on a dead finalizer with Kestra
+  metaDescription: Detect pods stuck Terminating on an uncleared finalizer, report which finalizer blocks each one, strip it behind an approval gate then re-verify.
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
+  description: |
+    ## Safety
+
+    Removing a finalizer tells Kubernetes that the cleanup the finalizer stands for is finished, when it may not be. A volume can still be attached, a cloud load balancer entry can be left orphaned, buffered data can go unflushed. That is why this flow is built to refuse by default and why every guard is load bearing:
+
+    - It reports which finalizer is blocking each pod, by name, before anything is written, so the operator can judge whether that cleanup matters.
+    - A grace window keeps it away from pods that are simply mid-termination.
+    - A write allowlist means a namespace you did not list cannot be touched even in live mode.
+    - A denylist refuses the storage and ordering finalizers outright rather than stripping them blindly.
+    - A per-run ceiling caps the damage if the detector is wrong.
+    - `auto_remediate` false plus `dry_run` true plus an explicit pause approval all have to be cleared before a single patch goes out.
+    - The patch returning 200 is not treated as success. The flow re-reads the API and fails the run if a pod is still there.
+
+    ## How it works
+
+    1. `list_pods` (`io.kestra.plugin.kubernetes.kubectl.Get`) reads pod metadata. `scan_namespace` empty reads every namespace, a name reads one.
+    2. `classify_stuck` (`io.kestra.plugin.scripts.python.Script`) keeps the pods that carry both a `metadata.deletionTimestamp` older than `grace_minutes` and a non-empty `metadata.finalizers`, then sorts each into `reapable`, `within_grace`, `namespace_not_allowed`, `protected_finalizer` or `over_ceiling`. A pod with no `deletionTimestamp` is running normally. A pod with a `deletionTimestamp` and no finalizer is already leaving. Neither is ever a candidate.
+    3. `log_findings` (`io.kestra.plugin.core.log.Log`) prints one line per stuck pod with its age, every finalizer on it plus the verdict.
+    4. `handle_findings` (`io.kestra.plugin.core.flow.If`) runs only when something is stuck. `notify_findings` posts the same table to Slack.
+    5. `route_remediation` (`io.kestra.plugin.core.flow.Switch`) on `auto_remediate` decides whether remediation is considered. `check_dry_run` then requires `dry_run` false and at least one reapable pod.
+    6. `approve_strip` (`io.kestra.plugin.core.flow.Pause`) waits for a human. The gate reads `onResume.approved ?? false`, so a pause resumed with no answer is a refusal.
+    7. `strip_remediation` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) patches one pod at a time. `clear_pod_finalizers` (`io.kestra.plugin.kubernetes.kubectl.Patch`) sends a JSON merge patch emptying `metadata.finalizers`.
+    8. `reread_pods` reads the API again and `verify_gone` exits non-zero if any target is still present, which fails the run and fires the Slack errors block.
+
+    The outputs worth reading afterwards: `{{ outputs.classify_stuck.vars.stuck }}` is the full table with a verdict per pod, `{{ outputs.classify_stuck.vars.targets }}` is just the pods the run is willing to patch, `{{ outputs.classify_stuck.vars.report }}` is the text block that goes to Slack and `{{ outputs.verify_gone.vars.survivors }}` lists any pod that was still in the API after the patch. `{{ outputs.list_pods.metadataItems }}` holds the raw `ObjectMeta` for every pod the scan read.
+
+    ## What you get
+
+    - Recovery from a pod that `kubectl delete` cannot remove, because the object is already marked for deletion and the delete is a no-op.
+    - The blocking finalizer named in the report, so the operator decides with the fact in front of them rather than guessing.
+    - A freed pod name, pod IP plus volume attachment, which is what a StatefulSet needs before it can recreate the replica.
+    - A run that fails loudly when the patch landed yet the pod is still in the API.
+
+    ## Who it's for
+
+    Platform and SRE teams running clusters where an operator or admission controller has been removed, crashed or lost its RBAC, leaving pods that nothing will ever finish deleting.
+
+    ## Why orchestrate this with Kestra
+
+    The manual fix is `kubectl patch pod x -p '{"metadata":{"finalizers":[]}}' --type=merge`, copied from a forum thread during an incident, with no record of which finalizer was dropped and no check that the pod actually went. As a flow it is auditable, it is gated, the credentials live in secrets, the approval is recorded against the execution plus the re-verify makes a silent no-op impossible. The Pause task is what makes a genuinely dangerous action safe to automate: the detection, the reporting plus the write are one audited unit, with a human in the middle of it.
+
+    ## Tested end to end
+
+    Run against k3s v1.31.5 with the Kubernetes plugin pointed at the real API server. Pods were stuck by adding a custom finalizer then deleting them, confirmed with `kubectl get pod -o jsonpath='{.metadata.deletionTimestamp} {.metadata.finalizers}'`.
+
+    - Clean cluster: 0 stuck, nothing reported.
+    - Three pods stuck on `example.com/block`: detected, each named with its finalizer.
+    - `dry_run: true`: the report named every pod plus every finalizer and the finalizers were still on the pods afterwards.
+    - Approved pause: finalizers cleared, the re-read confirmed the pods were gone from the API.
+    - Declined pause: the finalizers were still in place afterwards.
+    - A pod deleted three minutes earlier against a five minute window: held back as `within_grace`.
+    - A stuck pod in a namespace off the allowlist: reported, never patched.
+    - A pod carrying `kubernetes.io/pv-protection`: refused by the denylist.
+    - A third reapable pod with the ceiling at two: held back for the next run.
+    - A pod recreated under the same name between detection and patch: the patch succeeded, the re-verify found the name still present and failed the run.
+    - An unreachable API server: the run failed on the first read plus the Slack errors block fired.
+    - Two control pods that were never deleted were untouched in every run.
+
+    ## Prerequisites
+
+    - A Kubernetes cluster plus a ServiceAccount token that can list pods and patch pod metadata.
+    - Kestra 2.0 with the Kubernetes plugin plus the Docker task runner for the Python steps.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    | Secret | What it is |
+    | --- | --- |
+    | `K8S_MASTER_URL` | API server URL reachable from the Kestra worker |
+    | `K8S_OAUTH_TOKEN` | ServiceAccount bearer token with pod list plus pod patch rights |
+    | `K8S_CA_CERT_DATA` | base64 encoded PEM CA bundle for the API server |
+    | `SLACK_WEBHOOK_URL` | Slack incoming webhook for the findings plus the failure alert |
+
+    ### Inputs
+
+    | Input | Type | Default | What it does |
+    | --- | --- | --- | --- |
+    | `k8s_master_url` | STRING | `secret('K8S_MASTER_URL')` | API server URL |
+    | `k8s_oauth_token` | STRING | `secret('K8S_OAUTH_TOKEN')` | ServiceAccount bearer token |
+    | `k8s_ca_cert_data` | STRING | `secret('K8S_CA_CERT_DATA')` | base64 PEM CA bundle |
+    | `scan_namespace` | STRING | `""` | namespace to read, empty reads the whole cluster |
+    | `reapable_namespaces` | ARRAY | `["default"]` | write allowlist, anything else is report only |
+    | `grace_minutes` | INT | `15` | how long a deletionTimestamp must be old before the pod counts as stuck |
+    | `protected_finalizers` | ARRAY | pv-protection, pvc-protection, csi-driver, foregroundDeletion | finalizers that are refused rather than stripped |
+    | `max_pods_per_run` | INT | `3` | per-run ceiling, oldest first |
+    | `dry_run` | BOOL | `true` | report without writing |
+    | `auto_remediate` | BOOL | `false` | allow remediation to be considered |
+    | `slack_channel` | STRING | `#platform-alerts` | channel for the report plus the failure alert |
+
+    ## Quick start
+
+    1. Add the four secrets above to your Kestra instance.
+    2. Run it as it ships. `dry_run` true with `auto_remediate` false reports what is stuck plus which finalizer is holding each pod. Nothing is written.
+    3. Read the report. If a finalizer looks like something that still has work to do, fix the controller instead of stripping it.
+    4. Add the namespaces you are willing to write to in `reapable_namespaces`, then run with `dry_run: false` and `auto_remediate: true`. The execution pauses and waits for you.
+    5. Approve it. The flow clears the finalizers, re-reads the API and fails the run if any pod is still there.
+    6. Enable the schedule once you trust the report. It forces report-only mode.
+
+    ## How to extend
+
+    - Point `scan_namespace` at one namespace plus give each team its own schedule with its own allowlist.
+    - Raise `grace_minutes` on clusters where pods legitimately take a long time to drain.
+    - Add the finalizers your own operators register to `protected_finalizers`, so your cleanup is never short-circuited.
+    - Replace the Slack tasks with PagerDuty when a stuck pod blocks a StatefulSet replica in production.
+    - Record which finalizer shows up most often, which points at the operator that is actually broken.
+
+    ## Links
+
+    - [Kubernetes finalizers](https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/)
+    - [Pod termination lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
+    - [Kestra Kubernetes plugin](https://kestra.io/plugins/plugin-kubernetes)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).

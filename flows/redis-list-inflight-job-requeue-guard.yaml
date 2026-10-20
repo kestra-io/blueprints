@@ -1,0 +1,781 @@
+id: redis-list-inflight-job-requeue-guard
+namespace: company.team
+
+description: |
+  Find jobs stranded in a Redis list work queue because the worker that claimed them died before it
+  acknowledged them. In the reliable queue pattern a worker claims with
+  `LMOVE jobs:pending jobs:inflight:<worker> RIGHT LEFT` and acknowledges with `LREM`. A worker that
+  is killed between those two commands leaves the job sitting in its own in-flight list, where no
+  consumer will ever read it and no queue depth alert will ever see it, because `jobs:pending` looks
+  empty and healthy. This flow reads every in-flight list and the worker heartbeat hash with
+  `RedisCLI`, reports the entries whose owner stopped heartbeating and whose claim is older than the
+  visibility window, then on approval requeues each one with a single atomic `LMOVE` back onto the
+  pending list. It re-reads both lists afterwards and fails the run unless every approved job is in
+  exactly one list. A worker that is still heartbeating keeps its in-flight work, however old, since
+  that is a long running job and not a crash.
+
+inputs:
+  - id: pending_key
+    type: STRING
+    displayName: Pending list key
+    description: The list workers claim from. Producers push to the head, workers claim from the tail.
+    defaults: jobs:pending
+
+  - id: inflight_prefix
+    type: STRING
+    displayName: In-flight key prefix
+    description: >-
+      Private in-flight list per worker, one key per worker, scanned as `<prefix>*`. Keys outside
+      this prefix are never read or written.
+    defaults: "jobs:inflight:"
+
+  - id: heartbeat_key
+    type: STRING
+    displayName: Heartbeat hash key
+    description: Hash of worker name to last seen epoch milliseconds, written by the workers themselves.
+    defaults: jobs:heartbeat
+
+  - id: worker_timeout_ms
+    type: INT
+    displayName: Worker heartbeat timeout (ms)
+    description: >-
+      A worker counts as dead when its heartbeat is at least this old or missing from the hash. Set
+      it above your heartbeat interval times the number of beats you are willing to miss.
+    defaults: 60000
+
+  - id: visibility_timeout_ms
+    type: INT
+    displayName: Job visibility timeout (ms)
+    description: >-
+      Only entries claimed at least this long ago are requeued. Set it above the longest time a
+      healthy worker legitimately takes to finish one job, so work in progress is never taken twice.
+    defaults: 900000
+
+  - id: protected_workers
+    type: ARRAY
+    itemType: STRING
+    displayName: Protected workers
+    description: >-
+      Workers whose in-flight list is never written, even when every other condition is met. Use it
+      for a queue under manual investigation whose entries must stay where they are.
+    defaults: []
+
+  - id: max_requeue_per_worker
+    type: INT
+    displayName: Maximum requeues per worker
+    description: Ceiling on one pass, so a very long in-flight list cannot move in a single unbounded run.
+    defaults: 500
+
+  - id: max_workers
+    type: INT
+    displayName: Maximum in-flight keys scanned
+    defaults: 200
+
+  - id: max_list_scan
+    type: INT
+    displayName: Maximum entries read per list
+    description: How many entries are read from each list, oldest first, for the report and the balance check.
+    defaults: 200
+
+  - id: scan_count
+    type: INT
+    displayName: SCAN COUNT per step
+    defaults: 100
+
+  - id: host
+    type: STRING
+    displayName: Redis host
+    defaults: redis-jobs
+
+  - id: port
+    type: INT
+    displayName: Redis port
+    defaults: 6379
+
+  - id: database
+    type: INT
+    displayName: Database index
+    defaults: 0
+
+  - id: network
+    type: STRING
+    displayName: Docker network for redis-cli
+    description: Leave empty unless Redis is only reachable on a named Docker network.
+    defaults: ""
+
+  - id: approval_timeout
+    type: STRING
+    displayName: Approval timeout
+    description: ISO-8601 duration to wait for an answer before the pause expires and nothing changes.
+    defaults: "PT2H"
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow the requeue. Still needs dry_run false and an approval.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before a single entry is moved.
+    defaults: true
+
+variables:
+  detect_lua: |
+    local pending = KEYS[1]
+    local heartbeat = KEYS[2]
+    local prefix = ARGV[1]
+    local worker_timeout = tonumber(ARGV[2])
+    local visibility = tonumber(ARGV[3])
+    local scan_count = tonumber(ARGV[4])
+    local max_workers = tonumber(ARGV[5])
+    local max_list_scan = tonumber(ARGV[6])
+
+    local t = redis.call('TIME')
+    local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+
+    local function claim_of(raw)
+      if not raw then return nil end
+      local ok, obj = pcall(cjson.decode, raw)
+      if not ok or type(obj) ~= 'table' then return nil end
+      local c = tonumber(obj.claimed_at)
+      if not c then return nil end
+      return c, obj.id, tonumber(obj.attempts)
+    end
+
+    local hb = {}
+    local flat = redis.call('HGETALL', heartbeat)
+    for i = 1, #flat, 2 do hb[flat[i]] = tonumber(flat[i + 1]) end
+
+    local keys = {}
+    local cursor = '0'
+    local truncated = false
+    repeat
+      local res = redis.call('SCAN', cursor, 'MATCH', prefix .. '*', 'COUNT', scan_count)
+      cursor = res[1]
+      for _, k in ipairs(res[2]) do
+        if #keys >= max_workers then
+          truncated = true
+          break
+        end
+        keys[#keys + 1] = k
+      end
+    until cursor == '0' or truncated
+    table.sort(keys)
+
+    local workers = {}
+    local seen = {}
+    local total_stranded = 0
+    for _, k in ipairs(keys) do
+      local name = string.sub(k, #prefix + 1)
+      seen[name] = true
+      local ktype = redis.call('TYPE', k)['ok']
+      local row = {
+        key = k, worker = name, key_type = ktype, inflight = 0, entry_ids = {},
+        heartbeat_present = (hb[name] ~= nil), stranded = 0, stranded_ids = {}, dead = false
+      }
+      if hb[name] ~= nil then row.heartbeat_age_ms = now - hb[name] end
+      row.dead = (hb[name] == nil) or ((now - hb[name]) >= worker_timeout)
+
+      if ktype ~= 'list' then
+        row.reason = 'not_a_list'
+      else
+        row.inflight = redis.call('LLEN', k)
+        local raws = redis.call('LRANGE', k, -max_list_scan, -1)
+        local entries = {}
+        for i = #raws, 1, -1 do
+          local c, id = claim_of(raws[i])
+          entries[#entries + 1] = { id = id, parsed = (c ~= nil), age_ms = (c ~= nil) and (now - c) or nil }
+        end
+        row.scanned = #entries
+        row.list_truncated = (row.inflight > #entries)
+        for _, e in ipairs(entries) do
+          row.entry_ids[#row.entry_ids + 1] = e.id or '(unparsable)'
+        end
+        if #entries > 0 then
+          row.oldest_age_ms = entries[1].age_ms
+          row.oldest_job = entries[1].id
+          row.oldest_parsed = entries[1].parsed
+          row.newest_age_ms = entries[#entries].age_ms
+        end
+        if not row.dead then
+          row.reason = 'worker_alive'
+        elseif #entries == 0 then
+          row.reason = 'no_inflight'
+        elseif not entries[1].parsed then
+          row.reason = 'oldest_unparsable'
+        else
+          for _, e in ipairs(entries) do
+            if e.parsed and e.age_ms >= visibility then
+              row.stranded = row.stranded + 1
+              row.stranded_ids[#row.stranded_ids + 1] = e.id
+            else
+              break
+            end
+          end
+          if row.stranded == 0 then
+            row.reason = 'within_visibility'
+          else
+            row.reason = 'stranded'
+            total_stranded = total_stranded + row.stranded
+          end
+        end
+      end
+      workers[#workers + 1] = row
+    end
+
+    local roster_only = {}
+    for name, ts in pairs(hb) do
+      if not seen[name] then
+        roster_only[#roster_only + 1] = { worker = name, heartbeat_age_ms = now - ts, dead = ((now - ts) >= worker_timeout) }
+      end
+    end
+
+    local pend = {}
+    local praws = redis.call('LRANGE', pending, 0, max_list_scan - 1)
+    for i = 1, #praws do
+      local c, id = claim_of(praws[i])
+      pend[#pend + 1] = id or '(unparsable)'
+    end
+
+    return cjson.encode({
+      now_ms = now,
+      pending_key = pending,
+      pending_len = redis.call('LLEN', pending),
+      pending_ids = pend,
+      prefix = prefix,
+      worker_timeout_ms = worker_timeout,
+      visibility_timeout_ms = visibility,
+      scan_truncated = truncated,
+      total_stranded = total_stranded,
+      workers = workers,
+      roster_only = roster_only
+    })
+
+  requeue_lua: |
+    local src = KEYS[1]
+    local pending = KEYS[2]
+    local heartbeat = KEYS[3]
+    local worker = ARGV[1]
+    local worker_timeout = tonumber(ARGV[2])
+    local visibility = tonumber(ARGV[3])
+    local max_requeue = tonumber(ARGV[4])
+
+    local approved = {}
+    local approved_count = 0
+    do
+      local ok, plan = pcall(cjson.decode, ARGV[5])
+      if ok and type(plan) == 'table' and type(plan[worker]) == 'table' then
+        for _, id in ipairs(plan[worker]) do
+          approved[id] = true
+          approved_count = approved_count + 1
+        end
+      end
+    end
+
+    local t = redis.call('TIME')
+    local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+    local out = { worker = worker, now_ms = now, moved = 0, moved_ids = {}, remaining = 0, approved_count = approved_count }
+    local src_type = redis.call('TYPE', src)['ok']
+
+    local function finish(reason, refused)
+      out.stop_reason = reason
+      out.refused = refused
+      out.remaining = (src_type == 'list') and redis.call('LLEN', src) or 0
+      out.key_type = src_type
+      return cjson.encode(out)
+    end
+
+    if approved_count == 0 then
+      return finish('no_approved_entries', true)
+    end
+    if src_type ~= 'list' and src_type ~= 'none' then
+      return finish('not_a_list', true)
+    end
+
+    local hb = redis.call('HGET', heartbeat, worker)
+    if hb then
+      local age = now - tonumber(hb)
+      out.heartbeat_age_ms = age
+      if age < worker_timeout then
+        return finish('worker_alive_now', true)
+      end
+    end
+
+    for _ = 1, max_requeue do
+      local raw = redis.call('LINDEX', src, -1)
+      if not raw then return finish('drained', false) end
+
+      local ok, obj = pcall(cjson.decode, raw)
+      local claimed = (ok and type(obj) == 'table') and tonumber(obj.claimed_at) or nil
+      if not claimed then return finish('unparsable_entry', true) end
+      if (now - claimed) < visibility then return finish('reached_fresh_entry', false) end
+      if not approved[obj.id] then return finish('not_in_approved_plan', true) end
+      if redis.call('LPOS', pending, raw) ~= false then
+        out.duplicate_job = obj.id
+        return finish('duplicate_in_pending', true)
+      end
+
+      local movedRaw = redis.call('LMOVE', src, pending, 'RIGHT', 'LEFT')
+      if movedRaw ~= raw then
+        out.invariant_broken = true
+        return finish('tail_changed_under_script', true)
+      end
+      out.moved = out.moved + 1
+      out.moved_ids[#out.moved_ids + 1] = obj.id
+    end
+
+    return finish('max_requeue_reached', false)
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: >-
+      Read-only. One Lua script through `redis-cli --eval` that SCANs the in-flight key prefix, reads
+      each list oldest entry first with LRANGE, reads the heartbeat hash with HGETALL and returns per
+      worker liveness, claim ages and the stranded entry ids as JSON.
+    host: "{{ inputs.host }}"
+    port: "{{ inputs.port }}"
+    database: "{{ inputs.database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.network }}"
+    inputFiles:
+      detect.lua: "{{ vars.detect_lua }}"
+    commands:
+      - "--eval detect.lua {{ inputs.pending_key }} {{ inputs.heartbeat_key }} , '{{ inputs.inflight_prefix }}' {{ inputs.worker_timeout_ms }} {{ inputs.visibility_timeout_ms }} {{ inputs.scan_count }} {{ inputs.max_workers }} {{ inputs.max_list_scan }}"
+
+  - id: assess
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      Build the plan. A worker is in it only when its heartbeat is stale or missing, its key is a
+      list, its oldest entry carries a readable claim time past the visibility window and its name is
+      not protected. Everything else is recorded as spared with the reason it was spared.
+    values:
+      items: >-
+        {{ {'d': fromJson(outputs.detect.vars.command_1), 'prot': inputs.protected_workers, 'armed': (inputs.auto_remediate and not inputs.dry_run)} | jq('
+          .armed as $armed | .d as $d | (.prot // []) as $p
+          | [ $d.workers[] | . as $x | . + {sids: (if (.stranded_ids | type) == "array" then .stranded_ids else [] end),
+                                            eids: (if (.entry_ids | type) == "array" then .entry_ids else [] end),
+                                            protected: (($p | index($x.worker)) != null)} ] as $w
+          | [ $w[] | select(.reason == "stranded" and (.protected | not)) ] as $plan
+          | [ $w[] | select((.reason != "stranded") or .protected)
+                   | {worker, inflight, reason: (if .protected then "protected_worker" else .reason end),
+                      heartbeat_age_ms, oldest_age_ms, stranded: (.sids | length)} ] as $spared
+          | ($plan | map({(.worker): .sids}) | add // {}) as $approved
+          | ([ $plan[] | .sids | length ] | add // 0) as $planned_entries
+          | {pending_key: $d.pending_key, pending_len: $d.pending_len, prefix: $d.prefix,
+             now_ms: $d.now_ms, scan_truncated: $d.scan_truncated,
+             worker_timeout_ms: $d.worker_timeout_ms, visibility_timeout_ms: $d.visibility_timeout_ms,
+             workers_seen: ($w | length), findings: ($plan | length), planned_entries: $planned_entries,
+             plan_workers: [ $plan[] | .worker ], approved: $approved,
+             plan: [ $plan[] | {worker, inflight, stranded: (.sids | length), heartbeat_age_ms, oldest_age_ms, ids: .sids} ],
+             spared: $spared, armed: $armed,
+             slack: ("Redis queue " + $d.pending_key + ": "
+               + (if ($plan | length) == 0 then "no job is stranded in an in-flight list. "
+                  else (($planned_entries | tostring) + " job(s) stranded in " + (($plan | length) | tostring)
+                        + " in-flight list(s): "
+                        + ([ $plan[] | "\(.worker) holds \(.sids | length) of \(.inflight), oldest claimed \(.oldest_age_ms // 0)ms ago, heartbeat \(.heartbeat_age_ms // 0)ms old" ] | join("; "))
+                        + ". ") end)
+               + "Pending list holds " + ($d.pending_len | tostring) + " job(s). Spared: "
+               + (if ($spared | length) == 0 then "none" else ([ $spared[] | "\(.worker) (\(.reason))" ] | join(", ")) end) + "."),
+             action: (if $armed and ($plan | length) > 0 then
+                        "Asking for approval to requeue " + ($planned_entries | tostring) + " job(s) onto " + $d.pending_key + ": "
+                        + ([ $plan[] | .worker + " -> " + (.sids | join(", ")) ] | join("; ")) + "."
+                      elif $armed then "Remediation is armed, but nothing is stranded, so nothing will change."
+                      else "No change applied: this run is read-only." end)}
+          ') | first | toJson }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ fromJson(outputs.assess.values.items) | jq('"Scanned \(.workers_seen) in-flight list(s) under \(.prefix) with worker timeout \(.worker_timeout_ms)ms and visibility timeout \(.visibility_timeout_ms)ms. " + .slack + " " + .action') | first }}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: Alert when a job is stranded or when the SCAN hit its ceiling. A clean queue logs and stops.
+    condition: "{{ fromJson(outputs.assess.values.items) | jq('if (.findings > 0) or .scan_truncated then 1 else 0 end') | first > 0 }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': (fromJson(outputs.assess.values.items) | jq('.slack') | first) ~ ' ' ~ (fromJson(outputs.assess.values.items) | jq('.action') | first)} | toJson }}
+
+      - id: planned
+        type: io.kestra.plugin.core.log.Log
+        description: What a remediation run would do, printed on every run including a read-only one.
+        message: "{{ fromJson(outputs.assess.values.items) | jq('.action') | first }}"
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: The requeue runs only when auto_remediate is true, dry_run is false and at least one job is stranded.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run and (fromJson(outputs.assess.values.items) | jq('.findings') | first > 0) }}"
+        then:
+          - id: hold
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              A requeue makes a job run a second time, so a human answers first. Confirm the workers
+              in the plan are really gone. With no answer the pause expires and nothing changes.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Requeue the stranded jobs onto the pending list?
+                defaults: false
+              - id: note
+                type: STRING
+                displayName: Decision note
+                defaults: ""
+
+          - id: apply
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.hold.onResume.approved ?? false }}"
+            then:
+              - id: recheck
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: >-
+                  Read the queue again after the approval, so the write works from current state and
+                  not from the snapshot the approval was given on.
+                host: "{{ inputs.host }}"
+                port: "{{ inputs.port }}"
+                database: "{{ inputs.database }}"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.network }}"
+                inputFiles:
+                  detect.lua: "{{ vars.detect_lua }}"
+                commands:
+                  - "--eval detect.lua {{ inputs.pending_key }} {{ inputs.heartbeat_key }} , '{{ inputs.inflight_prefix }}' {{ inputs.worker_timeout_ms }} {{ inputs.visibility_timeout_ms }} {{ inputs.scan_count }} {{ inputs.max_workers }} {{ inputs.max_list_scan }}"
+
+              - id: plan_recheck
+                type: io.kestra.plugin.core.output.OutputValues
+                description: >-
+                  Compare the approved job ids with current state. A worker that started heartbeating
+                  again is dropped from the plan. An approved job that is in neither its in-flight
+                  list nor the pending list left the queue out of band and stops the run.
+                values:
+                  items: >-
+                    {{ {'a': fromJson(outputs.assess.values.items), 'r': fromJson(outputs.recheck.vars.command_1)} | jq('
+                      .a as $a | .r as $r
+                      | [ $r.workers[] | . + {eids: (if (.entry_ids | type) == "array" then .entry_ids else [] end)} ] as $w
+                      | ($w | map({(.worker): .}) | add // {}) as $now
+                      | (if ($r.pending_ids | type) == "array" then $r.pending_ids else [] end) as $pend
+                      | [ $a.plan[] | .worker as $name | .ids as $ids | ($now[$name] // null) as $cur
+                          | (if $cur == null then [] else $cur.eids end) as $eids
+                          | {worker: $name, approved: $ids,
+                             present: [ $ids[] | . as $id | select(($eids | index($id)) != null) ],
+                             in_pending: [ $ids[] | . as $id | select(($pend | index($id)) != null) ],
+                             missing: [ $ids[] | . as $id | select((($eids | index($id)) == null) and (($pend | index($id)) == null)) ],
+                             alive_now: (if $cur == null then false else ($cur.reason == "worker_alive") end),
+                             reason_now: (if $cur == null then "key_gone" else $cur.reason end)} ] as $rows
+                      | [ $rows[] | select((.alive_now | not) and ((.present | length) > 0)) ] as $eligible
+                      | [ $rows[] | select(.alive_now or ((.present | length) == 0)) ] as $skipped
+                      | ([ $rows[] | .missing | length ] | add // 0) as $missing_count
+                      | {eligible_workers: [ $eligible[] | .worker ], rows: $rows, skipped: $skipped,
+                         missing_count: $missing_count,
+                         missing: [ $rows[] | select((.missing | length) > 0) | {worker, missing} ],
+                         expected_moves: ([ $eligible[] | .present | length ] | add // 0),
+                         pending_len_before: $r.pending_len,
+                         note: ("Approved " + ($a.planned_entries | tostring) + " job(s) in " + (($a.plan | length) | tostring)
+                           + " list(s). Still eligible after the approval: "
+                           + (if ($eligible | length) == 0 then "none" else ([ $eligible[] | "\(.worker) (\(.present | length))" ] | join(", ")) end)
+                           + ". Dropped: " + (if ($skipped | length) == 0 then "none" else ([ $skipped[] | "\(.worker) (\(.reason_now))" ] | join(", ")) end)
+                           + ". Approved jobs no longer in either list: " + ($missing_count | tostring) + ".")}
+                      ') | first | toJson }}
+
+              - id: plan_recheck_log
+                type: io.kestra.plugin.core.log.Log
+                message: "{{ fromJson(outputs.plan_recheck.values.items) | jq('.note') | first }}"
+
+              - id: stale_plan_gate
+                type: io.kestra.plugin.core.flow.If
+                description: >-
+                  Stop before any write when an approved job has left both lists. Something else is
+                  moving this queue and the plan can no longer be trusted.
+                condition: "{{ fromJson(outputs.plan_recheck.values.items) | jq('.missing_count') | first > 0 }}"
+                then:
+                  - id: stale_plan_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      {{ fromJson(outputs.plan_recheck.values.items) | jq('"Refusing to write. " + (.missing_count | tostring) + " approved job(s) are in neither their in-flight list nor the pending list, so the queue changed under the approval: " + ([ .missing[] | "\(.worker) lost \(.missing | join(\", \"))" ] | join("; ")) + ". Nothing was moved. Re-run the flow to build a fresh plan."') | first }}
+
+              - id: requeue_gate
+                type: io.kestra.plugin.core.flow.If
+                description: >-
+                  Only run the write when at least one approved job is still eligible. When the
+                  recheck dropped every worker there is nothing left to do and nothing is written.
+                condition: "{{ fromJson(outputs.plan_recheck.values.items) | jq('.eligible_workers | length') | first > 0 }}"
+                then:
+                  - id: requeue
+                    type: io.kestra.plugin.core.flow.Loop
+                    description: >-
+                      One worker at a time. Each iteration runs a single Lua script that re-reads the
+                      heartbeat and the list tail, then moves each approved entry with one atomic
+                      LMOVE, so an entry is never in both lists and never in neither.
+                    concurrencyLimit: 1
+                    values: "{{ fromJson(outputs.plan_recheck.values.items) | jq('.eligible_workers') | first | toJson }}"
+                    tasks:
+                      - id: requeue_worker
+                        type: io.kestra.plugin.redis.cli.RedisCLI
+                        host: "{{ inputs.host }}"
+                        port: "{{ inputs.port }}"
+                        database: "{{ inputs.database }}"
+                        taskRunner:
+                          type: io.kestra.plugin.scripts.runner.docker.Docker
+                          networkMode: "{{ inputs.network }}"
+                        inputFiles:
+                          requeue.lua: "{{ vars.requeue_lua }}"
+                        commands:
+                          - "--eval requeue.lua '{{ inputs.inflight_prefix }}{{ item.value }}' {{ inputs.pending_key }} {{ inputs.heartbeat_key }} , {{ item.value }} {{ inputs.worker_timeout_ms }} {{ inputs.visibility_timeout_ms }} {{ inputs.max_requeue_per_worker }} '{{ fromJson(outputs.assess.values.items) | jq('.approved') | first | toJson }}'"
+
+                      - id: requeue_worker_log
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          {{ {'r': fromJson(outputs.requeue_worker.vars.command_1)} | jq('.r | "Worker \(.worker): moved \(.moved) job(s) \(if (.moved_ids | type) == "array" then (.moved_ids | join(", ")) else "none" end), \(.remaining) entry(ies) left in its in-flight list, stop reason \(.stop_reason), refused \(.refused)."') | first }}
+                else:
+                  - id: nothing_eligible
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Every approved worker was dropped by the recheck, so no entry was moved.
+                      {{ fromJson(outputs.plan_recheck.values.items) | jq('.note') | first }}
+
+              - id: reread
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: Final independent read of both lists and the heartbeat hash, used by the verify step.
+                host: "{{ inputs.host }}"
+                port: "{{ inputs.port }}"
+                database: "{{ inputs.database }}"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.network }}"
+                inputFiles:
+                  detect.lua: "{{ vars.detect_lua }}"
+                commands:
+                  - "--eval detect.lua {{ inputs.pending_key }} {{ inputs.heartbeat_key }} , '{{ inputs.inflight_prefix }}' {{ inputs.worker_timeout_ms }} {{ inputs.visibility_timeout_ms }} {{ inputs.scan_count }} {{ inputs.max_workers }} {{ inputs.max_list_scan }}"
+
+              - id: balance
+                type: io.kestra.plugin.core.output.OutputValues
+                description: >-
+                  Account for every approved job against the final read. Each one must now be in the
+                  pending list and out of its in-flight list. A job in both lists is a duplicate and a
+                  job in neither is lost. Either one fails the run.
+                values:
+                  items: >-
+                    {{ {'p': fromJson(outputs.plan_recheck.values.items), 'f': fromJson(outputs.reread.vars.command_1)} | jq('
+                      .p as $p | .f as $f
+                      | [ $f.workers[] | . + {eids: (if (.entry_ids | type) == "array" then .entry_ids else [] end)} ] as $w
+                      | ($w | map({(.worker): .}) | add // {}) as $after
+                      | (if ($f.pending_ids | type) == "array" then $f.pending_ids else [] end) as $pend
+                      | [ $p.rows[] | .worker as $name | .approved as $ids | ($after[$name] // null) as $cur
+                          | (if $cur == null then [] else $cur.eids end) as $still
+                          | {worker: $name, eligible: (($p.eligible_workers | index($name)) != null),
+                             requeued: [ $ids[] | . as $id | select(($pend | index($id)) != null) ],
+                             still_inflight: [ $ids[] | . as $id | select(($still | index($id)) != null) ],
+                             duplicated: [ $ids[] | . as $id | select((($pend | index($id)) != null) and (($still | index($id)) != null)) ],
+                             lost: [ $ids[] | . as $id | select((($pend | index($id)) == null) and (($still | index($id)) == null)) ]} ] as $rows
+                      | [ $rows[] | select(.eligible) ] as $elig
+                      | ([ $rows[] | .duplicated | length ] | add // 0) as $dup
+                      | ([ $rows[] | .lost | length ] | add // 0) as $lost
+                      | ([ $elig[] | .still_inflight | length ] | add // 0) as $not_requeued
+                      | ([ $elig[] | .requeued | length ] | add // 0) as $moved
+                      | ([ $rows[] | select(.eligible | not) | .requeued | length ] | add // 0) as $moved_skipped
+                      | {rows: $rows, moved: $moved, duplicated: $dup, lost: $lost, not_requeued: $not_requeued,
+                         moved_from_skipped: $moved_skipped, expected_moves: $p.expected_moves,
+                         pending_len_before: $p.pending_len_before, pending_len_after: $f.pending_len,
+                         total_stranded_after: $f.total_stranded,
+                         ok: (if ($dup == 0) and ($lost == 0) and ($not_requeued == 0) and ($moved_skipped == 0) and ($moved == $p.expected_moves) then true else false end),
+                         detail: ([ $rows[] | "\(.worker): requeued \(.requeued | length), still in-flight \(.still_inflight | length), duplicated \(.duplicated | length), lost \(.lost | length)" ] | join("; "))}
+                      ') | first | toJson }}
+
+              - id: verify_result
+                type: io.kestra.plugin.core.flow.If
+                description: >-
+                  Fail the run when an approved job was not requeued, ended up in both lists, ended up
+                  in neither or when a worker dropped from the plan was written anyway.
+                condition: "{{ fromJson(outputs.balance.values.items) | jq('if .ok then 0 else 1 end') | first > 0 }}"
+                then:
+                  - id: remediation_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      {{ fromJson(outputs.balance.values.items) | jq('"Requeue did not balance. Moved \(.moved) of \(.expected_moves) approved job(s), \(.not_requeued) still stranded in an in-flight list, \(.duplicated) in both lists, \(.lost) in neither, \(.moved_from_skipped) moved from a worker that was dropped from the plan. Per worker: " + .detail + ". Pending length \(.pending_len_before) before and \(.pending_len_after) after."') | first }}
+                else:
+                  - id: remediated
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      {{ fromJson(outputs.balance.values.items) | jq('"Requeued \(.moved) stranded job(s) onto the pending list, which went from \(.pending_len_before) to \(.pending_len_after) entries. No approved job is in both lists and none is missing. Stranded entries left in the whole queue: \(.total_stranded_after). Per worker: " + .detail + "."') | first }}
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Approval not granted{{ (outputs.hold.onResume.note ?? '') == '' ? '' : (', note: ' ~ outputs.hold.onResume.note) }}.
+                  Nothing was requeued and the stranded jobs stay in their in-flight lists. The findings stay open.
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          {{ fromJson(outputs.assess.values.items) | jq('"No stranded job. " + .slack') | first }}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Redis in-flight job requeue guard failed on ' ~ inputs.host ~ ' queue ' ~ inputs.pending_key ~ ' (execution ' ~ execution.id ~ '). Nothing is assumed to have been requeued. Check the logs.'} | toJson }}
+
+triggers:
+  - id: every_ten_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "*/10 * * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Requeue Redis list jobs stranded by a dead worker
+  shortDescription: Find jobs stuck in a dead worker's private in-flight list, requeue each one onto the pending list with a single atomic LMOVE behind a Pause, then re-read both lists and fail the run unless every job is in exactly one of them.
+  metaTitle: Requeue Redis list jobs stranded by a dead worker with Kestra
+  metaDescription: Find jobs stranded in a Redis in-flight list after a worker died, requeue them with an atomic LMOVE behind an approval, then verify both lists.
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Incident Response
+    - Approval Gates
+  ee: false
+  demo: false
+  description: |
+    ## Safety
+
+    Requeueing a job makes it run a second time. If the dead worker had already charged the card, sent the email or written the row, the replay does it again. The queue also cannot be fixed with two separate commands: an `LREM` followed by an `LPUSH` loses the job if the connection drops between them, while an `LPUSH` followed by an `LREM` runs it twice. So every write here is a single `LMOVE` inside one Lua script. The flow also refuses by default:
+
+    | Guard | What it stops |
+    | --- | --- |
+    | Two independent conditions, a stale heartbeat **and** a claim older than `visibility_timeout_ms` | A worker that is slow, paused or mid long running job keeps its work. One signal on its own is not enough to take a job away. |
+    | Oldest entry first, stop at the first fresh one | A worker that died holding both old and recent claims only gives up the claims that are genuinely abandoned. |
+    | `protected_workers` | A queue under manual investigation is reported but never written, even with remediation armed and approved. |
+    | `auto_remediate` false plus `dry_run` true plus a `Pause` approval | Three independent switches stand between a finding and a write. A pause that expires changes nothing. |
+    | Eligibility re-read after the approval | An approval is a snapshot. If the worker started heartbeating again while you were deciding, it is dropped from the plan. |
+    | Stale plan refusal | If an approved job has left both lists, something else is moving this queue. The run stops before any write rather than acting on a plan it can no longer trust. |
+    | One `LMOVE` per entry inside a Lua script | A job is never in both lists and never in neither, even if the worker, Kestra or the connection dies mid pass. |
+    | `LPOS` duplicate check before each move | An identical payload already waiting on the pending list is refused rather than queued twice. |
+    | `max_requeue_per_worker`, `max_workers`, `max_list_scan` | A detector mistake on a very long list cannot turn into an unbounded flood of replayed work. |
+    | Balance check on a final independent read | The write returning success is not treated as proof. The run fails if an approved job was not requeued, ended up in both lists, ended up in neither or if a worker dropped from the plan was written anyway. |
+
+    ## How it works
+
+    1. `detect` (`io.kestra.plugin.redis.cli.RedisCLI`) runs one read-only Lua script through `redis-cli --eval`. The script `SCAN`s for `<inflight_prefix>*`, checks each key's `TYPE`, reads it oldest entry first with `LRANGE`, reads the worker liveness hash with `HGETALL` plus the pending list, then returns one JSON row per worker with its heartbeat age, its claim ages, its stranded entry ids and the reason it is or is not a candidate. Running it as a script means the whole queue is read in one atomic server side pass, so the report cannot mix two different moments.
+    2. `assess` (`io.kestra.plugin.core.output.OutputValues`) turns that into a plan. A worker joins it only when its heartbeat is stale or missing, its key really is a list, its oldest entry carries a readable `claimed_at` past `visibility_timeout_ms` and its name is not in `protected_workers`. Everything else lands in `spared` with the reason: `worker_alive`, `within_visibility`, `oldest_unparsable`, `not_a_list`, `no_inflight` or `protected_worker`.
+    3. `summary` (`io.kestra.plugin.core.log.Log`) prints the thresholds used, the per worker findings plus the spared list, so a read-only run is already a useful report.
+    4. `route` (`io.kestra.plugin.core.flow.If`) fires only when something is stranded or when the `SCAN` hit `max_workers`. `alert` posts the same text to Slack, `planned` logs exactly what a remediation run would do.
+    5. `remediate_gate` requires `auto_remediate` true, `dry_run` false plus at least one finding. `hold` (`io.kestra.plugin.core.flow.Pause`) then waits for a human, read as `onResume.approved ?? false`, so a pause resumed with no answer is a refusal.
+    6. `recheck` runs the same detect script again after the approval. `plan_recheck` compares the approved job ids against that fresh read: a worker that is heartbeating again is dropped. An approved job that is now in neither list sends `stale_plan_gate` into `stale_plan_failed` (`io.kestra.plugin.core.execution.Fail`) before anything is written.
+    7. `requeue` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) handles one worker at a time. `requeue_worker` runs a second Lua script that re-reads the heartbeat with `HGET`, walks the list tail with `LINDEX`, checks the entry is in the approved plan, checks `LPOS` does not already find that payload on the pending list, then moves it with one `LMOVE <inflight> <pending> RIGHT LEFT` and verifies the moved value is the one it inspected.
+    8. `reread` reads the queue a third time. `balance` accounts for every approved job against that read, then `verify_result` sends the run into `remediation_failed` unless each one is now on the pending list, out of its in-flight list, present exactly once, with no write against a worker the recheck had dropped.
+
+    The outputs worth reading afterwards: `{{ outputs.detect.vars.command_1 }}` is the raw per worker read, `{{ outputs.assess.values.items }}` holds the plan plus the `spared` table with a reason per worker, `{{ outputs.plan_recheck.values.items }}` shows what the post-approval read changed, then `{{ outputs.balance.values.items }}` is the per job accounting the verification is based on.
+
+    ## What you get
+
+    - Recovery of work that no queue depth alert can see. `jobs:pending` reads zero and looks healthy while the jobs sit in a private in-flight list no consumer ever reads.
+    - A named report before anything moves: which worker, how many entries, how old its oldest claim is, how stale its heartbeat is.
+    - A requeue that cannot duplicate or lose a job, because each entry moves with one atomic `LMOVE` rather than a delete plus a push.
+    - A long running job left alone. A worker that is still heartbeating keeps its claims however old they are.
+    - A run that fails loudly when the move did not land, instead of reporting success on an empty write.
+
+    ## Who it's for
+
+    Teams running the Redis reliable queue pattern (`LMOVE` or the older `RPOPLPUSH`) for background jobs, where a worker crash, an OOM kill or a rolling deploy leaves claimed work in a per worker in-flight list that nothing will ever drain.
+
+    ## Why orchestrate this with Kestra
+
+    The manual fix is a developer reading in-flight lists by hand during an incident, deciding from memory which workers are dead, then pasting `LMOVE` commands into `redis-cli` with no record of what moved. Every risky part of that is exactly what a flow is good at: the detection rule is written down instead of recalled, the approval is recorded against the execution, the credentials stay in secrets, the write is bounded plus serialised, then the verification is a separate read that can fail the run. The `Pause` task is what makes replaying customer facing work safe to automate, because the plan is built, shown, re-checked against live state then applied as one audited unit with a human in the middle.
+
+    ## Tested end to end
+
+    Run against Redis 7.4.11 (`redis:7-alpine`) on Kestra 2.0.5 with `plugin-redis` 1.7.0, every case on flow revision 5. The fixture builds a list queue with `jobs:pending`, six `jobs:inflight:<worker>` lists, a `jobs:heartbeat` hash plus an out of prefix `other:inflight:worker-x` queue. Every assertion is read back with `redis-cli` inside the Redis container, never through Kestra. A second container runs a real consumer of the same queue as an independent probe.
+
+    Fixture roster: `worker-dead-1` (dead, three claims 28 to 30 minutes old), `worker-dead-5` (dead, one 30 minute claim behind one 10 second claim), `worker-live-1` (heartbeating every two seconds, claims 34 minutes old), `worker-dead-3` (dead, claims 15 to 20 seconds old), `worker-protected-1` (dead, 31 minute claims, named in `protected_workers`), `worker-badjson` (dead, oldest entry is not JSON), `worker-hash` (a hash, not a list).
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy: every worker heartbeating, old in-flight work | `KQKd43Y8R7V3tvKLkvoeI` | 0 findings, queue bytes identical before and after |
+    | Degraded, `dry_run: true` | `2JtAjAF4oGmM32ReRslWfF` | plan matched the independent computation exactly, `worker-dead-1` 3 jobs plus `worker-dead-5` 1 job; 5 lookalikes spared with a reason each; queue bytes unchanged |
+    | Approval declined | `2MNodpFfRqbkaLP7x2ek8b` | no requeue task ran, queue bytes unchanged, findings still open |
+    | Approved remediation | `3gKEmhWK6SYWRR64r3MDFb` | 4 jobs moved, `jobs:pending` 2 to 6, `jobs:inflight:worker-dead-1` drained to 0, `worker-dead-5` kept `job-0052`, 15 entry ids before and 15 after with no duplicate |
+    | Second run straight after | `5OvHXTysZdqglkRhRQTgIK` | 0 findings, no approval requested, no write, no duplicate created |
+    | Every stranded worker protected, armed plus approved | `1qjUCyp2SvM6kB39YRtxno` | 0 findings, no pause, queue bytes unchanged while the stranded work stayed in place |
+    | Refused write: an identical payload already on the pending list | `7Qip7kHkzcF8es9nBfTURY` | `LPOS` refused the move, `jobs:pending` 3 before and 3 after, in-flight list untouched, run FAILED |
+    | Worker revived during the pause | `3O8JZpPmtjIUV7xFzpTodn` | recheck dropped it as `worker_alive`, no requeue task ran, all 3 entries stayed with the worker |
+    | Approved job vanished from both lists during the pause | `QJ8pS5LdQvBC6fVYBfWPo` | stopped at `stale_plan_gate` before any write, surviving entries untouched, run FAILED |
+
+    Operational payoff, measured with a real consumer of the same queue rather than with flow output. Before the requeue, the consumer claimed `job-9001` plus `job-9002` then reported `queue empty after 2 claims` while six jobs sat in in-flight lists: `jobs:done` held 2. After the approved remediation the same consumer completed 6 jobs, `job-0001`, `job-0002`, `job-0003` plus `job-0051` among them, while `jobs:pending` returned to 0. The whole queue held 15 entry ids before the requeue and the same 15 afterwards.
+
+    ## Prerequisites
+
+    - Redis 6.2 or later, because `LMOVE` plus `LPOS` are 6.2 commands.
+    - Workers that claim with `LMOVE <pending> <inflight> RIGHT LEFT`, acknowledge with `LREM`, write their liveness into a hash plus store each job as a JSON object carrying `id` and `claimed_at` in epoch milliseconds.
+    - Kestra 2.0 with the Redis plugin plus the Docker task runner, which `RedisCLI` uses to run `redis-cli`.
+    - Minimum permissions. Detection needs `EVAL`, `SCAN`, `TYPE`, `LLEN`, `LRANGE` plus `HGETALL`; remediation adds `HGET`, `LINDEX`, `LPOS` plus `LMOVE`. Restrict it to the queue keys, for example `ACL SETUSER queueguard on >secret ~jobs:* +eval +scan +type +llen +lrange +hgetall +hget +lindex +lpos +lmove`. Leave `+lmove` off for a report only user.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    | Secret | What it is |
+    | --- | --- |
+    | `SLACK_WEBHOOK_URL` | Slack incoming webhook for the findings plus the failure alert |
+
+    ### Inputs
+
+    | Input | Type | Default | What it does |
+    | --- | --- | --- | --- |
+    | `pending_key` | STRING | `jobs:pending` | the list workers claim from |
+    | `inflight_prefix` | STRING | `jobs:inflight:` | per worker in-flight keys, scanned as `<prefix>*`; keys outside it are never read or written |
+    | `heartbeat_key` | STRING | `jobs:heartbeat` | hash of worker name to last seen epoch milliseconds |
+    | `worker_timeout_ms` | INT | `60000` | heartbeat age that makes a worker dead; a worker missing from the hash counts as dead too |
+    | `visibility_timeout_ms` | INT | `900000` | how old a claim must be before it can be requeued |
+    | `protected_workers` | ARRAY | `[]` | workers reported but never written |
+    | `max_requeue_per_worker` | INT | `500` | ceiling on one pass per worker |
+    | `max_workers` | INT | `200` | ceiling on in-flight keys scanned; hitting it raises the alert |
+    | `max_list_scan` | INT | `200` | how deep each list is read, oldest first |
+    | `scan_count` | INT | `100` | `SCAN COUNT` per step |
+    | `host` | STRING | `redis-jobs` | Redis host |
+    | `port` | INT | `6379` | Redis port |
+    | `database` | INT | `0` | database index |
+    | `network` | STRING | `""` | Docker network for `redis-cli`, only needed when Redis is on a named network |
+    | `approval_timeout` | STRING | `PT2H` | how long the pause waits before expiring with nothing changed |
+    | `auto_remediate` | BOOL | `false` | allow a requeue to be considered |
+    | `dry_run` | BOOL | `true` | report without writing |
+
+    ## Quick start
+
+    1. Add `SLACK_WEBHOOK_URL` to your Kestra instance.
+    2. Set `pending_key`, `inflight_prefix` plus `heartbeat_key` to your own key names, then run it as it ships. `dry_run` true with `auto_remediate` false reports which workers hold stranded work plus which ones were spared and why. Nothing is written.
+    3. Read the spared list first. If a worker you expected to be dead shows up as `worker_alive`, your heartbeat is still being written by something and the job is not actually abandoned.
+    4. Set `visibility_timeout_ms` above the longest time a healthy worker legitimately takes to finish one job, then set `worker_timeout_ms` above your heartbeat interval times the number of beats you are willing to miss.
+    5. Confirm the jobs in the report are safe to run again. Add any queue you are still investigating to `protected_workers`.
+    6. Run with `auto_remediate: true` plus `dry_run: false`. The execution pauses. Approve it: the flow re-checks eligibility, moves each entry with one `LMOVE`, then fails the run if the accounting does not balance.
+    7. Enable the schedule once you trust the report. It ships disabled plus forces report only mode.
+
+    ## How to extend
+
+    - Give each queue its own schedule with its own `pending_key`, `inflight_prefix` plus timeouts, since a video encoding queue and a webhook queue need very different visibility windows.
+    - Add a dead letter path: instead of requeueing an entry whose `attempts` field is already high, move it to a `jobs:failed` list and alert, so a job that keeps killing its worker stops taking out the next one.
+    - Swap Slack for PagerDuty when the stranded count crosses a number that means a worker fleet is cycling rather than a single pod having crashed.
+    - Feed `{{ outputs.assess.values.items }}` into a table to track which worker strands jobs most often, which usually points at one deploy target or one job type rather than at Redis.
+    - Pair it with a flow that scales the consumer deployment, so the requeued work is actually picked up rather than queued behind the same shortage.
+
+    Limits: an entry must be a JSON object carrying `id` and `claimed_at`. An entry whose claim time cannot be parsed stops the scan of that list, which is reported as `oldest_unparsable` and never written. Liveness is whatever the workers write into the heartbeat hash, so a fleet that does not heartbeat looks entirely dead, which is why the visibility timeout is a second required condition rather than a refinement. The requeue restores a job to the pending list; it cannot undo the part the dead worker already performed, so job bodies must be idempotent, which is already required of any at-least-once queue. Lists longer than `max_list_scan` are read only that deep and reported as truncated. The flow serialises its own iterations with `concurrencyLimit: 1` but takes no Redis lock, so two overlapping executions are not serialised against each other; the post-approval recheck plus the `LPOS` duplicate check are what stop a second pass from queueing the same payload twice. The duplicate check is `LPOS` on the exact payload, so if a producer re-created the same job `id` with a different payload while the guard was mid run, the requeue would add a second entry for that id; `plan_recheck` reports such an id under `in_pending` but does not refuse on it. Verification proves the entry moved and is present exactly once by payload; it does not prove a consumer later succeeded at the job.
+
+    ## Links
+
+    - [Redis LMOVE](https://redis.io/docs/latest/commands/lmove/)
+    - [Redis reliable queue pattern](https://redis.io/docs/latest/commands/rpoplpush/)
+    - [Kestra Redis plugin](https://kestra.io/plugins/plugin-redis)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
