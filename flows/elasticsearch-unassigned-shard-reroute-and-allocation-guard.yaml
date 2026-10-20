@@ -1,0 +1,488 @@
+id: elasticsearch-unassigned-shard-reroute-and-allocation-guard
+namespace: company.search
+
+description: |
+  Audit Elasticsearch cluster health and unassigned shards, distinguish stuck allocation
+  failures from transient node restarts using historical KV state, pause for human approval,
+  trigger POST /_cluster/reroute?retry_failed=true to retry stalled allocations, and verify
+  recovery on the live cluster.
+
+inputs:
+  - id: elasticsearch_url
+    type: STRING
+    defaults: "http://localhost:9200"
+    description: Base HTTP or HTTPS URL of the Elasticsearch cluster endpoint.
+
+  - id: elasticsearch_username
+    type: STRING
+    defaults: "{{ secret('ELASTICSEARCH_USERNAME') }}"
+    description: Username for Elasticsearch HTTP basic authentication.
+
+  - id: elasticsearch_password
+    type: STRING
+    defaults: "{{ secret('ELASTICSEARCH_PASSWORD') }}"
+    description: Password for Elasticsearch HTTP basic authentication.
+
+  - id: cluster_id
+    type: STRING
+    defaults: "primary"
+    description: Unique identifier for this Elasticsearch cluster, used for scoping Kestra KV state tracking keys.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, audits cluster state and simulates remediation without triggering live reroute mutations.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true and dry_run is false, pauses for human approval before issuing POST _cluster/reroute?retry_failed=true.
+
+  - id: max_tolerated_unassigned_shards
+    type: INT
+    defaults: 0
+    description: Threshold of unassigned shards above which shard allocation triage and alert routines are activated.
+
+  - id: settle_duration
+    type: STRING
+    defaults: "PT15S"
+    description: ISO-8601 duration to pause after executing cluster reroute, allowing shards to transition into initializing state before reverification.
+
+triggers:
+  - id: periodic_shard_allocation_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/30 * * * *"
+    disabled: true
+    description: Periodic shard allocation audit executed every 30 minutes. Shipped disabled by default.
+
+tasks:
+  - id: fetch_cluster_health
+    type: io.kestra.plugin.elasticsearch.Request
+    description: Query Elasticsearch /_cluster/health API to inspect cluster status, active nodes, and unassigned shard counts.
+    connection:
+      hosts:
+        - "{{ inputs.elasticsearch_url }}"
+      basicAuth:
+        username: "{{ inputs.elasticsearch_username }}"
+        password: "{{ inputs.elasticsearch_password }}"
+    method: GET
+    endpoint: "_cluster/health"
+
+  - id: fetch_cat_shards
+    type: io.kestra.plugin.core.http.Request
+    description: >-
+      Query Elasticsearch /_cat/shards API with JSON formatting to catalog unassigned shard states and allocation
+      failure reasons. Uses the generic HTTP task rather than io.kestra.plugin.elasticsearch.Request because _cat
+      endpoints always return a top-level JSON array, and the Elasticsearch plugin's Request task unconditionally
+      parses any JSON response body as a Map, which throws on array-shaped responses.
+    uri: "{{ inputs.elasticsearch_url }}/_cat/shards?format=json&h=index,shard,prirep,state,unassigned.reason,unassigned.details"
+    method: GET
+    headers:
+      Accept: application/json
+    options:
+      auth:
+        type: BASIC
+        username: "{{ inputs.elasticsearch_username }}"
+        password: "{{ inputs.elasticsearch_password }}"
+
+  - id: triage_unassigned_shards
+    type: io.kestra.plugin.scripts.python.Script
+    description: Analyze cluster health and shard catalogs, compare against prior KV run state, and isolate stuck shards needing reroute.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    inputFiles:
+      cluster_health.json: "{{ outputs.fetch_cluster_health.response is defined ? (outputs.fetch_cluster_health.response | toJson) : '{}' }}"
+      cat_shards.json: "{{ outputs.fetch_cat_shards.body is defined ? outputs.fetch_cat_shards.body : '[]' }}"
+      prior_state.json: "{{ kv('elasticsearch_unassigned_tracker_' ~ inputs.cluster_id, errorOnMissing=false) is defined and kv('elasticsearch_unassigned_tracker_' ~ inputs.cluster_id, errorOnMissing=false) != null ? kv('elasticsearch_unassigned_tracker_' ~ inputs.cluster_id, errorOnMissing=false) : '{}' }}"
+    env:
+      MAX_TOLERATED: "{{ inputs.max_tolerated_unassigned_shards }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      max_tolerated = int(os.environ.get("MAX_TOLERATED", "0"))
+
+      try:
+          with open("cluster_health.json", "r", encoding="utf-8") as f:
+              health_data = json.load(f)
+      except Exception:
+          health_data = {}
+
+      try:
+          with open("cat_shards.json", "r", encoding="utf-8") as f:
+              shards_data = json.load(f)
+      except Exception:
+          shards_data = []
+
+      try:
+          with open("prior_state.json", "r", encoding="utf-8") as f:
+              raw_prior = f.read().strip()
+              prior_data = json.loads(raw_prior) if raw_prior else {}
+      except Exception:
+          prior_data = {}
+
+      cluster_status = health_data.get("status", "unknown")
+      unassigned_shards_metric = int(health_data.get("unassigned_shards", 0))
+
+      if isinstance(shards_data, dict):
+          shards_list = [shards_data]
+      elif isinstance(shards_data, list):
+          shards_list = shards_data
+      else:
+          shards_list = []
+
+      unassigned_catalog = []
+      affected_indices = set()
+      allocation_failed_shards = []
+      reasons_tally = {}
+
+      for item in shards_list:
+          if not isinstance(item, dict):
+              continue
+          state = str(item.get("state", "")).upper()
+          if state == "UNASSIGNED":
+              idx = str(item.get("index", ""))
+              shard_num = str(item.get("shard", ""))
+              prirep = "primary" if str(item.get("prirep", "")).lower() == "p" else "replica"
+              reason = str(item.get("unassigned.reason", "UNKNOWN"))
+              details = str(item.get("unassigned.details", ""))
+
+              shard_key = f"{idx}/{shard_num}/{prirep}"
+              affected_indices.add(idx)
+              reasons_tally[reason] = reasons_tally.get(reason, 0) + 1
+
+              entry = {
+                  "key": shard_key,
+                  "index": idx,
+                  "shard": shard_num,
+                  "prirep": prirep,
+                  "reason": reason,
+                  "details": details
+              }
+              unassigned_catalog.append(entry)
+
+              if reason == "ALLOCATION_FAILED" or "max retries" in details.lower():
+                  allocation_failed_shards.append(entry)
+
+      prior_unassigned_keys = set(prior_data.get("unassigned_keys", []))
+      current_unassigned_keys = set(x["key"] for x in unassigned_catalog)
+
+      stuck_shards = [x for x in unassigned_catalog if x["key"] in prior_unassigned_keys]
+      stuck_keys = [x["key"] for x in stuck_shards]
+
+      effective_unassigned = len(unassigned_catalog) if unassigned_catalog else unassigned_shards_metric
+      consecutive_stuck_runs = int(prior_data.get("consecutive_stuck_runs", 0))
+
+      if len(stuck_shards) > 0 or len(allocation_failed_shards) > 0:
+          consecutive_stuck_runs += 1
+          remediation_needed = True
+      elif effective_unassigned > max_tolerated:
+          consecutive_stuck_runs += 1
+          remediation_needed = (consecutive_stuck_runs >= 2)
+      else:
+          consecutive_stuck_runs = 0
+          remediation_needed = False
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      new_snapshot = {
+          "timestamp": now_iso,
+          "cluster_status": cluster_status,
+          "unassigned_count": effective_unassigned,
+          "unassigned_keys": sorted(list(current_unassigned_keys)),
+          "stuck_keys": sorted(stuck_keys),
+          "consecutive_stuck_runs": consecutive_stuck_runs,
+          "affected_indices": sorted(list(affected_indices))
+      }
+
+      triage_summary = (
+          f"Elasticsearch cluster status '{cluster_status}' with {effective_unassigned} unassigned shard(s). "
+          f"Found {len(allocation_failed_shards)} shard(s) with ALLOCATION_FAILED (max retries reached), "
+          f"{len(stuck_shards)} shard(s) stuck across consecutive runs. "
+          f"Remediation recommended: {remediation_needed}."
+      )
+
+      outputs = {
+          "unassigned_count": effective_unassigned,
+          "stuck_count": len(stuck_shards),
+          "allocation_failed_count": len(allocation_failed_shards),
+          "affected_indices": sorted(list(affected_indices)),
+          "remediation_needed": remediation_needed,
+          "cluster_status": cluster_status,
+          "triage_summary": triage_summary,
+          "snapshot_json": json.dumps(new_snapshot),
+          "unassigned_catalog_json": json.dumps(unassigned_catalog[:25])
+      }
+
+      if Kestra:
+          for k, v in outputs.items():
+              Kestra.outputs({k: v})
+      else:
+          print(f'::{{\"outputs\": {json.dumps(outputs)}}}::')
+
+  - id: persist_kv_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Record current unassigned shard telemetry in Kestra KV store to enable trend detection in subsequent runs.
+    key: "elasticsearch_unassigned_tracker_{{ inputs.cluster_id }}"
+    value: "{{ outputs.triage_unassigned_shards.vars.snapshot_json }}"
+
+  - id: gate_unassigned_shards
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate whether unassigned shard count exceeds tolerance threshold or requires remediation.
+    condition: "{{ outputs.triage_unassigned_shards.vars.unassigned_count > inputs.max_tolerated_unassigned_shards }}"
+    then:
+      - id: dispatch_slack_triage
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches context-rich operational triage notification to Slack detailing unassigned shards and root causes.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.triage_unassigned_shards.vars.cluster_status == 'red' ? '#E01E5A' : '#ECB22E' }}",
+                "title": ":warning: Elasticsearch Unassigned Shards Detected",
+                "fields": [
+                  {
+                    "title": "Cluster Status",
+                    "value": "`{{ outputs.triage_unassigned_shards.vars.cluster_status | upper }}`",
+                    "short": true
+                  },
+                  {
+                    "title": "Unassigned Shards",
+                    "value": "{{ outputs.triage_unassigned_shards.vars.unassigned_count }} (Stuck: {{ outputs.triage_unassigned_shards.vars.stuck_count }})",
+                    "short": true
+                  },
+                  {
+                    "title": "Allocation Failed (Max Retries)",
+                    "value": "{{ outputs.triage_unassigned_shards.vars.allocation_failed_count }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Remediation Needed",
+                    "value": "`{{ outputs.triage_unassigned_shards.vars.remediation_needed }}` (dry_run: {{ inputs.dry_run }})",
+                    "short": true
+                  },
+                  {
+                    "title": "Affected Indices",
+                    "value": "{{ outputs.triage_unassigned_shards.vars.affected_indices | join(', ') }}",
+                    "short": false
+                  },
+                  {
+                    "title": "Triage Diagnostics",
+                    "value": "{{ outputs.triage_unassigned_shards.vars.triage_summary }}",
+                    "short": false
+                  }
+                ],
+                "footer": "Kestra Elasticsearch Shard Reroute Guard | Execution {{ execution.id }}"
+              }
+            ]
+          }
+
+      - id: check_remediation_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Check whether automated remediation is enabled and safe dry-run mode is disabled.
+        condition: "{{ inputs.auto_remediate == true and inputs.dry_run == false and outputs.triage_unassigned_shards.vars.remediation_needed == true }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause execution and require human operator sign-off before executing cluster reroute mutation.
+            onResume:
+              - id: approved
+                type: BOOL
+                description: Set to true to authorize POST /_cluster/reroute?retry_failed=true on the Elasticsearch cluster.
+
+          - id: verify_approval
+            type: io.kestra.plugin.core.flow.If
+            description: Verify that the operator approved the cluster reroute execution.
+            condition: "{{ outputs.approval_gate.onResume.approved == true }}"
+            then:
+              - id: execute_cluster_reroute
+                type: io.kestra.plugin.elasticsearch.Request
+                description: Issue POST /_cluster/reroute?retry_failed=true to clear failed allocation attempts and retry unassigned shards.
+                connection:
+                  hosts:
+                    - "{{ inputs.elasticsearch_url }}"
+                  basicAuth:
+                    username: "{{ inputs.elasticsearch_username }}"
+                    password: "{{ inputs.elasticsearch_password }}"
+                method: POST
+                endpoint: "_cluster/reroute"
+                parameters:
+                  retry_failed: "true"
+
+              - id: wait_for_allocation_settle
+                type: io.kestra.plugin.core.flow.Sleep
+                description: Allow cluster allocation coordinator time to assign shards and transition replicas to initializing/started states.
+                duration: "{{ inputs.settle_duration }}"
+
+              - id: reverify_cluster_health
+                type: io.kestra.plugin.elasticsearch.Request
+                description: Re-query /_cluster/health post-reroute to verify that unassigned shard count decreased and cluster health recovered.
+                connection:
+                  hosts:
+                    - "{{ inputs.elasticsearch_url }}"
+                  basicAuth:
+                    username: "{{ inputs.elasticsearch_username }}"
+                    password: "{{ inputs.elasticsearch_password }}"
+                method: GET
+                endpoint: "_cluster/health"
+
+              - id: assert_remediation_success
+                type: io.kestra.plugin.core.flow.If
+                description: Assert that post-reroute unassigned shards are zero or strictly lower than initial triage count.
+                condition: "{{ outputs.reverify_cluster_health.response.unassigned_shards > 0 and outputs.reverify_cluster_health.response.unassigned_shards >= outputs.triage_unassigned_shards.vars.unassigned_count }}"
+                then:
+                  - id: fail_remediation
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort execution with failure when reroute failed to resolve stuck unassigned shards.
+                    errorMessage: "Elasticsearch shard reroute completed but unassigned shards persist (Initial: {{ outputs.triage_unassigned_shards.vars.unassigned_count }}, Remaining: {{ outputs.reverify_cluster_health.response.unassigned_shards }}). Shards may require manual allocation explain inspection or disk watermark intervention."
+
+              - id: notify_remediation_success
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Post confirmation to Slack that cluster reroute successfully cleared unassigned shards.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "attachments": [
+                      {
+                        "color": "#2EB67D",
+                        "title": ":white_check_mark: Elasticsearch Shard Allocation Reroute Successful",
+                        "fields": [
+                          {
+                            "title": "Cluster Status",
+                            "value": "`{{ outputs.reverify_cluster_health.response.status | upper }}`",
+                            "short": true
+                          },
+                          {
+                            "title": "Unassigned Shards",
+                            "value": "{{ outputs.reverify_cluster_health.response.unassigned_shards }} (was {{ outputs.triage_unassigned_shards.vars.unassigned_count }})",
+                            "short": true
+                          },
+                          {
+                            "title": "Active Shards Percent",
+                            "value": "{{ outputs.reverify_cluster_health.response.active_shards_percent_as_number }}%",
+                            "short": true
+                          },
+                          {
+                            "title": "Remediation Outcome",
+                            "value": "POST /_cluster/reroute?retry_failed=true executed and verified.",
+                            "short": false
+                          }
+                        ],
+                        "footer": "Kestra Elasticsearch Shard Reroute Guard | Execution {{ execution.id }}"
+                      }
+                    ]
+                  }
+
+            else:
+              - id: log_approval_rejected
+                type: io.kestra.plugin.core.log.Log
+                message: "Elasticsearch cluster reroute was rejected by human operator during approval pause. No mutations executed."
+
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            message: "Operating in safe dry-run or report-only mode (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}). Detected {{ outputs.triage_unassigned_shards.vars.unassigned_count }} unassigned shard(s). Would request operator approval to trigger POST /_cluster/reroute?retry_failed=true."
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if an unexpected execution error occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":rotating_light: *Flow Execution Failed*: `elasticsearch-unassigned-shard-reroute-and-allocation-guard` (Execution: `{{ execution.id }}`). Check Elasticsearch connectivity and credentials."
+      }
+
+extend:
+  title: Elasticsearch Unassigned Shard Reroute and Stalled Allocation Guard
+  metaTitle: Elasticsearch Unassigned Shard Reroute & Allocation Guard | Kestra
+  shortDescription: Audit unassigned Elasticsearch shards across runs, diagnose max-retries allocation failures, execute safe cluster reroutes with approval gates, and verify recovery.
+  metaDescription: Remediate stuck unassigned Elasticsearch shards. Track state in KV, request operator approval, execute cluster reroute with retry_failed, and verify in Kestra.
+  description: |
+    Production Elasticsearch clusters frequently encounter unassigned shards following node restarts, transient network partitions, or storage volume attachments. When an initial allocation attempt fails, the cluster allocation coordinator increments the shard's failure tally against `index.allocation.max_retries` (default 5). Once this threshold is reached, Elasticsearch marks the shard as `ALLOCATION_FAILED` (reason `max_retries_exceeded`) and permanently halts automated allocation attempts.
+
+    The cluster remains indefinitely degraded in yellow (for replica shards) or red (for primary shards) status. Even after the underlying hardware or network condition is resolved, the shards will never recover without an explicit administrative intervention.
+
+    This blueprint provides an autonomous self-healing guard that catalogs unassigned shards via the Elasticsearch API, correlates findings against historical snapshots in Kestra KV to distinguish transient node bounces from persistently stuck allocation failures, requests human approval via an interactive pause gate, issues `POST /_cluster/reroute?retry_failed=true` to reset allocation attempts, and verifies post-remediation health on the live cluster.
+
+    ## How it works
+
+    1. **Cluster Health & Shard Inventory**: `fetch_cluster_health` queries `GET /_cluster/health` via `io.kestra.plugin.elasticsearch.Request` to extract cluster status and unassigned shard counts. `fetch_cat_shards` queries `GET /_cat/shards` via the generic `io.kestra.plugin.core.http.Request` (since `_cat` endpoints return a top-level JSON array, which the Elasticsearch-specific Request task cannot parse) to extract per-shard indices, primary/replica designations, and failure reasons.
+    2. **State Correlation & Failure Triage**: `triage_unassigned_shards` (`io.kestra.plugin.scripts.python.Script`) parses shard catalogs and compares them against historical telemetry retrieved from Kestra KV store under `elasticsearch_unassigned_tracker_{cluster_id}`. It isolates shards stuck across consecutive runs or halted by `ALLOCATION_FAILED` (max retries reached).
+    3. **KV State Persistence**: `persist_kv_state` (`io.kestra.plugin.core.kv.Set`) stores the updated unassigned shard manifest and consecutive run counters to maintain trend detection across execution cycles.
+    4. **Condition Gating & Slack Triage**: `gate_unassigned_shards` (`io.kestra.plugin.core.flow.If`) activates when unassigned shards exceed `max_tolerated_unassigned_shards`. It dispatches a structured Slack card via `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` detailing cluster severity, affected indices, and root-cause reasons.
+    5. **Human Approval Gate**: When `auto_remediate` is enabled and `dry_run` is false, `approval_gate` (`io.kestra.plugin.core.flow.Pause`) halts execution until an authorized operator inspects the proposed actions and submits approval.
+    6. **Cluster Reroute Mutation**: `execute_cluster_reroute` sends `POST /_cluster/reroute?retry_failed=true` via `io.kestra.plugin.elasticsearch.Request`, instructing Elasticsearch to reset failure counters and immediately retry shard allocation.
+    7. **Settling & Health Verification**: After a settling period (`wait_for_allocation_settle`), `reverify_cluster_health` re-queries `GET /_cluster/health`. `assert_remediation_success` fails the flow if unassigned shards persist, preventing silent failures.
+    8. **Failure & Success Notifications**: Dispatches an emergency Slack alert on execution failures (`errors` block) or a success confirmation card upon verified recovery.
+
+    ## What you get
+
+    - Automated detection of unassigned shards stalled behind `max_retries_exceeded` thresholds.
+    - Historical state tracking in Kestra KV to distinguish transient rolling restarts from stuck allocation loops.
+    - Human-in-the-loop approval gate preventing accidental or unreviewed cluster state alterations.
+    - Live write-path mutation resetting allocation retries via `POST /_cluster/reroute?retry_failed=true`.
+    - Post-remediation verification asserting that unassigned shard counts decrease and cluster status recovers.
+    - Contextual Slack alerts detailing exact affected indices and failure reasons.
+
+    ## Who it's for
+
+    - Site Reliability Engineers (SREs) and Platform Engineers maintaining Elasticsearch logging or search infrastructure.
+    - Database Administrators (DBAs) managing Elasticsearch or OpenSearch clusters.
+    - Search Platform Engineers troubleshooting persistent yellow or red cluster allocation states.
+
+    ## Why orchestrate this with Kestra
+
+    Elasticsearch native cluster monitors lack cross-run memory, human approval gates, and multi-system alerting. Shell scripts or standalone cron jobs operating against cluster endpoints lack centralized audit trails, fail to preserve differential state between checks, and risk unconstrained retry loops during active node outages.
+    Orchestrating this guard with Kestra delivers declarative scheduling, built-in key-value state persistence, interactive pause-and-resume approval gates, secret masking, and verified post-remediation assertions.
+
+    ## Prerequisites
+
+    - Reachable Elasticsearch cluster (version 7.x or 8.x) or OpenSearch cluster.
+    - HTTP basic authentication credentials with `monitor` and `manage` cluster privileges.
+    - Slack Incoming Webhook URL configured for incident triage and remediation notifications.
+
+    ### Secrets
+
+    - `ELASTICSEARCH_USERNAME`: Username for Elasticsearch HTTP basic authentication.
+    - `ELASTICSEARCH_PASSWORD`: Password for Elasticsearch HTTP basic authentication.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for alert and notification dispatch.
+
+    ## Quick start
+
+    1. Configure `ELASTICSEARCH_USERNAME`, `ELASTICSEARCH_PASSWORD`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this blueprint into your Kestra instance.
+    3. Run an initial manual execution with default settings (`dry_run: true`) to record baseline shard state without mutating the cluster.
+    4. To remediate stuck shards, execute with `auto_remediate: true` and `dry_run: false`, then approve the interactive pause prompt.
+    5. Enable the `periodic_shard_allocation_check` schedule trigger to run continuous health checks every 30 minutes.
+
+    ## How to extend
+
+    - **Allocation Explain Integration**: Wire an automated `GET /_cluster/allocation/explain` call on specific stuck shards to extract node-level disk watermark or filter exclusion reasons directly into the Slack message.
+    - **Disk Watermark Auto-Clear**: Combine with disk usage checks to verify free space before triggering reroutes.
+    - **PagerDuty Escalation**: Add `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` when primary shards remain unassigned (cluster status RED).
+
+    ## Links
+
+    - [Elasticsearch Cluster Reroute API Documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-reroute.html)
+    - [Elasticsearch Cluster Allocation Explain API](https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-allocation-explain.html)
+    - [Kestra Elasticsearch Plugin Documentation](https://kestra.io/plugins/plugin-elasticsearch)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+    - Monitoring & Alerting
+  ee: false
+  demo: false
