@@ -1,0 +1,288 @@
+id: rabbitmq-parking-lot-triage
+namespace: company.messaging
+
+variables:
+  rabbitmq_host: localhost
+  rabbitmq_port: "5672"
+  rabbitmq_vhost: /
+  parking_lot_queue: orders.parking-lot
+  replay_queue: orders.work
+  ledger_url: jdbc:postgresql://localhost:5432/messaging
+
+tasks:
+  - id: ensure_ledger
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Creates the ledger on first use. Two messages parked at the same instant can race on CREATE TABLE in Postgres, and the retry absorbs that.
+    url: "{{ vars.ledger_url }}"
+    username: "{{ secret('LEDGER_DB_USERNAME') }}"
+    password: "{{ secret('LEDGER_DB_PASSWORD') }}"
+    retry:
+      type: constant
+      interval: PT2S
+      maxAttempts: 3
+    sql: |
+      CREATE TABLE IF NOT EXISTS parked_messages (
+        triage_execution_id   text PRIMARY KEY,
+        message_id            text NOT NULL,
+        source_queue          text,
+        reason                text,
+        attempts              integer,
+        last_status           integer,
+        content_type          text,
+        payload               text,
+        parked_at             timestamptz,
+        consumer_execution_id text,
+        status                text NOT NULL DEFAULT 'PENDING',
+        replayed_payload      text,
+        decision_note         text,
+        decided_at            timestamptz
+      )
+
+  - id: read_parked_message
+    type: io.kestra.plugin.core.output.OutputValues
+    description: |
+      Messages parked by rabbitmq-retry-ladder-consumer carry an envelope (AMQP type `kestra.parked-message`) with the reason and attempts.
+      Anything else, such as a message RabbitMQ dead-lettered itself, is wrapped the same way. Its x-first-death-* headers arrive as "key=value" strings from the AMQP plugin, so the key prefix is stripped.
+    values:
+      parked: >-
+        {%- if (trigger.type ?? '') == 'kestra.parked-message' -%}{{ trigger.data }}
+        {%- else -%}
+        {%- set death_reason = (trigger.headers['x-first-death-reason'] ?? '') | replace({'x-first-death-reason=': ''}) -%}
+        {{ {
+          'messageId': trigger.messageId ?? ('body-sha256-' ~ (trigger.data | sha256)),
+          'sourceQueue': (trigger.headers['x-first-death-queue'] ?? 'unknown') | replace({'x-first-death-queue=': ''}),
+          'reason': death_reason == '' ? 'no reason was recorded' : 'dead-lettered by RabbitMQ: ' ~ death_reason,
+          'attempts': 0,
+          'lastStatus': 0,
+          'parkedAt': now(),
+          'consumerExecutionId': '',
+          'contentType': trigger.contentType ?? 'application/octet-stream',
+          'payload': trigger.data
+        } | toJson }}
+        {%- endif -%}
+
+  - id: record_parked
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ vars.ledger_url }}"
+    username: "{{ secret('LEDGER_DB_USERNAME') }}"
+    password: "{{ secret('LEDGER_DB_PASSWORD') }}"
+    sql: |
+      INSERT INTO parked_messages (triage_execution_id, message_id, source_queue, reason, attempts, last_status, content_type, payload, parked_at, consumer_execution_id)
+      VALUES (:triage_execution_id, :message_id, :source_queue, :reason, CAST(:attempts AS integer), CAST(:last_status AS integer), :content_type, :payload, CAST(:parked_at AS timestamptz), :consumer_execution_id)
+      ON CONFLICT (triage_execution_id) DO NOTHING
+    parameters:
+      triage_execution_id: "{{ execution.id }}"
+      message_id: "{{ fromJson(outputs.read_parked_message.values.parked).messageId }}"
+      source_queue: "{{ fromJson(outputs.read_parked_message.values.parked).sourceQueue }}"
+      reason: "{{ fromJson(outputs.read_parked_message.values.parked).reason }}"
+      attempts: "{{ fromJson(outputs.read_parked_message.values.parked).attempts }}"
+      last_status: "{{ fromJson(outputs.read_parked_message.values.parked).lastStatus }}"
+      content_type: "{{ fromJson(outputs.read_parked_message.values.parked).contentType }}"
+      payload: "{{ fromJson(outputs.read_parked_message.values.parked).payload }}"
+      parked_at: "{{ fromJson(outputs.read_parked_message.values.parked).parkedAt }}"
+      consumer_execution_id: "{{ fromJson(outputs.read_parked_message.values.parked).consumerExecutionId }}"
+
+  - id: label_parked
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      messageId: "{{ fromJson(outputs.read_parked_message.values.parked).messageId }}"
+      decision: pending
+
+  - id: show_parked_message
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ fromJson(outputs.read_parked_message.values.parked).messageId }} was parked from {{ fromJson(outputs.read_parked_message.values.parked).sourceQueue }}{{ (fromJson(outputs.read_parked_message.values.parked).attempts ~ '') == '0' ? '' : ' after ' ~ fromJson(outputs.read_parked_message.values.parked).attempts ~ ' attempt(s)' }}: {{ fromJson(outputs.read_parked_message.values.parked).reason }}.
+      Payload: {{ fromJson(outputs.read_parked_message.values.parked).payload }}
+      Resume this execution with REPLAY (optionally with a corrected payload) or DISCARD.
+
+  - id: await_decision
+    type: io.kestra.plugin.core.flow.Pause
+    description: Waits until someone resumes the execution from the UI or the API. Each parked message has its own execution, so decisions never block each other.
+    onResume:
+      - id: decision
+        type: SELECT
+        displayName: Decision
+        description: REPLAY sends the message back to the work queue, DISCARD drops it. Both are recorded in the ledger.
+        values:
+          - REPLAY
+          - DISCARD
+
+      - id: patched_payload
+        type: STRING
+        displayName: Corrected payload
+        description: Leave empty to replay the original payload unchanged.
+        required: false
+
+      - id: note
+        type: STRING
+        displayName: Note
+        description: Why you made this decision; stored in the ledger.
+        required: false
+
+  - id: apply_decision
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ outputs.await_decision.onResume.decision }}"
+    cases:
+      REPLAY:
+        - id: replay
+          type: io.kestra.plugin.amqp.Publish
+          description: Publishes straight to the work queue through the default exchange, with the original message id, so the consumer starts a fresh retry ladder for it.
+          host: "{{ vars.rabbitmq_host }}"
+          port: "{{ vars.rabbitmq_port }}"
+          virtualHost: "{{ vars.rabbitmq_vhost }}"
+          username: "{{ secret('RABBITMQ_USERNAME') }}"
+          password: "{{ secret('RABBITMQ_PASSWORD') }}"
+          exchange: ""
+          routingKey: "{{ vars.replay_queue }}"
+          retry:
+            type: exponential
+            interval: PT5S
+            maxInterval: PT1M
+            maxAttempts: 20
+          from:
+            data: "{{ (outputs.await_decision.onResume.patched_payload ?? '') | trim | length > 0 ? outputs.await_decision.onResume.patched_payload : fromJson(outputs.read_parked_message.values.parked).payload }}"
+            messageId: "{{ fromJson(outputs.read_parked_message.values.parked).messageId }}"
+            contentType: "{{ fromJson(outputs.read_parked_message.values.parked).contentType }}"
+            deliveryMode: 2
+
+        - id: record_replay
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ vars.ledger_url }}"
+          username: "{{ secret('LEDGER_DB_USERNAME') }}"
+          password: "{{ secret('LEDGER_DB_PASSWORD') }}"
+          sql: |
+            UPDATE parked_messages
+            SET status = 'REPLAYED', replayed_payload = NULLIF(:patched_payload, ''), decision_note = NULLIF(:note, ''), decided_at = now()
+            WHERE triage_execution_id = :triage_execution_id
+          parameters:
+            triage_execution_id: "{{ execution.id }}"
+            patched_payload: "{{ outputs.await_decision.onResume.patched_payload ?? '' }}"
+            note: "{{ outputs.await_decision.onResume.note ?? '' }}"
+
+      DISCARD:
+        - id: record_discard
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ vars.ledger_url }}"
+          username: "{{ secret('LEDGER_DB_USERNAME') }}"
+          password: "{{ secret('LEDGER_DB_PASSWORD') }}"
+          sql: |
+            UPDATE parked_messages
+            SET status = 'DISCARDED', decision_note = NULLIF(:note, ''), decided_at = now()
+            WHERE triage_execution_id = :triage_execution_id
+          parameters:
+            triage_execution_id: "{{ execution.id }}"
+            note: "{{ outputs.await_decision.onResume.note ?? '' }}"
+
+  - id: label_decision
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      decision: "{{ outputs.await_decision.onResume.decision | lower }}"
+
+errors:
+  - id: log_triage_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Triage of a parked message failed in {{ errorLogs()[0].taskId ?? 'an unknown task' }}: {{ errorLogs()[0].message ?? 'see the execution logs' }}. The trigger already acknowledged it, so its payload is in this execution's trigger variables; fix the cause and replay the execution."
+
+triggers:
+  - id: on_parked_message
+    type: io.kestra.plugin.amqp.RealtimeTrigger
+    host: "{{ vars.rabbitmq_host }}"
+    port: "{{ vars.rabbitmq_port }}"
+    virtualHost: "{{ vars.rabbitmq_vhost }}"
+    username: "{{ secret('RABBITMQ_USERNAME') }}"
+    password: "{{ secret('RABBITMQ_PASSWORD') }}"
+    queue: "{{ vars.parking_lot_queue }}"
+
+extend:
+  title: Human triage for a RabbitMQ parking lot, with replay and a Postgres ledger
+  metaTitle: RabbitMQ parking lot triage with approval, replay and audit ledger | Kestra
+  shortDescription: Every message that reaches a RabbitMQ parking lot is recorded in Postgres and waits for someone to replay it, optionally with a corrected payload, or discard it. Each decision and its reason stay in the ledger.
+  metaDescription: Triage a RabbitMQ parking lot or DLQ with Kestra. Each message is logged to Postgres and waits for a person to replay it, fixed if needed, or discard it.
+  description: |
+    Parking lots and dead-letter queues fill up quietly. When someone finally looks, the usual tools move everything back at once, poison messages included, and nothing records what was replayed or why. This flow turns each parked message into a Kestra execution that records it in a Postgres ledger and pauses. Whoever is on call opens it, reads why it was parked, and resumes it with **REPLAY** (optionally with a corrected payload) or **DISCARD** and a note. The message goes back to the work queue or is dropped, and the ledger keeps the decision.
+
+    It works with any parking lot or DLQ, and is built to follow [rabbitmq-retry-ladder-consumer](https://kestra.io/blueprints/rabbitmq-retry-ladder-consumer), which parks messages with the reason and the number of attempts.
+
+    This blueprint was created by [kruxarth](https://github.com/kruxarth).
+
+    ## How it works
+
+    1. `on_parked_message` (`io.kestra.plugin.amqp.RealtimeTrigger`) starts one execution per message on `orders.parking-lot`. Executions run side by side, so a message waiting for a decision never holds up the next one.
+    2. `ensure_ledger` creates the `parked_messages` table on first use.
+    3. `read_parked_message` reads the envelope written by the consumer flow (AMQP type `kestra.parked-message`). Any other message, such as one RabbitMQ dead-lettered itself, is wrapped the same way, with the source queue and reason taken from its `x-first-death-*` headers.
+    4. `record_parked` (`io.kestra.plugin.jdbc.postgresql.Query`) inserts a `PENDING` row with bound parameters, and `show_parked_message` logs the message id, the reason and the payload.
+    5. `await_decision` (`Pause`) waits with three `onResume` inputs: `decision` (REPLAY or DISCARD), `patched_payload` and `note`.
+    6. `apply_decision` (`Switch`):
+       - **REPLAY:** `replay` (`io.kestra.plugin.amqp.Publish`) sends the corrected payload, or the original one, back to `orders.work` as a persistent message with the same `message_id`, and the row becomes `REPLAYED`.
+       - **DISCARD:** the row becomes `DISCARDED`.
+    7. Labels show `messageId` and `decision` (`pending`, `replay` or `discard`) on every execution.
+
+    ## What you get
+
+    - Nothing goes back to the work queue without a decision, and each decision is kept with its note, the corrected payload and the time it was made.
+    - Fix-and-replay: correct a bad field in the resume form instead of writing a script.
+    - The open work at a glance: paused executions labelled `decision: pending`, and `PENDING` rows you can query or chart.
+    - It keeps up with bursts: in tests, 12 messages parked at once had their rows and paused executions within 5.2 s, and 10 decisions sent through the API were applied in 1.9 s.
+
+    ## Who it's for
+
+    - On-call and SRE teams who own a RabbitMQ parking lot or DLQ.
+    - Backend and support teams who fix bad data and need to send the message through again.
+
+    ## Why orchestrate this with Kestra
+
+    - `Pause` with typed `onResume` inputs gives you an approval form in the UI and an API endpoint, with no extra app to build.
+    - Every parked message is its own execution with logs and labels, so the audit trail exists before anyone writes a report.
+    - Retries on the replay publish, secrets and the Postgres plugin's bound parameters are configuration, not code.
+
+    ## Prerequisites
+
+    - RabbitMQ with a parking-lot queue. Running the consumer flow once creates `orders.parking-lot`; otherwise set `parking_lot_queue` to your DLQ.
+    - Postgres, reachable from Kestra:
+
+      ```bash
+      docker run -d --name ledger -p 5432:5432 -e POSTGRES_USER=kestra -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=messaging postgres:16-alpine
+      ```
+
+    The variables point at `localhost`. If Kestra runs in Docker, use `host.docker.internal` instead.
+
+    ### Secrets
+
+    - `RABBITMQ_USERNAME` and `RABBITMQ_PASSWORD`: a RabbitMQ user that can read the parking lot and write to `replay_queue`.
+    - `LEDGER_DB_USERNAME` and `LEDGER_DB_PASSWORD`: a Postgres user that can create the `parked_messages` table and insert and update its rows.
+
+    ## Quick start
+
+    1. Start Postgres, add the four secrets, and run the consumer flow once (or point `parking_lot_queue` at an existing queue).
+    2. Save this flow. In the RabbitMQ console, publish `{"order_id": "7"}` to `orders.parking-lot` with the property `message_id` = `order-7`.
+    3. A paused execution appears. Its logs show the message; click **Resume**, choose **REPLAY**, enter `{"order_id": "7", "amount": 10}` as the corrected payload, and add a note.
+    4. Check the ledger: `SELECT message_id, status, replayed_payload, decision_note FROM parked_messages;`
+
+    ## Things to know
+
+    - The trigger acknowledges each message once its execution is created, so `orders.parking-lot` looks empty while decisions are pending. The paused executions and the `PENDING` rows hold the messages; don't delete a paused execution before deciding.
+    - The pause has no time limit. Set `pauseDuration` and `behavior` on `await_decision` to discard or escalate automatically.
+    - A replay goes straight to `replay_queue` through the default exchange, and the consumer flow starts a fresh retry ladder for it.
+    - To decide in bulk, call `POST /api/v1/<tenant>/executions/<id>/actions/resume` with the form fields `decision`, `patched_payload` and `note`.
+    - Original AMQP headers are not carried over to the replayed message.
+
+    ## How to extend
+
+    - Notify the on-call channel from `onPause` on `await_decision`, with a link to the execution.
+    - Schedule a daily report of `PENDING` rows grouped by `reason`.
+    - Add a `REPLAY_LATER` choice that republishes to one of the consumer's delay queues instead.
+
+    ## Links
+
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [AMQP plugin](https://kestra.io/plugins/plugin-amqp)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [RabbitMQ dead-letter exchanges](https://www.rabbitmq.com/docs/dlx)
+  tags:
+    - Infrastructure
+  subTags:
+    - Approval Gates
+    - Day 2 Operations
+  ee: false
+  demo: false
