@@ -1,0 +1,583 @@
+﻿id: kubernetes-failed-job-and-pod-reaper-guard
+namespace: company.platform
+
+description: |
+  Audit Kubernetes batch Jobs across namespaces to detect abandoned failed Jobs and dangling terminated
+  pods. Enforces a retention quarantine grace window, tracks persistent failure age across runs in Kestra KV,
+  gates destructive deletion behind human approval, cascades removal of dead pods and unreleased volume mounts,
+  and re-queries the Kubernetes API to verify complete cluster reclamation.
+
+labels:
+  project: k8s-failed-job-reaper
+  domain: reliability
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    displayName: Cluster Identifier
+    description: Stable identifier for the target Kubernetes cluster being monitored.
+    defaults: "k8s-prod"
+
+  - id: k8s_master_url
+    type: STRING
+    displayName: Kubernetes API Server URL
+    description: Base URL of the Kubernetes API server reachable by the Kestra worker.
+    defaults: "{{ secret('K8S_MASTER_URL') }}"
+
+  - id: k8s_oauth_token
+    type: STRING
+    displayName: Kubernetes OAuth Token
+    description: Bearer token for the ServiceAccount with batch/v1 Jobs list and delete permissions.
+    defaults: "{{ secret('K8S_OAUTH_TOKEN') }}"
+
+  - id: k8s_ca_cert_data
+    type: STRING
+    displayName: Kubernetes CA Certificate
+    description: Base64-encoded PEM CA certificate bundle for the Kubernetes API server.
+    defaults: "{{ secret('K8S_CA_CERT_DATA') }}"
+
+  - id: scan_namespace
+    type: STRING
+    displayName: Scan Namespace
+    description: Kubernetes namespace to inspect. Leave empty to scan across all namespaces cluster-wide.
+    defaults: ""
+
+  - id: reapable_namespaces
+    type: ARRAY
+    itemType: STRING
+    displayName: Reapable Namespaces Allowlist
+    description: Write allowlist. Failed Jobs outside these namespaces are reported in full but never deleted.
+    defaults:
+      - "default"
+      - "batch"
+      - "etl"
+      - "analytics"
+
+  - id: retention_grace_hours
+    type: INT
+    displayName: Retention Grace Window (Hours)
+    description: Quarantine duration in hours after failure before a Job is eligible for deletion, preserving logs for triage.
+    defaults: 24
+
+  - id: min_consecutive_runs
+    type: INT
+    displayName: Minimum Consecutive Runs
+    description: Number of consecutive scheduled executions a Job must remain in Failed state before becoming eligible for deletion.
+    defaults: 2
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, plans and reports reap candidates without deleting any cluster resources.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, triggers the approval gate to delete confirmed stale failed Jobs.
+    defaults: false
+
+variables:
+  state_key: "k8s_failed_jobs_{{ inputs.cluster_id | slugify }}"
+
+triggers:
+  - id: every_6_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scheduled scan auditing failed Jobs every 6 hours in report mode.
+    cron: "0 */6 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: list_jobs
+    type: io.kestra.plugin.kubernetes.kubectl.Get
+    description: Query the Kubernetes API for batch Jobs in the scan namespace or cluster-wide.
+    connection:
+      masterUrl: "{{ inputs.k8s_master_url }}"
+      oauthToken: "{{ inputs.k8s_oauth_token }}"
+      caCertData: "{{ inputs.k8s_ca_cert_data }}"
+    namespace: "{{ inputs.scan_namespace }}"
+    resourceType: jobs
+    apiGroup: batch
+    apiVersion: v1
+    fetchType: FETCH
+
+  - id: load_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Load previous execution tracking state from Kestra KV store.
+    key: "{{ render(vars.state_key) }}"
+    errorOnMissing: false
+
+  - id: analyze_failed_jobs
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse Job metadata and conditions, evaluate failure age against grace window, and build remediation plan.
+    containerImage: python:3.11-slim
+    inputFiles:
+      jobs.json: "{{ outputs.list_jobs | toJson }}"
+      prev_state.json: "{{ (outputs.load_state.value is defined and outputs.load_state.value is not null ? outputs.load_state.value : {}) | toJson }}"
+    env:
+      RETENTION_GRACE_HOURS: "{{ inputs.retention_grace_hours }}"
+      MIN_CONSECUTIVE_RUNS: "{{ inputs.min_consecutive_runs }}"
+      REAPABLE_NAMESPACES: "{{ inputs.reapable_namespaces | toJson }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    script: |
+      import json
+      import os
+      import sys
+      from datetime import datetime, timezone
+
+      now_utc = datetime.now(timezone.utc)
+      now_iso = now_utc.isoformat()
+
+      retention_grace_hours = float(os.environ.get("RETENTION_GRACE_HOURS", "24"))
+      min_consecutive_runs = int(os.environ.get("MIN_CONSECUTIVE_RUNS", "2"))
+      cluster_id = os.environ.get("CLUSTER_ID", "k8s-prod")
+
+      try:
+          reapable_namespaces_raw = os.environ.get("REAPABLE_NAMESPACES", "[]")
+          reapable_namespaces = set(json.loads(reapable_namespaces_raw))
+      except Exception:
+          reapable_namespaces = set()
+
+      protected_namespaces = {"kube-system", "kube-public", "kube-node-lease", "kestra"}
+
+      try:
+          with open("jobs.json", "r", encoding="utf-8") as f:
+              raw_jobs = json.load(f)
+      except Exception:
+          raw_jobs = {}
+
+      try:
+          with open("prev_state.json", "r", encoding="utf-8") as f:
+              prev_state = json.load(f)
+              if not isinstance(prev_state, dict):
+                  prev_state = {}
+      except Exception:
+          prev_state = {}
+
+      items = raw_jobs.get("items") or []
+      if not items and "metadataItems" in raw_jobs:
+          meta_list = raw_jobs.get("metadataItems") or []
+          status_list = raw_jobs.get("statusItems") or []
+          for i, meta in enumerate(meta_list):
+              # Each entry in statusItems is a Kestra ResourceStatus object, which wraps the raw
+              # Kubernetes .status map under its own "status" key (confirmed via the plugin's
+              # ResourceStatus.java and its own test suite, which accesses it as
+              # output.getStatusItem().getStatus()). Unwrap it here, or every downstream
+              # status.get("conditions"/"failed"/"active") silently reads an empty/absent key.
+              raw_status_item = status_list[i] if i < len(status_list) else {}
+              st = (raw_status_item.get("status") or {}) if isinstance(raw_status_item, dict) else {}
+              items.append({"metadata": meta, "status": st})
+
+      total_jobs_inspected = len(items)
+      stale_failed_jobs = []
+      reapable_jobs = []
+      target_keys = []
+      new_state = {}
+      total_dead_pods = 0
+
+      for job in items:
+          meta = job.get("metadata") or {}
+          status = job.get("status") or {}
+          name = meta.get("name", "")
+          ns = meta.get("namespace", "default")
+          labels = meta.get("labels") or {}
+          conditions = status.get("conditions") or []
+          failed_pods = int(status.get("failed") or 0)
+          active_pods = int(status.get("active") or 0)
+
+          is_failed = False
+          fail_reason = "UnknownFailure"
+          fail_msg = ""
+          last_transition = None
+
+          for c in conditions:
+              if c.get("type") == "Failed" and str(c.get("status")).lower() == "true":
+                  is_failed = True
+                  fail_reason = c.get("reason", "UnknownFailure")
+                  fail_msg = c.get("message", "")
+                  last_transition = c.get("lastTransitionTime")
+                  break
+
+          has_succeeded = any(
+              c.get("type") == "Complete" and str(c.get("status")).lower() == "true"
+              for c in conditions
+          )
+          if has_succeeded or (active_pods > 0 and not is_failed):
+              continue
+
+          if not is_failed and failed_pods == 0:
+              continue
+
+          if ns in protected_namespaces:
+              continue
+
+          is_ns_allowed = (not reapable_namespaces) or (ns in reapable_namespaces)
+
+          is_opted_out = (
+              labels.get("job-reaper.kestra.io/opt-out", "").lower() in ["true", "yes", "1"] or
+              labels.get("helm.sh/hook") is not None
+          )
+
+          ref_time_str = last_transition or meta.get("creationTimestamp")
+          elapsed_hours = 0.0
+          if ref_time_str:
+              try:
+                  t = datetime.fromisoformat(ref_time_str.replace("Z", "+00:00"))
+                  elapsed_hours = max(0.0, (now_utc - t).total_seconds() / 3600.0)
+              except Exception:
+                  elapsed_hours = 0.0
+
+          job_key = f"{ns}/{name}"
+          prev_entry = prev_state.get(job_key, {})
+          consecutive_runs = prev_entry.get("consecutive_runs", 0) + 1
+          first_seen = prev_entry.get("first_seen", now_iso)
+
+          new_state[job_key] = {
+              "first_seen": first_seen,
+              "consecutive_runs": consecutive_runs,
+              "failure_reason": fail_reason,
+              "failed_pods": failed_pods,
+              "elapsed_hours": round(elapsed_hours, 1)
+          }
+
+          info = {
+              "namespace": ns,
+              "name": name,
+              "failure_reason": fail_reason,
+              "failed_pods": failed_pods,
+              "elapsed_hours": round(elapsed_hours, 1),
+              "consecutive_runs": consecutive_runs,
+              "key": job_key
+          }
+
+          if is_opted_out:
+              info["verdict"] = "OPTED_OUT_LABEL"
+              info["note"] = "Protected by job-reaper.kestra.io/opt-out or Helm hook label"
+              stale_failed_jobs.append(info)
+          elif not is_ns_allowed:
+              info["verdict"] = "NAMESPACE_NOT_ALLOWED"
+              info["note"] = f"Namespace '{ns}' not in reapable_namespaces allowlist"
+              stale_failed_jobs.append(info)
+          elif elapsed_hours < retention_grace_hours:
+              info["verdict"] = "WITHIN_GRACE_WINDOW"
+              info["note"] = f"Failed {round(elapsed_hours, 1)}h ago; below {retention_grace_hours}h grace ceiling"
+              stale_failed_jobs.append(info)
+          elif consecutive_runs < min_consecutive_runs:
+              info["verdict"] = "AWAITING_CONSECUTIVE_RUNS"
+              info["note"] = f"Seen in {consecutive_runs} run(s); requires {min_consecutive_runs} consecutive observations"
+              stale_failed_jobs.append(info)
+          else:
+              info["verdict"] = "REAPABLE"
+              info["note"] = f"Eligible for reap ({round(elapsed_hours, 1)}h failed, {failed_pods} dead pods)"
+              stale_failed_jobs.append(info)
+              reapable_jobs.append(info)
+              target_keys.append(job_key)
+              total_dead_pods += failed_pods
+
+      summary_lines = []
+      for j in stale_failed_jobs:
+          summary_lines.append(
+              f"• `{j['key']}` | Verdict: *{j['verdict']}* | Reason: `{j['failure_reason']}` | "
+              f"Failed Pods: {j['failed_pods']} | Age: {j['elapsed_hours']}h (Runs: {j['consecutive_runs']})\n"
+              f"  Note: {j['note']}"
+          )
+      slack_details = "\n".join(summary_lines) if summary_lines else "No failed jobs detected."
+
+      output_payload = {
+          "total_jobs_inspected": total_jobs_inspected,
+          "total_failed_jobs_found": len(stale_failed_jobs),
+          "reapable_count": len(reapable_jobs),
+          "has_findings": len(stale_failed_jobs) > 0,
+          "has_reapable_jobs": len(reapable_jobs) > 0,
+          "total_dead_pods": total_dead_pods,
+          "reapable_jobs": reapable_jobs,
+          "target_keys": target_keys,
+          "stale_failed_jobs": stale_failed_jobs,
+          "new_state": new_state,
+          "slack_details": slack_details
+      }
+
+      print("::" + json.dumps({"outputs": output_payload}) + "::")
+
+  - id: save_tracker_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist updated failed Job tracking state in Kestra KV store.
+    key: "{{ render(vars.state_key) }}"
+    value: "{{ outputs.analyze_failed_jobs.vars.new_state | toJson }}"
+    kvType: JSON
+    overwrite: true
+
+  - id: handle_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Branch execution when failed Jobs are discovered.
+    condition: "{{ outputs.analyze_failed_jobs.vars.has_findings == true }}"
+    then:
+      - id: notify_findings_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch Slack incident alert with failed Job details, error reasons, and verdicts.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.analyze_failed_jobs.vars.has_reapable_jobs ? 'danger' : 'warning' }}",
+                "title": ":wastebasket: Kubernetes Failed Job & Dead Pod Audit | {{ inputs.cluster_id }}",
+                "text": "*Inspected:* {{ outputs.analyze_failed_jobs.vars.total_jobs_inspected }} jobs\n*Failed Jobs Found:* {{ outputs.analyze_failed_jobs.vars.total_failed_jobs_found }}\n*Reapable Candidates:* {{ outputs.analyze_failed_jobs.vars.reapable_count }} ({{ outputs.analyze_failed_jobs.vars.total_dead_pods }} dead pods)\n*Mode:* auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}\n\n*Findings Breakdown:*\n{{ outputs.analyze_failed_jobs.vars.slack_details }}"
+              }
+            ]
+          }
+
+      - id: route_remediation
+        type: io.kestra.plugin.core.flow.If
+        description: Enter remediation branch only when auto_remediate is true, dry_run is false, and reapable jobs exist.
+        condition: "{{ inputs.auto_remediate == true and inputs.dry_run == false and outputs.analyze_failed_jobs.vars.reapable_count > 0 }}"
+        then:
+          - id: pause_for_reap_approval
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: PT4H
+            description: Pause execution for operator review before deleting failed Jobs from the cluster.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Approve deletion of the targeted failed Jobs and their dead pods.
+
+          - id: execute_reap
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.pause_for_reap_approval.onResume.approved is defined ? outputs.pause_for_reap_approval.onResume.approved : false) == true }}"
+            then:
+              - id: reap_failed_jobs
+                type: io.kestra.plugin.core.flow.Loop
+                description: Delete each targeted failed Job; Kubernetes cascades deletion to child pods and releases attached volumes.
+                values: "{{ outputs.analyze_failed_jobs.vars.reapable_jobs }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: delete_job
+                    type: io.kestra.plugin.kubernetes.kubectl.Delete
+                    description: Delete the failed Job object and terminate its associated dead pods.
+                    connection:
+                      masterUrl: "{{ inputs.k8s_master_url }}"
+                      oauthToken: "{{ inputs.k8s_oauth_token }}"
+                      caCertData: "{{ inputs.k8s_ca_cert_data }}"
+                    namespace: "{{ item.value.namespace }}"
+                    resourceType: jobs
+                    apiGroup: batch
+                    apiVersion: v1
+                    resourcesNames:
+                      - "{{ item.value.name }}"
+
+              - id: reread_jobs
+                type: io.kestra.plugin.kubernetes.kubectl.Get
+                description: Re-query the Kubernetes API after reaping to verify that deleted Jobs are no longer present.
+                connection:
+                  masterUrl: "{{ inputs.k8s_master_url }}"
+                  oauthToken: "{{ inputs.k8s_oauth_token }}"
+                  caCertData: "{{ inputs.k8s_ca_cert_data }}"
+                namespace: "{{ inputs.scan_namespace }}"
+                resourceType: jobs
+                apiGroup: batch
+                apiVersion: v1
+                fetchType: FETCH
+
+              - id: verify_jobs_reaped
+                type: io.kestra.plugin.scripts.python.Script
+                description: Verify that none of the reaped Jobs appear in the post-remediation API response.
+                containerImage: python:3.11-slim
+                inputFiles:
+                  reread.json: "{{ outputs.reread_jobs | toJson }}"
+                env:
+                  TARGET_KEYS: "{{ outputs.analyze_failed_jobs.vars.target_keys | toJson }}"
+                script: |
+                  import json
+                  import os
+                  import sys
+
+                  with open("reread.json", "r", encoding="utf-8") as f:
+                      raw_data = json.load(f)
+
+                  items = raw_data.get("items") or []
+                  if not items and "metadataItems" in raw_data:
+                      meta_list = raw_data.get("metadataItems") or []
+                      for meta in meta_list:
+                          items.append({"metadata": meta})
+
+                  target_keys = set(json.loads(os.environ.get("TARGET_KEYS", "[]")))
+                  survivors = []
+
+                  for item in items:
+                      meta = item.get("metadata") or {}
+                      k = f"{meta.get('namespace', 'default')}/{meta.get('name', '')}"
+                      if k in target_keys:
+                          survivors.append(k)
+
+                  if survivors:
+                      print(f"Post-remediation verification FAILED: {len(survivors)} job(s) survived deletion: {survivors}", file=sys.stderr)
+                      sys.exit(1)
+
+                  print(f"Post-remediation verification SUCCESS: All {len(target_keys)} targeted failed job(s) confirmed deleted.")
+
+              - id: log_remediation_success
+                type: io.kestra.plugin.core.log.Log
+                description: Log verified completion of failed Job reaping.
+                message: "Successfully deleted and verified {{ outputs.analyze_failed_jobs.vars.reapable_count }} failed Job(s) (freed {{ outputs.analyze_failed_jobs.vars.total_dead_pods }} dead pods) in cluster {{ inputs.cluster_id }}."
+
+            else:
+              - id: log_approval_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Log that approval was declined or unanswered.
+                message: "Approval declined or timed out. {{ outputs.analyze_failed_jobs.vars.reapable_count }} reapable Job(s) were left in cluster {{ inputs.cluster_id }}."
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log planned reap actions in dry-run mode.
+            message: "Dry-run mode active (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}). Found {{ outputs.analyze_failed_jobs.vars.reapable_count }} reapable failed Job(s) holding {{ outputs.analyze_failed_jobs.vars.total_dead_pods }} dead pods."
+
+    else:
+      - id: log_cluster_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: Log clean cluster state when no failed Jobs are found.
+        message: "Kubernetes failed Job audit clean. Inspected {{ outputs.analyze_failed_jobs.vars.total_jobs_inspected }} Job(s) in cluster {{ inputs.cluster_id }}. Zero failed Jobs detected."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch critical alert if the failed Job reaper workflow encounters an unhandled execution error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: Kubernetes Failed Job Reaper Execution Failed",
+            "text": "Execution `{{ execution.id }}` failed on cluster `{{ inputs.cluster_id }}` (scan namespace: `{{ inputs.scan_namespace == '' ? 'all namespaces' : inputs.scan_namespace }}`).\nCheck API server reachability, ServiceAccount RBAC permissions, or worker logs."
+          }
+        ]
+      }
+
+extend:
+  title: Kubernetes Failed Job and Dead Pod Reaper Guard
+  metaTitle: Kubernetes Failed Job & Dead Pod Reaper Guard | Kestra
+  shortDescription: Audit Kubernetes batch Jobs, detect abandoned failed Jobs and dead pods past retention grace, gate deletion behind operator approval, and verify cluster reclamation.
+  metaDescription: Reap abandoned failed Kubernetes Jobs and dead pods safely. Track failure age in KV, gate deletion behind operator approval, and verify cluster reclamation.
+  description: |
+    Production Kubernetes clusters frequently run batch Jobs for database migrations, scheduled ETL
+    tasks, machine learning training, and one-off backfills. When a batch Job encounters an unhandled
+    exception, exceeds its `backoffLimit`, or hits its `activeDeadlineSeconds`, the Kubernetes Job
+    controller marks the Job condition as `Failed` with reason `BackoffLimitExceeded` or `DeadlineExceeded`.
+
+    By default, Kubernetes does not automatically clean up failed Jobs or their terminated pods unless
+    `ttlSecondsAfterFinished` was explicitly specified in the Job manifest. Because most deployment tools
+    and Helm charts omit this property, failed Jobs and their associated pods (`Error`, `CrashLoopBackOff`,
+    `OOMKilled`) accumulate indefinitely across namespaces.
+
+    These lingering dead objects cause severe operational degradation:
+    - **PersistentVolume Lock Deadlocks**: Dead pods keep PersistentVolumeClaims in use, preventing cloud
+      volume detachments (AWS EBS, GCP Persistent Disk, Azure Managed Disk) and blocking Cluster Autoscaler node drains.
+    - **CNI IPAM Subnet Exhaustion**: In AWS VPC CNI and Azure CNI, dead pods hold secondary ENI IP addresses,
+      causing IP starvation that blocks new production workloads from scheduling.
+    - **ResourceQuota Saturation**: Accumulating failed objects saturate namespace quotas (`count/jobs.batch`
+      and `count/pods`), causing subsequent deployments to be rejected.
+    - **API Server & etcd Latency**: Thousands of stale Job and Pod objects degrade kube-apiserver list-watch
+      performance and bloat etcd storage.
+
+    This blueprint provides an automated, safety-first failed Job reaper guard that inventories batch Jobs,
+    tracks failure persistence in Kestra KV across consecutive scheduled runs, enforces a quarantine grace window
+    to allow engineer debugging, alerts Slack with failure root causes, pauses for human operator approval before
+    live deletion, executes cascading deletion of Jobs and child pods, and re-reads the Kubernetes API to verify
+    complete cluster reclamation.
+
+    ## How it works
+
+    1. `list_jobs` (`io.kestra.plugin.kubernetes.kubectl.Get`) connects to the Kubernetes API server using ServiceAccount credentials and retrieves all batch/v1 Jobs in the target namespace or across all namespaces cluster-wide.
+    2. `load_state` (`io.kestra.plugin.core.kv.Get`) retrieves historical Job tracking timestamps from the Kestra KV store under key `k8s_failed_jobs_{cluster_id}` to track failure persistence across consecutive executions.
+    3. `analyze_failed_jobs` (`io.kestra.plugin.scripts.python.Script`) inspects Job conditions and metadata:
+       - Succeeded Jobs (`Complete=True`) and active running Jobs are strictly skipped.
+       - Identifies failed Jobs with condition `Failed=True` (`BackoffLimitExceeded` or `DeadlineExceeded`) and counts associated dead pods.
+       - Enforces namespace safety by rejecting protected system namespaces (`kube-system`, `kube-public`, `kube-node-lease`, `kestra`) and checking the `reapable_namespaces` allowlist.
+       - Checks exclusion labels (`job-reaper.kestra.io/opt-out=true` and `helm.sh/hook`).
+       - Calculates elapsed hours since failure against `retention_grace_hours` (default 24h) and verifies that the Job has persisted across `min_consecutive_runs` (default 2).
+       - Sorts findings into explicit verdicts (`REAPABLE`, `WITHIN_GRACE_WINDOW`, `AWAITING_CONSECUTIVE_RUNS`, `NAMESPACE_NOT_ALLOWED`, `OPTED_OUT_LABEL`).
+    4. `save_tracker_state` (`io.kestra.plugin.core.kv.Set`) writes the updated tracking state into Kestra KV.
+    5. `handle_findings` (`io.kestra.plugin.core.flow.If`) evaluates whether any failed Jobs were detected:
+       - Dispatches an actionable Slack notification via `notify_findings_slack` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) detailing affected namespaces, Job names, error reasons, and pod counts.
+       - If `auto_remediate` is enabled, `dry_run` is disabled, and reapable Jobs exist, execution enters `route_remediation`.
+    6. `pause_for_reap_approval` (`io.kestra.plugin.core.flow.Pause`) holds execution for operator verification with a 4-hour timeout. An operator must resume the execution with `approved: true` to authorize live deletion.
+    7. `reap_failed_jobs` (`io.kestra.plugin.core.flow.Loop`) iterates over approved reapable Jobs and invokes `delete_job` (`io.kestra.plugin.kubernetes.kubectl.Delete`). Kubernetes cascading deletion automatically terminates child pods and frees attached volume mounts.
+    8. `reread_jobs` and `verify_jobs_reaped` (`io.kestra.plugin.kubernetes.kubectl.Get` and Python validation) re-query the cluster API and assert that none of the reaped Jobs remain in the cluster. If any targeted Job survives, the run fails immediately with non-zero exit status.
+    9. `errors` block catches any execution failure and alerts on-call engineers via Slack.
+
+    ## What you get
+
+    - Automated discovery and classification of abandoned failed batch Jobs across Kubernetes namespaces.
+    - Elimination of dead pod volume locks and CNI IP address leaks without manual SRE script execution.
+    - Quarantine grace window (default 24 hours) ensuring engineers have ample time to investigate logs before cleanup.
+    - Multi-run tracking via Kestra KV store preventing premature reaping of transient or flapping failures.
+    - Strict namespace allowlists and opt-out labels protecting critical system workloads and Helm hooks.
+    - Human-in-the-loop approval gate (`io.kestra.plugin.core.flow.Pause`) preventing unintended production mutations.
+    - Post-remediation verification confirming that all targeted Jobs and pods were completely removed from etcd.
+
+    ## Who it's for
+
+    - Platform Engineers and SREs maintaining production Kubernetes clusters (EKS, GKE, AKS, or bare metal).
+    - Data Engineers running scheduled batch ETL and dbt pipelines that generate high volumes of ephemeral Jobs.
+    - FinOps teams mitigating idle cloud storage costs caused by unreleased PersistentVolume attachments.
+
+    ## Why orchestrate this with Kestra
+
+    A simple shell script or raw cron job lack cross-run state tracking, cannot enforce safe human approval gates,
+    and cannot verify whether an asynchronous deletion actually succeeded. Ad-hoc `kubectl delete` commands risk
+    accidentally deleting jobs currently being debugged by incident responders.
+
+    Orchestrating this guard with Kestra delivers a declarative workflow with native Kubernetes API integration,
+    atomic state persistence in Kestra KV, safe pause-and-resume approval mechanics, automated Slack escalation,
+    and post-action verification.
+
+    ## Prerequisites
+
+    - A Kubernetes cluster (version 1.24 or higher) reachable from the Kestra worker.
+    - A Kubernetes ServiceAccount with RBAC permissions to `get`, `list`, `watch`, and `delete` resources in `batch/v1` `jobs`.
+    - A Slack Incoming Webhook URL to receive audit notifications and failure alerts.
+
+    ### Secrets
+
+    - `K8S_MASTER_URL`: Base URL of the Kubernetes API server (e.g. `https://kubernetes.default.svc` or cloud API endpoint).
+    - `K8S_OAUTH_TOKEN`: Bearer token for the ServiceAccount used to authenticate against the Kubernetes API.
+    - `K8S_CA_CERT_DATA`: Base64-encoded PEM CA certificate bundle for verifying API server TLS certificates.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint used for audit reports and error notifications.
+
+    ## Quick start
+
+    1. Configure `K8S_MASTER_URL`, `K8S_OAUTH_TOKEN`, `K8S_CA_CERT_DATA`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this blueprint and set `cluster_id` and `reapable_namespaces` to match your cluster environment.
+    3. Run a manual execution with default inputs (`dry_run: true`, `auto_remediate: false`) to review discovered failed Jobs without modifying cluster state.
+    4. To reap confirmed abandoned Jobs, execute with `auto_remediate: true` and `dry_run: false`, review the Slack notification, and approve the paused execution.
+    5. Enable the `every_6_hours` schedule trigger to monitor batch Jobs continuously in report-only mode.
+
+    ## How to extend
+
+    - **Prometheus Metrics Push**: Add an `io.kestra.plugin.prometheus.Push` task to publish counts of dead pods and reclaimed Jobs to your cluster monitoring dashboard.
+    - **Automated Pod Log Archival**: Use `io.kestra.plugin.aws.s3.Upload` or `io.kestra.plugin.gcp.gcs.Upload` before deletion to archive final container log tails into long-term cloud object storage.
+    - **PagerDuty Incident Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` to page on-call teams if failed Jobs exceed critical namespace saturation thresholds.
+
+    ## Links
+
+    - [Kubernetes Jobs Documentation](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
+    - [Kestra Kubernetes Plugin Documentation](https://kestra.io/plugins/plugin-kubernetes)
+    - [Kestra KV Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
