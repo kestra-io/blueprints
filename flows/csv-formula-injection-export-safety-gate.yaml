@@ -1,0 +1,445 @@
+id: csv-formula-injection-export-safety-gate
+namespace: company.data
+description: |
+  Scan a public CSV export for spreadsheet formula-injection payloads before analysts or
+  downstream systems consume it. The flow performs a bounded HTTPS download from explicitly
+  allowed public hosts, validates the CSV structure, and flags cells beginning with spreadsheet
+  formula operators or control characters. It emits a report without copying raw cell contents
+  into outputs, can alert Slack, and can fail a strict export gate.
+
+inputs:
+  - id: csv_url
+    type: STRING
+    displayName: CSV export URL
+    defaults: https://raw.githubusercontent.com/plotly/datasets/master/2014_usa_states.csv
+    description: HTTPS URL of the CSV to audit.
+  - id: allowed_hosts
+    type: STRING
+    displayName: Allowed download hosts
+    defaults: raw.githubusercontent.com
+    description: Comma-separated exact hostnames permitted for the source and every redirect.
+  - id: delimiter
+    type: STRING
+    displayName: CSV delimiter
+    defaults: ","
+    description: Single-character CSV delimiter.
+  - id: maximum_download_bytes
+    type: INT
+    displayName: Maximum CSV bytes
+    defaults: 2000000
+    description: Maximum download size, from 1024 to 10000000 bytes.
+  - id: maximum_rows
+    type: INT
+    displayName: Maximum CSV rows
+    defaults: 20000
+    description: Maximum number of data records to inspect, from 1 to 100000.
+  - id: require_header
+    type: BOOL
+    displayName: Require CSV header
+    defaults: true
+    description: Block the audit if the file is empty or the first record contains no non-empty column names.
+  - id: strict_mode
+    type: BOOL
+    displayName: Fail on formula-injection findings
+    defaults: true
+    description: When enabled, fail the flow if any blocking structure or formula-injection finding exists.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alert
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+
+triggers:
+  - id: weekday_csv_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Optional weekday audit schedule; disabled until the CSV source and alert destination are approved.
+    cron: "0 9 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the URL, exact host allowlist, delimiter and bounded scan limits before downloading data.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      CSV_URL: "{{ inputs.csv_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      DELIMITER: "{{ inputs.delimiter }}"
+      MAXIMUM_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_ROWS: "{{ inputs.maximum_rows }}"
+    script: |
+      import os
+      import re
+      from urllib.parse import urlsplit
+
+      url = os.environ.get("CSV_URL", "").strip()
+      parsed = urlsplit(url)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("csv_url must be an HTTPS URL without embedded credentials")
+      if parsed.port not in (None, 443):
+          raise ValueError("csv_url must use the default HTTPS port")
+      allowed_hosts = [h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
+      if not allowed_hosts or parsed.hostname.lower() not in allowed_hosts:
+          raise ValueError("the CSV source host must exactly match one of allowed_hosts")
+      if any(not re.fullmatch(r"[a-z0-9.-]+", host) or host.startswith(".") or host.endswith(".") for host in allowed_hosts):
+          raise ValueError("allowed_hosts must contain plain DNS hostnames, not wildcard or URL patterns")
+      delimiter = os.environ.get("DELIMITER", ",")
+      if len(delimiter) != 1 or delimiter in ("\r", "\n", "\x00", '"'):
+          raise ValueError("delimiter must be exactly one valid character")
+      bounds = {
+          "maximum_download_bytes": (int(os.environ["MAXIMUM_DOWNLOAD_BYTES"]), 1024, 10_000_000),
+          "maximum_rows": (int(os.environ["MAXIMUM_ROWS"]), 1, 100_000),
+      }
+      for name, (value, minimum, maximum) in bounds.items():
+          if not minimum <= value <= maximum:
+              raise ValueError(f"{name} must be between {minimum} and {maximum}")
+      print("CSV source URL, allowlist, delimiter and scan limits are valid.")
+
+  - id: inspect_csv
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download bounded CSV data, reject unsafe redirect targets, check table shape, and identify potentially executable spreadsheet cells without logging their raw contents.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      CSV_URL: "{{ inputs.csv_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      DELIMITER: "{{ inputs.delimiter }}"
+      MAXIMUM_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_ROWS: "{{ inputs.maximum_rows }}"
+      REQUIRE_HEADER: "{{ inputs.require_header }}"
+    outputFiles:
+      - csv-safety-report.json
+    script: |
+      import csv
+      import hashlib
+      import io
+      import ipaddress
+      import json
+      import os
+      import re
+      import socket
+      import time
+      import urllib.request
+      from datetime import datetime, timezone
+      from urllib.parse import urljoin, urlsplit
+
+      from kestra import Kestra
+
+      source_url = os.environ["CSV_URL"].strip()
+      allowed_hosts = {
+          host.strip().lower()
+          for host in os.environ.get("ALLOWED_HOSTS", "").split(",")
+          if host.strip()
+      }
+      delimiter = os.environ.get("DELIMITER", ",")
+      maximum_download_bytes = int(os.environ["MAXIMUM_DOWNLOAD_BYTES"])
+      maximum_rows = int(os.environ["MAXIMUM_ROWS"])
+      require_header = os.environ.get("REQUIRE_HEADER", "true").lower() == "true"
+
+      redirect_chain = []
+      findings = []
+      downloaded_url = None
+      download_bytes = 0
+      data_rows_scanned = 0
+      cell_count = 0
+      formula_cell_count = 0
+      header = []
+      irregular_rows = 0
+      formula_samples = []
+      parse_failed = False
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def validate_public_https_url(url):
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise ValueError("redirect target must be HTTPS without embedded credentials")
+          if parsed.port not in (None, 443):
+              raise ValueError("redirect target used an unexpected port")
+          hostname = parsed.hostname.lower()
+          if hostname not in allowed_hosts:
+              raise ValueError(f"redirect host '{hostname}' is not present in allowed_hosts")
+          try:
+              addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as exc:
+              raise ValueError(f"could not resolve allowed host '{hostname}': {exc}") from exc
+          resolved = {entry[4][0] for entry in addresses}
+          if not resolved:
+              raise ValueError(f"host '{hostname}' did not resolve")
+          for address in resolved:
+              parsed_ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not parsed_ip.is_global:
+                  raise ValueError(f"host '{hostname}' resolved to a non-public address")
+          return hostname
+
+      class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              target = urljoin(req.full_url, newurl)
+              hostname = validate_public_https_url(target)
+              redirect_chain.append({"from": req.full_url, "to": target, "host": hostname, "status": int(code)})
+              return super().redirect_request(req, fp, code, msg, headers, target)
+
+      started = time.monotonic()
+      try:
+          validate_public_https_url(source_url)
+          opener = urllib.request.build_opener(AllowlistedRedirectHandler())
+          request = urllib.request.Request(
+              source_url,
+              headers={"User-Agent": "Kestra-CSV-Formula-Injection-Gate/1.0", "Accept": "text/csv, text/plain, */*"},
+          )
+          with opener.open(request, timeout=20) as response:
+              downloaded_url = response.geturl()
+              validate_public_https_url(downloaded_url)
+              declared_length = response.headers.get("Content-Length")
+              if declared_length:
+                  try:
+                      if int(declared_length) > maximum_download_bytes:
+                          raise ValueError(f"Content-Length exceeds maximum_download_bytes ({maximum_download_bytes})")
+                  except ValueError as exc:
+                      if "invalid literal" not in str(exc):
+                          raise
+                      add("CONTENT_LENGTH_INVALID", "BLOCK", "The response Content-Length header is not a valid integer.")
+              chunks = []
+              total_read = 0
+              while True:
+                  chunk = response.read(min(65536, maximum_download_bytes + 1 - total_read))
+                  if not chunk:
+                      break
+                  chunks.append(chunk)
+                  total_read += len(chunk)
+                  if total_read > maximum_download_bytes:
+                      raise ValueError(f"download exceeded maximum_download_bytes ({maximum_download_bytes})")
+              payload = b"".join(chunks)
+          download_bytes = len(payload)
+          text = payload.decode("utf-8-sig")
+          if not text.strip():
+              raise ValueError("CSV download is empty")
+          csv.field_size_limit(1_000_000)
+          reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+          try:
+              header = next(reader)
+          except StopIteration:
+              header = []
+          if require_header and (not header or not any(item.strip() for item in header)):
+              add("CSV_HEADER_MISSING", "BLOCK", "The first CSV record has no non-empty column names.")
+          normalized_headers = [item.strip().casefold() for item in header]
+          non_empty_headers = [item for item in normalized_headers if item]
+          duplicates = sorted({name for name in non_empty_headers if non_empty_headers.count(name) > 1})
+          if duplicates:
+              add("DUPLICATE_HEADER_NAMES", "BLOCK", "The header contains duplicate normalized column names: " + ", ".join(duplicates[:20]))
+          for column_index, value in enumerate(header, 1):
+              cell_count += 1
+              cell = value
+              stripped = cell.lstrip(" \f\v")
+              if cell.startswith(("\t", "\r")) or stripped[:1] in ("=", "+", "@") or (stripped.startswith("-") and not re.fullmatch(r"-\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", stripped)):
+                  formula_cell_count += 1
+                  if len(formula_samples) < 100:
+                      formula_samples.append({
+                          "row": 1,
+                          "column": column_index,
+                          "columnName": value[:100],
+                          "prefixCharacter": (stripped or cell)[:1],
+                          "cellSha256": hashlib.sha256(cell.encode("utf-8", "replace")).hexdigest(),
+                      })
+          for row_number, row in enumerate(reader, start=2):
+              if data_rows_scanned >= maximum_rows:
+                  add("ROW_LIMIT_EXCEEDED", "BLOCK", f"CSV contains more than maximum_rows ({maximum_rows}) data records.")
+                  break
+              data_rows_scanned += 1
+              if len(row) != len(header):
+                  irregular_rows += 1
+              for column_index, cell in enumerate(row, start=1):
+                  cell_count += 1
+                  stripped = cell.lstrip(" \f\v")
+                  is_formula = (
+                      cell.startswith(("\t", "\r"))
+                      or stripped[:1] in ("=", "+", "@")
+                      or (
+                          stripped.startswith("-")
+                          and not re.fullmatch(r"-\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", stripped)
+                      )
+                  )
+                  if is_formula:
+                      formula_cell_count += 1
+                      if len(formula_samples) < 100:
+                          column_name = header[column_index - 1][:100] if column_index <= len(header) else ""
+                          formula_samples.append({
+                              "row": row_number,
+                              "column": column_index,
+                              "columnName": column_name,
+                              "prefixCharacter": (stripped or cell)[:1],
+                              "cellSha256": hashlib.sha256(cell.encode("utf-8", "replace")).hexdigest(),
+                          })
+          if formula_cell_count:
+              add("SPREADSHEET_FORMULA_RISK", "BLOCK", f"Found {formula_cell_count} cell(s) beginning with formula operators or dangerous control characters.")
+          if irregular_rows:
+              add("ROW_WIDTH_MISMATCH", "WARN", f"{irregular_rows} data record(s) have a different number of cells than the header.")
+          if time.monotonic() - started > 120:
+              add("DOWNLOAD_OR_SCAN_SLOW", "WARN", "Download and scan took longer than 120 seconds.")
+      except Exception as exc:
+          parse_failed = True
+          add("CSV_INSPECTION_FAILED", "BLOCK", str(exc)[:1000])
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "sourceUrl": source_url,
+          "finalUrl": downloaded_url,
+          "redirectChain": redirect_chain,
+          "downloadBytes": download_bytes,
+          "headerColumnCount": len(header),
+          "headerNames": header[:200],
+          "dataRowsScanned": data_rows_scanned,
+          "maximumRows": maximum_rows,
+          "maximumDownloadBytes": maximum_download_bytes,
+          "cellCountScanned": cell_count,
+          "formulaRiskCellCount": formula_cell_count,
+          "formulaRiskSamples": formula_samples,
+          "irregularRowCount": irregular_rows,
+          "parseFailed": parse_failed,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This is a heuristic formula-injection screen. It reports likely spreadsheet execution prefixes and does not sanitize or rewrite the original CSV.",
+      }
+      with open("csv-safety-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"CSV formula-injection audit: bytes={download_bytes}, dataRows={data_rows_scanned}, cells={cell_count}, formulaRiskCells={formula_cell_count}, verdict={verdict}.")
+      Kestra.outputs({
+          "source_url": source_url,
+          "final_url": downloaded_url or "",
+          "download_bytes": download_bytes,
+          "header_column_count": len(header),
+          "data_rows_scanned": data_rows_scanned,
+          "cell_count_scanned": cell_count,
+          "formula_risk_cell_count": formula_cell_count,
+          "irregular_row_count": irregular_rows,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: notify_on_formula_risk
+    type: io.kestra.plugin.core.flow.If
+    description: Send an alert only when enabled and the CSV contains blocking findings.
+    condition: "{{ inputs.notify_slack and outputs.inspect_csv.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: send_csv_safety_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert with the source URL, finding summary, and execution ID. Raw cell contents are never included.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: CSV formula-injection gate blocked an export\nSource: " ~ outputs.inspect_csv.vars.source_url ~
+                "\nVerdict: " ~ outputs.inspect_csv.vars.verdict ~
+                "\nFindings: " ~ (outputs.inspect_csv.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nSee csv-safety-report.json for row/column and hash evidence."
+            } | toJson
+          }}
+
+  - id: enforce_export_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed in strict mode when dangerous cells or blocking CSV-structure findings are detected.
+    condition: "{{ inputs.strict_mode and outputs.inspect_csv.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: fail_export_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Prevent a risky CSV from moving to spreadsheet consumers or downstream export steps.
+        errorMessage: "CSV export safety policy failed. Review csv-safety-report.json and the inspect_csv task output."
+    else:
+      - id: log_export_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "CSV export safety verdict={{ outputs.inspect_csv.vars.verdict }}; rows={{ outputs.inspect_csv.vars.data_rows_scanned }}; formulaRiskCells={{ outputs.inspect_csv.vars.formula_risk_cell_count }}."
+
+outputs:
+  - id: csv_safety_report
+    type: JSON
+    description: Machine-readable CSV scan summary with formula-risk counts and row/column/hash samples, but no raw cell contents.
+    value: "{{ outputs.inspect_csv.vars | toJson }}"
+
+extend:
+  title: CSV Formula-Injection Export Safety Gate
+  metaTitle: CSV Formula-Injection Export Safety Gate | Kestra
+  shortDescription: Scan CSV exports for formula-injection prefixes, malformed rows and unsafe download redirects before spreadsheets consume them.
+  metaDescription: Inspect bounded CSV exports for spreadsheet formula injection, duplicate headers, malformed row widths and unsafe HTTPS redirects before release.
+  description: |
+    Check a public CSV export before it is opened in spreadsheet software or passed to downstream consumers. The flow performs an HTTPS download bounded by size, validates redirect destinations against an exact public-host allowlist, checks header and row consistency, and flags cells beginning with spreadsheet formula operators or dangerous control characters. It emits a JSON report without storing raw cell contents in task outputs, can alert Slack, and can fail a strict release gate.
+
+    ## How it works
+
+    1. The input-validation task checks the HTTPS source URL, exact host allowlist, one-character delimiter and resource limits.
+    2. The inspection task downloads a bounded payload and validates every redirect target before reading the CSV as UTF-8.
+    3. The CSV scanner checks header quality, duplicate column names, irregular row widths and cells starting with potentially executable spreadsheet prefixes.
+    4. The report contains row/column positions, prefix characters and SHA-256 hashes for suspicious cells rather than copying their raw values.
+    5. An optional Slack branch sends a concise alert, while strict mode fails the flow when blocking findings exist.
+
+    ## What you get
+
+    - A JSON audit report with source/final URL, redirects, headers, row counts and policy findings.
+    - Detection of likely formula-injection cells starting with equals, plus, at-sign, dangerous control characters, or non-numeric minus-prefixed expressions.
+    - Checks for duplicate headers, invalid redirects, oversized downloads and inconsistent row widths.
+    - Optional alerting and a strict gate before spreadsheet or data-platform consumers.
+    - Evidence that avoids duplicating potentially sensitive raw cell contents in execution outputs.
+
+    ## Who it's for
+
+    - Data engineering teams publishing CSV extracts to business users.
+    - Security teams reviewing machine-generated spreadsheet exports.
+    - Platform teams building controlled ingestion and reporting workflows.
+
+    ## Why orchestrate this with Kestra
+
+    The flow keeps scanning, evidence, alerting and fail-closed release policy in one traceable execution. Its limits and host allowlist are explicit inputs, so the same workflow can be safely reused for different trusted CSV producers.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script runner.
+    - Network access from the worker to the explicitly allowed public HTTPS source hosts.
+    - Configure the exact raw-host source allowlist before targeting another producer.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook; required only when notify_slack is enabled.
+
+    ## Quick start
+
+    1. Import this flow and run the public CSV example in csv_url.
+    2. Inspect csv-safety-report.json and the csv_safety_report output.
+    3. Add the exact source and redirect hostnames to allowed_hosts; broad wildcard patterns are rejected.
+    4. Adjust delimiter, maximum_download_bytes and maximum_rows to match the producer.
+    5. Configure SLACK_WEBHOOK_URL before enabling notifications. Keep the schedule disabled until the source and policy are approved.
+
+    ## How to extend
+
+    - Add a separate sanitization task that writes a new safe CSV; do not overwrite the source.
+    - Apply column-specific rules for formulas in fields that are expected to contain plain text.
+    - Attach a signed source manifest or expected schema before allowing downstream publishing.
+    - Archive reports to object storage and require a passing execution before distributing exports.
+
+    ## Links
+
+    - [Python CSV documentation](https://docs.python.org/3/library/csv.html)
+    - [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection)
+    - [Python urllib request documentation](https://docs.python.org/3/library/urllib.request.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
