@@ -1,0 +1,624 @@
+id: github-actions-cache-quota-and-stale-branch-sweeper
+namespace: company.devops
+
+inputs:
+  - id: repository_owner
+    type: STRING
+    displayName: Repository Owner
+    defaults: my-org
+    description: GitHub organization or account name hosting the target repository.
+
+  - id: repository_name
+    type: STRING
+    displayName: Repository Name
+    defaults: backend-service
+    description: Target GitHub repository name to audit and sweep.
+
+  - id: max_saturation_pct
+    type: INT
+    displayName: Quota Saturation Warning Threshold (%)
+    defaults: 80
+    description: Alert threshold percentage against GitHub's 10 GB repository cache quota.
+
+  - id: max_cache_age_days
+    type: INT
+    displayName: Stale Cache Age Threshold (Days)
+    defaults: 7
+    description: Flag caches unaccessed for more than this number of days.
+
+  - id: prune_orphaned_branches
+    type: BOOL
+    displayName: Prune Orphaned Branch Caches
+    defaults: true
+    description: Flag caches whose originating Git branch no longer exists in the repository.
+
+  - id: prune_closed_prs
+    type: BOOL
+    displayName: Prune Closed PR Caches
+    defaults: true
+    description: Flag caches whose originating Pull Request has been merged or closed.
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    defaults: true
+    description: When true, audits repository cache usage without issuing DELETE calls. Must be false for live eviction.
+
+  - id: allow_eviction
+    type: BOOL
+    displayName: Allow Destructive Eviction
+    defaults: false
+    description: Explicit secondary confirmation required for live deletion. Both dry_run=false and allow_eviction=true are mandatory.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: daily_cache_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic scheduled audit scanning repository cache quota daily at 03:00 UTC. Shipped disabled by default.
+    cron: "0 3 * * *"
+    disabled: true
+
+  - id: pr_closed_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated event-driven webhook trigger to sweep dead cache scopes when a pull request closes.
+    key: "{{ secret('GITHUB_CACHE_SWEEPER_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert target repository parameters and numeric thresholds are valid.
+    conditions:
+      - "{{ inputs.repository_owner | length > 0 }}"
+      - "{{ inputs.repository_name | length > 0 }}"
+      - "{{ inputs.max_saturation_pct >= 1 and inputs.max_saturation_pct <= 100 }}"
+      - "{{ inputs.max_cache_age_days >= 1 }}"
+    errorMessage: "Invalid inputs: repository_owner and repository_name must not be empty, and thresholds must be positive values."
+
+  - id: fetch_cache_state
+    type: io.kestra.plugin.scripts.python.Script
+    description: Paginates GitHub Actions API for all repository caches, active branches, and pull request statuses.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+      REPO_OWNER: "{{ inputs.repository_owner }}"
+      REPO_NAME: "{{ inputs.repository_name }}"
+    script: |
+      import os
+      import sys
+      import json
+      import time
+      import re
+      import urllib.request
+      import urllib.error
+
+      token = os.environ.get("GITHUB_TOKEN", "").strip()
+      owner = os.environ.get("REPO_OWNER", "").strip()
+      repo = os.environ.get("REPO_NAME", "").strip()
+
+      if not token:
+          print("ERROR: GITHUB_TOKEN secret is required but was not provided.")
+          sys.exit(1)
+
+      headers = {
+          "Accept": "application/vnd.github+json",
+          "Authorization": f"Bearer {token}",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "Kestra-Cache-Sweeper"
+      }
+
+      def request_with_retry(url, max_retries=3):
+          for attempt in range(max_retries):
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      try:
+                          remaining = resp.headers.get("X-RateLimit-Remaining")
+                          if remaining and int(remaining) < 5:
+                              print(f"WARNING: GitHub API rate limit low: {remaining} requests remaining.")
+                      except (ValueError, TypeError):
+                          pass
+                      return json.loads(resp.read().decode())
+              except urllib.error.HTTPError as e:
+                  if e.code in (403, 429) and attempt < max_retries - 1:
+                      try:
+                          reset_header = e.headers.get("X-RateLimit-Reset")
+                          reset_time = int(reset_header) if reset_header else int(time.time() + 60)
+                      except (ValueError, TypeError):
+                          reset_time = int(time.time() + 60)
+                      sleep_duration = max(5, min(reset_time - int(time.time()), 60))
+                      print(f"Rate limited (HTTP {e.code}). Sleeping {sleep_duration}s...")
+                      time.sleep(sleep_duration)
+                  elif e.code == 404:
+                      return None
+                  else:
+                      print(f"HTTP Error {e.code} requesting {url}: {e.reason}")
+                      raise
+              except Exception as e:
+                  if attempt < max_retries - 1:
+                      time.sleep(2 ** attempt)
+                  else:
+                      raise
+
+      def paginate_get(base_url, item_key=None):
+          items = []
+          page = 1
+          while True:
+              sep = "&" if "?" in base_url else "?"
+              url = f"{base_url}{sep}per_page=100&page={page}"
+              try:
+                  data = request_with_retry(url)
+              except Exception as e:
+                  raise RuntimeError(f"Pagination failed on page {page} for {base_url}: {e}. Aborting to prevent destructive actions on partial data.") from e
+
+              if data is None:
+                  if page == 1:
+                      raise RuntimeError(f"Failed to fetch initial page from {base_url} (resource not found or HTTP 404). Verify repository existence and GITHUB_TOKEN permissions.")
+                  else:
+                      raise RuntimeError(f"Pagination failed on page {page} for {base_url}: received null/unusable response. Aborting to prevent destructive actions on partial data.")
+
+              if item_key:
+                  if not isinstance(data, dict) or item_key not in data:
+                      raise RuntimeError(f"Pagination failed on page {page} for {base_url}: expected key '{item_key}' missing from API response. Aborting to prevent destructive actions on partial data.")
+                  page_items = data[item_key]
+              else:
+                  page_items = data
+
+              if not isinstance(page_items, list):
+                  raise RuntimeError(f"Pagination failed on page {page} for {base_url}: expected list of items, got {type(page_items).__name__}. Aborting to prevent destructive actions on partial data.")
+
+              if not page_items:
+                  break
+
+              items.extend(page_items)
+              if len(page_items) < 100:
+                  break
+              page += 1
+          return items
+
+      # 1. Fetch Repository Cache Total Usage
+      usage_url = f"https://api.github.com/repos/{owner}/{repo}/actions/cache/usage"
+      try:
+          usage_data = request_with_retry(usage_url)
+      except Exception as e:
+          raise RuntimeError(f"Failed to fetch cache usage from {usage_url}: {e}. Aborting to prevent destructive actions.") from e
+      if usage_data is None:
+          raise RuntimeError(f"Failed to fetch cache usage from {usage_url} (resource not found or HTTP 404). Verify repository existence and GITHUB_TOKEN permissions.")
+
+      # 2. Paginate All Active Branches
+      branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches"
+      branches_raw = paginate_get(branches_url)
+      active_branches = []
+      for b in branches_raw:
+          if not isinstance(b, dict) or "name" not in b or not isinstance(b["name"], str) or not b["name"].strip():
+              raise RuntimeError(
+                  f"Branch API returned malformed branch record: {b!r}. "
+                  "Aborting to prevent classifying valid branch caches as orphaned."
+              )
+          active_branches.append(b["name"].strip())
+
+      # 3. Paginate All Repository Actions Caches
+      caches_url = f"https://api.github.com/repos/{owner}/{repo}/actions/caches?sort=last_accessed_at&direction=asc"
+      caches = paginate_get(caches_url, item_key="actions_caches")
+
+      # Validate every cache record immediately before PR lookup or downstream analysis
+      for c in caches:
+          if not isinstance(c, dict):
+              raise RuntimeError(
+                  f"Cache API returned malformed cache record (expected dict, got {type(c).__name__}): {c!r}. "
+                  "Aborting to prevent destructive actions on incomplete or invalid data."
+              )
+          cache_id = c.get("id")
+          if isinstance(cache_id, bool) or not isinstance(cache_id, int) or cache_id <= 0:
+              raise RuntimeError(
+                  f"Cache API returned invalid cache ID {cache_id!r} in record {c!r}. "
+                  "Aborting to prevent destructive actions on incomplete or invalid data."
+              )
+          if "size_in_bytes" in c:
+              size_bytes = c["size_in_bytes"]
+              if isinstance(size_bytes, bool) or not isinstance(size_bytes, (int, float)) or size_bytes < 0:
+                  raise RuntimeError(
+                      f"Cache API returned invalid size_in_bytes {size_bytes!r} in record {c!r}. "
+                      "Aborting to prevent destructive actions on incomplete or invalid data."
+                  )
+
+      # 4. Resolve Pull Request States Conservatively
+      pr_states = {}
+      pr_numbers = set()
+      for c in caches:
+          ref = (c.get("ref") or "").strip()
+          m = re.search(r"refs/pull/(\d+)/", ref)
+          if m:
+              pr_numbers.add(int(m.group(1)))
+
+      for pr_num in sorted(pr_numbers):
+          pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
+          try:
+              pr_data = request_with_retry(pr_url)
+          except Exception as e:
+              print(f"WARNING: Failed to fetch PR #{pr_num} state ({e}). Defaulting to open for safety.")
+              pr_data = None
+          if pr_data and isinstance(pr_data, dict):
+              pr_states[pr_num] = {
+                  "state": pr_data.get("state", "unknown"),
+                  "merged": pr_data.get("merged_at") is not None
+              }
+          else:
+              # Conservative fallback: treat unknown, failed, or 404 PRs as open to prevent accidental deletion
+              pr_states[pr_num] = {"state": "open", "merged": False}
+
+      payload = {
+          "usage": usage_data,
+          "branches": active_branches,
+          "caches": caches,
+          "pr_states": pr_states
+      }
+
+      with open("cache_state.json", "w") as f:
+          json.dump(payload, f)
+
+      print(f"Successfully collected {len(caches)} cache entries, {len(active_branches)} branches, and {len(pr_states)} PR states.")
+    outputFiles:
+      - cache_state.json
+
+  - id: analyze_cache_saturation
+    type: io.kestra.plugin.scripts.python.Script
+    description: Evaluates quota saturation, identifies dead branch and closed PR scopes, and compiles eviction candidates.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      cache_state.json: "{{ outputs.fetch_cache_state.outputFiles['cache_state.json'] }}"
+    env:
+      MAX_SATURATION_PCT: "{{ inputs.max_saturation_pct }}"
+      MAX_AGE_DAYS: "{{ inputs.max_cache_age_days }}"
+      PRUNE_ORPHANED_BRANCHES: "{{ inputs.prune_orphaned_branches }}"
+      PRUNE_CLOSED_PRS: "{{ inputs.prune_closed_prs }}"
+    script: |
+      import os
+      import json
+      import datetime
+      import re
+      from kestra import Kestra
+
+      with open("cache_state.json") as f:
+          data = json.load(f)
+
+      total_size_bytes = data["usage"].get("active_caches_size_in_bytes", 0)
+      quota_limit_bytes = 10 * 1024 * 1024 * 1024  # 10 GiB GitHub repository limit
+      saturation_pct = round((total_size_bytes / quota_limit_bytes) * 100, 2)
+      max_saturation = int(os.environ.get("MAX_SATURATION_PCT", 80))
+      max_age_days = int(os.environ.get("MAX_AGE_DAYS", 7))
+      prune_orphaned = os.environ.get("PRUNE_ORPHANED_BRANCHES", "true").lower() == "true"
+      prune_closed_prs = os.environ.get("PRUNE_CLOSED_PRS", "true").lower() == "true"
+
+      active_branches = set(data["branches"])
+      pr_states = data.get("pr_states", {})
+      now = datetime.datetime.now(datetime.timezone.utc)
+
+      candidates = []
+      protected_count = 0
+      stale_count = 0
+
+      def validate_cache_record(c):
+          if not isinstance(c, dict):
+              raise RuntimeError(
+                  f"Cache record must be a dictionary, got {type(c).__name__}: {c!r}. "
+                  "Aborting to prevent destructive actions on incomplete or invalid data."
+              )
+          cache_id = c.get("id")
+          if isinstance(cache_id, bool) or not isinstance(cache_id, int) or cache_id <= 0:
+              raise RuntimeError(
+                  f"Cache record has invalid cache ID {cache_id!r} in {c!r}. "
+                  "Aborting to prevent destructive actions on incomplete or invalid data."
+              )
+          if "size_in_bytes" in c:
+              size_bytes = c["size_in_bytes"]
+              if isinstance(size_bytes, bool) or not isinstance(size_bytes, (int, float)) or size_bytes < 0:
+                  raise RuntimeError(
+                      f"Cache record has invalid size_in_bytes {size_bytes!r} in {c!r}. "
+                      "Aborting to prevent destructive actions on incomplete or invalid data."
+                  )
+
+      for c in data.get("caches", []):
+          validate_cache_record(c)
+
+          ref = (c.get("ref") or "").strip()
+          accessed_at_str = c.get("last_accessed_at") or c.get("created_at")
+          if accessed_at_str:
+              try:
+                  accessed_at = datetime.datetime.fromisoformat(accessed_at_str.replace("Z", "+00:00"))
+                  age_days = (now - accessed_at).total_seconds() / 86400.0
+              except Exception:
+                  age_days = 0.0
+          else:
+              age_days = 0.0
+
+          if age_days >= max_age_days:
+              stale_count += 1
+
+          reasons = []
+          is_candidate = False
+
+          # 1. Inspect Pull Request Caches
+          pr_match = re.search(r"refs/pull/(\d+)/", ref)
+          if pr_match:
+              pr_num = str(pr_match.group(1))
+              pr_info = pr_states.get(pr_num) or pr_states.get(int(pr_num)) or {}
+              if pr_info.get("state") == "closed":
+                  if prune_closed_prs:
+                      is_candidate = True
+                      reasons.append("closed_pr")
+                  else:
+                      protected_count += 1
+                      continue
+              else:
+                  # Explicitly protect active open PR caches
+                  protected_count += 1
+                  continue
+
+          # 2. Inspect Branch Caches
+          elif ref.startswith("refs/heads/"):
+              branch_name = ref[len("refs/heads/"):].strip()
+              if not branch_name:
+                  # Malformed empty branch name: protect by default
+                  protected_count += 1
+                  continue
+              if branch_name in active_branches:
+                  # Explicitly protect active branch caches from any eviction or age-based fallthrough
+                  protected_count += 1
+                  continue
+              elif prune_orphaned:
+                  is_candidate = True
+                  reasons.append("deleted_branch")
+              else:
+                  protected_count += 1
+                  continue
+
+          # 3. Unknown, missing, malformed, or unsupported refs
+          else:
+              # Explicitly protect unknown, missing, malformed, or unsupported refs by default;
+              # they must never become deletion candidates solely because they are old
+              protected_count += 1
+              continue
+
+          if is_candidate:
+              candidates.append({
+                  "id": c["id"],
+                  "key": c.get("key", "unknown"),
+                  "ref": ref,
+                  "size_mb": round(c.get("size_in_bytes", 0) / (1024 * 1024), 2),
+                  "age_days": round(age_days, 1),
+                  "reasons": reasons
+              })
+
+      planned_reclaim_mb = round(sum(c["size_mb"] for c in candidates), 2)
+      quota_breached = saturation_pct >= max_saturation
+
+      report_lines = [
+          "# GitHub Actions Cache Quota & Hygiene Report",
+          f"- **Total Cache Size**: {round(total_size_bytes / (1024 * 1024), 2)} MB / 10,240 MB ({saturation_pct}%)",
+          f"- **Active Protected Caches**: {protected_count}",
+          f"- **Eviction Candidates Identified**: {len(candidates)}",
+          f"- **Planned Storage Reclamation**: {planned_reclaim_mb} MB",
+          f"- **Stale Inactivity Horizon**: {max_age_days} days ({stale_count} entries unaccessed beyond threshold)",
+          "",
+          "## Identified Candidates",
+          "| Cache ID | Git Ref | Size (MB) | Age (Days) | Reasons |",
+          "| :--- | :--- | :--- | :--- | :--- |"
+      ]
+
+      for c in candidates[:50]:
+          report_lines.append(f"| {c['id']} | `{c['ref']}` | {c['size_mb']} | {c['age_days']} | {', '.join(c['reasons'])} |")
+
+      if len(candidates) > 50:
+          report_lines.append(f"\n*...and {len(candidates) - 50} additional candidates.*")
+
+      with open("cache_audit_report.md", "w") as f:
+          f.write("\n".join(report_lines))
+
+      Kestra.outputs({
+          "total_size_mb": round(total_size_bytes / (1024 * 1024), 2),
+          "saturation_pct": saturation_pct,
+          "quota_breached": quota_breached,
+          "candidate_count": len(candidates),
+          "protected_count": protected_count,
+          "stale_cache_count": stale_count,
+          "max_age_days": max_age_days,
+          "planned_reclaim_mb": planned_reclaim_mb,
+          "candidates": candidates
+      })
+    outputFiles:
+      - cache_audit_report.md
+
+  - id: sweep_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Gated execution that requires dry_run=false and allow_eviction=true before any DELETE call is sent.
+    condition: "{{ not inputs.dry_run and inputs.allow_eviction and outputs.analyze_cache_saturation.vars.candidate_count > 0 }}"
+    then:
+      - id: purge_caches
+        type: io.kestra.plugin.scripts.python.Script
+        description: Executes verified DELETE requests against GitHub Actions API, accounting only for succeeded calls.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        inputFiles:
+          candidates.json: "{{ outputs.analyze_cache_saturation.vars.candidates | toJson }}"
+        env:
+          GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+          REPO_OWNER: "{{ inputs.repository_owner }}"
+          REPO_NAME: "{{ inputs.repository_name }}"
+        script: |
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+          from kestra import Kestra
+
+          token = os.environ.get("GITHUB_TOKEN", "").strip()
+          owner = os.environ.get("REPO_OWNER", "").strip()
+          repo = os.environ.get("REPO_NAME", "").strip()
+          with open("candidates.json") as f:
+              candidates = json.load(f)
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "Kestra-Cache-Sweeper"
+          }
+
+          succeeded_ids = []
+          failed_ids = []
+          actual_reclaimed_mb = 0.0
+
+          for item in candidates:
+              cache_id = item["id"]
+              url = f"https://api.github.com/repos/{owner}/{repo}/actions/caches/{cache_id}"
+              req = urllib.request.Request(url, headers=headers, method="DELETE")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      if resp.status in (200, 204):
+                          succeeded_ids.append(cache_id)
+                          actual_reclaimed_mb += item.get("size_mb", 0.0)
+                      else:
+                          failed_ids.append({"id": cache_id, "status": resp.status})
+              except urllib.error.HTTPError as e:
+                  print(f"Failed to delete cache {cache_id}: HTTP {e.code} ({e.reason})")
+                  failed_ids.append({"id": cache_id, "error": f"HTTP {e.code}"})
+              except Exception as e:
+                  print(f"Exception deleting cache {cache_id}: {e}")
+                  failed_ids.append({"id": cache_id, "error": str(e)})
+
+          print(f"Eviction complete: {len(succeeded_ids)} deleted, {len(failed_ids)} failed. Reclaimed: {round(actual_reclaimed_mb, 2)} MB.")
+
+          Kestra.outputs({
+              "deleted_count": len(succeeded_ids),
+              "actual_reclaimed_mb": round(actual_reclaimed_mb, 2),
+              "failed_count": len(failed_ids),
+              "failed_ids": failed_ids
+          })
+    else:
+      - id: log_audit_mode
+        type: io.kestra.plugin.core.log.Log
+        message: "Dry-run / audit mode active. No caches deleted. Found {{ outputs.analyze_cache_saturation.vars.candidate_count }} eligible cache candidates ({{ outputs.analyze_cache_saturation.vars.planned_reclaim_mb }} MB planned)."
+
+  - id: notify_slack
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatches an operational digest to Slack detailing cache quota, candidates, and reclaimed storage.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "#devops-alerts",
+        "username": "Kestra Actions Cache Sentinel",
+        "icon_emoji": ":wastebasket:",
+        "attachments": [
+          {
+            "color": "{{ outputs.analyze_cache_saturation.vars.quota_breached ? '#E01E5A' : (outputs.analyze_cache_saturation.vars.candidate_count > 0 ? '#ECB22E' : '#2EB67D') }}",
+            "title": "GitHub Actions Cache Audit: {{ inputs.repository_owner }}/{{ inputs.repository_name }}",
+            "fields": [
+              {
+                "title": "Storage Saturation",
+                "value": "{{ outputs.analyze_cache_saturation.vars.saturation_pct }}% ({{ outputs.analyze_cache_saturation.vars.total_size_mb }} MB / 10,240 MB)",
+                "short": true
+              },
+              {
+                "title": "Execution Mode",
+                "value": "{{ (not inputs.dry_run and inputs.allow_eviction) ? 'Live Eviction' : 'Dry Run (Audit Only)' }}",
+                "short": true
+              },
+              {
+                "title": "Candidates Identified",
+                "value": "{{ outputs.analyze_cache_saturation.vars.candidate_count }} entries ({{ outputs.analyze_cache_saturation.vars.planned_reclaim_mb }} MB planned)",
+                "short": true
+              },
+              {
+                "title": "Confirmed Storage Reclaimed",
+                "value": "{{ (outputs.purge_caches is defined and outputs.purge_caches.vars is defined) ? (outputs.purge_caches.vars.actual_reclaimed_mb ~ ' MB (' ~ outputs.purge_caches.vars.deleted_count ~ ' deleted)') : '0 MB (Dry Run / Audited Only)' }}",
+                "short": true
+              }
+            ],
+            "footer": "Kestra Declarative CI/CD Orchestrator",
+            "ts": "{{ now() | date('X') }}"
+          }
+        ]
+      }
+
+extend:
+  title: GitHub Actions Cache Quota & Stale Branch Sweeper
+  metaTitle: GitHub Actions Cache Quota & Stale Branch Sweeper | Kestra
+  shortDescription: Audits GitHub Actions 10GB cache quota, protects active PRs, sweeps dead branch caches, and reports reclaimed storage.
+  metaDescription: Audit GitHub Actions cache quota, protect active PRs, purge dead branch caches, and report reclaimed storage to Slack before build cache thrashing occurs.
+  description: |
+    Audits and manages GitHub Actions cache storage against the 10 GB per-repository quota limit (`actions/cache`). It reconciles cache scopes against live repository states, explicitly protects active pull requests and existing branches, safely evicts orphaned caches belonging to closed PRs and deleted branches, and reports verified storage savings to Slack.
+
+    ## How it works
+
+    1. **Preflight Validation**: Validates target repository parameters, saturation warning thresholds, and age horizons.
+    2. **Paginated State Collection**: Traverses GitHub REST API endpoints (`/actions/cache/usage`, `/actions/caches`, and `/branches`) across all pages, extracting cache keys, byte sizes, access dates, and active branch refs.
+    3. **Conservative Reference Resolution**: Resolves pull request states (`/pulls/{number}`) for all `refs/pull/` caches. Active pull requests (`state == "open"`) and valid branches are explicitly protected.
+    4. **Hygiene & Saturation Assessment**: Evaluates total cache saturation against the 10 GB limit, flags dead scopes from merged PRs and deleted branches, compiles a markdown inventory, and calculates planned storage reclamation.
+    5. **Double-Confirmation Gating**: Evaluates conditional execution requiring both `dry_run: false` and `allow_eviction: true` before issuing any `DELETE` calls. In dry-run mode, all deletions are bypassed.
+    6. **Deterministic Purge & Verification**: Issues authenticated DELETE calls against eligible dead caches, recording only confirmed `204 No Content` responses toward the actual reclaimed storage metric.
+    7. **Slack Operational Digest**: Posts an operational summary to Slack detailing quota utilization, candidate counts, and verified storage reclamation.
+
+    ## What you get
+
+    - Elimination of build cache thrashing where blunt LRU eviction deletes main branch caches.
+    - Automated reclamation of storage consumed by merged pull requests and deleted feature branches.
+    - Strict protection for active, ongoing pull request builds.
+    - True zero-destruction dry-run mode by default with explicit secondary confirmation gating.
+    - Accurate accounting reporting only verified, successfully deleted bytes.
+    - Actionable Slack notifications detailing cache health.
+
+    ## Who it's for
+
+    - Platform Engineers and DevOps teams maintaining GitHub Actions CI/CD workflows.
+    - Repository Maintainers managing high-frequency pull request contributions.
+    - FinOps Engineers optimizing cloud build performance and resource quotas.
+
+    ## Why orchestrate this with Kestra
+
+    - **Out-of-Band Execution**: Running cleanup workflows inside GitHub Actions consumes runner minutes and fails if CI runners are backpressured. Kestra runs on an independent, predictable schedule.
+    - **Declarative Safety**: Native secret masking safeguards GitHub tokens and Slack webhooks.
+    - **Safe Failure Isolation**: Rate limits, missing branches, and partial deletion errors are caught and logged without corrupting repository state.
+
+    ## Prerequisites
+
+    - A GitHub Personal Access Token (Fine-Grained Token with `Actions: Read and write`, `Pull requests: Read`, `Contents: Read`, or Classic Token with `repo` scope).
+    - A Slack Incoming Webhook URL.
+
+    ### Secrets
+
+    - `GITHUB_TOKEN`: GitHub authentication token with permissions to list and delete repository caches (required).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for operational alerting (required).
+    - `GITHUB_CACHE_SWEEPER_WEBHOOK_KEY`: Secret-backed key for authenticating on-demand webhook triggers (optional).
+
+    ## Quick start
+
+    1. Configure `GITHUB_TOKEN` and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this blueprint into your Kestra instance.
+    3. Run a test execution with default inputs (`dry_run: true`, `allow_eviction: false`) to audit current cache saturation.
+    4. Review the generated `cache_audit_report.md` artifact in the execution output.
+    5. To perform live cleanup, trigger an execution with `dry_run: false` and `allow_eviction: true`, or enable the `daily_cache_audit` schedule.
+
+    ## How to extend
+
+    - **Multi-Repository Fleet Sweeper**: Wrap this flow with Kestra's `ForEachItem` to iterate over an entire GitHub organization.
+    - **Artifact Quota Monitoring**: Expand the collection script to query `/actions/artifacts` and prune expired test recordings.
+    - **PagerDuty Integration**: Add `io.kestra.plugin.notifications.pagerduty.PagerDutyAlert` if cache saturation exceeds 95%.
+
+    ## Links
+
+    - [GitHub Actions Cache API Documentation](https://docs.github.com/en/rest/actions/cache)
+    - [GitHub Actions Cache Usage Limits](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy)
+    - [Kestra Python Script Plugin](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+    - FinOps & Cost Management
+  ee: false
+  demo: false
