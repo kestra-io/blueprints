@@ -1,0 +1,376 @@
+id: sqlserver-blocking-session-killer-guard
+namespace: company.team
+description: Release a bounded abandoned SQL Server head blocker after approval and a same-batch identity check.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: sqlserver_url
+    type: STRING
+    defaults: "jdbc:sqlserver://localhost:1433;databaseName=app;encrypt=true;loginTimeout=5;socketTimeout=90000"
+  - id: sqlserver_username
+    type: STRING
+    defaults: "{{ secret('SQLSERVER_USERNAME') }}"
+  - id: sqlserver_password
+    type: SECRET
+    defaults: "{{ secret('SQLSERVER_PASSWORD') }}"
+  - id: target_login
+    type: STRING
+    description: Exact opt-in application login. Privileged logins remain excluded.
+  - id: protected_logins
+    type: ARRAY
+    itemType: STRING
+    defaults: [sa]
+  - id: min_age_seconds
+    type: INT
+    defaults: 300
+    min: 1
+    max: 86400
+  - id: max_age_seconds
+    type: INT
+    defaults: 3600
+    min: 1
+    max: 86400
+  - id: max_waiters
+    type: INT
+    defaults: 20
+    min: 1
+    max: 100
+  - id: max_log_mb
+    type: INT
+    defaults: 16
+    min: 1
+    max: 64
+  - id: recovery_seconds
+    type: INT
+    defaults: 30
+    min: 1
+    max: 60
+  - id: trust_server_certificate
+    type: BOOL
+    defaults: false
+  - id: dry_run
+    type: BOOL
+    defaults: true
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+  - id: slack_webhook_url
+    type: SECRET
+    defaults: "{{ secret('SLACK_WEBHOOK_URL') }}"
+
+variables:
+  snapshot_sql: |
+    SET NOCOUNT ON;
+    SET LOCK_TIMEOUT 2000;
+    DECLARE @minAge int=CONVERT(int,:min_age), @maxAge int=CONVERT(int,:max_age),
+      @maxWaiters int=CONVERT(int,:max_waiters), @maxLog bigint=CONVERT(bigint,:max_log_mb)*1048576;
+    IF DB_ID() <= 4 OR CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) <> 16
+      THROW 51000, 'Requires SQL Server 2022 and an explicit user database.', 1;
+    IF HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER PERFORMANCE STATE') <> 1
+      OR HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION') <> 1
+      THROW 51000, 'Full DMV and principal visibility is required.', 1;
+    IF @minAge > @maxAge OR LEN(:target_login) NOT BETWEEN 1 AND 128
+      OR DATALENGTH(:protected_json) > 8192
+      THROW 51000, 'Invalid age bounds or login scope.', 1;
+    DECLARE @edges TABLE (spid int, request_id int, started datetime,
+      connection_id uniqueidentifier, blocked_by int, dbid int, wait_type nvarchar(60));
+    INSERT @edges SELECT TOP (1001) session_id, request_id, start_time,
+      connection_id, blocking_session_id, database_id, wait_type
+      FROM sys.dm_exec_requests WHERE blocking_session_id <> 0;
+    IF (SELECT COUNT(*) FROM @edges) > 1000
+      THROW 51000, 'Blocking graph exceeds 1000 requests.', 1;
+    IF EXISTS (SELECT spid FROM @edges GROUP BY spid HAVING COUNT(*)>1)
+      THROW 51000, 'Multiple blocked requests per session are unsupported.', 1;
+    DECLARE @tree TABLE (head int, spid int, request_id int, started datetime,
+      connection_id uniqueidentifier, dbid int, wait_type nvarchar(60), depth int);
+    WITH chain AS (
+      SELECT e.blocked_by AS head, e.spid, e.request_id, e.started,
+        e.connection_id, e.dbid, e.wait_type, 1 AS depth,
+        CAST('/' + CONVERT(varchar(6), e.blocked_by) + '/' + CONVERT(varchar(6), e.spid) + '/' AS varchar(256)) AS path
+      FROM @edges e WHERE e.blocked_by > 0
+        AND NOT EXISTS (SELECT 1 FROM @edges b WHERE b.spid=e.blocked_by)
+      UNION ALL
+      SELECT c.head, e.spid, e.request_id, e.started, e.connection_id,
+        e.dbid, e.wait_type, c.depth+1,
+        CAST(c.path + CONVERT(varchar(6), e.spid) + '/' AS varchar(256))
+      FROM chain c JOIN @edges e ON e.blocked_by=c.spid
+      WHERE c.depth < 16 AND CHARINDEX('/'+CONVERT(varchar(6), e.spid)+'/',c.path)=0
+    )
+    INSERT @tree SELECT head, spid, request_id, started, connection_id,
+      dbid, wait_type, depth FROM chain OPTION (MAXRECURSION 16);
+    IF EXISTS (SELECT 1 FROM @tree t JOIN @edges e ON e.blocked_by=t.spid WHERE t.depth=16)
+      THROW 51000, 'Blocking graph exceeds 16 levels.', 1;
+    DECLARE @heads TABLE (spid int, connection_id uniqueidentifier, login_name nvarchar(128),
+      login_time varchar(23), transaction_id varchar(20), transaction_start varchar(23),
+      sql_handle varchar(130), host_name nvarchar(128), program_name nvarchar(128),
+      age_seconds bigint, log_bytes bigint, waiters int, eligible bit);
+    DECLARE @matched datetime2=SYSDATETIME();
+    INSERT @heads
+    SELECT s.session_id, c.connection_id, s.login_name,
+      CONVERT(varchar(23),s.login_time,121), CONVERT(varchar(20),t.transaction_id),
+      CONVERT(varchar(23),t.transaction_begin_time,121),
+      CONVERT(varchar(130),c.most_recent_sql_handle,1), s.host_name,s.program_name,
+      DATEDIFF_BIG(second,t.transaction_begin_time,GETDATE()), d.database_transaction_log_bytes_used,
+      (SELECT COUNT(DISTINCT spid) FROM @tree WHERE head=s.session_id),
+      CASE WHEN s.is_user_process=1 AND s.session_id <> @@SPID
+        AND s.login_name COLLATE Latin1_General_100_BIN2 = :target_login COLLATE Latin1_General_100_BIN2
+        AND s.login_name <> ORIGINAL_LOGIN() AND s.login_name=s.original_login_name
+        AND p.type='S' AND p.principal_id > 1
+        AND IS_SRVROLEMEMBER('sysadmin',s.login_name)=0
+        AND IS_SRVROLEMEMBER('processadmin',s.login_name)=0
+        AND NOT EXISTS (SELECT 1 FROM OPENJSON(:protected_json) j
+          WHERE j.value COLLATE Latin1_General_100_BIN2=s.login_name COLLATE Latin1_General_100_BIN2)
+        AND s.status='sleeping' AND s.open_transaction_count=1
+        AND NOT EXISTS (SELECT 1 FROM sys.dm_exec_requests r WHERE r.session_id=s.session_id)
+        AND c.parent_connection_id IS NULL AND c.protocol_type='TSQL'
+        AND (SELECT COUNT(*) FROM sys.dm_exec_connections cc WHERE cc.session_id=s.session_id)=1
+        AND c.most_recent_sql_handle IS NOT NULL
+        AND st.is_user_transaction=1 AND st.is_local=1
+        AND t.transaction_type=1 AND t.transaction_state=2
+        AND (SELECT COUNT(*) FROM sys.dm_tran_session_transactions tt WHERE tt.session_id=s.session_id)=1
+        AND (SELECT COUNT(*) FROM sys.dm_tran_database_transactions dd WHERE dd.transaction_id=t.transaction_id)=1
+        AND d.database_id=DB_ID()
+        AND d.database_transaction_log_bytes_used BETWEEN 1 AND @maxLog
+        AND t.transaction_begin_time <= DATEADD(second,-@minAge,GETDATE())
+        AND t.transaction_begin_time >= DATEADD(second,-@maxAge,GETDATE())
+        AND EXISTS (SELECT 1 FROM sys.dm_tran_locks l WHERE l.request_session_id=s.session_id
+          AND l.resource_database_id=DB_ID() AND l.request_owner_type='TRANSACTION'
+          AND l.request_owner_id=t.transaction_id AND l.request_status IN ('GRANT','GRANTED')
+          AND l.request_mode IN ('X','IX','U'))
+        AND (SELECT COUNT(DISTINCT spid) FROM @tree WHERE head=s.session_id) BETWEEN 1 AND @maxWaiters
+        AND NOT EXISTS (SELECT 1 FROM @tree w WHERE w.head=s.session_id
+          AND (w.dbid<>DB_ID() OR w.connection_id IS NULL OR w.wait_type IS NULL OR w.wait_type NOT LIKE 'LCK[_]M[_]%'))
+        THEN 1 ELSE 0 END
+    FROM sys.dm_exec_sessions s
+    JOIN sys.dm_exec_connections c ON c.session_id=s.session_id
+    JOIN sys.dm_tran_session_transactions st ON st.session_id=s.session_id
+    JOIN sys.dm_tran_active_transactions t ON t.transaction_id=st.transaction_id
+    JOIN sys.dm_tran_database_transactions d ON d.transaction_id=t.transaction_id
+    LEFT JOIN sys.server_principals p ON p.sid=s.security_id
+    WHERE EXISTS (SELECT 1 FROM @tree w WHERE w.head=s.session_id)
+      AND s.is_user_process=1 AND s.login_name COLLATE Latin1_General_100_BIN2=:target_login COLLATE Latin1_General_100_BIN2;
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.sqlserver.Query
+    timeout: PT30S
+    url: "{{ inputs.sqlserver_url }}"
+    username: "{{ inputs.sqlserver_username }}"
+    password: "{{ inputs.sqlserver_password }}"
+    trustServerCertificate: "{{ inputs.trust_server_certificate }}"
+    fetchType: FETCH_ONE
+    parameters:
+      target_login: "{{ inputs.target_login }}"
+      protected_json: "{{ inputs.protected_logins | toJson }}"
+      min_age: "{{ inputs.min_age_seconds }}"
+      max_age: "{{ inputs.max_age_seconds }}"
+      max_waiters: "{{ inputs.max_waiters }}"
+      max_log_mb: "{{ inputs.max_log_mb }}"
+    sql: |
+      BEGIN
+      {{ render(vars.snapshot_sql) }}
+      SELECT (SELECT COUNT(*) FROM @heads WHERE eligible=1) AS eligible_heads,
+        (SELECT COUNT(*) FROM @heads WHERE eligible=0) AS excluded_heads,
+        COALESCE((SELECT TOP (1) spid, CONVERT(varchar(36),connection_id) AS connection_id,
+          login_name,login_time,transaction_id,transaction_start,sql_handle,
+          host_name,program_name,age_seconds,log_bytes,waiters
+          FROM @heads WHERE eligible=1 ORDER BY age_seconds DESC,spid
+          FOR JSON PATH,WITHOUT_ARRAY_WRAPPER),'{}') AS [plan];
+      END
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Eligible abandoned heads={{ outputs.audit.row.eligible_heads }};
+      excluded heads={{ outputs.audit.row.excluded_heads }}.
+      At most one termination is proposed: {{ outputs.audit.row.plan }}.
+
+  - id: gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.row.eligible_heads > 0 and inputs.auto_remediate and not inputs.dry_run }}"
+    then:
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        pauseDuration: PT30M
+        behavior: FAIL
+        onResume:
+          - id: approved
+            type: BOOL
+            required: false
+            description: Approve one termination and rollback. A numeric session ID remains subject to a brief reuse race.
+      - id: approved_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approval.onResume.approved ?? false }}"
+        then:
+          - id: terminate
+            type: io.kestra.plugin.jdbc.sqlserver.Query
+            timeout: PT85S
+            url: "{{ inputs.sqlserver_url }}"
+            username: "{{ inputs.sqlserver_username }}"
+            password: "{{ inputs.sqlserver_password }}"
+            trustServerCertificate: "{{ inputs.trust_server_certificate }}"
+            fetchType: FETCH_ONE
+            parameters:
+              target_login: "{{ inputs.target_login }}"
+              protected_json: "{{ inputs.protected_logins | toJson }}"
+              min_age: "{{ inputs.min_age_seconds }}"
+              max_age: "{{ inputs.max_age_seconds }}"
+              max_waiters: "{{ inputs.max_waiters }}"
+              max_log_mb: "{{ inputs.max_log_mb }}"
+              plan: "{{ outputs.audit.row.plan }}"
+              recovery_seconds: "{{ inputs.recovery_seconds }}"
+            sql: |
+              BEGIN
+              {{ render(vars.snapshot_sql) }}
+              DECLARE @plan nvarchar(max)=:plan;
+              DECLARE @spid int=TRY_CONVERT(int,JSON_VALUE(@plan,'$.spid'));
+              DECLARE @tx bigint=TRY_CONVERT(bigint,JSON_VALUE(@plan,'$.transaction_id'));
+              IF NOT EXISTS (SELECT 1 FROM @heads h WHERE h.eligible=1 AND h.spid=@spid
+                AND CONVERT(varchar(36),h.connection_id)=JSON_VALUE(@plan,'$.connection_id')
+                AND h.login_name COLLATE Latin1_General_100_BIN2=JSON_VALUE(@plan,'$.login_name') COLLATE Latin1_General_100_BIN2
+                AND h.login_time=JSON_VALUE(@plan,'$.login_time')
+                AND h.transaction_id=JSON_VALUE(@plan,'$.transaction_id')
+                AND h.transaction_start=JSON_VALUE(@plan,'$.transaction_start')
+                AND h.sql_handle=JSON_VALUE(@plan,'$.sql_handle')
+                AND h.waiters=TRY_CONVERT(int,JSON_VALUE(@plan,'$.waiters')))
+                THROW 51001, 'Stale or ineligible head. No KILL issued. Replan.', 1;
+              IF @spid=@@SPID OR HAS_PERMS_BY_NAME(NULL,NULL,'ALTER ANY CONNECTION')<>1
+                THROW 51002, 'Termination permission absent or target is self. No KILL issued.', 1;
+              DECLARE @kill nvarchar(32)='KILL '+CONVERT(varchar(6),@spid);
+              DECLARE @issued datetime2=SYSDATETIME();
+              EXEC (@kill);
+              DECLARE @deadline datetime2=DATEADD(second,CONVERT(int,:recovery_seconds),SYSDATETIME());
+              DECLARE @pollDelay varchar(12)=CONVERT(varchar(12),TIMEFROMPARTS(0,0,0,100,3),114);
+              DECLARE @rollback_observed bit=0;
+              DECLARE @rollback_percent real=NULL;
+              DECLARE @remaining int=1;
+              WHILE SYSDATETIME()<@deadline AND @remaining>0
+              BEGIN
+                IF EXISTS (SELECT 1 FROM sys.dm_tran_active_transactions
+                  WHERE transaction_id=@tx AND transaction_state=7) SET @rollback_observed=1;
+                SELECT @rollback_percent=r.percent_complete FROM sys.dm_exec_requests r
+                  WHERE r.session_id=@spid AND r.command='KILLED/ROLLBACK';
+                SELECT @remaining=(SELECT COUNT(*) FROM sys.dm_tran_active_transactions WHERE transaction_id=@tx)
+                  +(SELECT COUNT(*) FROM sys.dm_exec_connections
+                    WHERE connection_id=TRY_CONVERT(uniqueidentifier,JSON_VALUE(@plan,'$.connection_id')))
+                  +(SELECT COUNT(*) FROM @tree w JOIN sys.dm_exec_requests r
+                    ON r.session_id=w.spid AND r.request_id=w.request_id AND r.start_time=w.started
+                    AND r.connection_id=w.connection_id WHERE w.head=@spid AND r.wait_type LIKE 'LCK[_]M[_]%');
+                IF @remaining>0 WAITFOR DELAY @pollDelay;
+              END;
+              SELECT CASE WHEN @remaining=0 THEN 'RECOVERED' ELSE 'RECOVERY_TIMEOUT' END AS result,
+                @spid AS terminated_spid, @rollback_observed AS rollback_observed,
+                @rollback_percent AS last_rollback_percent,
+                DATEDIFF_BIG(microsecond,@matched,@issued) AS rematch_read_to_issue_us,
+                DATEDIFF_BIG(millisecond,@issued,SYSDATETIME()) AS recovery_observation_ms,
+                @remaining AS remaining_original_work;
+              END
+          - id: verify_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.terminate.row.result ?? 'MISSING_RESULT') != 'RECOVERED' }}"
+            then:
+              - id: recovery_failed
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: Recovery was not proved within the observation budget. Inspect rollback and original waiters. Do not repeat KILL.
+          - id: recovered
+            type: io.kestra.plugin.core.log.Log
+            message: "{{ outputs.terminate.row | toJson }}"
+        else:
+          - id: declined
+            type: io.kestra.plugin.core.log.Log
+            message: Approval absent or declined. No termination issued.
+
+errors:
+  - id: failure_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    timeout: PT10S
+    url: "{{ inputs.slack_webhook_url }}"
+    payload: "{{ {'text': 'SQL Server blocking recovery failed. Inspect execution ' ~ execution.id ~ '. Do not retry a numeric KILL without a fresh plan.'} | toJson }}"
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+    disabled: true
+    inputs:
+      target_login: application_login
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  # SPDX-License-Identifier: Apache-2.0
+  title: Release an abandoned SQL Server head blocker after approval
+  shortDescription: Re-match one abandoned blocking transaction before KILL and verify bounded recovery of the original waiters.
+  metaTitle: Guard SQL Server head-blocker termination with Kestra
+  metaDescription: Approve one bounded SQL Server head-blocker termination, re-match its connection and transaction identity then verify rollback and waiter recovery.
+  description: |
+    ## Safety
+    KILL ends a connection and rolls back its uncommitted work. Session IDs are reused. The identity read and KILL share one batch but are not atomic. A replacement between them can still be terminated. Approval accepts that risk.
+
+    | Guard | What it stops |
+    |---|---|
+    | Exact opt-in login, protected list | Other applications, sa, sysadmin, processadmin and the observing login |
+    | Sleeping head, one local transaction | Active work, blocked middle sessions, system sessions, MARS and distributed work |
+    | Age, waiter and logged-byte ceilings | Young transactions and repairs beyond the chosen blast radius |
+    | One KILL, no retry | A stale numeric termination repeated after rollback |
+
+    ## How it works
+    1. `audit` uses native `jdbc.sqlserver.Query` to follow lock-wait chains and propose the oldest eligible head in the connected database. It reports excluded heads too, without exposing SQL text.
+    2. `approval` requires `approved=true` after both live-mode inputs are set. `terminate` re-reads eligibility and matches SPID, connection UUID, login, login time, transaction ID/start, SQL handle and downstream waiter count before one KILL.
+    3. The same Query polls the original transaction, connection and waiting request identities. `verify_result` fails if they remain after the observation budget. Rollback is reported when sampled. A missing SQL result also fails.
+
+    ## What you get
+    Identity, age, logged bytes, waiter count and a recovery verdict.
+
+    ## Who it's for
+    DBAs handling a forgotten application transaction whose owner has approved losing its uncommitted work.
+
+    ## Why orchestrate this with Kestra
+    Keep approval and recovery checks in one execution. Concurrency queues this flow only; other tools remain independent.
+
+    ## Tested end to end
+    SQL Server 2022 Developer 16.0.4305.5: 25 cases on Kestra 2.0.6, 14 on 2.0.5 and 16 on a fresh instance. Independent sqlcmd reads proved two blocked requests completed, an uncommitted value of 999 rolled back before the waiters committed 12 and three other rows survived unchanged. A separate transaction's 12000 inserts rolled back; recovery was sampled at 102 to 106 ms, not timed to exact completion.
+
+    | Case | Execution | Result |
+    |---|---|---|
+    | dry | 5lulYZKF20x5xrhYJ7VfMW | SUCCESS |
+    | declined | 711qPMjwTxHswBE6vc5rMN | SUCCESS |
+    | repair | 4k74Q9Owz6eyUiEmW1ZsVQ | SUCCESS |
+    | reused SPID | 3pXsPZQHullgPf8itBqvnn | FAILED |
+    | recovery timeout | JJlxB00Mg59tocObLMals | FAILED |
+
+    A real replacement reused the approved SPID during the pause and survived. Missing permission, a changed SQL handle and a new transaction refused KILL. Local identity-read-start to issue samples ranged from timer-resolution zero to 44.824 ms; they are observations, not a maximum race window.
+
+    ## Prerequisites
+    SQL Server 2022, JDBC access to a user database and SQL-authenticated target logins. The flow login needs CONNECT SQL, database access, VIEW SERVER PERFORMANCE STATE and VIEW ANY DEFINITION. Live mode also needs ALTER ANY CONNECTION, a server-wide privilege; the flow's login scope does not restrict that grant.
+
+    ### Secrets
+    `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD` and `SLACK_WEBHOOK_URL`. Password and webhook overrides use SECRET inputs.
+
+    ### Inputs
+    Set `sqlserver_url` with databaseName, loginTimeout and socketTimeout, plus `target_login`. Defaults: age 300 to 3600 seconds, at most 20 waiters, 16 MB logged bytes and 30 seconds of recovery observation. `dry_run=true`, `auto_remediate=false` and certificate validation stay on.
+
+    ## Quick start
+    1. Configure secrets and the database URL. Run in dry mode and inspect the plan.
+    2. Choose thresholds and protected logins with the application owner. Set live mode and approve only the displayed incident.
+    3. On failure inspect current rollback and waiter state. Start a new execution with a fresh plan, never retry the old KILL task.
+
+    ## How to extend
+    Add an application probe after recovery. Limits: 1000 blocked requests, 16 graph levels and one termination per execution. Overflow fails. The observation budget is capped at 60 seconds; SQL Server may continue rollback afterward. Request departure proves progress or cancellation, not application success.
+
+    ## Links
+    - KILL: https://learn.microsoft.com/en-us/sql/t-sql/language-elements/kill-transact-sql
+    - Blocking: https://learn.microsoft.com/en-us/troubleshoot/sql/performance/understand-resolve-blocking
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
