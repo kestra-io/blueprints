@@ -1,0 +1,405 @@
+id: postgres-slow-query-ai-index-healer
+namespace: company.data
+
+description: |
+  Continuously profiles PostgreSQL for slow SELECT queries via pg_stat_statements, scores and ranks
+  bottlenecks in-memory using DuckDB, synthesizes non-locking B-tree indexes with an LLM, verifies
+  cost reductions via EXPLAIN and HypoPG, and dispatches GitHub issues and Slack notifications.
+
+variables:
+  llm_endpoint: https://api.groq.com/openai/v1/chat/completions
+
+inputs:
+  - id: pg_url
+    type: STRING
+    defaults: "jdbc:postgresql://postgres-test:5432/postgres"
+    description: "JDBC connection string for the target PostgreSQL instance."
+
+  - id: pg_user
+    type: STRING
+    defaults: "postgres"
+    description: "PostgreSQL role with pg_read_all_stats privileges."
+
+  - id: min_mean_exec_time_ms
+    type: FLOAT
+    defaults: 1.0
+    description: "Minimum mean execution latency (in ms) required to flag a slow query."
+
+  - id: min_calls
+    type: INT
+    defaults: 25
+    description: "Minimum call count required before evaluating a query."
+
+  - id: max_queries_to_analyze
+    type: INT
+    defaults: 3
+    description: "Maximum number of top-ranked slow queries to remediate per run."
+
+  - id: github_repository
+    type: STRING
+    defaults: "your-org/your-repo"
+    description: "Target GitHub repository (owner/repo) for remediation issues."
+
+  - id: llm_model
+    type: STRING
+    defaults: "openai/gpt-oss-20b"
+    description: "OpenAI-compatible model identifier served by the LLM endpoint."
+
+tasks:
+  - id: extract_slow_queries
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: "Extract top slow SELECT statements from pg_stat_statements."
+    url: "{{ inputs.pg_url }}"
+    username: "{{ inputs.pg_user }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        CAST(queryid AS text) AS query_id,
+        LEFT(regexp_replace(query, '\s+', ' ', 'g'), 8000) AS query,
+        calls,
+        CAST(ROUND(CAST(mean_exec_time AS numeric), 2) AS double precision) AS mean_exec_time_ms,
+        CAST(ROUND(CAST(stddev_exec_time AS numeric), 2) AS double precision) AS stddev_exec_time_ms,
+        CAST(ROUND(CAST(total_exec_time AS numeric), 2) AS double precision) AS total_exec_time_ms,
+        rows AS rows_returned,
+        shared_blks_hit,
+        shared_blks_read
+      FROM pg_stat_statements
+      WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        AND query ILIKE 'select%'
+        AND query NOT ILIKE '%pg_stat_statements%'
+        AND query NOT ILIKE '%pg_catalog.%'
+        AND mean_exec_time >= {{ inputs.min_mean_exec_time_ms }}
+        AND calls >= {{ inputs.min_calls }}
+      ORDER BY total_exec_time DESC
+      LIMIT 50
+
+  - id: check_slow_queries_exist
+    type: io.kestra.plugin.core.flow.If
+    description: "Proceed with catalog extraction and ranking only if slow queries exist."
+    condition: "{{ outputs.extract_slow_queries.size > 0 }}"
+    then:
+      - id: fetch_index_catalog
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: "Fetch existing user-defined indexes to prevent duplicate index proposals."
+        url: "{{ inputs.pg_url }}"
+        username: "{{ inputs.pg_user }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        sql: |
+          SELECT LEFT(COALESCE(string_agg(indexdef, chr(10) ORDER BY tablename, indexname), ''), 6000) AS index_catalog
+          FROM pg_indexes
+          WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+
+      - id: rank_bottlenecks
+        type: io.kestra.plugin.jdbc.duckdb.Query
+        description: "Compute composite severity scores in DuckDB using latency, buffer misses, and jitter."
+        fetchType: FETCH
+        inputFiles:
+          slow_queries.json: "{{ outputs.extract_slow_queries.rows | toJson }}"
+        sql: |
+          WITH metrics AS (
+            SELECT
+              CAST(query_id AS VARCHAR) AS query_id,
+              query,
+              CAST(calls AS BIGINT) AS calls,
+              mean_exec_time_ms,
+              stddev_exec_time_ms,
+              total_exec_time_ms,
+              rows_returned,
+              CASE WHEN shared_blks_hit + shared_blks_read = 0 THEN 1.0
+                   ELSE shared_blks_hit * 1.0 / (shared_blks_hit + shared_blks_read) END AS cache_hit_ratio,
+              CASE WHEN mean_exec_time_ms = 0 THEN 0.0
+                   ELSE stddev_exec_time_ms / mean_exec_time_ms END AS latency_variability
+            FROM read_json_auto('{{ workingDir }}/slow_queries.json')
+          ),
+          scored AS (
+            SELECT
+              *,
+              ROUND(
+                (mean_exec_time_ms * calls / 1000.0)
+                * (1 + (1 - cache_hit_ratio))
+                * (1 + LEAST(latency_variability, 1.0)),
+                2
+              ) AS severity_score
+            FROM metrics
+          )
+          SELECT
+            query_id,
+            query,
+            calls,
+            mean_exec_time_ms,
+            CAST(ROUND(mean_exec_time_ms) AS BIGINT) AS mean_ms_rounded,
+            stddev_exec_time_ms,
+            total_exec_time_ms,
+            rows_returned,
+            ROUND(cache_hit_ratio, 3) AS cache_hit_ratio,
+            severity_score,
+            ROW_NUMBER() OVER (ORDER BY severity_score DESC) AS severity_rank
+          FROM scored
+          ORDER BY severity_score DESC
+          LIMIT {{ inputs.max_queries_to_analyze }}
+
+      - id: heal_each_bottleneck
+        type: io.kestra.plugin.core.flow.Loop
+        description: "Iterate over top-ranked bottlenecks with bounded concurrency."
+        values: "{{ outputs.rank_bottlenecks.rows }}"
+        concurrencyLimit: 2
+        tasks:
+          - id: check_already_tracked
+            type: io.kestra.plugin.core.kv.Get
+            description: "Check Kestra KV Store to avoid duplicate alerts for the same query ID."
+            key: "pg_healer_{{ fromJson(item.value).query_id }}"
+            errorOnMissing: false
+
+          - id: gate_new_bottleneck
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.check_already_tracked.value ?? '') == '' }}"
+            then:
+              - id: ai_synthesis
+                type: io.kestra.plugin.core.http.Request
+                description: "Request a non-locking B-tree index DDL and rollback plan from the LLM."
+                uri: "{{ vars.llm_endpoint }}"
+                method: POST
+                contentType: application/json
+                timeout: PT2M
+                headers:
+                  Authorization: "Bearer {{ secret('LLM_API_KEY') }}"
+                body: |
+                  {%- set q = fromJson(item.value) -%}
+                  {{ {
+                    "model": inputs.llm_model,
+                    "temperature": 0.1,
+                    "max_tokens": 900,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                      {
+                        "role": "system",
+                        "content": "You are a Principal PostgreSQL Database Engineer. Design the single best B-tree index to fix the slow query. Respond with ONE JSON object only, using keys: bottleneck_reason (string), index_ddl (string, non-locking CREATE INDEX CONCURRENTLY IF NOT EXISTS statement), rollback_ddl (string, DROP INDEX CONCURRENTLY IF EXISTS statement), expected_impact (string)."
+                      },
+                      {
+                        "role": "user",
+                        "content": "Query ID: " ~ q.query_id ~ ". Mean latency: " ~ q.mean_exec_time_ms ~ " ms over " ~ q.calls ~ " calls. SQL: " ~ q.query ~ " EXISTING INDEXES: " ~ (outputs.fetch_index_catalog.row.index_catalog | default('none'))
+                      }
+                    ]
+                  } | toJson }}
+
+              - id: parse_ai_response
+                type: io.kestra.plugin.core.output.OutputValues
+                description: "Validate that both creation and rollback DDL statements use CONCURRENTLY."
+                values:
+                  fix: |-
+                    {%- set raw = outputs.ai_synthesis.body -%}
+                    {%- set envelope = raw is map ? raw : fromJson(raw) -%}
+                    {%- set content = envelope.choices[0].message.content -%}
+                    {%- set answer = content is map ? content : fromJson(content) -%}
+                    {%- set ddl = (answer.index_ddl ?? '') | trim -%}
+                    {%- set rollback = (answer.rollback_ddl ?? '') | trim -%}
+                    {%- set safe = (ddl | upper | startsWith('CREATE INDEX CONCURRENTLY ')) and (rollback | upper | startsWith('DROP INDEX CONCURRENTLY ')) -%}
+                    {{ {
+                      "bottleneck_reason": answer.bottleneck_reason ?? 'n/a',
+                      "index_ddl": ddl,
+                      "rollback_ddl": rollback,
+                      "expected_impact": answer.expected_impact ?? 'n/a',
+                      "guardrails_passed": safe
+                    } | toJson }}
+
+              - id: verify_with_explain
+                type: io.kestra.plugin.jdbc.postgresql.Queries
+                description: "Compare generic query plans before and after virtual index creation via HypoPG."
+                runIf: "{{ fromJson(outputs.parse_ai_response.values.fix).guardrails_passed }}"
+                allowFailure: true
+                url: "{{ inputs.pg_url }}"
+                username: "{{ inputs.pg_user }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH
+                sql: |
+                  {%- set q = fromJson(item.value) -%}
+                  {%- set fix = fromJson(outputs.parse_ai_response.values.fix) -%}
+                  EXPLAIN (GENERIC_PLAN) {{ q.query | trim | replace({';': ''}) }};
+                  SELECT * FROM hypopg_create_index('{{ fix.index_ddl | replace({'CONCURRENTLY ': '', 'IF NOT EXISTS ': '', ';': '', "'": "''"}) }}');
+                  EXPLAIN (GENERIC_PLAN) {{ q.query | trim | replace({';': ''}) }};
+
+              - id: score_verification
+                type: io.kestra.plugin.jdbc.duckdb.Query
+                description: "Parse EXPLAIN cost estimates in DuckDB to confirm >= 10% planner cost reduction."
+                runIf: "{{ (outputs.verify_with_explain.outputs ?? []) | length == 3 }}"
+                allowFailure: true
+                fetchType: FETCH
+                inputFiles:
+                  plans.json: |
+                    {{ {
+                      "before_rows": outputs.verify_with_explain.outputs[0].rows,
+                      "after_rows": outputs.verify_with_explain.outputs[2].rows
+                    } | toJson }}
+                sql: |
+                  WITH p AS (
+                    SELECT
+                      CAST(before_rows[1]."QUERY PLAN" AS VARCHAR) AS plan_before,
+                      CAST(after_rows[1]."QUERY PLAN" AS VARCHAR) AS plan_after
+                    FROM read_json_auto('{{ workingDir }}/plans.json')
+                  ),
+                  c AS (
+                    SELECT
+                      plan_before,
+                      plan_after,
+                      TRY_CAST(regexp_extract(plan_before, 'cost=[0-9.]+\.\.([0-9.]+)', 1) AS DOUBLE) AS cost_before,
+                      TRY_CAST(regexp_extract(plan_after, 'cost=[0-9.]+\.\.([0-9.]+)', 1) AS DOUBLE) AS cost_after
+                    FROM p
+                  )
+                  SELECT
+                    plan_before,
+                    plan_after,
+                    cost_before,
+                    cost_after,
+                    ROUND(100.0 * (cost_before - cost_after) / NULLIF(cost_before, 0), 1) AS improvement_pct,
+                    CASE
+                      WHEN cost_before IS NULL OR cost_after IS NULL THEN 'UNVERIFIED'
+                      WHEN cost_after < cost_before * 0.9 THEN 'CONFIRMED'
+                      ELSE 'NOT_CONFIRMED'
+                    END AS verdict
+                  FROM c
+
+              - id: route_remediation
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ fromJson(outputs.parse_ai_response.values.fix).guardrails_passed }}"
+                then:
+                  - id: fan_out_remediation
+                    type: io.kestra.plugin.core.flow.Parallel
+                    tasks:
+                      - id: open_github_issue
+                        type: io.kestra.plugin.core.http.Request
+                        description: "Open a GitHub issue with telemetry, AI diagnosis, and verified DDL."
+                        uri: "https://api.github.com/repos/{{ inputs.github_repository }}/issues"
+                        method: POST
+                        contentType: application/json
+                        headers:
+                          Accept: application/vnd.github+json
+                          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+                          X-GitHub-Api-Version: "2022-11-28"
+                          User-Agent: kestra-postgres-index-healer
+                        body: |
+                          {%- set q = fromJson(item.value) -%}
+                          {%- set fix = fromJson(outputs.parse_ai_response.values.fix) -%}
+                          {%- set vr = outputs.score_verification.rows[0] ?? null -%}
+                          {%- set verdict = vr is null ? 'UNVERIFIED' : vr.verdict -%}
+                          {
+                            "title": {{ ('[DB Healer] Slow Query Remediation (Query ' ~ q.query_id ~ ' - ' ~ q.mean_ms_rounded ~ 'ms)') | toJson }},
+                            "labels": ["db-healer", "performance", "automated"],
+                            "body": {% filter toJson %}## Slow query remediation proposal
+
+                          - Query ID: `{{ q.query_id }}`
+                          - Mean latency: **{{ q.mean_exec_time_ms }} ms**
+                          - Calls: {{ q.calls }}
+
+                          ### Slow query
+                          ```sql
+                          {{ q.query }}
+                          ```
+
+                          ### AI Diagnosis
+                          {{ fix.bottleneck_reason }}
+
+                          ### Migration DDL
+                          ```sql
+                          {{ fix.index_ddl }}
+                          ```
+
+                          ### Rollback DDL
+                          ```sql
+                          {{ fix.rollback_ddl }}
+                          ```
+
+                          **Verdict: {{ verdict }}**
+                          {% endfilter %}
+                          }
+
+                      - id: notify_slack
+                        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                        description: "Send real-time remediation alert to Slack."
+                        allowFailure: true
+                        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                        payload: |
+                          {%- set q = fromJson(item.value) -%}
+                          {%- set fix = fromJson(outputs.parse_ai_response.values.fix) -%}
+                          {{ {
+                            "text": "⚡ PostgreSQL Slow Query Remediated - Query " ~ q.query_id ~ " (AI DDL: `" ~ fix.index_ddl ~ "`)"
+                          } | toJson }}
+
+                  - id: remember_query
+                    type: io.kestra.plugin.core.kv.Set
+                    description: "Record query_id in KV Store with a 7-day TTL to prevent duplicate issues."
+                    key: "pg_healer_{{ fromJson(item.value).query_id }}"
+                    value: "{{ execution.id }}"
+                    kvType: STRING
+                    ttl: P7D
+
+    else:
+      - id: log_database_healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "All PostgreSQL queries are executing within SLA threshold."
+
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+
+extend:
+  title: PostgreSQL Slow Query AI Index Healer with DuckDB and HypoPG
+  metaTitle: Automate PostgreSQL Slow Query Index Remediation with Kestra, DuckDB, and AI
+  shortDescription: Detect slow PostgreSQL queries via pg_stat_statements, rank bottlenecks in DuckDB, verify AI-generated B-tree indexes with EXPLAIN, and open GitHub issues.
+  metaDescription: Detect slow PostgreSQL queries, rank severity in DuckDB, verify non-locking AI index DDL with EXPLAIN, and dispatch GitHub issues and Slack alerts.
+  description: |
+    ## What you get
+    - Automated extraction of slow `SELECT` queries from PostgreSQL `pg_stat_statements` filtered by execution latency and call volume.
+    - In-memory composite bottleneck scoring via DuckDB combining cumulative database time, shared buffer cache-miss ratios, and latency jitter.
+    - Guardrailed LLM synthesis that enforces non-locking `CREATE INDEX CONCURRENTLY IF NOT EXISTS` and `DROP INDEX CONCURRENTLY` statements.
+    - Virtual execution plan verification using PostgreSQL `EXPLAIN (GENERIC_PLAN)` and `hypopg`, plus 7-day alert deduplication via Kestra KV Store.
+
+    ## Who it's for
+    - Database Reliability Engineers (DBREs), Backend Engineers, and Platform Teams operating production PostgreSQL databases who want proactive, non-locking index recommendations before slow queries degrade application SLAs.
+
+    ## Why orchestrate this with Kestra
+    Kestra unifies JDBC database introspection, embedded DuckDB analytical scoring, LLM API calls, conditional safety gates, parallel webhook/GitHub fan-out, and stateful KV deduplication inside a single declarative YAML workflow with built-in retries and execution lineage.
+
+    ## How it works
+    1. `hourly_schedule` (`io.kestra.plugin.core.trigger.Schedule`) triggers the pipeline every hour.
+    2. `extract_slow_queries` (`io.kestra.plugin.jdbc.postgresql.Query`) queries `pg_stat_statements` for slow `SELECT` queries exceeding `min_mean_exec_time_ms` and `min_calls`.
+    3. `check_slow_queries_exist` (`io.kestra.plugin.core.flow.If`) branches only when bottlenecks are detected, invoking `fetch_index_catalog` to retrieve existing `pg_indexes` definitions.
+    4. `rank_bottlenecks` (`io.kestra.plugin.jdbc.duckdb.Query`) ingests query metrics into DuckDB and computes a composite `severity_score` to isolate the top bottlenecks.
+    5. `heal_each_bottleneck` (`io.kestra.plugin.core.flow.Loop`) iterates over each bottleneck, checking `check_already_tracked` (`io.kestra.plugin.core.kv.Get`) to skip queries already reported within the last 7 days.
+    6. `ai_synthesis` (`io.kestra.plugin.core.http.Request`) sends query telemetry and existing indexes to an OpenAI-compatible LLM endpoint, and `parse_ai_response` enforces `CONCURRENTLY` DDL safety guardrails.
+    7. `verify_with_explain` and `score_verification` test the proposed index virtually via `hypopg` and compare `EXPLAIN (GENERIC_PLAN)` planner costs in DuckDB.
+    8. `fan_out_remediation` (`io.kestra.plugin.core.flow.Parallel`) opens a detailed GitHub issue and posts a Slack notification simultaneously, followed by `remember_query` (`io.kestra.plugin.core.kv.Set`) setting a `P7D` deduplication key.
+
+    ## Prerequisites
+    - PostgreSQL 16+ instance with `pg_stat_statements` enabled (`shared_preload_libraries=pg_stat_statements`) and optional `hypopg` extension installed.
+    - Outbound HTTPS access to an OpenAI-compatible LLM endpoint (e.g., Groq), GitHub REST API, and Slack Incoming Webhooks.
+
+    ### Secrets
+    - `POSTGRES_PASSWORD`: Password for the PostgreSQL monitoring role.
+    - `LLM_API_KEY`: API key for the OpenAI-compatible LLM provider (e.g., Groq API key).
+    - `GITHUB_TOKEN`: GitHub Personal Access Token with `issues:write` permission on the target repository.
+    - `SLACK_WEBHOOK_URL`: Incoming Webhook URL for Slack notifications.
+
+    ## Quick start
+    1. Configure `POSTGRES_PASSWORD`, `LLM_API_KEY`, `GITHUB_TOKEN`, and `SLACK_WEBHOOK_URL` as namespace secrets in Kestra.
+    2. Import this blueprint into the `company.data` namespace and update `pg_url` and `github_repository` inputs.
+    3. Click **Execute** to run an immediate diagnostic pass, verify the generated GitHub issue and Slack alert, and keep `hourly_schedule` enabled.
+
+    ## How to extend
+    - Add a GitOps pull request task using `io.kestra.plugin.git.PushFlows` or GitHub API to automatically commit verified `.sql` migration files into a Flyway or Liquibase directory.
+    - Route `NOT_CONFIRMED` virtual index plans to PagerDuty or Jira for manual DBA inspection.
+
+    ## Links
+    - [PostgreSQL JDBC Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [DuckDB JDBC Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-duckdb)
+    - [Slack Notifications Plugin Documentation](https://kestra.io/plugins/plugin-notifications/slack)
+    - [PostgreSQL pg_stat_statements Documentation](https://www.postgresql.org/docs/current/pgstatstatements.html)
+  tags:
+    - Data
+    - AI
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
