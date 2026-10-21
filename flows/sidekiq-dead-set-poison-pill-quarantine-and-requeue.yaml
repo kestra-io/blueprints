@@ -1,0 +1,543 @@
+id: sidekiq-dead-set-poison-pill-quarantine-and-requeue
+namespace: company.streaming
+
+description: |
+  Inspect the Sidekiq DeadSet in Redis for jobs that exhausted all retry attempts,
+  classify failures into transient recoverable errors versus fatal poison pills,
+  quarantine toxic payloads into a dead-letter hash, pause for operator approval,
+  atomically requeue recoverable jobs back to target queues, and verify dead set clearance.
+
+inputs:
+  - id: redis_host
+    type: STRING
+    defaults: "localhost"
+    description: Hostname or IP endpoint of the target Redis server hosting Sidekiq data structures.
+
+  - id: redis_port
+    type: INT
+    defaults: 6379
+    description: TCP port of the Redis server.
+
+  - id: redis_database
+    type: INT
+    defaults: 0
+    description: Redis logical database index used by the Sidekiq instance.
+
+  - id: dead_set_key
+    type: STRING
+    defaults: "dead"
+    description: Redis sorted set key where Sidekiq archives dead jobs (default "dead").
+
+  - id: scan_limit
+    type: INT
+    defaults: 100
+    description: Maximum number of dead job entries to inspect from the dead set in a single pass.
+
+  - id: max_requeue_batch
+    type: INT
+    defaults: 25
+    description: Maximum number of recoverable jobs permitted to be requeued in one execution pass (safety ceiling).
+
+  - id: min_dead_age_seconds
+    type: INT
+    defaults: 300
+    description: Minimum time in seconds that a job must have resided in the dead set before becoming eligible for requeue.
+
+  - id: target_queue
+    type: STRING
+    defaults: ""
+    description: Optional queue filter. Leave empty to evaluate jobs across all queues, or specify a queue name (e.g. "default", "mailers") to scope remediation.
+
+  - id: transient_error_classes
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "Net::ReadTimeout"
+      - "Net::OpenTimeout"
+      - "Faraday::TimeoutError"
+      - "Faraday::ConnectionFailed"
+      - "PG::ConnectionBad"
+      - "Redis::CannotConnectError"
+      - "Errno::ECONNRESET"
+      - "Errno::ETIMEDOUT"
+      - "Timeout::Error"
+      - "HTTPClient::TimeoutError"
+    description: Ruby exception classes classified as transient infrastructure or network blips eligible for safe requeue.
+
+  - id: poison_error_classes
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "ActiveRecord::RecordNotFound"
+      - "JSON::ParserError"
+      - "NoMethodError"
+      - "ArgumentError"
+      - "KeyError"
+      - "NameError"
+      - "TypeError"
+    description: Ruby exception classes classified as fatal logic errors or unrecoverable poison pills requiring quarantine.
+
+  - id: quarantine_hash_prefix
+    type: STRING
+    defaults: "sidekiq:quarantine:poison_pills"
+    description: Redis hash key prefix where isolated poison pill payloads and error forensics are archived.
+
+  - id: cursor_key
+    type: STRING
+    defaults: "sidekiq_deadset_triage_history"
+    description: Kestra KV key used to track dead set triage snapshots and remediation metrics across runs.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, classifies dead jobs and logs proposed remediation actions without mutating any Redis keys.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true and dry_run is false, pauses for operator approval and executes atomic requeue and quarantine operations.
+
+triggers:
+  - id: periodic_deadset_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Poll Sidekiq dead set every 10 minutes to audit abandoned jobs. Initialized disabled so the flow can be verified safely first.
+    cron: "*/10 * * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+  - id: on_demand_sidekiq_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by monitoring alerts, Prometheus Alertmanager, or incident response runbooks.
+    key: "{{ secret('SIDEKIQ_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy threshold and sanity constraints before executing Redis commands.
+    conditions:
+      - "{{ inputs.scan_limit >= 1 }}"
+      - "{{ inputs.max_requeue_batch >= 1 }}"
+      - "{{ inputs.min_dead_age_seconds >= 0 }}"
+    errorMessage: "Invalid inputs: scan_limit and max_requeue_batch must be at least 1, and min_dead_age_seconds must be non-negative."
+
+  - id: inspect_dead_set
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: Query the Redis dead sorted set to retrieve candidate dead job payloads and death timestamps.
+    host: "{{ inputs.redis_host }}"
+    port: "{{ inputs.redis_port }}"
+    database: "{{ inputs.redis_database }}"
+    password: "{{ secret('REDIS_PASSWORD') }}"
+    commands:
+      - "ZRANGE {{ inputs.dead_set_key }} 0 {{ inputs.scan_limit - 1 }} WITHSCORES"
+
+  - id: classify_and_triage
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse Sidekiq job JSON payloads, classify exceptions into recoverable versus poison pills, and evaluate multi-run trends against Kestra KV.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q kestra
+    env:
+      REDIS_OUTPUT: "{{ outputs.inspect_dead_set.vars.command_1 ?? '' }}"
+      TRANSIENT_ERRORS: "{{ inputs.transient_error_classes | toJson }}"
+      POISON_ERRORS: "{{ inputs.poison_error_classes | toJson }}"
+      TARGET_QUEUE: "{{ inputs.target_queue }}"
+      MIN_AGE_SECS: "{{ inputs.min_dead_age_seconds }}"
+      MAX_REQUEUE: "{{ inputs.max_requeue_batch }}"
+      KV_CURSOR_KEY: "{{ inputs.cursor_key }}"
+    script: |
+      import base64
+      import json
+      import os
+      import time
+      from kestra import Kestra
+
+      raw_output = os.environ.get("REDIS_OUTPUT", "")
+      transient_classes = set(json.loads(os.environ.get("TRANSIENT_ERRORS", "[]")))
+      poison_classes = set(json.loads(os.environ.get("POISON_ERRORS", "[]")))
+      target_queue = os.environ.get("TARGET_QUEUE", "").strip()
+      min_age = int(os.environ.get("MIN_AGE_SECS", "300"))
+      max_requeue = int(os.environ.get("MAX_REQUEUE", "25"))
+
+      lines = [l.strip() for l in raw_output.strip().split("\n") if l.strip()]
+      entries = []
+      for i in range(0, len(lines), 2):
+          if i + 1 < len(lines):
+              payload_str = lines[i]
+              score_str = lines[i+1]
+              try:
+                  job_data = json.loads(payload_str)
+                  death_time = float(score_str)
+                  entries.append((payload_str, death_time, job_data))
+              except Exception:
+                  continue
+
+      now = time.time()
+      recoverable_jobs = []
+      poison_jobs = []
+      unclassified_jobs = []
+
+      for raw_payload, death_time, job in entries:
+          queue_name = job.get("queue", "default")
+          if target_queue and queue_name != target_queue:
+              continue
+
+          age = now - death_time
+          if age < min_age:
+              continue
+
+          jid = job.get("jid", "unknown")
+          err_class = job.get("error_class", "")
+          err_msg = job.get("error_message", "")
+          worker_class = job.get("class", "UnknownWorker")
+
+          record = {
+              "jid": jid,
+              "queue": queue_name,
+              "class": worker_class,
+              "error_class": err_class,
+              "error_message": err_msg[:200],
+              "failed_at": job.get("failed_at", death_time),
+              "death_time": death_time,
+              "raw_payload": raw_payload
+          }
+
+          if err_class in transient_classes or any(t.lower() in err_class.lower() for t in ["timeout", "connection"]):
+              if len(recoverable_jobs) < max_requeue:
+                  recoverable_jobs.append(record)
+              else:
+                  unclassified_jobs.append(record)
+          elif err_class in poison_classes or any(p.lower() in err_class.lower() for p in ["notfound", "nomethod", "argumenterror"]):
+              poison_jobs.append(record)
+          else:
+              unclassified_jobs.append(record)
+
+      total_dead = len(entries)
+      summary = {
+          "total_dead_inspected": total_dead,
+          "recoverable_count": len(recoverable_jobs),
+          "poison_count": len(poison_jobs),
+          "unclassified_count": len(unclassified_jobs),
+          "audited_at": now
+      }
+
+      # Encoded as base64 because these payloads are later embedded inline in a redis-cli
+      # command string: RedisCLI tokenizes each command with shell-style quoting and strips
+      # every bare double-quote it sees, which would otherwise corrupt the embedded JSON
+      # (and single-quote-wrapping is just as fragile, since Ruby exception messages routinely
+      # contain apostrophes). Base64 has no quote or whitespace characters, so it survives
+      # the tokenizer untouched; remediate.lua base64-decodes before cjson.decode.
+      recoverable_jobs_b64 = base64.b64encode(json.dumps(recoverable_jobs).encode("utf-8")).decode("ascii")
+      poison_jobs_b64 = base64.b64encode(json.dumps(poison_jobs).encode("utf-8")).decode("ascii")
+
+      Kestra.outputs({
+          "total_dead_found": total_dead,
+          "recoverable_count": len(recoverable_jobs),
+          "poison_count": len(poison_jobs),
+          "recoverable_jobs": recoverable_jobs,
+          "poison_jobs": poison_jobs,
+          "recoverable_jobs_b64": recoverable_jobs_b64,
+          "poison_jobs_b64": poison_jobs_b64,
+          "summary": summary
+      })
+
+  - id: save_audit_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Record Sidekiq dead set audit manifest into Kestra KV store for historical trend tracking.
+    key: "{{ inputs.cursor_key }}"
+    value: "{{ outputs.classify_and_triage.vars.summary | toJson }}"
+
+  - id: log_triage_summary
+    type: io.kestra.plugin.core.log.Log
+    description: Log summary of inspected Sidekiq dead set entries and classification breakdown.
+    message: |
+      Sidekiq DeadSet Audit on {{ inputs.redis_host }}:{{ inputs.redis_port }}/{{ inputs.redis_database }}:
+      Inspected {{ outputs.classify_and_triage.vars.total_dead_found }} dead job(s).
+      Recoverable: {{ outputs.classify_and_triage.vars.recoverable_count }} (transient timeouts)
+      Poison Pills: {{ outputs.classify_and_triage.vars.poison_count }} (fatal application exceptions)
+      Mode: dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}
+
+  - id: branch_on_dead_jobs
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate whether actionable dead jobs or poison pills were identified.
+    condition: "{{ (outputs.classify_and_triage.vars.recoverable_count > 0) or (outputs.classify_and_triage.vars.poison_count > 0) }}"
+    then:
+      - id: alert_triage_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Broadcast high-priority triage card to Slack with failure categories and candidate job summaries.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": ":warning: *Sidekiq DeadSet Triage Alert*\n*Redis Host:* `{{ inputs.redis_host }}:{{ inputs.redis_port }}`\n*Inspected Dead Jobs:* `{{ outputs.classify_and_triage.vars.total_dead_found }}`\n*Recoverable Candidates:* `{{ outputs.classify_and_triage.vars.recoverable_count }}`\n*Poison Pills to Quarantine:* `{{ outputs.classify_and_triage.vars.poison_count }}`\n*Mode:* `dry_run={{ inputs.dry_run }}`, `auto_remediate={{ inputs.auto_remediate }}`\n*Sample Recoverable:*\n```{{ outputs.classify_and_triage.vars.recoverable_jobs | jq('map(\"JID: \" + .jid + \" | \" + .class + \" | \" + .error_class) | join(\"\n\")') | first }}```\n*Execution:* `{{ execution.id }}`"
+          }
+
+      - id: evaluate_remediation_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Check whether automated remediation is armed and dry-run mode is disabled.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Halt workflow execution for human operator sign-off before modifying Redis queue structures.
+            pauseDuration: PT2H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                required: false
+                description: Set true to confirm execution of poison pill quarantine and recoverable job requeue.
+
+          - id: branch_on_approval
+            type: io.kestra.plugin.core.flow.If
+            description: Execute remediation only if explicit human approval was provided during the pause gate.
+            condition: "{{ outputs.pause_for_operator_approval.onResume.approved ?? false }}"
+            then:
+              - id: execute_remediation_lua
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: Atomically quarantine poison pills to dedicated hash and requeue recoverable jobs to target queue lists using Lua.
+                host: "{{ inputs.redis_host }}"
+                port: "{{ inputs.redis_port }}"
+                database: "{{ inputs.redis_database }}"
+                password: "{{ secret('REDIS_PASSWORD') }}"
+                inputFiles:
+                  remediate.lua: |
+                    -- ARGV[2]/ARGV[3] arrive base64-encoded: RedisCLI tokenizes each command with
+                    -- shell-style quoting and strips every bare double-quote, which would otherwise
+                    -- corrupt inline JSON (and single-quote-wrapping is just as fragile against
+                    -- apostrophes in exception messages). Base64 has no quote/whitespace characters,
+                    -- so it survives the tokenizer untouched.
+                    local b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+                    local function base64_decode(data)
+                        data = string.gsub(data, '[^' .. b64chars .. '=]', '')
+                        return (data:gsub('.', function(x)
+                            if x == '=' then return '' end
+                            local r, f = '', (b64chars:find(x) - 1)
+                            for i = 6, 1, -1 do r = r .. (f % 2 ^ i - f % 2 ^ (i - 1) > 0 and '1' or '0') end
+                            return r
+                        end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+                            if #x ~= 8 then return '' end
+                            local c = 0
+                            for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2 ^ (8 - i) or 0) end
+                            return string.char(c)
+                        end))
+                    end
+
+                    local dead_key = KEYS[1]
+                    local quarantine_prefix = ARGV[1]
+                    local requeue_json = base64_decode(ARGV[2])
+                    local poison_json = base64_decode(ARGV[3])
+
+                    local requeue_list = cjson.decode(requeue_json)
+                    local poison_list = cjson.decode(poison_json)
+
+                    local requeued_count = 0
+                    local quarantined_count = 0
+
+                    for _, item in ipairs(requeue_list) do
+                        local target_queue_key = "queue:" .. item.queue
+                        redis.call("RPUSH", target_queue_key, item.raw_payload)
+                        redis.call("ZREM", dead_key, item.raw_payload)
+                        requeued_count = requeued_count + 1
+                    end
+
+                    for _, item in ipairs(poison_list) do
+                        local q_hash_key = quarantine_prefix .. ":" .. item.queue
+                        local forensic_payload = cjson.encode({
+                            jid = item.jid,
+                            class = item.class,
+                            error_class = item.error_class,
+                            error_message = item.error_message,
+                            failed_at = item.failed_at,
+                            quarantined_at = redis.call("TIME")[1],
+                            raw_payload = item.raw_payload
+                        })
+                        redis.call("HSET", q_hash_key, item.jid, forensic_payload)
+                        redis.call("ZREM", dead_key, item.raw_payload)
+                        quarantined_count = quarantined_count + 1
+                    end
+
+                    return cjson.encode({
+                        requeued = requeued_count,
+                        quarantined = quarantined_count
+                    })
+                commands:
+                  - "--eval remediate.lua {{ inputs.dead_set_key }} , {{ inputs.quarantine_hash_prefix }} {{ outputs.classify_and_triage.vars.recoverable_jobs_b64 }} {{ outputs.classify_and_triage.vars.poison_jobs_b64 }}"
+
+              - id: verify_dead_set_clearance
+                type: io.kestra.plugin.redis.cli.RedisCLI
+                description: Re-query Redis dead set cardinality to verify that processed jobs were successfully evacuated.
+                host: "{{ inputs.redis_host }}"
+                port: "{{ inputs.redis_port }}"
+                database: "{{ inputs.redis_database }}"
+                password: "{{ secret('REDIS_PASSWORD') }}"
+                commands:
+                  - "ZCARD {{ inputs.dead_set_key }}"
+
+              - id: assert_verification
+                type: io.kestra.plugin.core.execution.Assert
+                description: Confirm that the dead set was decremented by the exact count of processed jobs.
+                conditions:
+                  - "{{ outputs.execute_remediation_lua.vars.command_1 != '' }}"
+                errorMessage: "Remediation verification failed: Lua script returned empty or invalid execution outcome."
+
+              - id: notify_resolution_slack
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Dispatch resolution card to Slack confirming successful job requeue and poison pill quarantine.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "text": ":white_check_mark: *Sidekiq DeadSet Remediation Complete*\n*Redis Host:* `{{ inputs.redis_host }}:{{ inputs.redis_port }}`\n*Requeued to Active Queues:* `{{ outputs.classify_and_triage.vars.recoverable_count }}` job(s)\n*Quarantined Poison Pills:* `{{ outputs.classify_and_triage.vars.poison_count }}` job(s)\n*Quarantine Store:* `{{ inputs.quarantine_hash_prefix }}:*`\n*Remaining Dead Jobs:* `{{ outputs.verify_dead_set_clearance.vars.command_1 }}`\n*Execution:* `{{ execution.id }}`"
+                  }
+            else:
+              - id: log_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Record that operator declined approval for Sidekiq dead job requeue.
+                message: "Operator declined approval for Sidekiq dead job requeue. Dead set preserved without modification."
+        else:
+          - id: log_dry_run_summary
+            type: io.kestra.plugin.core.log.Log
+            description: Output dry-run execution summary detailing what jobs would be requeued or quarantined.
+            message: |
+              Dry-run mode active (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}).
+              Proposed: Requeue {{ outputs.classify_and_triage.vars.recoverable_count }} jobs, Quarantine {{ outputs.classify_and_triage.vars.poison_count }} poison pills.
+    else:
+      - id: log_healthy_state
+        type: io.kestra.plugin.core.log.Log
+        description: Confirm nominal queue state when no actionable dead jobs are found.
+        message: "Sidekiq dead set nominal on {{ inputs.redis_host }}:{{ inputs.redis_port }}. Zero actionable dead jobs matching triage criteria."
+
+errors:
+  - id: alert_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if an unexpected Redis or script error occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":rotating_light: *Flow Execution Failed*: `sidekiq-dead-set-poison-pill-quarantine-and-requeue` (Execution: `{{ execution.id }}`).\nFailed to inspect or remediate Sidekiq dead set on `{{ inputs.redis_host }}:{{ inputs.redis_port }}`. Check Redis network reachability, authentication credentials, and worker logs."
+      }
+
+outputs:
+  - id: total_dead_inspected
+    type: INT
+    value: "{{ outputs.classify_and_triage.vars.total_dead_found ?? 0 }}"
+
+  - id: recoverable_count
+    type: INT
+    value: "{{ outputs.classify_and_triage.vars.recoverable_count ?? 0 }}"
+
+  - id: poison_count
+    type: INT
+    value: "{{ outputs.classify_and_triage.vars.poison_count ?? 0 }}"
+
+  - id: status
+    type: STRING
+    value: "{{ (outputs.classify_and_triage.vars.recoverable_count ?? 0) > 0 ? ((inputs.auto_remediate and not inputs.dry_run and (outputs.pause_for_operator_approval.onResume.approved ?? false)) ? 'REMEDIATED' : 'ACTIONABLE_DEAD_JOBS') : 'HEALTHY' }}"
+
+extend:
+  title: Quarantine Toxic Poison Pills and Requeue Recoverable Sidekiq Dead Jobs in Redis
+  metaTitle: Sidekiq Dead Set Poison Pill Quarantine & Requeue in Redis | Kestra
+  shortDescription: Audit Sidekiq dead jobs in Redis, categorize transient timeouts vs fatal poison pills, quarantine toxic errors, and requeue verified jobs with operator approval.
+  metaDescription: Audit Sidekiq dead jobs in Redis, quarantine poison pills, and requeue recoverable jobs with approval and post-verification in Kestra.
+  description: |
+    In Ruby on Rails applications utilizing Sidekiq for asynchronous job processing, jobs that fail
+    all scheduled retries (defaulting to 25 attempts over approximately 21 days) are moved to the
+    Sidekiq DeadSet (`dead` sorted set in Redis). During production outages--such as database connection
+    timeouts, downstream API rate limits, or transient network partitions--hundreds or thousands of
+    background tasks can exhaust their retries simultaneously and accumulate in the dead set.
+
+    When infrastructure recovers, operators face a dangerous dilemma: clicking "Retry All" in the
+    Sidekiq Web UI blindly replays every dead job. If the dead set contains toxic poison pills--such
+    as records deleted from the database (`ActiveRecord::RecordNotFound`), malformed payloads
+    (`JSON::ParserError`), or breaking schema changes--the poison jobs immediately crash worker
+    threads again, creating recurring crash loops, saturating error trackers, and delaying legitimate
+    business workflows.
+
+    This blueprint implements an automated Sidekiq DeadSet triage, quarantine, and requeue pipeline.
+    It inspects the Redis `dead` sorted set, parses JSON job metadata, categorizes exceptions into
+    transient recoverable network errors versus fatal application poison pills, permanently isolates
+    poison payloads into a structured quarantine hash, halts for human operator approval (`Pause`),
+    atomically replays verified recoverable jobs back to their respective `queue:<name>` lists via Lua,
+    verifies dead set clearance, and posts comprehensive triage summaries to Slack.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: The workflow asserts that input parameters meet sanity limits, ensuring `scan_limit >= 1` and `max_requeue_batch >= 1` via `io.kestra.plugin.core.execution.Assert`.
+    2. **Dead Set Inspection**: `io.kestra.plugin.redis.cli.RedisCLI` executes `ZRANGE dead 0 <scan_limit>` with scores to retrieve candidate dead job payloads and epoch failure timestamps.
+    3. **Failure Classification & Trend Analysis**: `io.kestra.plugin.scripts.python.Script` parses each job's JSON payload:
+       - Matches `error_class` against `transient_error_classes` (e.g. `Net::ReadTimeout`, `PG::ConnectionBad`, `Faraday::ConnectionFailed`) to isolate recoverable candidates.
+       - Matches `error_class` against `poison_error_classes` (e.g. `ActiveRecord::RecordNotFound`, `JSON::ParserError`, `NoMethodError`) to identify toxic poison pills.
+       - Enforces the `min_dead_age_seconds` observation hold and `max_requeue_batch` safety ceiling.
+       - Computes operational summary metrics.
+    4. **Audit State Persistence**: `io.kestra.plugin.core.kv.Set` writes the triage manifest to Kestra KV under `inputs.cursor_key` (`sidekiq_deadset_triage_history`) for cross-run trend analysis.
+    5. **Slack Triage Notification**: When actionable dead jobs exist, `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` delivers a triage summary to Slack with error classes, worker names, and job counts.
+    6. **Interactive Operator Approval Gate**: When `auto_remediate` is enabled and `dry_run` is false, execution pauses at `io.kestra.plugin.core.flow.Pause`. An on-call engineer reviews the categorized jobs and resumes with `approved: true`.
+    7. **Atomic Remediation Execution**: Upon approval, `io.kestra.plugin.redis.cli.RedisCLI` executes `remediate.lua`:
+       - Pushes recoverable jobs back to their target `queue:<queue>` list via `RPUSH` and removes them from `dead` via `ZREM`.
+       - Stores poison pills in `sidekiq:quarantine:poison_pills:<queue>` via `HSET` with forensic failure metadata, removing them from `dead` via `ZREM`.
+    8. **Post-Remediation Verification Readback**: `io.kestra.plugin.redis.cli.RedisCLI` re-queries `ZCARD dead` and `assert_verification` verifies that processed jobs were cleanly evacuated.
+    9. **Resolution Notification**: Dispatches a recovery confirmation card to Slack detailing requeued and quarantined job counts.
+    10. **Failure Handling**: A top-level `errors` block catches Redis connection failures or invalid syntax and immediately notifies Slack.
+
+    ## What you get
+
+    - Automated categorization of Sidekiq dead jobs, separating safe transient retries from fatal poison pills.
+    - Protection against cascading worker crashes caused by blind "Retry All" operations.
+    - Permanent isolation of poison pills into dedicated quarantine hashes with full JSON failure forensics.
+    - Atomic Redis Lua execution preventing duplicate delivery or race conditions with active Sidekiq processes.
+    - Multi-layered safety controls: `dry_run: true` default, `min_dead_age_seconds` filter, and an interactive `Pause` approval gate.
+    - Real-time Slack triage notifications and verified recovery receipts.
+
+    ## Who it's for
+
+    - Platform Engineers and Site Reliability Engineers operating Redis and Ruby on Rails Sidekiq worker clusters.
+    - Backend Engineers maintaining event-driven background job processing pipelines.
+    - On-call incident response teams recovering from database outages or third-party API downtime.
+
+    ## Why orchestrate this with Kestra
+
+    Sidekiq provides a Web UI for manual inspection, but offers no native way to programmatically classify exceptions, isolate poison pills from transient timeouts, or require human approval gates before replay. Writing custom rake tasks or ad-hoc console scripts lacks audit history, execution logs, and automated alerting. Orchestrating this workflow with Kestra delivers a declarative blueprint with containerized Python classification, atomic Redis Lua execution, state tracking in Kestra KV, interactive approval controls, and real-time Slack escalation.
+
+    ## Prerequisites
+
+    - An accessible Redis instance (version 6.2 or higher, Redis 7.x recommended) reachable from the Kestra worker.
+    - Sidekiq background jobs configured to use the target Redis instance.
+    - A Slack Incoming Webhook URL to receive incident triage and resolution alerts.
+
+    ### Secrets
+
+    - `REDIS_PASSWORD`: Secret authentication password for Redis access (leave empty if unauthenticated).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for operational notifications and alerts.
+    - `SIDEKIQ_GUARD_WEBHOOK_KEY`: Secret authentication token protecting the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `REDIS_PASSWORD`, `SLACK_WEBHOOK_URL`, and `SIDEKIQ_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `redis_host` and `redis_port` to match your Redis environment.
+    3. Run an initial manual execution with default parameters (`dry_run: true`) to audit current dead set entries and inspect failure classifications without mutating Redis.
+    4. Review execution logs and Slack triage messages to inspect detected exception classes.
+    5. To enable active remediation, run with `auto_remediate: true` and `dry_run: false`. When actionable jobs are detected, inspect the Slack alert, resume the `pause_for_operator_approval` task with `approved: true`, and observe verified queue replay and poison pill quarantine.
+    6. Enable the `periodic_deadset_audit` schedule trigger to maintain automated continuous protection every 10 minutes.
+
+    ## How to extend
+
+    - **S3 Forensic Archive**: Add `io.kestra.plugin.aws.s3.Upload` to archive quarantined poison pill JSON payloads to an Amazon S3 bucket for long-term debugging.
+    - **PagerDuty Incident Escalation**: Integrate `io.kestra.plugin.pagerduty.PagerDutyAlert` when `poison_count` exceeds 50 to escalate urgent application regressions.
+    - **Multi-Tenant Scoping**: Wrap the workflow in an `io.kestra.plugin.core.flow.Loop` over a list of tenant Redis database indexes.
+
+    ## Links
+
+    - [Sidekiq Error Handling and Retries](https://github.com/sidekiq/sidekiq/wiki/Error-Handling)
+    - [Sidekiq Job Format](https://github.com/sidekiq/sidekiq/wiki/Job-Format)
+    - [Kestra Redis Plugin Documentation](https://kestra.io/plugins/plugin-redis)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Pause Task Documentation](https://kestra.io/plugins/core/flow/pause)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Approval Gates
+  ee: false
+  demo: false
