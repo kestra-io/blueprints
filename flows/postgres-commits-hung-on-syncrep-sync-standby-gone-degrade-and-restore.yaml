@@ -1,0 +1,383 @@
+id: postgres-commits-hung-on-syncrep-sync-standby-gone-degrade-and-restore
+namespace: company.platform
+
+description: |
+  When the synchronous standby disappears, every commit on the primary waits forever in SyncRep. After approval this
+  flow remembers the configured synchronous_standby_names, switches the primary to asynchronous replication so writes
+  resume, and on a later run restores the original value once the standby is streaming and caught up again.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL of the primary
+    defaults: "jdbc:postgresql://localhost:5432/postgres"
+
+  - id: standby_application_names
+    type: STRING
+    description: Comma-separated application_name values of the standbys that must be streaming before synchronous replication is restored. Use the names that appear in synchronous_standby_names, otherwise a restore can block commits again.
+    defaults: "replica1"
+
+  - id: required_ready_standbys
+    type: INT
+    description: How many of those standbys must be streaming and caught up before the original setting is restored.
+    defaults: 1
+
+  - id: min_waiting_backends
+    type: INT
+    description: Backends stuck in SyncRep before degrading is even proposed.
+    defaults: 1
+
+  - id: min_wait_seconds
+    type: INT
+    description: The longest commit must have waited at least this long, so a standby that merely reconnects is left alone.
+    defaults: 60
+
+  - id: max_flush_gap_bytes
+    type: INT
+    description: A standby counts as caught up when its flushed WAL trails the primary by less than this.
+    defaults: 16777216
+
+  - id: max_degraded_hours
+    type: INT
+    description: Escalate when the primary has been running without synchronous replication for longer than this.
+    defaults: 4
+
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT30M
+
+triggers:
+  - id: every_two_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/2 * * * *"
+    disabled: true
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ not (inputs.standby_application_names matches '^[A-Za-z0-9_.-]+(, ?[A-Za-z0-9_.-]+)*$') or inputs.required_ready_standbys < 1 or inputs.min_waiting_backends < 1 or inputs.min_wait_seconds < 0 or inputs.max_flush_gap_bytes < 0 or inputs.max_degraded_hours < 1 }}"
+    errorMessage: "Rejected inputs: standby_application_names must be a comma-separated list of plain names and the numeric limits must be positive."
+
+  - id: facts
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: One look at the primary. Who is stuck in SyncRep, which walsenders are connected, and what the setting is right now.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH waiting AS (
+        SELECT count(*)::int AS n,
+               coalesce(max(extract(epoch FROM now() - query_start)), 0)::int AS longest_s
+          FROM pg_stat_activity
+         WHERE wait_event_type = 'IPC' AND wait_event = 'SyncRep'
+      ), standbys AS (
+        SELECT application_name::text AS application_name, state::text AS state, sync_state::text AS sync_state,
+               coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn), 9223372036854775807)::bigint AS flush_gap_bytes
+          FROM pg_stat_replication
+      )
+      SELECT pg_is_in_recovery() AS in_recovery,
+             (SELECT system_identifier::text FROM pg_control_system()) AS cluster_id,
+             current_setting('synchronous_standby_names') AS sync_names,
+             coalesce((SELECT CASE WHEN sourcefile IS NULL THEN 'unknown'
+                                   WHEN sourcefile LIKE '%postgresql.auto.conf' THEN 'auto'
+                                   ELSE 'conf' END
+                         FROM pg_settings WHERE name = 'synchronous_standby_names'), 'unknown') AS setting_source,
+             current_setting('synchronous_commit') AS sync_commit,
+             extract(epoch FROM now())::bigint AS now_epoch,
+             (SELECT n FROM waiting) AS waiting_backends,
+             (SELECT longest_s FROM waiting) AS longest_wait_s,
+             (SELECT count(*) FROM standbys WHERE sync_state IN ('sync', 'quorum'))::int AS sync_standbys,
+             (SELECT count(*) FROM standbys
+               WHERE application_name = ANY (string_to_array(replace('{{ inputs.standby_application_names }}', ' ', ''), ','))
+                 AND state = 'streaming' AND flush_gap_bytes <= {{ inputs.max_flush_gap_bytes }})::int AS ready_standbys,
+             coalesce((SELECT jsonb_agg(to_jsonb(standbys)) FROM standbys), '[]'::jsonb)::text AS standby_list
+
+  - id: require_primary
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (outputs.facts.row.in_recovery ~ '') == 'true' }}"
+    errorMessage: "The JDBC URL points at a standby. Point it at the primary, the only server that can change synchronous_standby_names."
+
+  - id: read_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Present only while this flow has switched the primary to asynchronous replication. It holds the original setting.
+    key: "pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}"
+    errorOnMissing: false
+
+  - id: mode_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Either we are degraded and looking for the moment to restore, or we are normal and watching for stuck commits.
+    condition: "{{ (outputs.read_state.value ?? '') != '' }}"
+    then:
+      - id: restore_probe
+        type: io.kestra.plugin.core.flow.If
+        description: Restore only when the original setting is not already back and enough standbys are streaming and caught up.
+        condition: "{{ (outputs.facts.row.sync_names) != (fromJson(outputs.read_state.value).original) }}"
+        then:
+          - id: restore_ready_gate
+            type: io.kestra.plugin.core.flow.If
+            description: A failed restore sets a one hour cool-down, so a standby that looks ready but cannot acknowledge commits does not block writes again every two minutes.
+            condition: "{{ (outputs.facts.row.ready_standbys | number) >= inputs.required_ready_standbys and (outputs.facts.row.now_epoch | number) >= ((fromJson(outputs.read_state.value).retry_after ?? 0) | number) }}"
+            then:
+              - id: build_restore_ddl
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: format(%L) quotes the stored value, so a setting such as FIRST 1 (a, "b c") is restored byte for byte. A value that came from postgresql.conf is restored with RESET, so no copy of it is left behind in postgresql.auto.conf where it would shadow later edits of the main file.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: "SELECT CASE WHEN $src${{ fromJson(outputs.read_state.value).source ?? 'unknown' }}$src$ = 'conf' THEN 'ALTER SYSTEM RESET synchronous_standby_names' ELSE format('ALTER SYSTEM SET synchronous_standby_names = %L', $orig${{ fromJson(outputs.read_state.value).original }}$orig$) END AS ddl"
+
+              - id: restore_setting
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                sql: "{{ outputs.build_restore_ddl.row.ddl }}"
+
+              - id: reload_after_restore
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: "SELECT pg_reload_conf() AS reloaded"
+
+              - id: settle_after_restore
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: A reload is asynchronous, and a synchronous standby needs a moment to be picked up by the walsender.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                sql: "SELECT pg_sleep(3)"
+
+              - id: verify_restore
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: The setting must match the stored original, a walsender must now be sync or quorum, and nothing may be stuck in SyncRep.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT current_setting('synchronous_standby_names') AS sync_names,
+                         (SELECT count(*) FROM pg_stat_replication WHERE sync_state IN ('sync', 'quorum'))::int AS sync_standbys,
+                         (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'IPC' AND wait_event = 'SyncRep')::int AS waiting_backends
+
+              - id: restore_check_gate
+                type: io.kestra.plugin.core.flow.If
+                description: If the restored setting does not hold, go back to the asynchronous state that was approved earlier instead of leaving commits blocked, and wait an hour before trying again.
+                condition: "{{ (outputs.verify_restore.row.sync_names != fromJson(outputs.read_state.value).original) or ((outputs.verify_restore.row.sync_standbys | number) < 1) or ((outputs.verify_restore.row.waiting_backends | number) > 0) }}"
+                then:
+                  - id: revert_failed_restore
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('POSTGRES_USERNAME') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    sql: "ALTER SYSTEM SET synchronous_standby_names = ''"
+
+                  - id: reload_after_revert
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('POSTGRES_USERNAME') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    sql: "SELECT pg_reload_conf() AS reloaded"
+
+                  - id: record_retry_cooldown
+                    type: io.kestra.plugin.core.kv.Set
+                    key: "pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}"
+                    kvType: STRING
+                    value: "{{ { 'original': fromJson(outputs.read_state.value).original, 'source': fromJson(outputs.read_state.value).source ?? 'unknown', 'degraded_at': fromJson(outputs.read_state.value).degraded_at, 'degraded_epoch': fromJson(outputs.read_state.value).degraded_epoch, 'retry_after': (outputs.facts.row.now_epoch | number) + 3600, 'execution': execution.id } | toJson }}"
+
+                  - id: fail_after_revert
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "Restore check failed. synchronous_standby_names was '{{ outputs.verify_restore.row.sync_names }}' (stored original '{{ fromJson(outputs.read_state.value).original }}'), synchronous standbys {{ outputs.verify_restore.row.sync_standbys }}, backends waiting in SyncRep {{ outputs.verify_restore.row.waiting_backends }}. The primary was put back to asynchronous replication, the degrade record was kept and the next restore attempt waits one hour."
+
+              - id: clear_degrade_record
+                type: io.kestra.plugin.core.kv.Delete
+                key: "pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}"
+
+              - id: notify_restored
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: |
+                  Synchronous replication restored on cluster {{ outputs.facts.row.cluster_id }}: synchronous_standby_names is back to '{{ fromJson(outputs.read_state.value).original }}' and {{ outputs.verify_restore.row.sync_standbys }} standby is acknowledging commits. It had been asynchronous since {{ fromJson(outputs.read_state.value).degraded_at }}.
+            else:
+              - id: escalate_stale_degrade
+                type: io.kestra.plugin.core.flow.If
+                description: Still asynchronous and no standby is ready. Keep nagging until a person looks, because commits made now exist on one server only.
+                condition: "{{ (outputs.facts.row.now_epoch | number) - (fromJson(outputs.read_state.value).degraded_epoch | number) > inputs.max_degraded_hours * 3600 }}"
+                then:
+                  - id: notify_stale_degrade
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    messageText: |
+                      The primary of cluster {{ outputs.facts.row.cluster_id }} has run without synchronous replication since {{ fromJson(outputs.read_state.value).degraded_at }}, longer than {{ inputs.max_degraded_hours }} hours. Ready standbys: {{ outputs.facts.row.ready_standbys }} of {{ inputs.required_ready_standbys }} required. Standbys seen: {{ outputs.facts.row.standby_list }}. Original setting to restore: '{{ fromJson(outputs.read_state.value).original }}'.
+        else:
+          - id: clear_stale_record
+            type: io.kestra.plugin.core.kv.Delete
+            description: Somebody already put the original setting back by hand, so the degrade record is obsolete.
+            key: "pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}"
+    else:
+      - id: degrade_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Degrade is proposed only when commits are really stuck behind a synchronous standby that is not about to acknowledge them.
+        condition: "{{ (outputs.facts.row.sync_names | length) > 0 and (outputs.facts.row.waiting_backends | number) >= inputs.min_waiting_backends and (outputs.facts.row.longest_wait_s | number) >= inputs.min_wait_seconds and (outputs.facts.row.sync_standbys | number) == 0 }}"
+        then:
+          - id: request_approval
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: |
+              Writes are blocked on cluster {{ outputs.facts.row.cluster_id }}: {{ outputs.facts.row.waiting_backends }} backend(s) have waited up to {{ outputs.facts.row.longest_wait_s }}s in SyncRep and no standby is acknowledging (synchronous_standby_names = '{{ outputs.facts.row.sync_names }}'). Approving execution {{ execution.id }} switches the primary to asynchronous replication until the standby is back. Commits made meanwhile will exist only on the primary. Expires in {{ inputs.approval_timeout }}.
+
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Hold the change. FAIL on timeout, so an unanswered request leaves replication as it is.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                description: Accept that new commits are not on a standby until synchronous replication is restored.
+                defaults: false
+              - id: note
+                type: STRING
+                defaults: ""
+
+          - id: apply_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.approval.onResume.approved ~ '') == 'true' }}"
+            then:
+              - id: record_original_setting
+                type: io.kestra.plugin.core.kv.Set
+                description: Saved before anything changes, so a crash between the change and the next step can never lose the original value.
+                key: "pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}"
+                kvType: STRING
+                value: "{{ { 'original': outputs.facts.row.sync_names, 'source': outputs.facts.row.setting_source, 'degraded_at': now(), 'degraded_epoch': outputs.facts.row.now_epoch, 'waiting_backends': outputs.facts.row.waiting_backends, 'execution': execution.id, 'note': outputs.approval.onResume.note } | toJson }}"
+
+              - id: set_asynchronous
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: ALTER SYSTEM writes postgresql.auto.conf and cannot run inside a transaction block, which suits the one-statement Query task.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                sql: "ALTER SYSTEM SET synchronous_standby_names = ''"
+
+              - id: reload_after_degrade
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: An empty synchronous_standby_names releases every backend waiting in SyncRep as soon as the reload is processed.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: "SELECT pg_reload_conf() AS reloaded"
+
+              - id: settle_after_degrade
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                sql: "SELECT pg_sleep(2)"
+
+              - id: verify_degrade
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT current_setting('synchronous_standby_names') AS sync_names,
+                         (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'IPC' AND wait_event = 'SyncRep')::int AS waiting_backends
+
+              - id: fail_if_still_blocked
+                type: io.kestra.plugin.core.execution.Fail
+                condition: "{{ (outputs.verify_degrade.row.sync_names | length) > 0 or (outputs.verify_degrade.row.waiting_backends | number) > 0 }}"
+                errorMessage: "After the reload synchronous_standby_names is '{{ outputs.verify_degrade.row.sync_names }}' and {{ outputs.verify_degrade.row.waiting_backends }} backend(s) still wait in SyncRep. The original setting '{{ outputs.facts.row.sync_names }}' is stored in KV key pg_syncrep_degrade_{{ outputs.facts.row.cluster_id }}."
+
+              - id: notify_degraded
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: |
+                  Primary of cluster {{ outputs.facts.row.cluster_id }} is now asynchronous and writes have resumed. Original synchronous_standby_names '{{ outputs.facts.row.sync_names }}' is stored and will be restored when {{ inputs.required_ready_standbys }} of [{{ inputs.standby_application_names }}] stream and are caught up. Execution {{ execution.id }}.
+            else:
+              - id: log_declined
+                type: io.kestra.plugin.core.log.Log
+                message: "Degrade declined for cluster {{ outputs.facts.row.cluster_id }}. Note: {{ outputs.approval.onResume.note ?? '' }}. Commits remain blocked in SyncRep."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      Synchronous replication handling failed (execution {{ execution.id }}). Check synchronous_standby_names and the KV key pg_syncrep_degrade_{{ outputs.facts.row.cluster_id ?? 'unknown' }} before the next run.
+
+extend:
+  title: Unblock PostgreSQL commits hung in SyncRep when the synchronous standby is gone, then restore it
+  metaTitle: PostgreSQL SyncRep Commit Hang Degrade and Restore | Kestra
+  shortDescription: Detect commits stuck waiting for a missing synchronous standby, switch the primary to asynchronous after approval, verify, and restore the original setting once the standby is caught up.
+  metaDescription: Unblock PostgreSQL writes stuck in SyncRep when the sync standby is gone. Degrade to async after approval, remember the setting and restore it verified.
+  description: |
+    With synchronous replication a commit does not return until a standby confirms it. If the only synchronous standby disappears, every write on the primary hangs in the SyncRep wait event. The usual fix is to clear `synchronous_standby_names`, and the usual mistake is forgetting to put it back. This blueprint does both halves and verifies each.
+
+    ## How it works
+
+    1. `facts` reads the primary: backends waiting in `SyncRep`, connected walsenders with their sync state and flush gap, and the current setting. `require_primary` refuses to run against a standby.
+    2. `read_state` loads the degrade record, which exists only while this flow has switched the primary to asynchronous.
+    3. With no record, `degrade_gate` proposes a change only if commits have been stuck beyond `min_wait_seconds` and no walsender is acknowledging. `request_approval` and the `approval` Pause make the durability trade-off explicit. Timeout fails the run.
+    4. After approval `record_original_setting` stores the original value first, then `set_asynchronous` runs `ALTER SYSTEM`, `reload_after_degrade` reloads, and `verify_degrade` plus `fail_if_still_blocked` confirm the setting is empty and no backend still waits.
+    5. With a record, `restore_ready_gate` waits until enough listed standbys are streaming within `max_flush_gap_bytes`. `restore_setting` writes the stored value back (`RESET` if it came from `postgresql.conf`) and `verify_restore` requires the exact value, a sync or quorum walsender and no waiting backends. If that fails, `restore_check_gate` returns the primary to asynchronous and waits an hour before retrying. Otherwise `clear_degrade_record` removes the record.
+
+    Only the loss of the whole synchronous set is handled. A partly degraded `FIRST 2 (a, b)` is left alone.
+
+    ## What you get
+
+    - Writes resume without anyone editing `postgresql.auto.conf` at 3 a.m.
+    - The original setting can never be lost, because it is stored before it is changed.
+    - A checked restore, and `escalate_stale_degrade` nags when the primary stays unprotected too long.
+
+    ## Who it's for
+
+    - DBAs and SREs running PostgreSQL primaries with synchronous standbys outside an automatic failover manager.
+
+    ## Why orchestrate this with Kestra
+
+    The job spans minutes to hours and needs a person in the middle: observe, ask, change, remember, wait for health, restore, verify. Kestra holds the approval and the stored setting between runs.
+
+    ## Prerequisites
+
+    - A PostgreSQL 12+ primary with `synchronous_standby_names` set (the `postgres` Docker image works for a local test). A role allowed to run `ALTER SYSTEM` and `pg_reload_conf()` (superuser, or the matching parameter grants on PostgreSQL 15+) and `pg_monitor` for `pg_stat_replication`.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`: role that may run `ALTER SYSTEM`.
+    - `POSTGRES_PASSWORD`: its password.
+    - `SLACK_WEBHOOK_URL`: approval requests and results.
+
+    ## Quick start
+
+    1. Create the secrets and list your standbys in `standby_application_names`.
+    2. Block a commit by pointing `synchronous_standby_names` at a missing standby, then execute the flow and resume the Pause.
+    3. Start the standby, execute again to see the restore, then remove `disabled: true` from the trigger.
+
+    ## How to extend
+
+    - Add a Kafka or Debezium check so the restore waits for downstream consumers too.
+
+    ## Links
+
+    - [Synchronous replication](https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION)
+    - [synchronous_standby_names](https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES)
+    - [pg_stat_replication](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW)
+    - [Kestra PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Incident Response
+  ee: false
+  demo: false
