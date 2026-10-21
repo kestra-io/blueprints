@@ -1,0 +1,633 @@
+id: rabbitmq-dead-letter-replay-with-approval
+namespace: company.messaging
+
+description: |
+  Snapshot a RabbitMQ dead-letter queue without consuming it, group the messages by x-death reason and source queue,
+  and wait for an operator approval. Approved reasons are replayed to their source queue (or original exchange) in
+  rate-limited batches with replay headers. Other messages go back to the dead-letter queue or to a parking queue.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: dlq_queue
+    type: STRING
+    displayName: Dead-letter queue
+    description: The queue that collects dead-lettered messages from your dead-letter exchange.
+    defaults: orders.dlq
+
+  - id: parking_queue
+    type: STRING
+    displayName: Parking queue
+    description: Messages that cannot be replayed safely go here. The flow declares it as a durable queue if it does not exist.
+    defaults: orders.dlq.parked
+
+  - id: virtual_host
+    type: STRING
+    displayName: Virtual host
+    defaults: /
+
+  - id: replay_target
+    type: SELECT
+    displayName: Replay target
+    description: QUEUE sends each message only to the queue that dead-lettered it, so other subscribers get no duplicate. EXCHANGE republishes to the original exchange and routing key.
+    values:
+      - QUEUE
+      - EXCHANGE
+    defaults: QUEUE
+
+  - id: max_messages
+    type: INT
+    displayName: Maximum messages per run
+    description: Upper limit of messages read from the dead-letter queue in one run.
+    defaults: 500
+
+  - id: max_replays
+    type: INT
+    displayName: Replay limit per message
+    description: A message with an x-replay-count header at or above this value goes to the parking queue, not back to its consumer.
+    defaults: 3
+
+  - id: batch_size
+    type: INT
+    displayName: Batch size
+    description: Number of messages in one publish batch.
+    defaults: 50
+
+  - id: batch_interval
+    type: DURATION
+    displayName: Wait between batches
+    description: The flow waits this long after each batch. The replay rate stays at or below batch_size messages per interval.
+    defaults: PT2S
+
+  - id: approval_timeout
+    type: DURATION
+    displayName: Approval timeout
+    description: The execution is cancelled if nobody resumes it in this time. The dead-letter queue stays unchanged.
+    defaults: PT4H
+
+variables:
+  rabbitmq_host: rabbitmq.internal
+  amqp_port: "5672"
+  management_url: http://rabbitmq.internal:15672
+  vhost_path: "{{ inputs.virtual_host | urlencode }}"
+  kv_key: "rabbitmq_dlq_replay_{{ inputs.dlq_queue | slugify }}"
+
+tasks:
+  - id: read_broker_state
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Reads the dead-letter backlog and the routing topology from the RabbitMQ management API at the same time.
+    tasks:
+      - id: snapshot_dlq
+        type: io.kestra.plugin.core.http.Download
+        description: Reads up to max_messages messages and requeues them at once (ackmode ack_requeue_true). Nothing leaves the queue before the approval.
+        uri: "{{ vars.management_url }}/api/queues/{{ render(vars.vhost_path) }}/{{ inputs.dlq_queue }}/get"
+        method: POST
+        contentType: application/json
+        body: |
+          {"count": {{ inputs.max_messages }}, "ackmode": "ack_requeue_true", "encoding": "auto"}
+        failOnEmptyResponse: true
+        timeout: PT2M
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        options:
+          auth:
+            type: BASIC
+            username: "{{ secret('RABBITMQ_USERNAME') }}"
+            password: "{{ secret('RABBITMQ_PASSWORD') }}"
+
+      - id: list_exchanges
+        type: io.kestra.plugin.core.http.Download
+        uri: "{{ vars.management_url }}/api/exchanges/{{ render(vars.vhost_path) }}?columns=name,type"
+        timeout: PT1M
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        options:
+          auth:
+            type: BASIC
+            username: "{{ secret('RABBITMQ_USERNAME') }}"
+            password: "{{ secret('RABBITMQ_PASSWORD') }}"
+
+      - id: list_bindings
+        type: io.kestra.plugin.core.http.Download
+        description: The bindings list includes the implicit default-exchange binding of every queue, so it also tells which queues exist.
+        uri: "{{ vars.management_url }}/api/bindings/{{ render(vars.vhost_path) }}?columns=source,destination,destination_type,routing_key"
+        timeout: PT1M
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        options:
+          auth:
+            type: BASIC
+            username: "{{ secret('RABBITMQ_USERNAME') }}"
+            password: "{{ secret('RABBITMQ_PASSWORD') }}"
+
+  - id: classify_backlog
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Groups the snapshot by the most recent x-death entry (reason and source queue). It marks a message as blocked when the
+      replay limit is reached, when the replay route no longer delivers to the source queue, or when the payload is binary.
+      It writes one plan line per message for the replay step.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT5M
+    inputFiles:
+      snapshot.json: "{{ outputs.snapshot_dlq.uri }}"
+      exchanges.json: "{{ outputs.list_exchanges.uri }}"
+      bindings.json: "{{ outputs.list_bindings.uri }}"
+    env:
+      DLQ_QUEUE: "{{ inputs.dlq_queue }}"
+      PARKING_QUEUE: "{{ inputs.parking_queue }}"
+      REPLAY_TARGET: "{{ inputs.replay_target }}"
+      MAX_REPLAYS: "{{ inputs.max_replays }}"
+    outputFiles:
+      - plan.jsonl
+    script: |
+      import collections, datetime, hashlib, json, os
+
+      dlq, parking = os.environ["DLQ_QUEUE"], os.environ["PARKING_QUEUE"]
+      target_mode, max_replays = os.environ["REPLAY_TARGET"], int(os.environ["MAX_REPLAYS"])
+      if dlq == parking:
+          raise SystemExit("parking_queue must be different from dlq_queue")
+
+      snapshot = json.load(open("snapshot.json"))
+      exchange_types = {e["name"]: e["type"] for e in json.load(open("exchanges.json"))}
+      bindings = json.load(open("bindings.json"))
+      queues = {b["destination"] for b in bindings if b["source"] == "" and b["destination_type"] == "queue"}
+      if dlq not in queues:
+          raise SystemExit(f"queue {dlq} does not exist in this virtual host")
+
+      def topic_match(pattern, key):
+          p, k = pattern.split("."), key.split(".")
+          def m(i, j):
+              if i == len(p):
+                  return j == len(k)
+              if p[i] == "#":
+                  return any(m(i + 1, n) for n in range(j, len(k) + 1))
+              return j < len(k) and p[i] in ("*", k[j]) and m(i + 1, j + 1)
+          return m(0, 0)
+
+      def route_delivers(exchange, routing_key, queue):
+          if queue not in queues:
+              return False
+          if exchange == "":
+              return routing_key == queue
+          kind = exchange_types.get(exchange)
+          if kind is None:
+              return False
+          to_queue = [b for b in bindings if b["source"] == exchange and b["destination"] == queue
+                      and b["destination_type"] == "queue"]
+          if kind == "direct":
+              return any(b["routing_key"] == routing_key for b in to_queue)
+          if kind == "topic":
+              return any(topic_match(b["routing_key"], routing_key) for b in to_queue)
+          return len(to_queue) > 0
+
+      def fingerprint(message_id, payload):
+          return hashlib.sha256(f"{message_id or ''}\0{payload or ''}".encode()).hexdigest()
+
+      internal = ("x-death", "x-first-death-", "x-last-death-", "x-dlq-", "x-replay")
+      groups = collections.OrderedDict()
+      with open("plan.jsonl", "w") as plan:
+          for msg in snapshot:
+              props = msg.get("properties") or {}
+              headers = props.get("headers") or {}
+              deaths = headers.get("x-death") or []
+              if deaths:
+                  last = deaths[0]
+                  reason, queue, exchange = last.get("reason"), last.get("queue"), last.get("exchange", "")
+                  routing_key = (last.get("routing-keys") or [msg.get("routing_key", "")])[0]
+                  died_at = last.get("time")
+              elif "x-dlq-reason" in headers:
+                  reason, queue = headers["x-dlq-reason"], headers.get("x-dlq-queue")
+                  exchange, routing_key = headers.get("x-dlq-exchange", ""), headers.get("x-dlq-routing-key", "")
+                  died_at = headers.get("x-dlq-death-time")
+              else:
+                  reason, queue, exchange, routing_key, died_at = "unknown", None, "", "", None
+              replay_count = int(headers.get("x-replay-count") or 0)
+              if target_mode == "QUEUE":
+                  target_exchange, target_key = "", queue or ""
+              else:
+                  target_exchange, target_key = exchange, routing_key
+
+              blocker = None
+              if queue is None:
+                  blocker = "no_death_info"
+              elif msg.get("payload_encoding") != "string":
+                  blocker = "binary_payload"
+              elif replay_count >= max_replays:
+                  blocker = "replay_limit"
+              elif not route_delivers(target_exchange, target_key, queue):
+                  blocker = "route_missing"
+
+              message = {"data": msg.get("payload", ""), "headers": {k: v for k, v in headers.items() if not k.startswith(internal)}}
+              for src, dst in (("message_id", "messageId"), ("content_type", "contentType"), ("content_encoding", "contentEncoding"),
+                               ("correlation_id", "correlationId"), ("delivery_mode", "deliveryMode"), ("priority", "priority"),
+                               ("reply_to", "replyTo"), ("type", "type"), ("app_id", "appId")):
+                  if props.get(src) is not None:
+                      message[dst] = props[src]
+              if props.get("timestamp"):
+                  message["timestamp"] = datetime.datetime.fromtimestamp(props["timestamp"], datetime.timezone.utc).isoformat()
+
+              plan.write(json.dumps({
+                  "fp": fingerprint(props.get("message_id"), msg.get("payload")), "reason": reason, "queue": queue,
+                  "exchange": exchange, "routing_key": routing_key, "died_at": died_at, "replay_count": replay_count,
+                  "blocker": blocker, "target_exchange": target_exchange, "target_key": target_key, "message": message}) + "\n")
+
+              g = groups.setdefault((reason, queue), {"reason": reason, "queue": queue, "messages": 0, "replayable": 0,
+                                                      "blocked": collections.Counter()})
+              g["messages"] += 1
+              if blocker:
+                  g["blocked"][blocker] += 1
+              else:
+                  g["replayable"] += 1
+
+      rows = []
+      for g in groups.values():
+          blocked = ", ".join(f"{n} {cause}" for cause, n in sorted(g["blocked"].items())) or "none"
+          rows.append(f"- {g['reason']} from {g['queue']}: {g['messages']} message(s), {g['replayable']} replayable, blocked: {blocked}")
+      total = len(snapshot)
+      summary = "\n".join(rows) if rows else "- the queue is empty"
+      print("::" + json.dumps({"outputs": {
+          "total": total,
+          "replayable": sum(g["replayable"] for g in groups.values()),
+          "reasons": sorted({g["reason"] for g in groups.values()}),
+          "parking_queue_exists": parking in queues,
+          "summary": summary}}) + "::")
+
+  - id: check_backlog
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.classify_backlog.vars.total > 0 }}"
+    then:
+      - id: show_summary
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          {{ outputs.classify_backlog.vars.total }} message(s) in {{ inputs.dlq_queue }}, {{ outputs.classify_backlog.vars.replayable }} replayable to {{ inputs.replay_target }}.
+          {{ outputs.classify_backlog.vars.summary }}
+
+      - id: request_approval
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          RabbitMQ dead-letter replay needs approval: {{ outputs.classify_backlog.vars.total }} message(s) in {{ inputs.dlq_queue }} (vhost {{ inputs.virtual_host }}), {{ outputs.classify_backlog.vars.replayable }} replayable to {{ inputs.replay_target }}.
+          {{ outputs.classify_backlog.vars.summary }}
+          Resume execution {{ execution.id }} of {{ flow.namespace }}.{{ flow.id }} in Kestra before the approval timeout. If nobody resumes it, the run is cancelled and the queue stays unchanged.
+
+      - id: approve_replay
+        type: io.kestra.plugin.core.flow.Pause
+        description: Waits for an operator. Select the reasons to replay. Nothing is consumed until you resume with REPLAY.
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        behavior: CANCEL
+        onResume:
+          - id: decision
+            type: SELECT
+            displayName: Decision
+            description: KEEP leaves the dead-letter queue unchanged. REPLAY drains the snapshot and replays the selected reasons.
+            values:
+              - KEEP
+              - REPLAY
+            defaults: KEEP
+          - id: replay_reasons
+            type: MULTISELECT
+            displayName: Reasons to replay
+            description: Messages with other reasons go back to the dead-letter queue with x-dlq headers.
+            values:
+              - rejected
+              - expired
+              - maxlen
+              - delivery_limit
+            defaults:
+              - rejected
+          - id: note
+            type: STRING
+            displayName: Note
+            description: Stored with the replay summary in the KV store.
+            required: false
+
+      - id: apply_decision
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_replay.onResume.decision == 'REPLAY' and (outputs.approve_replay.onResume.replay_reasons | length) > 0 }}"
+        then:
+          - id: drain_snapshot
+            type: io.kestra.plugin.amqp.Consume
+            description: Consumes exactly the number of messages in the snapshot. The broker gets the acknowledgment only after Kestra stores the batch.
+            host: "{{ vars.rabbitmq_host }}"
+            port: "{{ vars.amqp_port }}"
+            virtualHost: "{{ inputs.virtual_host }}"
+            username: "{{ secret('RABBITMQ_USERNAME') }}"
+            password: "{{ secret('RABBITMQ_PASSWORD') }}"
+            queue: "{{ inputs.dlq_queue }}"
+            maxRecords: "{{ outputs.classify_backlog.vars.total }}"
+            maxDuration: PT1M
+            timeout: PT5M
+
+          - id: drained_to_json
+            type: io.kestra.plugin.serdes.json.IonToJson
+            from: "{{ outputs.drain_snapshot.uri }}"
+
+          - id: build_batches
+            type: io.kestra.plugin.scripts.python.Script
+            description: |
+              Matches each drained message to its snapshot line by message id and payload hash. Approved and unblocked messages
+              get replay headers. Messages with other reasons go back to the dead-letter queue. Blocked messages and messages
+              that were not in the snapshot go to the parking queue. Each batch holds one exchange and one routing key.
+            containerImage: python:3.13-slim
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            timeout: PT5M
+            inputFiles:
+              plan.jsonl: "{{ outputs.classify_backlog.outputFiles['plan.jsonl'] }}"
+              drained.jsonl: "{{ outputs.drained_to_json.uri }}"
+            env:
+              APPROVED_REASONS: "{{ outputs.approve_replay.onResume.replay_reasons | toJson }}"
+              APPROVED_BY: "{{ outputs.approve_replay.resumed.by ?? 'unknown' }}"
+              EXECUTION_ID: "{{ execution.id }}"
+              DLQ_QUEUE: "{{ inputs.dlq_queue }}"
+              PARKING_QUEUE: "{{ inputs.parking_queue }}"
+              BATCH_SIZE: "{{ inputs.batch_size }}"
+            outputFiles:
+              - "batch-*.jsonl"
+            script: |
+              import collections, datetime, hashlib, json, os
+
+              approved = set(json.loads(os.environ["APPROVED_REASONS"]))
+              dlq, parking, size = os.environ["DLQ_QUEUE"], os.environ["PARKING_QUEUE"], int(os.environ["BATCH_SIZE"])
+              now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+              def fingerprint(message_id, payload):
+                  return hashlib.sha256(f"{message_id or ''}\0{payload or ''}".encode()).hexdigest()
+
+              plan = collections.defaultdict(collections.deque)
+              for line in open("plan.jsonl"):
+                  entry = json.loads(line)
+                  plan[entry["fp"]].append(entry)
+
+              def dlq_headers(entry):
+                  return {"x-dlq-reason": entry["reason"], "x-dlq-queue": entry["queue"] or "",
+                          "x-dlq-exchange": entry["exchange"], "x-dlq-routing-key": entry["routing_key"],
+                          "x-dlq-death-time": entry["died_at"] or 0, "x-replay-count": entry["replay_count"]}
+
+              out = {"replay": collections.defaultdict(list), "return": [], "park": []}
+              counts = collections.Counter()
+              for line in open("drained.jsonl"):
+                  if not line.strip():
+                      continue
+                  drained = json.loads(line)
+                  candidates = plan.get(fingerprint(drained.get("messageId"), drained.get("data")))
+                  if not candidates:
+                      # The AMQP plugin returns header values as "name=value" strings.
+                      headers = {}
+                      for name, value in (drained.get("headers") or {}).items():
+                          if not name.startswith(("x-death", "x-first-death-", "x-last-death-")):
+                              headers[name] = str(value).split("=", 1)[1] if str(value).startswith(name + "=") else value
+                      headers["x-dlq-park-cause"] = "not_in_snapshot"
+                      message = {"data": drained.get("data", ""), "headers": headers}
+                      for key in ("messageId", "contentType", "deliveryMode", "correlationId"):
+                          if drained.get(key) is not None:
+                              message[key] = drained[key]
+                      out["park"].append(message)
+                      counts["park:not_in_snapshot"] += 1
+                      continue
+                  entry = candidates.popleft()
+                  message = dict(entry["message"])
+                  headers = dict(message["headers"])
+                  if entry["blocker"]:
+                      headers.update(dlq_headers(entry), **{"x-dlq-park-cause": entry["blocker"]})
+                      message["headers"] = headers
+                      out["park"].append(message)
+                      counts["park:" + entry["blocker"]] += 1
+                  elif entry["reason"] in approved:
+                      headers.update({"x-replay-count": entry["replay_count"] + 1, "x-replayed-by": os.environ["EXECUTION_ID"],
+                                      "x-replay-approved-by": os.environ["APPROVED_BY"], "x-replayed-at": now,
+                                      "x-replay-reason": entry["reason"], "x-replay-source-queue": entry["queue"]})
+                      message["headers"] = headers
+                      out["replay"][(entry["target_exchange"], entry["target_key"])].append(message)
+                      counts["replay:" + entry["reason"]] += 1
+                  else:
+                      headers.update(dlq_headers(entry))
+                      message["headers"] = headers
+                      out["return"].append(message)
+                      counts["return:" + entry["reason"]] += 1
+
+              batches = []
+              # The AMQP Publish task routes with its own routingKey property, so one batch holds one exchange and one routing key.
+              def write(kind, exchange, routing_key, messages):
+                  for start in range(0, len(messages), size):
+                      name = f"batch-{len(batches):04d}.jsonl"
+                      with open(name, "w") as f:
+                          for m in messages[start:start + size]:
+                              f.write(json.dumps(m) + "\n")
+                      batches.append({"file": name, "kind": kind, "exchange": exchange, "routing_key": routing_key,
+                                      "count": len(messages[start:start + size])})
+
+              # Park and return first, so that only approved messages remain if a replay batch fails.
+              write("park", "", parking, out["park"])
+              write("return", "", dlq, out["return"])
+              for (exchange, routing_key), messages in sorted(out["replay"].items()):
+                  write("replay", exchange, routing_key, messages)
+
+              print("::" + json.dumps({"outputs": {
+                  "batches": batches,
+                  "replayed": sum(len(m) for m in out["replay"].values()),
+                  "returned": len(out["return"]),
+                  "parked": len(out["park"]),
+                  "breakdown": dict(sorted(counts.items()))}}) + "::")
+
+          - id: ensure_parking_queue
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.build_batches.vars.parked > 0 and not outputs.classify_backlog.vars.parking_queue_exists }}"
+            then:
+              - id: declare_parking_queue
+                type: io.kestra.plugin.amqp.CreateQueue
+                host: "{{ vars.rabbitmq_host }}"
+                port: "{{ vars.amqp_port }}"
+                virtualHost: "{{ inputs.virtual_host }}"
+                username: "{{ secret('RABBITMQ_USERNAME') }}"
+                password: "{{ secret('RABBITMQ_PASSWORD') }}"
+                name: "{{ inputs.parking_queue }}"
+                durability: true
+
+          - id: publish_batches
+            type: io.kestra.plugin.core.flow.Loop
+            description: Publishes one batch at a time and waits batch_interval after each batch to keep the replay rate bounded.
+            values: "{{ outputs.build_batches.vars.batches | toJson }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: publish_batch
+                type: io.kestra.plugin.amqp.Publish
+                host: "{{ vars.rabbitmq_host }}"
+                port: "{{ vars.amqp_port }}"
+                virtualHost: "{{ inputs.virtual_host }}"
+                username: "{{ secret('RABBITMQ_USERNAME') }}"
+                password: "{{ secret('RABBITMQ_PASSWORD') }}"
+                exchange: "{{ fromJson(item.value).exchange }}"
+                routingKey: "{{ fromJson(item.value).routing_key }}"
+                from: "{{ outputs.build_batches.outputFiles[fromJson(item.value).file] }}"
+                retry:
+                  type: exponential
+                  interval: PT5S
+                  maxInterval: PT1M
+                  maxAttempts: 5
+              - id: check_batch_count
+                type: io.kestra.plugin.core.execution.Fail
+                description: Fails the run when the Publish task sent fewer messages than the batch file holds.
+                condition: "{{ outputs.publish_batch.messagesCount != fromJson(item.value).count }}"
+                errorMessage: "Batch {{ fromJson(item.value).file }} ({{ fromJson(item.value).kind }}) published {{ outputs.publish_batch.messagesCount }} of {{ fromJson(item.value).count }} message(s)."
+              - id: rate_limit
+                type: io.kestra.plugin.core.flow.Sleep
+                duration: "{{ inputs.batch_interval }}"
+
+          - id: verify_dlq
+            type: io.kestra.plugin.core.http.Request
+            description: Reads one message from the dead-letter queue and requeues it. The response gives the live queue depth after the replay.
+            uri: "{{ vars.management_url }}/api/queues/{{ render(vars.vhost_path) }}/{{ inputs.dlq_queue }}/get"
+            method: POST
+            contentType: application/json
+            body: '{"count": 1, "ackmode": "ack_requeue_true", "encoding": "auto", "truncate": 64}'
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+            options:
+              auth:
+                type: BASIC
+                username: "{{ secret('RABBITMQ_USERNAME') }}"
+                password: "{{ secret('RABBITMQ_PASSWORD') }}"
+
+          - id: record_replay
+            type: io.kestra.plugin.core.kv.Set
+            description: Keeps the latest replay summary per dead-letter queue for audits and dashboards.
+            key: "{{ render(vars.kv_key) }}"
+            kvType: JSON
+            value: |
+              {
+                "execution_id": "{{ execution.id }}",
+                "approved_by": "{{ outputs.approve_replay.resumed.by ?? 'unknown' }}",
+                "approved_at": "{{ outputs.approve_replay.resumed.on ?? now() }}",
+                "note": {{ (outputs.approve_replay.onResume.note ?? '') | toJson }},
+                "replay_target": "{{ inputs.replay_target }}",
+                "reasons": {{ outputs.approve_replay.onResume.replay_reasons | toJson }},
+                "snapshot": {{ outputs.classify_backlog.vars.total }},
+                "drained": {{ outputs.drain_snapshot.count }},
+                "replayed": {{ outputs.build_batches.vars.replayed }},
+                "returned_to_dlq": {{ outputs.build_batches.vars.returned }},
+                "parked": {{ outputs.build_batches.vars.parked }},
+                "breakdown": {{ outputs.build_batches.vars.breakdown | toJson }},
+                "dlq_depth_after": {{ (fromJson(outputs.verify_dlq.body) | length) == 0 ? 0 : fromJson(outputs.verify_dlq.body)[0].message_count + 1 }}
+              }
+
+          - id: report_replay
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: |
+              RabbitMQ dead-letter replay done for {{ inputs.dlq_queue }} (approved by {{ outputs.approve_replay.resumed.by ?? 'unknown' }}).
+              Drained {{ outputs.drain_snapshot.count }} of {{ outputs.classify_backlog.vars.total }}: replayed {{ outputs.build_batches.vars.replayed }} to {{ inputs.replay_target }}, returned {{ outputs.build_batches.vars.returned }} to {{ inputs.dlq_queue }}, parked {{ outputs.build_batches.vars.parked }} in {{ inputs.parking_queue }}.
+              Breakdown: {{ outputs.build_batches.vars.breakdown | toJson }}.
+              Live depth of {{ inputs.dlq_queue }} now: {{ (fromJson(outputs.verify_dlq.body) | length) == 0 ? 0 : fromJson(outputs.verify_dlq.body)[0].message_count + 1 }}.
+        else:
+          - id: log_kept
+            type: io.kestra.plugin.core.log.Log
+            message: "Replay not approved (decision {{ outputs.approve_replay.onResume.decision }}). {{ inputs.dlq_queue }} is unchanged: the snapshot requeued every message."
+    else:
+      - id: log_empty
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ inputs.dlq_queue }} is empty. Nothing to replay."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      RabbitMQ dead-letter replay for {{ inputs.dlq_queue }} failed in execution {{ execution.id }}: {{ errorLogs()[0].message ?? 'see the execution logs' }}.
+      If drain_snapshot succeeded, the drained messages are in the execution storage. Fix the cause and restart the execution from the failed task.
+
+
+triggers:
+  - id: business_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Checks the dead-letter queue every hour in working hours, when an operator can approve. Runs with an empty queue end at once.
+    cron: "0 8-17 * * 1-5"
+
+extend:
+  title: Replay RabbitMQ Dead Letters by x-death Reason After Approval
+  metaTitle: RabbitMQ Dead-Letter Replay with Approval | Kestra
+  shortDescription: Group a RabbitMQ dead-letter queue by x-death reason, wait for an operator, then replay the approved messages in rate-limited batches with replay headers.
+  metaDescription: Group RabbitMQ dead letters by x-death reason, approve in Kestra, and replay them to their source queue in rate-limited batches with a replay limit.
+  description: |
+    Group a dead-letter backlog by cause and replay only what an operator approves.
+
+    ## How it works
+
+    1. A schedule starts the flow each hour in working hours.
+    2. Three management API `Download` tasks run in `Parallel`. The snapshot uses `ack_requeue_true`, so no message leaves the queue.
+    3. A Python script groups messages by the latest `x-death` reason and source queue. It blocks a message at the `x-replay-count` limit, when its route is gone, or when the payload is binary.
+    4. Slack and a `Pause` show the summary. The operator selects reasons and resumes with REPLAY or KEEP. At `approval_timeout`, Kestra cancels the run.
+    5. On REPLAY, AMQP `Consume` drains the snapshot. A script matches messages by id and payload hash. Approved messages get replay headers. Other reasons go back to the queue with `x-dlq-*` headers. Blocked messages go to the parking queue.
+    6. A `Loop` publishes one batch at a time and waits `batch_interval`.
+    7. The flow reads the live queue depth, writes a KV summary and reports.
+
+    ## What you get
+
+    - A grouped backlog view before any change.
+    - Replay to the source queue only (QUEUE) or to the original exchange and routing key (EXCHANGE).
+    - Headers `x-replay-count`, `x-replayed-by`, `x-replayed-at` and `x-replay-reason`.
+    - A replay limit, a parking queue, a bounded rate and a failure alert.
+
+    ## Who it's for
+
+    - Platform and SRE teams that operate RabbitMQ.
+    - Owners of consumers that dead-letter messages.
+
+    ## Why orchestrate this with Kestra
+
+    - Approval, replay and audit record are in one execution.
+    - Retries, timeouts and concurrency are in YAML.
+
+    ## Prerequisites
+
+    - RabbitMQ 3.8 or later with the management plugin, and a dead-letter exchange to `dlq_queue`.
+    - A user with the `management` tag and configure, write and read permissions on the virtual host.
+    - Text payloads, and a Docker task runner.
+    - A classic `dlq_queue`. Snapshot requeues can count toward a quorum queue delivery limit.
+
+    ### Secrets
+
+    - `RABBITMQ_USERNAME`: RabbitMQ user for AMQP and the management API.
+    - `RABBITMQ_PASSWORD`: Password of that user.
+    - `SLACK_WEBHOOK_URL`: Slack webhook for all notifications.
+
+    ## Quick start
+
+    1. Add the secrets.
+    2. Set `rabbitmq_host` and `management_url` in `variables`.
+    3. Execute the flow and read the summary.
+    4. Resume with KEEP to test, or with REPLAY.
+
+    ## How to extend
+
+    - Upload drained messages to object storage first.
+    - Send the approval request to Microsoft Teams.
+
+    ## Links
+
+    - [AMQP Consume](https://kestra.io/plugins/plugin-amqp/io.kestra.plugin.amqp.consume)
+    - [AMQP Publish](https://kestra.io/plugins/plugin-amqp/io.kestra.plugin.amqp.publish)
+    - [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [RabbitMQ dead letter exchanges](https://www.rabbitmq.com/docs/dlx)
+    - [RabbitMQ HTTP API](https://www.rabbitmq.com/docs/http-api-reference)
+  tags:
+    - Infrastructure
+  subTags:
+    - Approval Gates
+    - Day 2 Operations
+  ee: false
+  demo: false
