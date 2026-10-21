@@ -1,0 +1,595 @@
+id: redis-job-queue-dead-letter-drain
+namespace: company.team
+
+description: |
+  Retry or dead-letter the failed jobs of a Redis list job queue, report the dead-letter list
+  (DLQ) depth, and replay DLQ jobs after an approval. Producers push jobs onto `<prefix>:ready`.
+  Workers push a failed job onto `<prefix>:failed` with `error_class` and `last_error` fields. A SWEEP drains
+  `<prefix>:failed` in one atomic Lua script. The script counts attempts per job id in the
+  `<prefix>:attempts` hash. It puts a job back onto the ready list until the job reaches
+  `max_attempts`. Then it wraps the original bytes in a DLQ record with the attempt counter, the
+  error class and the last error. A REPLAY run previews the matching DLQ records, waits for an
+  approval and moves them back onto the ready list. Then it reads the DLQ again to verify the move.
+
+inputs:
+  - id: mode
+    type: SELECT
+    displayName: Mode
+    description: SWEEP drains the failed list and reports the DLQ. REPLAY moves approved DLQ jobs back to the ready list.
+    values:
+      - SWEEP
+      - REPLAY
+    defaults: SWEEP
+
+  - id: queue_prefix
+    type: STRING
+    displayName: Queue key prefix
+    description: >-
+      Prefix of the queue keys. The flow uses `<prefix>:ready`, `<prefix>:failed`, `<prefix>:dead`,
+      `<prefix>:attempts`, `<prefix>:replays` and `<prefix>:dead:audit`. On Redis Cluster, use a hash
+      tag such as `{jobs}` so that all keys are in the same slot.
+    defaults: jobs
+    validator: ^[A-Za-z0-9_.:{}-]{1,64}$
+
+  - id: max_attempts
+    type: INT
+    displayName: Maximum processing attempts
+    description: A job goes to the DLQ when its failed attempt count reaches this number.
+    defaults: 5
+    min: 1
+    max: 100
+
+  - id: sweep_batch
+    type: INT
+    displayName: Failed jobs per sweep
+    description: Upper limit of failed jobs that one sweep moves. The Lua script blocks Redis while it runs, so keep it small.
+    defaults: 500
+    min: 1
+    max: 5000
+
+  - id: attempt_ttl_hours
+    type: INT
+    displayName: Attempt counter retention (hours)
+    description: The attempt counter of a job expires after this time without a new failure. This removes counters of jobs that later succeeded.
+    defaults: 72
+    min: 1
+
+  - id: dlq_alert_depth
+    type: INT
+    displayName: DLQ alert depth
+    description: Send a Slack alert when a sweep adds jobs to the DLQ and the DLQ holds this number of jobs or more.
+    defaults: 25
+    min: 1
+
+  - id: dlq_scan_limit
+    type: INT
+    displayName: DLQ scan limit
+    description: Upper limit of DLQ records that the report and the replay read, oldest first for the replay.
+    defaults: 2000
+    min: 10
+    max: 20000
+
+  - id: replay_filter
+    type: STRING
+    displayName: Replay filter
+    description: >-
+      REPLAY only. Use `*` for all records. Other values select the records whose error class is equal
+      to the value or whose last error contains the value.
+    defaults: "*"
+    validator: ^[A-Za-z0-9 _.:/*-]{1,100}$
+
+  - id: replay_limit
+    type: INT
+    displayName: Replay limit
+    description: REPLAY only. Upper limit of DLQ records that one approved replay moves.
+    defaults: 200
+    min: 1
+    max: 5000
+
+  - id: max_replays
+    type: INT
+    displayName: Maximum replays per job
+    description: REPLAY only. A job that was replayed this number of times stays in the DLQ for manual analysis.
+    defaults: 2
+    min: 1
+
+  - id: approval_timeout
+    type: DURATION
+    displayName: Approval timeout
+    description: REPLAY only. The execution is cancelled and changes nothing if nobody approves within this time.
+    defaults: PT4H
+
+  - id: redis_host
+    type: STRING
+    displayName: Redis host
+    defaults: redis
+
+  - id: redis_port
+    type: INT
+    displayName: Redis port
+    defaults: 6379
+
+  - id: redis_database
+    type: INT
+    displayName: Redis database
+    defaults: 0
+    min: 0
+    max: 15
+
+  - id: redis_username
+    type: STRING
+    displayName: Redis ACL user
+    description: Use an ACL user that can only run the commands of this flow on the queue keys.
+    defaults: default
+
+variables:
+  # Shared by the preview and the apply step, so both select the same DLQ records.
+  replay_lua: |
+    local dead, ready, attempts, replays, audit = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+    local apply = ARGV[1] == '1'
+    local filter = ARGV[2]
+    local limit = tonumber(ARGV[3])
+    local max_replays = tonumber(ARGV[4])
+    local scan = tonumber(ARGV[5])
+    local history_ttl = tonumber(ARGV[6])
+    local exec_id = ARGV[7]
+    local reason = ARGV[8]
+    if apply then
+      for _, a in ipairs(redis.call('LRANGE', audit, 0, 99)) do
+        local oka, rec = pcall(cjson.decode, a)
+        if oka and type(rec) == 'table' and rec.execution_id == exec_id then
+          return cjson.encode({ apply = true, already_applied = true, moved = rec.moved,
+            dlq_depth_after = redis.call('LLEN', dead), ready_depth_after = redis.call('LLEN', ready) })
+        end
+      end
+    end
+    local t = redis.call('TIME')
+    local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+    local out = { apply = apply, already_applied = false, filter = filter, matched = 0, moved = 0,
+      parked = 0, not_replayable = 0, dlq_depth_before = redis.call('LLEN', dead) }
+    local entries = redis.call('LRANGE', dead, -scan, -1)
+    out.scanned = #entries
+    local sample, moved_ids, replay_counts = {}, {}, {}
+    for i = #entries, 1, -1 do
+      local raw = entries[i]
+      local ok, d = pcall(cjson.decode, raw)
+      if not ok or type(d) ~= 'table' or type(d.id) ~= 'string' or type(d.job) ~= 'string' then
+        out.not_replayable = out.not_replayable + 1
+      else
+        local cls = (type(d.error_class) == 'string') and d.error_class or 'unclassified'
+        local err = (type(d.last_error) == 'string') and d.last_error or ''
+        local hit = filter == '*' or cls == filter or string.find(err, filter, 1, true) ~= nil
+        if hit then
+          local rp = tonumber(d.replays) or 0
+          if rp >= max_replays then
+            out.parked = out.parked + 1
+          elseif out.matched < limit then
+            out.matched = out.matched + 1
+            if #sample < 10 then sample[#sample + 1] = d.id .. ' (' .. cls .. ')' end
+            if apply and redis.call('LREM', dead, 1, raw) == 1 then
+              redis.call('LPUSH', ready, d.job)
+              redis.call('HDEL', attempts, d.id)
+              local n = redis.call('HINCRBY', replays, d.id, 1)
+              redis.call('HEXPIRE', replays, history_ttl, 'FIELDS', 1, d.id)
+              out.moved = out.moved + 1
+              moved_ids[#moved_ids + 1] = d.id
+              replay_counts[d.id] = n
+            end
+          end
+        end
+      end
+    end
+    out.sample = (#sample > 0) and table.concat(sample, ', ') or 'none'
+    out.dlq_depth_after = redis.call('LLEN', dead)
+    out.ready_depth_after = redis.call('LLEN', ready)
+    if apply and out.moved > 0 then
+      redis.call('LPUSH', audit, cjson.encode({ execution_id = exec_id, reason = reason, at = now,
+        filter = filter, moved = out.moved, replays = replay_counts }))
+      redis.call('LTRIM', audit, 0, 999)
+    end
+    return cjson.encode(out)
+
+tasks:
+  - id: route_mode
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ inputs.mode }}"
+    cases:
+      SWEEP:
+        - id: sweep_failed
+          type: io.kestra.plugin.redis.cli.RedisCLI
+          description: >-
+            One atomic Lua script. It pops up to `sweep_batch` jobs from the failed list, increments the
+            attempt counter of each job id and routes the job to the ready list or to the DLQ. It
+            never decodes and encodes the job body again, so large numbers in the job stay exact.
+            Then it reads the DLQ depth and groups the DLQ records by error class.
+          host: "{{ inputs.redis_host }}"
+          port: "{{ inputs.redis_port }}"
+          database: "{{ inputs.redis_database }}"
+          username: "{{ inputs.redis_username }}"
+          password: "{{ secret('REDIS_PASSWORD') }}"
+          timeout: PT5M
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+          inputFiles:
+            sweep.lua: |
+              local failed, ready, dead, attempts, replays = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+              local max_attempts = tonumber(ARGV[1])
+              local batch = tonumber(ARGV[2])
+              local ttl = tonumber(ARGV[3])
+              local scan = tonumber(ARGV[4])
+              local expected = { [failed] = 'list', [ready] = 'list', [dead] = 'list', [attempts] = 'hash', [replays] = 'hash' }
+              for k, want in pairs(expected) do
+                local got = redis.call('TYPE', k)['ok']
+                if got ~= want and got ~= 'none' then
+                  return redis.error_reply('ERR wrong key type: ' .. k .. ' is a ' .. got .. ', expected ' .. want)
+                end
+              end
+              local t = redis.call('TIME')
+              local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+              local out = { popped = 0, requeued = 0, dead_lettered = 0, malformed = 0 }
+              local dead_ids = {}
+              for _ = 1, batch do
+                local raw = redis.call('RPOP', failed)
+                if not raw then break end
+                out.popped = out.popped + 1
+                local ok, job = pcall(cjson.decode, raw)
+                local id = nil
+                if ok and type(job) == 'table' and type(job.id) == 'string' and job.id ~= '' then id = job.id end
+                if not id then
+                  out.malformed = out.malformed + 1
+                  out.dead_lettered = out.dead_lettered + 1
+                  redis.call('LPUSH', dead, cjson.encode({ job = raw, attempts = 1, reason = 'malformed',
+                    error_class = 'malformed_envelope', last_error = 'entry is not a JSON object with a string id',
+                    dead_at = now, replays = 0 }))
+                else
+                  local n = redis.call('HINCRBY', attempts, id, 1)
+                  if n >= max_attempts then
+                    local cls = (type(job.error_class) == 'string' and job.error_class ~= '') and job.error_class or 'unclassified'
+                    local err = (type(job.last_error) == 'string') and string.sub(job.last_error, 1, 500) or ''
+                    local rp = tonumber(redis.call('HGET', replays, id) or '0') or 0
+                    redis.call('LPUSH', dead, cjson.encode({ id = id, job = raw, attempts = n, reason = 'max_attempts',
+                      error_class = cls, last_error = err, dead_at = now, replays = rp }))
+                    redis.call('HDEL', attempts, id)
+                    out.dead_lettered = out.dead_lettered + 1
+                    if #dead_ids < 20 then dead_ids[#dead_ids + 1] = id end
+                  else
+                    redis.call('LPUSH', ready, raw)
+                    redis.call('HEXPIRE', attempts, ttl, 'FIELDS', 1, id)
+                    out.requeued = out.requeued + 1
+                  end
+                end
+              end
+              out.failed_remaining = redis.call('LLEN', failed)
+              out.ready_depth = redis.call('LLEN', ready)
+              out.in_retry = redis.call('HLEN', attempts)
+              out.dlq_depth = redis.call('LLEN', dead)
+              local groups, order, oldest = {}, {}, nil
+              local entries = redis.call('LRANGE', dead, 0, scan - 1)
+              for _, e in ipairs(entries) do
+                local okd, d = pcall(cjson.decode, e)
+                local cls = 'unreadable_record'
+                if okd and type(d) == 'table' then
+                  cls = (type(d.error_class) == 'string') and d.error_class or 'unclassified'
+                  local at = tonumber(d.dead_at)
+                  if at and (oldest == nil or at < oldest) then oldest = at end
+                end
+                if groups[cls] == nil then
+                  groups[cls] = 0
+                  order[#order + 1] = cls
+                end
+                groups[cls] = groups[cls] + 1
+              end
+              table.sort(order, function(a, b) return groups[a] > groups[b] end)
+              local parts = {}
+              for i = 1, math.min(#order, 5) do parts[#parts + 1] = order[i] .. '=' .. groups[order[i]] end
+              out.dlq_scanned = #entries
+              out.dlq_top_classes = (#parts > 0) and table.concat(parts, ', ') or 'none'
+              out.dlq_oldest_age_min = oldest and math.floor((now - oldest) / 60000) or 0
+              out.new_dead_ids = (#dead_ids > 0) and table.concat(dead_ids, ', ') or 'none'
+              return cjson.encode(out)
+          commands:
+            - "--eval sweep.lua {{ inputs.queue_prefix }}:failed {{ inputs.queue_prefix }}:ready {{ inputs.queue_prefix }}:dead {{ inputs.queue_prefix }}:attempts {{ inputs.queue_prefix }}:replays , {{ inputs.max_attempts }} {{ inputs.sweep_batch }} {{ inputs.attempt_ttl_hours * 3600 }} {{ inputs.dlq_scan_limit }}"
+
+        - id: log_sweep
+          type: io.kestra.plugin.core.log.Log
+          message: >-
+            Queue {{ inputs.queue_prefix }}: swept {{ fromJson(outputs.sweep_failed.vars.command_1).popped }} failed job(s),
+            requeued {{ fromJson(outputs.sweep_failed.vars.command_1).requeued }},
+            dead-lettered {{ fromJson(outputs.sweep_failed.vars.command_1).dead_lettered }}
+            ({{ fromJson(outputs.sweep_failed.vars.command_1).malformed }} malformed).
+            DLQ depth {{ fromJson(outputs.sweep_failed.vars.command_1).dlq_depth }}
+            (previous run {{ kv('redis_dlq_depth_' ~ (inputs.queue_prefix | slugify), errorOnMissing=false) ?? 'unknown' }}),
+            oldest record {{ fromJson(outputs.sweep_failed.vars.command_1).dlq_oldest_age_min }} min,
+            classes {{ fromJson(outputs.sweep_failed.vars.command_1).dlq_top_classes }}.
+            Ready depth {{ fromJson(outputs.sweep_failed.vars.command_1).ready_depth }},
+            jobs in retry {{ fromJson(outputs.sweep_failed.vars.command_1).in_retry }},
+            failed jobs left {{ fromJson(outputs.sweep_failed.vars.command_1).failed_remaining }}.
+
+        - id: check_dlq_growth
+          type: io.kestra.plugin.core.flow.If
+          description: Alert when this sweep added jobs to a DLQ that is at or above the alert depth, or when a producer wrote a malformed job.
+          condition: >-
+            {{ (fromJson(outputs.sweep_failed.vars.command_1).dead_lettered > 0
+                and fromJson(outputs.sweep_failed.vars.command_1).dlq_depth >= inputs.dlq_alert_depth)
+               or fromJson(outputs.sweep_failed.vars.command_1).malformed > 0 }}
+          then:
+            - id: alert_dlq_growth
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: exponential
+                interval: PT5S
+                maxInterval: PT1M
+                maxAttempts: 3
+              messageText: >-
+                Redis queue {{ inputs.queue_prefix }}: {{ fromJson(outputs.sweep_failed.vars.command_1).dead_lettered }}
+                job(s) moved to {{ inputs.queue_prefix }}:dead in this sweep
+                ({{ fromJson(outputs.sweep_failed.vars.command_1).malformed }} malformed).
+                DLQ depth is {{ fromJson(outputs.sweep_failed.vars.command_1).dlq_depth }}
+                (previous run {{ kv('redis_dlq_depth_' ~ (inputs.queue_prefix | slugify), errorOnMissing=false) ?? 'unknown' }}, alert depth {{ inputs.dlq_alert_depth }}).
+                Top error classes: {{ fromJson(outputs.sweep_failed.vars.command_1).dlq_top_classes }}.
+                New dead job ids: {{ fromJson(outputs.sweep_failed.vars.command_1).new_dead_ids }}.
+                Fix the cause, then run {{ flow.namespace }}.{{ flow.id }} with mode REPLAY and a replay filter.
+                Execution: {{ execution.id }}.
+
+        - id: record_dlq_depth
+          type: io.kestra.plugin.core.kv.Set
+          description: Keep the DLQ depth for the trend in the next run.
+          key: "redis_dlq_depth_{{ inputs.queue_prefix | slugify }}"
+          kvType: NUMBER
+          value: "{{ fromJson(outputs.sweep_failed.vars.command_1).dlq_depth }}"
+
+      REPLAY:
+        - id: preview_replay
+          type: io.kestra.plugin.redis.cli.RedisCLI
+          description: Read-only. Select the DLQ records that the replay would move, with the same Lua logic as the apply step.
+          host: "{{ inputs.redis_host }}"
+          port: "{{ inputs.redis_port }}"
+          database: "{{ inputs.redis_database }}"
+          username: "{{ inputs.redis_username }}"
+          password: "{{ secret('REDIS_PASSWORD') }}"
+          timeout: PT5M
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+          inputFiles:
+            replay.lua: "{{ vars.replay_lua }}"
+          commands:
+            - "--eval replay.lua {{ inputs.queue_prefix }}:dead {{ inputs.queue_prefix }}:ready {{ inputs.queue_prefix }}:attempts {{ inputs.queue_prefix }}:replays {{ inputs.queue_prefix }}:dead:audit , 0 '{{ inputs.replay_filter }}' {{ inputs.replay_limit }} {{ inputs.max_replays }} {{ inputs.dlq_scan_limit }} 2592000 {{ execution.id }} preview"
+
+        - id: replay_gate
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ fromJson(outputs.preview_replay.vars.command_1).matched > 0 }}"
+          then:
+            - id: log_preview
+              type: io.kestra.plugin.core.log.Log
+              message: >-
+                Replay preview for {{ inputs.queue_prefix }}:dead with filter '{{ inputs.replay_filter }}':
+                {{ fromJson(outputs.preview_replay.vars.command_1).matched }} record(s) match,
+                {{ fromJson(outputs.preview_replay.vars.command_1).parked }} record(s) reached {{ inputs.max_replays }} replays and stay,
+                {{ fromJson(outputs.preview_replay.vars.command_1).not_replayable }} record(s) cannot be replayed.
+                Sample: {{ fromJson(outputs.preview_replay.vars.command_1).sample }}.
+                Resume with approved=true to move them to {{ inputs.queue_prefix }}:ready.
+
+            - id: approve_replay
+              type: io.kestra.plugin.core.flow.Pause
+              description: >-
+                The approver reads the preview in the logs. The apply step moves at most the previewed
+                number of records, even if more matching jobs reach the DLQ during the pause.
+              pauseDuration: "{{ inputs.approval_timeout }}"
+              behavior: CANCEL
+              onResume:
+                - id: approved
+                  type: BOOL
+                  description: Set to true to move the previewed DLQ records back to the ready list.
+                  defaults: false
+                - id: reason
+                  type: STRING
+                  description: The fix that makes the replay safe, for example a deploy version or a ticket. The audit record keeps it.
+                  defaults: not given
+                  validator: ^[A-Za-z0-9 _.:/#-]{1,200}$
+
+            - id: apply_gate
+              type: io.kestra.plugin.core.flow.If
+              condition: "{{ outputs.approve_replay.onResume.approved }}"
+              then:
+                - id: replay_dead_letters
+                  type: io.kestra.plugin.redis.cli.RedisCLI
+                  description: >-
+                    One atomic Lua script. It moves the original job bytes back to the ready list,
+                    resets the attempt counter, increments the replay counter and writes an audit
+                    record. A retry of this task finds the audit record and does not move jobs twice.
+                  host: "{{ inputs.redis_host }}"
+                  port: "{{ inputs.redis_port }}"
+                  database: "{{ inputs.redis_database }}"
+                  username: "{{ inputs.redis_username }}"
+                  password: "{{ secret('REDIS_PASSWORD') }}"
+                  timeout: PT5M
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT1M
+                    maxAttempts: 3
+                  inputFiles:
+                    replay.lua: "{{ vars.replay_lua }}"
+                  commands:
+                    - "--eval replay.lua {{ inputs.queue_prefix }}:dead {{ inputs.queue_prefix }}:ready {{ inputs.queue_prefix }}:attempts {{ inputs.queue_prefix }}:replays {{ inputs.queue_prefix }}:dead:audit , 1 '{{ inputs.replay_filter }}' {{ fromJson(outputs.preview_replay.vars.command_1).matched }} {{ inputs.max_replays }} {{ inputs.dlq_scan_limit }} 2592000 {{ execution.id }} '{{ outputs.approve_replay.onResume.reason }}'"
+
+                - id: verify_replay
+                  type: io.kestra.plugin.redis.cli.RedisCLI
+                  description: >-
+                    Read-only. Read the audit record of this execution and the DLQ again. A replayed job
+                    that is still in the DLQ with its old replay count means the move did not happen.
+                  host: "{{ inputs.redis_host }}"
+                  port: "{{ inputs.redis_port }}"
+                  database: "{{ inputs.redis_database }}"
+                  username: "{{ inputs.redis_username }}"
+                  password: "{{ secret('REDIS_PASSWORD') }}"
+                  timeout: PT5M
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT1M
+                    maxAttempts: 3
+                  inputFiles:
+                    verify.lua: |
+                      local dead, audit = KEYS[1], KEYS[2]
+                      local exec_id = ARGV[1]
+                      local scan = tonumber(ARGV[2])
+                      local rec = nil
+                      for _, a in ipairs(redis.call('LRANGE', audit, 0, 99)) do
+                        local ok, r = pcall(cjson.decode, a)
+                        if ok and type(r) == 'table' and r.execution_id == exec_id then
+                          rec = r
+                          break
+                        end
+                      end
+                      local out = { audit_found = rec ~= nil, audited = 0, still_in_dlq = 0, dlq_depth = redis.call('LLEN', dead) }
+                      if rec == nil then return cjson.encode(out) end
+                      out.audited = rec.moved
+                      for _, e in ipairs(redis.call('LRANGE', dead, 0, scan - 1)) do
+                        local ok, d = pcall(cjson.decode, e)
+                        if ok and type(d) == 'table' and type(d.id) == 'string' and type(rec.replays) == 'table' then
+                          local n = rec.replays[d.id]
+                          if n ~= nil and (tonumber(d.replays) or 0) < n then out.still_in_dlq = out.still_in_dlq + 1 end
+                        end
+                      end
+                      return cjson.encode(out)
+                  commands:
+                    - "--eval verify.lua {{ inputs.queue_prefix }}:dead {{ inputs.queue_prefix }}:dead:audit , {{ execution.id }} {{ inputs.dlq_scan_limit }}"
+
+                - id: fail_on_unverified_replay
+                  type: io.kestra.plugin.core.execution.Fail
+                  description: Fail loudly when Redis does not show the approved move.
+                  condition: >-
+                    {{ (not fromJson(outputs.verify_replay.vars.command_1).audit_found)
+                       or fromJson(outputs.verify_replay.vars.command_1).still_in_dlq > 0
+                       or fromJson(outputs.verify_replay.vars.command_1).audited != fromJson(outputs.replay_dead_letters.vars.command_1).moved }}
+                  errorMessage: >-
+                    Replay verification failed for {{ inputs.queue_prefix }}:dead. Audit record found:
+                    {{ fromJson(outputs.verify_replay.vars.command_1).audit_found }}, records still in the DLQ:
+                    {{ fromJson(outputs.verify_replay.vars.command_1).still_in_dlq }}. Compare LRANGE {{ inputs.queue_prefix }}:dead:audit 0 0 with the DLQ.
+
+                - id: notify_replay
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  retry:
+                    type: exponential
+                    interval: PT5S
+                    maxInterval: PT1M
+                    maxAttempts: 3
+                  messageText: >-
+                    Redis queue {{ inputs.queue_prefix }}: replayed {{ fromJson(outputs.replay_dead_letters.vars.command_1).moved }}
+                    DLQ job(s) with filter '{{ inputs.replay_filter }}' to {{ inputs.queue_prefix }}:ready.
+                    DLQ depth is now {{ fromJson(outputs.verify_replay.vars.command_1).dlq_depth }}.
+                    Reason: {{ outputs.approve_replay.onResume.reason }}. Audit record: LRANGE {{ inputs.queue_prefix }}:dead:audit 0 0.
+                    Execution: {{ execution.id }}.
+              else:
+                - id: log_rejected
+                  type: io.kestra.plugin.core.log.Log
+                  level: WARN
+                  message: Replay of {{ inputs.queue_prefix }}:dead was not approved. No DLQ record moved.
+          else:
+            - id: log_nothing_to_replay
+              type: io.kestra.plugin.core.log.Log
+              message: >-
+                No DLQ record in {{ inputs.queue_prefix }}:dead matches filter '{{ inputs.replay_filter }}'
+                with fewer than {{ inputs.max_replays }} replays. Parked records:
+                {{ fromJson(outputs.preview_replay.vars.command_1).parked }}. Nothing changed.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Redis queue {{ inputs.queue_prefix }}: {{ flow.id }} failed in mode {{ inputs.mode }}.
+      Check the Redis connection, the REDIS_PASSWORD secret and the key types. Failed jobs stay
+      in {{ inputs.queue_prefix }}:failed and DLQ records stay in {{ inputs.queue_prefix }}:dead.
+      Execution: {{ execution.id }}.
+
+triggers:
+  - id: sweep_every_5_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    inputs:
+      mode: SWEEP
+
+extend:
+  title: Redis Job Queue Dead-Letter Drain and Approved Replay
+  metaTitle: Redis List Job Queue Retry, Dead-Letter and Replay | Kestra
+  shortDescription: >-
+    Retry failed jobs of a Redis list queue with a per-job attempt counter, move exhausted jobs to a
+    dead-letter list, report its depth and replay selected jobs after an approval.
+  metaDescription: Drain a Redis list job queue with attempt counters, move exhausted jobs to a dead-letter list, alert on depth and replay jobs after approval.
+  description: |
+    A Redis list has no retry limit and no dead-letter queue (DLQ). This flow adds both with atomic Lua scripts.
+
+    ## How it works
+
+    1. A Schedule trigger starts a SWEEP every 5 minutes. Workers push failed jobs onto `<prefix>:failed`.
+    2. `sweep_failed` runs one Lua script with `RedisCLI`. It pops up to `sweep_batch` jobs and counts attempts per job id in `<prefix>:attempts`.
+    3. A job below `max_attempts` goes back onto `<prefix>:ready`. Other jobs go to `<prefix>:dead` with the original bytes, the attempt counter and the last error. A job without an `id` goes to the DLQ as `malformed_envelope`.
+    4. The flow logs the DLQ depth, the KV trend and the top error classes. Slack gets an alert when new dead jobs push the DLQ to `dlq_alert_depth`, or on a malformed job.
+    5. A manual REPLAY run previews the records that match `replay_filter`. A `Pause` task waits for an approval.
+    6. After approval, one Lua script moves the jobs back and writes an audit record. `verify_replay` reads the DLQ again and fails the run if a job did not move.
+
+    ## What you get
+
+    - A retry limit per job id. Job bytes stay exact.
+    - DLQ records with attempt counter, error class and replay count.
+    - An approval gate, a replay limit and a `max_replays` limit that parks repeat failures.
+    - An audit list `<prefix>:dead:audit`. A retried apply moves nothing twice.
+
+    ## Who it's for
+
+    - Backend teams that run workers on Redis lists.
+    - On-call engineers that replay jobs after a fix.
+
+    ## Why orchestrate this with Kestra
+
+    - Schedule, approval, retries and alerts are in one flow. Each run keeps the counts and the reason.
+
+    ## Prerequisites
+
+    - Redis 7.4 or later, because the scripts use `HEXPIRE`.
+    - A Docker task runner for `RedisCLI`, with network access to Redis.
+    - A Redis ACL user with `EVAL` and the list and hash commands on `~<prefix>:*`.
+
+    ### Secrets
+
+    - `REDIS_PASSWORD`: Password of the Redis ACL user.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for alerts and replay reports.
+
+    ## Quick start
+
+    1. Add the two secrets to your namespace.
+    2. Make workers push failed jobs with `id`, `error_class` and `last_error` to `<prefix>:failed`.
+    3. Execute the flow in SWEEP mode and read the log.
+    4. Execute it in REPLAY mode, read the preview and resume with `approved` set to true.
+
+    ## How to extend
+
+    - Use a delay with a sorted set for exponential backoff between attempts.
+    - Copy DLQ records to object storage before a replay.
+
+    ## Links
+
+    - [Redis RedisCLI task](https://kestra.io/plugins/plugin-redis/cli/io.kestra.plugin.redis.cli.rediscli)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Slack incoming webhook task](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Redis EVAL scripts](https://redis.io/docs/latest/develop/interact/programmability/eval-intro/)
+    - [Redis LMOVE reliable queue pattern](https://redis.io/docs/latest/commands/lmove/)
+    - [Redis HEXPIRE](https://redis.io/docs/latest/commands/hexpire/)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+    - Monitoring & Alerting
+  ee: false
+  demo: false
