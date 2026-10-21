@@ -1,0 +1,577 @@
+id: postgres-time-partition-roller
+namespace: company.data
+
+description: >-
+  Roll one monthly RANGE partitioned PostgreSQL table. Create the next months ahead of time.
+  Seal, export to S3, verify and drop each partition older than the retention window.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    defaults: jdbc:postgresql://postgres:5432/app
+    description: JDBC URL of the database that holds the partitioned table.
+
+  - id: table_schema
+    type: STRING
+    defaults: public
+    validator: ^[a-z_][a-z0-9_]{0,62}$
+    description: Schema of the partitioned parent table.
+
+  - id: parent_table
+    type: STRING
+    defaults: events
+    validator: ^[a-z_][a-z0-9_]{0,54}$
+    description: >-
+      Name of the parent table. It must be RANGE partitioned on one date, timestamp or timestamptz column.
+      New partitions get the name <parent_table>_pYYYYMM.
+
+  - id: months_ahead
+    type: INT
+    defaults: 3
+    min: 1
+    max: 24
+    description: Number of future months after the current month that must have a partition.
+
+  - id: retention_months
+    type: INT
+    defaults: 13
+    min: 1
+    max: 240
+    description: >-
+      Number of full months to keep online before the current month.
+      A partition is expired when its upper bound is on or before this cutoff.
+
+  - id: max_partitions_per_run
+    type: INT
+    defaults: 3
+    min: 1
+    max: 24
+    description: Maximum number of expired partitions to archive and drop in one run.
+
+  - id: s3_bucket
+    type: STRING
+    defaults: company-db-archive
+    description: S3 bucket that receives the partition archives.
+
+  - id: s3_prefix
+    type: STRING
+    defaults: postgres/partitions
+    validator: ^[A-Za-z0-9_./-]+[A-Za-z0-9_-]$
+    description: Key prefix for the archives. The flow adds <schema>/<parent>/<partition>.csv.gz.
+
+  - id: s3_storage_class
+    type: SELECT
+    values:
+      - STANDARD
+      - STANDARD_IA
+      - GLACIER_IR
+    defaults: STANDARD_IA
+    description: S3 storage class of the archive objects.
+
+  - id: aws_region
+    type: STRING
+    defaults: eu-west-1
+    description: AWS region of the archive bucket.
+
+  - id: lock_timeout
+    type: STRING
+    defaults: 5s
+    validator: ^[0-9]{1,4}(ms|s)$
+    description: >-
+      PostgreSQL lock_timeout for each DDL statement. A short value stops the DDL from queueing behind long queries
+      and blocking the application. The task retries when the lock is not granted.
+
+  - id: require_approval
+    type: BOOL
+    defaults: true
+    description: When true, a human must approve before the flow archives and drops expired partitions.
+
+variables:
+  parent: "{{ inputs.table_schema }}.{{ inputs.parent_table }}"
+  archive_approved: "{{ not inputs.require_approval or (outputs.approval_gate.onResume.approved ?? false) }}"
+  # Lists every attached RANGE partition of the parent with its bounds as timestamps.
+  # MINVALUE and MAXVALUE become -infinity and infinity. The DEFAULT partition has no bounds and is not listed.
+  ranges_cte: |
+    WITH parts AS (
+      SELECT c.oid::bigint AS part_oid,
+             n.nspname AS part_schema,
+             c.relname AS part_name,
+             quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS qualified,
+             pg_get_expr(c.relpartbound, c.oid) AS bound,
+             GREATEST(c.reltuples, 0)::bigint AS row_estimate
+      FROM pg_inherits i
+      JOIN pg_class c ON c.oid = i.inhrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE i.inhparent = format('%I.%I', '{{ inputs.table_schema }}', '{{ inputs.parent_table }}')::regclass
+    ), ranges AS (
+      SELECT p.*,
+             CASE WHEN m[1] = 'MINVALUE' THEN '-infinity'::timestamp ELSE btrim(m[1], '''')::timestamp END AS range_from,
+             CASE WHEN m[2] = 'MAXVALUE' THEN 'infinity'::timestamp ELSE btrim(m[2], '''')::timestamp END AS range_to
+      FROM parts p
+      CROSS JOIN LATERAL regexp_match(p.bound, '^FOR VALUES FROM \((.+)\) TO \((.+)\)$') AS m
+      WHERE m IS NOT NULL
+    ), months AS (
+      SELECT g::timestamp AS month_start
+      FROM generate_series(date_trunc('month', localtimestamp),
+                           date_trunc('month', localtimestamp) + make_interval(months => {{ inputs.months_ahead }}),
+                           interval '1 month') AS g
+    ), cutoff AS (
+      SELECT date_trunc('month', localtimestamp) - make_interval(months => {{ inputs.retention_months }}) AS ts
+    )
+
+triggers:
+  - id: nightly_roll
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 2 * * *"
+    description: >-
+      Run every night. Most nights there is nothing to do. The run after a month boundary creates
+      the new month and asks for approval to archive the month that left the retention window.
+
+concurrency:
+  limit: 1
+
+tasks:
+  - id: inspect_parent
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: >-
+      Read the partition key of the parent table. The regclass cast fails the task when the table does not exist.
+    fetchType: FETCH_ONE
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+    sql: |
+      SELECT COALESCE(pt.partstrat::text, 'none') AS strategy,
+             COALESCE(pt.partnatts, 0) AS key_columns,
+             COALESCE(format_type(a.atttypid, a.atttypmod), 'expression') AS key_type,
+             COALESCE(a.attname::text, '') AS key_column,
+             COALESCE((SELECT d.oid::regclass::text FROM pg_class d WHERE d.oid = pt.partdefid), '') AS default_partition
+      FROM pg_class p
+      LEFT JOIN pg_partitioned_table pt ON pt.partrelid = p.oid
+      LEFT JOIN pg_attribute a ON a.attrelid = p.oid AND a.attnum = pt.partattrs[0]
+      WHERE p.oid = format('%I.%I', '{{ inputs.table_schema }}', '{{ inputs.parent_table }}')::regclass
+
+  - id: check_partition_key
+    type: io.kestra.plugin.core.flow.If
+    description: Stop when the table is not RANGE partitioned on exactly one date or timestamp column.
+    condition: >-
+      {{ outputs.inspect_parent.row.strategy != 'r'
+         or outputs.inspect_parent.row.key_columns != 1
+         or not (['date', 'timestamp without time zone', 'timestamp with time zone'] contains outputs.inspect_parent.row.key_type) }}
+    then:
+      - id: unsupported_table
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          {{ render(vars.parent) }} is not RANGE partitioned on one date or timestamp column
+          (strategy={{ outputs.inspect_parent.row.strategy }}, key_columns={{ outputs.inspect_parent.row.key_columns }},
+          key_type={{ outputs.inspect_parent.row.key_type }}). The roller supports only monthly RANGE partitions.
+
+  - id: plan_months
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: >-
+      List the months from the current month to months_ahead that no partition overlaps.
+      A month that an existing partition overlaps in part is not touched.
+    fetchType: FETCH
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+    sql: |
+      {{ render(vars.ranges_cte) }}
+      SELECT to_char(m.month_start, 'YYYY-MM-DD') AS month_start,
+             to_char(m.month_start + interval '1 month', 'YYYY-MM-DD') AS month_end,
+             '{{ inputs.parent_table }}_p' || to_char(m.month_start, 'YYYYMM') AS partition_name
+      FROM months m
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ranges r
+        WHERE r.range_from < m.month_start + interval '1 month' AND r.range_to > m.month_start
+      )
+      ORDER BY m.month_start
+
+  - id: create_months
+    type: io.kestra.plugin.core.flow.Loop
+    description: Create one partition per missing month, one at a time, so two statements never wait on the same parent lock.
+    values: "{{ outputs.plan_months.rows }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: create_partition
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ inputs.jdbc_url }}"
+        username: "{{ secret('POSTGRES_USERNAME') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        description: >-
+          Create the month partition with quoted identifiers and a short lock_timeout.
+          PostgreSQL rejects the create when the DEFAULT partition already holds rows for this month.
+        fetchType: NONE
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
+        sql: |
+          DO $roll$
+          BEGIN
+            PERFORM set_config('lock_timeout', '{{ inputs.lock_timeout }}', true);
+            EXECUTE format('CREATE TABLE %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
+                           '{{ inputs.table_schema }}', '{{ fromJson(item.value).partition_name }}',
+                           '{{ inputs.table_schema }}', '{{ inputs.parent_table }}',
+                           '{{ fromJson(item.value).month_start }}', '{{ fromJson(item.value).month_end }}');
+          END
+          $roll$;
+
+  - id: plan_retention
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: >-
+      List the attached partitions whose upper bound is on or before the retention cutoff, oldest first.
+      expired_total counts all expired partitions before the per-run limit.
+    fetchType: FETCH
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+    sql: |
+      {{ render(vars.ranges_cte) }}
+      SELECT r.part_oid, r.part_schema, r.part_name, r.qualified,
+             r.range_from::text AS range_from, r.range_to::text AS range_to, r.row_estimate,
+             count(*) OVER () AS expired_total
+      FROM ranges r, cutoff c
+      WHERE r.range_to <= c.ts
+      ORDER BY r.range_to
+      LIMIT {{ inputs.max_partitions_per_run }}
+
+  - id: retention
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan_retention.size > 0 }}"
+    then:
+      - id: approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.require_approval }}"
+        then:
+          - id: request_approval
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'text': 'PostgreSQL partition roller for ' ~ render(vars.parent) ~ ' waits for approval in execution ' ~ execution.id ~ '. Partitions to archive to s3://' ~ inputs.s3_bucket ~ '/' ~ inputs.s3_prefix ~ ' and then drop: ' ~ (outputs.plan_retention.rows | jq('map(.part_name + " (~" + (.row_estimate | tostring) + " rows)") | join(", ")') | first) ~ '. Resume the execution with approved=true to continue.'} | toJson }}
+
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Wait for a human decision. The run is cancelled after 23 hours without an answer, so the next nightly run asks again.
+            pauseDuration: PT23H
+            behavior: CANCEL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to archive and drop the listed partitions.
+
+      - id: archive_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ render(vars.archive_approved) == 'true' }}"
+        then:
+          - id: archive_partitions
+            type: io.kestra.plugin.core.flow.Loop
+            description: Seal, export, upload, verify and drop each expired partition in turn. A failure stops the loop and leaves the partition attached.
+            values: "{{ outputs.plan_retention.rows }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: seal_partition
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                description: >-
+                  Add the NOT VALID constraint kestra_archive_seal CHECK (false) to the partition. After this, no row can be
+                  inserted or updated, so the export cannot miss a change. Reads continue. The step does nothing when the seal exists.
+                fetchType: NONE
+                retry:
+                  type: constant
+                  interval: PT1M
+                  maxAttempts: 3
+                sql: |
+                  DO $roll$
+                  BEGIN
+                    PERFORM set_config('lock_timeout', '{{ inputs.lock_timeout }}', true);
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                                   WHERE conrelid = {{ fromJson(item.value).part_oid }}::oid
+                                     AND conname = 'kestra_archive_seal') THEN
+                      EXECUTE format('ALTER TABLE %s ADD CONSTRAINT kestra_archive_seal CHECK (false) NOT VALID',
+                                     {{ fromJson(item.value).part_oid }}::oid::regclass);
+                    END IF;
+                  END
+                  $roll$;
+
+              - id: export_partition
+                type: io.kestra.plugin.jdbc.postgresql.CopyOut
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                description: Stream the sealed partition with COPY TO STDOUT as CSV with a header line.
+                timeout: PT2H
+                format: CSV
+                header: true
+                sql: SELECT * FROM {{ fromJson(item.value).qualified }}
+
+              - id: compress_archive
+                type: io.kestra.plugin.compress.FileCompress
+                timeout: PT1H
+                compression: GZIP
+                from: "{{ outputs.export_partition.uri }}"
+
+              - id: upload_archive
+                type: io.kestra.plugin.aws.s3.Upload
+                accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+                secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+                region: "{{ inputs.aws_region }}"
+                description: Upload the gzip file. The object metadata records the row count and the range for a later restore.
+                timeout: PT1H
+                retry:
+                  type: exponential
+                  interval: PT30S
+                  maxInterval: PT5M
+                  maxAttempts: 4
+                bucket: "{{ inputs.s3_bucket }}"
+                key: "{{ inputs.s3_prefix }}/{{ fromJson(item.value).part_schema }}/{{ inputs.parent_table }}/{{ fromJson(item.value).part_name }}.csv.gz"
+                from: "{{ outputs.compress_archive.uri }}"
+                contentType: application/gzip
+                storageClass: "{{ inputs.s3_storage_class }}"
+                metadata:
+                  source-table: "{{ fromJson(item.value).qualified }}"
+                  range-from: "{{ fromJson(item.value).range_from }}"
+                  range-to: "{{ fromJson(item.value).range_to }}"
+                  row-count: "{{ outputs.export_partition.rowCount }}"
+                  kestra-execution: "{{ execution.id }}"
+
+              - id: read_back_archive
+                type: io.kestra.plugin.aws.s3.List
+                accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+                secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+                region: "{{ inputs.aws_region }}"
+                description: List the uploaded key in S3 to get the stored object size.
+                retry:
+                  type: constant
+                  interval: PT30S
+                  maxAttempts: 3
+                bucket: "{{ inputs.s3_bucket }}"
+                prefix: "{{ inputs.s3_prefix }}/{{ fromJson(item.value).part_schema }}/{{ inputs.parent_table }}/{{ fromJson(item.value).part_name }}.csv.gz"
+                filter: FILES
+
+              - id: check_archive
+                type: io.kestra.plugin.core.flow.If
+                description: Stop before the drop when S3 does not hold exactly the bytes that the flow uploaded.
+                condition: >-
+                  {{ (outputs.read_back_archive.objects | length) != 1
+                     or outputs.read_back_archive.objects[0].size != fileSize(outputs.compress_archive.uri) }}
+                then:
+                  - id: archive_mismatch
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      The S3 object for {{ fromJson(item.value).qualified }} is missing or has the wrong size
+                      (expected {{ fileSize(outputs.compress_archive.uri) }} bytes). The partition stays attached and sealed.
+
+              - id: drop_partition
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                description: >-
+                  In one transaction, confirm that the partition is still attached and sealed, count its rows,
+                  and compare the count with the exported row count. Detach and drop the partition only when all checks pass.
+                fetchType: NONE
+                retry:
+                  type: constant
+                  interval: PT1M
+                  maxAttempts: 3
+                sql: |
+                  DO $roll$
+                  DECLARE
+                    live_rows bigint;
+                  BEGIN
+                    PERFORM set_config('lock_timeout', '{{ inputs.lock_timeout }}', true);
+                    IF NOT EXISTS (SELECT 1 FROM pg_inherits
+                                   WHERE inhrelid = {{ fromJson(item.value).part_oid }}::oid
+                                     AND inhparent = format('%I.%I', '{{ inputs.table_schema }}', '{{ inputs.parent_table }}')::regclass) THEN
+                      RAISE EXCEPTION 'partition % is no longer attached to %', {{ fromJson(item.value).part_oid }}::oid::regclass, '{{ render(vars.parent) }}';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                                   WHERE conrelid = {{ fromJson(item.value).part_oid }}::oid AND conname = 'kestra_archive_seal') THEN
+                      RAISE EXCEPTION 'partition % has no kestra_archive_seal constraint', {{ fromJson(item.value).part_oid }}::oid::regclass;
+                    END IF;
+                    SELECT count(*) INTO live_rows FROM {{ fromJson(item.value).qualified }};
+                    IF live_rows <> {{ outputs.export_partition.rowCount }} THEN
+                      RAISE EXCEPTION 'partition % has % rows but the archive has {{ outputs.export_partition.rowCount }} rows',
+                        {{ fromJson(item.value).part_oid }}::oid::regclass, live_rows;
+                    END IF;
+                    EXECUTE format('ALTER TABLE %I.%I DETACH PARTITION %s',
+                                   '{{ inputs.table_schema }}', '{{ inputs.parent_table }}', {{ fromJson(item.value).part_oid }}::oid::regclass);
+                    EXECUTE format('DROP TABLE %s', {{ fromJson(item.value).part_oid }}::oid::regclass);
+                  END
+                  $roll$;
+
+              - id: record_archive
+                type: io.kestra.plugin.core.kv.Set
+                description: Keep one KV entry per archived partition, so a restore can find the object without a bucket scan.
+                key: "pg_partition_archive.{{ fromJson(item.value).part_schema }}.{{ fromJson(item.value).part_name }}"
+                kvType: JSON
+                value: |
+                  {{ {
+                    'parent': render(vars.parent),
+                    'object': 's3://' ~ inputs.s3_bucket ~ '/' ~ inputs.s3_prefix ~ '/' ~ fromJson(item.value).part_schema ~ '/' ~ inputs.parent_table ~ '/' ~ fromJson(item.value).part_name ~ '.csv.gz',
+                    'range_from': fromJson(item.value).range_from,
+                    'range_to': fromJson(item.value).range_to,
+                    'rows': outputs.export_partition.rowCount,
+                    'bytes': fileSize(outputs.compress_archive.uri),
+                    'archived_at': now(),
+                    'execution': execution.id
+                  } | toJson }}
+        else:
+          - id: not_approved
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Archive not approved. {{ outputs.plan_retention.size }} expired partition(s) of {{ render(vars.parent) }}
+              stay attached and unchanged.
+
+  - id: verify_layout
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    description: >-
+      Read the partition tree again after all changes. Count the months that still have no partition,
+      the planned partitions that still exist, and the expired partitions left for the next run.
+    fetchType: FETCH_ONE
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+    sql: |
+      {{ render(vars.ranges_cte) }}
+      SELECT
+        (SELECT count(*) FROM months m
+          WHERE NOT EXISTS (SELECT 1 FROM ranges r
+                            WHERE r.range_from <= m.month_start AND r.range_to >= m.month_start + interval '1 month')) AS months_uncovered,
+        (SELECT count(*) FROM pg_class
+          WHERE oid = ANY('{ {{- outputs.plan_retention.rows | jq('map(.part_oid | tostring) | join(",")') | first -}} }'::oid[])) AS planned_still_present,
+        (SELECT count(*) FROM ranges r, cutoff c WHERE r.range_to <= c.ts) AS expired_remaining,
+        (SELECT count(*) FROM ranges) AS partitions_now
+
+  - id: check_layout
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      Fail when a month in the window is not fully covered by one partition, or when an approved partition was not dropped.
+    condition: >-
+      {{ outputs.verify_layout.row.months_uncovered > 0
+         or (outputs.plan_retention.size > 0 and render(vars.archive_approved) == 'true'
+             and outputs.verify_layout.row.planned_still_present > 0) }}
+    then:
+      - id: layout_failed
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          Partition layout of {{ render(vars.parent) }} is not as expected after the run:
+          months_uncovered={{ outputs.verify_layout.row.months_uncovered }},
+          planned_still_present={{ outputs.verify_layout.row.planned_still_present }}.
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan_months.size > 0 or outputs.verify_layout.row.planned_still_present < outputs.plan_retention.size }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'PostgreSQL partition roller for ' ~ render(vars.parent) ~ ' finished. Created: ' ~ outputs.plan_months.size ~ (outputs.plan_months.size > 0 ? ' (' ~ (outputs.plan_months.rows | jq('map(.partition_name) | join(", ")') | first) ~ ')' : '') ~ '. Archived to S3 and dropped: ' ~ (outputs.plan_retention.size - outputs.verify_layout.row.planned_still_present) ~ '. Expired partitions left: ' ~ outputs.verify_layout.row.expired_remaining ~ '. Partitions now: ' ~ outputs.verify_layout.row.partitions_now ~ '.'} | toJson }}
+    else:
+      - id: nothing_changed
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No change on {{ render(vars.parent) }}. {{ outputs.verify_layout.row.partitions_now }} partitions,
+          {{ outputs.verify_layout.row.expired_remaining }} expired partition(s) left.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'PostgreSQL partition roller FAILED for ' ~ render(vars.parent) ~ ' in execution ' ~ execution.id ~ '. A partition that failed a check stays attached and sealed. Read the task logs before the next run.'} | toJson }}
+
+extend:
+  title: PostgreSQL Monthly Partition Roller with Verified S3 Archive
+  metaTitle: Roll PostgreSQL Monthly Partitions and Archive Expired Ones to S3 | Kestra
+  shortDescription: >-
+    Create the next monthly partitions of a RANGE partitioned PostgreSQL table, then seal, export to S3, verify and drop
+    each partition older than the retention window after approval.
+  metaDescription: Create future monthly PostgreSQL partitions, then seal, COPY to S3, verify and drop expired ones after approval, with a KV archive index.
+  description: |
+    A monthly RANGE partitioned table needs two jobs every month. Someone must create next month before rows arrive. Someone must also remove the month that left the retention window, without loss of data. This flow does both jobs on one table. It removes old data with DETACH and DROP, not with DELETE, so the table gets no bloat and no long VACUUM.
+
+    ## How it works
+
+    1. A nightly `Schedule` starts the run. `concurrency.limit: 1` stops two runs on the same table.
+    2. `inspect_parent` reads the partition key. The run fails when the table is not RANGE partitioned on one date or timestamp column.
+    3. `plan_months` finds each month from now to `months_ahead` that no partition overlaps. A `Loop` creates them one at a time with `lock_timeout`.
+    4. `plan_retention` lists attached partitions older than `retention_months`, oldest first, up to `max_partitions_per_run`.
+    5. When `require_approval` is true, Slack gets the list and a `Pause` waits for `approved=true`.
+    6. A second `Loop` handles each expired partition. It adds a `CHECK (false) NOT VALID` seal, exports with `COPY` to gzip CSV and uploads to S3 with row count metadata. It reads the object size back from S3.
+    7. One transaction checks that the partition is still attached and sealed and that the live row count equals the exported count. Then it detaches and drops the partition.
+    8. A KV entry records the S3 object for each dropped partition. `verify_layout` reads the tree again and fails the run when a month is uncovered or a planned partition still exists.
+
+    ## What you get
+
+    - Future months exist before rows arrive.
+    - No expired partition is dropped before S3 holds a verified copy with the same row count.
+    - A failed check leaves the partition attached and sealed. The next run repeats it.
+    - A KV index from partition name to S3 object for restores.
+    - Slack messages for approval, changes and failures.
+
+    ## Who it's for
+
+    - Database administrators and platform teams that own large time series or event tables in PostgreSQL.
+
+    ## Why orchestrate this with Kestra
+
+    - Retries, timeouts, the approval `Pause`, KV state and the execution history replace a cron script and a runbook.
+
+    ## Prerequisites
+
+    - PostgreSQL 13 or later. The role must own the parent table.
+    - An S3 bucket and an IAM user with `s3:PutObject` and `s3:ListBucket`.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`: credentials of the table owner role.
+    - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: S3 write and list access.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for approval and alerts.
+
+    ## Quick start
+
+    1. Add the secrets to the namespace.
+    2. Set `jdbc_url`, `table_schema`, `parent_table` and `s3_bucket`.
+    3. Execute once and approve. Check the new partitions and the S3 objects.
+
+    ## How to extend
+
+    - Set `endpointOverride`, `forcePathStyle` and `compatibilityMode` on the two S3 tasks to use MinIO or another S3 API.
+    - Add a `Subflow` per table to roll many tables.
+
+    ## Links
+
+    - [PostgreSQL CopyOut](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.copyout)
+    - [PostgreSQL Query](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.query)
+    - [S3 Upload](https://kestra.io/plugins/plugin-aws/s3/io.kestra.plugin.aws.s3.upload)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [PostgreSQL table partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html)
+    - [ALTER TABLE DETACH PARTITION](https://www.postgresql.org/docs/current/sql-altertable.html)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false
