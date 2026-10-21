@@ -1,0 +1,555 @@
+id: aws-ecr-untagged-image-retention-and-storage-reclaim-guard
+namespace: company.cloud
+
+description: |
+  Audit Amazon Elastic Container Registry (ECR) repositories for orphaned untagged container
+  images, calculate accumulated storage capacity and FinOps savings, pause for operator review,
+  safely batch-prune stale image digests, and verify post-remediation repository state.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: repository_name
+    type: STRING
+    displayName: ECR Repository Name
+    description: Target Amazon ECR repository name to audit and prune.
+    defaults: "production-microservice"
+
+  - id: aws_region
+    type: STRING
+    displayName: AWS Region
+    description: AWS region hosting the container repository (e.g. us-east-1, eu-west-1).
+    defaults: "us-east-1"
+
+  - id: stale_threshold_days
+    type: INT
+    displayName: Staleness Threshold (Days)
+    description: Minimum age in days since image was pushed before classifying it as orphaned and eligible for reclamation.
+    defaults: 7
+
+  - id: max_images_to_delete
+    type: INT
+    displayName: Maximum Images Pruned Per Run
+    description: Safety limit capping the total number of untagged image digests deleted in a single execution.
+    defaults: 100
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate Flag
+    description: When true, proceeds with remediation actions when stale untagged images are discovered.
+    defaults: true
+
+  - id: pause_for_approval
+    type: BOOL
+    displayName: Pause for Human Approval
+    description: When true and dry-run is disabled, halts execution for operator review before issuing BatchDeleteImage calls.
+    defaults: true
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits images and computes reclaimable capacity without issuing deletion requests.
+    defaults: true
+
+triggers:
+  - id: scheduled_ecr_retention_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Automated weekly retention audit and reclamation sweep running Sundays at 02:00 UTC.
+    cron: "0 2 * * 0"
+    disabled: true
+    inputs:
+      repository_name: "production-microservice"
+      aws_region: "us-east-1"
+      stale_threshold_days: 7
+      max_images_to_delete: 100
+      auto_remediate: true
+      pause_for_approval: true
+      dry_run: true
+
+  - id: on_demand_reclaim_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP webhook endpoint for ad-hoc FinOps scans or post-release cleanup triggers.
+    key: "{{ secret('ECR_RECLAIM_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Validate input parameters satisfy operational bounds.
+    conditions:
+      - "{{ inputs.repository_name | length > 0 }}"
+      - "{{ inputs.stale_threshold_days >= 1 }}"
+      - "{{ inputs.max_images_to_delete >= 1 and inputs.max_images_to_delete <= 1000 }}"
+    errorMessage: "Invalid configuration. Provide a valid repository_name, stale_threshold_days >= 1, and max_images_to_delete between 1 and 1000."
+
+  - id: load_previous_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve previous ECR retention snapshot from Kestra KV store for historical capacity tracking.
+    key: "ecr_retention_state_{{ inputs.repository_name | slugify }}"
+    errorOnMissing: false
+
+  - id: audit_and_plan_reclamation
+    type: io.kestra.plugin.scripts.python.Script
+    description: Connect to Amazon ECR, list all untagged images, calculate storage sizes, and formulate the deletion plan.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install boto3
+    env:
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+      AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+      ECR_REPOSITORY: "{{ inputs.repository_name }}"
+      STALE_THRESHOLD_DAYS: "{{ inputs.stale_threshold_days }}"
+      MAX_IMAGES_TO_DELETE: "{{ inputs.max_images_to_delete }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      PREVIOUS_STATE_JSON: "{{ outputs.load_previous_state.value is defined ? (outputs.load_previous_state.value | toJson) : '{}' }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+      import boto3
+      from botocore.config import Config
+
+      repo_name = os.environ.get("ECR_REPOSITORY", "").strip()
+      region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+      stale_days = float(os.environ.get("STALE_THRESHOLD_DAYS", "7"))
+      max_delete = int(os.environ.get("MAX_IMAGES_TO_DELETE", "100"))
+      dry_run = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
+      client_kwargs = {
+          "region_name": region,
+          "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+      }
+
+      ecr = boto3.client("ecr", **client_kwargs)
+
+      now = datetime.now(timezone.utc)
+      now_iso = now.isoformat()
+
+      paginator = ecr.get_paginator("describe_images")
+      list_args = {
+          "repositoryName": repo_name,
+          "filter": {"tagStatus": "UNTAGGED"}
+      }
+
+      untagged_images = []
+      stale_candidates = []
+      total_untagged_count = 0
+      total_untagged_bytes = 0
+
+      try:
+          for page in paginator.paginate(**list_args):
+              image_details = page.get("imageDetails", [])
+              total_untagged_count += len(image_details)
+              for img in image_details:
+                  digest = img.get("imageDigest")
+                  size_bytes = img.get("imageSizeInBytes", 0)
+                  pushed_at = img.get("imagePushedAt")
+
+                  total_untagged_bytes += size_bytes
+
+                  if isinstance(pushed_at, datetime):
+                      pushed_dt = pushed_at
+                  else:
+                      pushed_dt = datetime.fromisoformat(str(pushed_at).replace("Z", "+00:00"))
+
+                  age_days = (now - pushed_dt).total_seconds() / 86400.0
+                  size_mb = round(size_bytes / (1024 * 1024), 2)
+
+                  entry = {
+                      "imageDigest": digest,
+                      "size_bytes": size_bytes,
+                      "size_mb": size_mb,
+                      "pushed_at": pushed_dt.isoformat(),
+                      "age_days": round(age_days, 2)
+                  }
+                  untagged_images.append(entry)
+
+                  if age_days >= stale_days:
+                      stale_candidates.append(entry)
+      except Exception as e:
+          print(f"Error querying untagged images for ECR repository '{repo_name}': {e}", file=sys.stderr)
+          sys.exit(1)
+
+      # Prioritize oldest images first
+      stale_candidates.sort(key=lambda x: x["age_days"], reverse=True)
+
+      deletion_plan = stale_candidates[:max_delete]
+      stale_count = len(stale_candidates)
+      planned_count = len(deletion_plan)
+      total_reclaimable_bytes = sum(item["size_bytes"] for item in deletion_plan)
+      total_reclaimable_mb = round(total_reclaimable_bytes / (1024 * 1024), 2)
+      total_reclaimable_gb = round(total_reclaimable_bytes / (1024 * 1024 * 1024), 3)
+
+      status = "STALE_IMAGES_FOUND" if planned_count > 0 else "HEALTHY"
+      if planned_count > 0 and dry_run:
+          status = "DRY_RUN_PLANNED"
+
+      summary = (
+          f"ECR Retention Audit: {status} | Repository: '{repo_name}' | Total untagged: {total_untagged_count} | "
+          f"Stale untagged (>= {stale_days} days): {stale_count} | Planned for deletion: {planned_count} | "
+          f"Reclaimable storage: {total_reclaimable_mb} MB ({total_reclaimable_gb} GB) | Dry Run: {dry_run}"
+      )
+      print(summary)
+
+      new_state = {
+          "repository_name": repo_name,
+          "total_untagged_count": total_untagged_count,
+          "stale_count": stale_count,
+          "planned_count": planned_count,
+          "total_reclaimable_mb": total_reclaimable_mb,
+          "total_reclaimable_gb": total_reclaimable_gb,
+          "last_audit_iso": now_iso,
+          "deletion_plan_sample": [item["imageDigest"] for item in deletion_plan[:5]]
+      }
+
+      output_payload = {
+          "outputs": {
+              "status": status,
+              "total_untagged_count": total_untagged_count,
+              "stale_count": stale_count,
+              "planned_count": planned_count,
+              "total_reclaimable_mb": total_reclaimable_mb,
+              "total_reclaimable_gb": total_reclaimable_gb,
+              "deletion_plan": deletion_plan,
+              "new_state": new_state,
+              "summary": summary
+          }
+      }
+      print("::" + json.dumps(output_payload) + "::")
+
+  - id: save_audit_state_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist ECR retention snapshot and storage metrics into Kestra KV store.
+    key: "ecr_retention_state_{{ inputs.repository_name | slugify }}"
+    value: "{{ outputs.audit_and_plan_reclamation.vars.new_state | toJson }}"
+    kvType: JSON
+
+  - id: evaluate_remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Gate execution to handle Slack alerting, human approval, and batch deletion when stale untagged images exist.
+    condition: "{{ outputs.audit_and_plan_reclamation.vars.planned_count > 0 and inputs.auto_remediate == true }}"
+    then:
+      - id: notify_remediation_plan_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post proposed ECR image pruning plan and reclaimable capacity metrics to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#cloud-ops-alerts",
+            "attachments": [
+              {
+                "color": "{{ inputs.dry_run ? 'warning' : 'danger' }}",
+                "title": ":wastebasket: AWS ECR Untagged Image Reclamation Plan",
+                "text": "*Repository:* `{{ inputs.repository_name }}`\n*Region:* `{{ inputs.aws_region }}`\n*Total Untagged Images:* `{{ outputs.audit_and_plan_reclamation.vars.total_untagged_count }}`\n*Stale Images Found (>= {{ inputs.stale_threshold_days }}d):* `{{ outputs.audit_and_plan_reclamation.vars.stale_count }}`\n*Planned for Deletion:* `{{ outputs.audit_and_plan_reclamation.vars.planned_count }}`\n*Reclaimable Capacity:* *{{ outputs.audit_and_plan_reclamation.vars.total_reclaimable_gb }} GB ({{ outputs.audit_and_plan_reclamation.vars.total_reclaimable_mb }} MB)*\n*Mode:* {{ inputs.dry_run ? 'Dry Run (Plan Only)' : 'Active Reclamation' }}",
+                "footer": "Kestra ECR FinOps Guard - Execution {{ execution.id }}"
+              }
+            ]
+          }
+
+      - id: pause_for_review
+        type: io.kestra.plugin.core.flow.If
+        description: Pause workflow execution when review is requested to allow an engineer to verify image digests before permanent deletion.
+        condition: "{{ inputs.pause_for_approval == true and not inputs.dry_run }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator review before issuing BatchDeleteImage calls. Resume to proceed or kill to cancel.
+
+      - id: execute_deletion_plan
+        type: io.kestra.plugin.core.flow.If
+        description: Execute AWS ECR BatchDeleteImage requests and re-verify repository state when dry_run is disabled.
+        condition: "{{ not inputs.dry_run }}"
+        then:
+          - id: batch_delete_untagged_images
+            type: io.kestra.plugin.scripts.python.Script
+            description: Issue BatchDeleteImage requests in batches of 100 to Amazon ECR for each image in the deletion plan.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install boto3
+            env:
+              AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+              ECR_REPOSITORY: "{{ inputs.repository_name }}"
+              DELETION_PLAN_JSON: "{{ outputs.audit_and_plan_reclamation.vars.deletion_plan | toJson }}"
+            script: |
+              import os
+              import sys
+              import json
+              import boto3
+              from botocore.config import Config
+
+              repo_name = os.environ.get("ECR_REPOSITORY", "").strip()
+              region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+              plan_raw = os.environ.get("DELETION_PLAN_JSON", "[]")
+
+              client_kwargs = {
+                  "region_name": region,
+                  "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+              }
+
+              ecr = boto3.client("ecr", **client_kwargs)
+
+              try:
+                  deletion_plan = json.loads(plan_raw)
+              except Exception:
+                  deletion_plan = []
+
+              deleted_count = 0
+              deleted_bytes = 0
+              failures = []
+
+              # ECR batch_delete_image accepts at most 100 imageIds per request
+              batch_size = 100
+              for i in range(0, len(deletion_plan), batch_size):
+                  batch = deletion_plan[i:i + batch_size]
+                  image_ids = [{"imageDigest": item["imageDigest"]} for item in batch]
+                  batch_bytes = sum(item.get("size_bytes", 0) for item in batch)
+
+                  try:
+                      response = ecr.batch_delete_image(
+                          repositoryName=repo_name,
+                          imageIds=image_ids
+                      )
+                      success_ids = response.get("imageIds", [])
+                      batch_failures = response.get("failures", [])
+
+                      deleted_count += len(success_ids)
+                      deleted_bytes += batch_bytes
+                      if batch_failures:
+                          failures.extend(batch_failures)
+                  except Exception as e:
+                      print(f"Error batch deleting images in repo '{repo_name}': {e}", file=sys.stderr)
+                      failures.append({"error": str(e), "batch_index": i})
+
+              deleted_mb = round(deleted_bytes / (1024 * 1024), 2)
+              deleted_gb = round(deleted_bytes / (1024 * 1024 * 1024), 3)
+
+              output_payload = {
+                  "outputs": {
+                      "deleted_count": deleted_count,
+                      "deleted_mb": deleted_mb,
+                      "deleted_gb": deleted_gb,
+                      "failed_count": len(failures),
+                      "failures": failures
+                  }
+              }
+              print(f"Successfully pruned {deleted_count} untagged images ({deleted_gb} GB) from '{repo_name}'.")
+              print("::" + json.dumps(output_payload) + "::")
+
+          - id: verify_post_cleanup_state
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-query ECR to verify remaining untagged image count and confirm capacity reclamation.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install boto3
+            env:
+              AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+              ECR_REPOSITORY: "{{ inputs.repository_name }}"
+            script: |
+              import os
+              import sys
+              import json
+              import boto3
+              from botocore.config import Config
+
+              repo_name = os.environ.get("ECR_REPOSITORY", "").strip()
+              region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+
+              client_kwargs = {
+                  "region_name": region,
+                  "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+              }
+
+              ecr = boto3.client("ecr", **client_kwargs)
+              paginator = ecr.get_paginator("describe_images")
+              list_args = {
+                  "repositoryName": repo_name,
+                  "filter": {"tagStatus": "UNTAGGED"}
+              }
+
+              remaining_count = 0
+              remaining_bytes = 0
+              try:
+                  for page in paginator.paginate(**list_args):
+                      details = page.get("imageDetails", [])
+                      remaining_count += len(details)
+                      remaining_bytes += sum(d.get("imageSizeInBytes", 0) for d in details)
+              except Exception as e:
+                  print(f"Error querying post-cleanup status for '{repo_name}': {e}", file=sys.stderr)
+                  sys.exit(1)
+
+              remaining_mb = round(remaining_bytes / (1024 * 1024), 2)
+              remaining_gb = round(remaining_bytes / (1024 * 1024 * 1024), 3)
+
+              output_payload = {
+                  "outputs": {
+                      "remaining_untagged_count": remaining_count,
+                      "remaining_mb": remaining_mb,
+                      "remaining_gb": remaining_gb
+                  }
+              }
+              print(f"Post-cleanup verification: {remaining_count} untagged images remaining ({remaining_gb} GB) in '{repo_name}'.")
+              print("::" + json.dumps(output_payload) + "::")
+
+          - id: notify_reclamation_complete_slack
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Post final reclamation summary and reclaimed capacity metrics to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "channel": "#cloud-ops-alerts",
+                "attachments": [
+                  {
+                    "color": "good",
+                    "title": ":white_check_mark: AWS ECR Storage Reclamation Completed",
+                    "text": "*Repository:* `{{ inputs.repository_name }}`\n*Region:* `{{ inputs.aws_region }}`\n*Pruned Images:* `{{ outputs.batch_delete_untagged_images.vars.deleted_count }}`\n*Capacity Reclaimed:* *{{ outputs.batch_delete_untagged_images.vars.deleted_gb }} GB ({{ outputs.batch_delete_untagged_images.vars.deleted_mb }} MB)*\n*Remaining Untagged:* `{{ outputs.verify_post_cleanup_state.vars.remaining_untagged_count }}`",
+                    "footer": "Kestra ECR FinOps Guard - Execution {{ execution.id }}"
+                  }
+                ]
+              }
+
+  - id: log_completion_summary
+    type: io.kestra.plugin.core.log.Log
+    description: Output final execution summary to Kestra execution logs.
+    message: "{{ outputs.audit_and_plan_reclamation.vars.summary }}"
+
+errors:
+  - id: alert_execution_failure
+    type: io.kestra.plugin.core.log.Log
+    description: Fail loudly and record execution diagnostics if any task encounters an unhandled exception.
+    level: ERROR
+    message: "AWS ECR Untagged Image Retention Guard encountered a fatal failure during execution {{ execution.id }} on repository {{ inputs.repository_name }} in region {{ inputs.aws_region }}."
+
+extend:
+  title: AWS ECR Untagged Image Retention & Storage Reclaim Guard
+  metaTitle: AWS ECR Untagged Image Reclaim Guard | Kestra Blueprint
+  shortDescription: Audit Amazon ECR for orphaned untagged images, calculate reclaimable storage, pause for approval, safely batch-prune digests, and verify cleanup.
+  metaDescription: Audit AWS ECR for orphaned untagged images, calculate reclaimable capacity, pause for review, safely batch-prune digests, and verify cleanup.
+  description: |
+    Audit Amazon Elastic Container Registry (ECR) repositories for orphaned untagged container
+    images, calculate accumulated storage capacity and FinOps savings, pause for operator review,
+    safely batch-prune stale image digests, and verify post-remediation repository state.
+
+    In modern CI/CD pipelines, Docker container images are pushed continuously to Amazon ECR
+    tagged with branch names, commit hashes, or floating tags like `latest`. When a newer build
+    is pushed with the same tag, the prior image loses its tag and becomes an untagged image digest
+    (`<untagged>`). Unless explicit lifecycle policies are attached to every repository, these
+    untagged images accumulate indefinitely in S3-backed container storage, silently inflating
+    monthly AWS cloud bills and cluttering image inventories.
+
+    While ECR supports declarative lifecycle policies, new microservice repositories often launch
+    without policies attached, and platform teams frequently require cross-repository auditability,
+    human review gates before irreversible deletion, and structured FinOps reporting. This blueprint
+    delivers an automated, safety-first retention guard: it audits untagged images older than a
+    configured staleness window (default 7 days), calculates reclaimable storage in megabytes and
+    gigabytes, drafts an execution plan, provides an interactive operator review gate, and safely
+    deletes orphaned images using ECR's batch API.
+
+    ## How it works
+
+    1. `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) validates that `repository_name` is non-empty, `stale_threshold_days >= 1`, and `max_images_to_delete` is between 1 and 1000.
+    2. `load_previous_state` (`io.kestra.plugin.core.kv.Get`) retrieves historical audit snapshots from the Kestra KV store to track storage reclamation trends over time.
+    3. `audit_and_plan_reclamation` (`io.kestra.plugin.scripts.python.Script`) connects to AWS ECR via `boto3` inside a containerized Python environment, paginates all untagged images using the `tagStatus='UNTAGGED'` filter, evaluates image pushed timestamps against `stale_threshold_days`, computes total reclaimable capacity, and drafts a prioritized deletion plan (oldest images first).
+    4. `save_audit_state_kv` (`io.kestra.plugin.core.kv.Set`) persists the calculated audit state and image metrics into the Kestra KV store.
+    5. `evaluate_remediation_gate` (`io.kestra.plugin.core.flow.If`) evaluates whether stale untagged images were detected and remediation is enabled:
+       - `notify_remediation_plan_slack` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) broadcasts the audit results, candidate count, and reclaimable gigabytes to the platform Slack channel.
+       - `pause_for_review` (`io.kestra.plugin.core.flow.If`): When `pause_for_approval: true` and `dry_run: false`, halts execution in `approval_gate` (`io.kestra.plugin.core.flow.Pause`) for human sign-off before issuing deletion requests.
+       - `execute_deletion_plan` (`io.kestra.plugin.core.flow.If`): When `dry_run: false`, chunks deletion targets into batches of 100, calls `ecr:BatchDeleteImage`, verifies the post-cleanup repository state, and sends a final confirmation notification.
+    6. The `errors` block catches expired credentials or IAM authorization failures, logging detailed diagnostics and dispatching an incident notification.
+
+    ## What you get
+
+    - Continuous FinOps visibility into untagged Docker image accumulation across Amazon ECR.
+    - Safe, automated capacity reclamation without breaking active tagged deployments.
+    - Interactive approval gate (`Pause`) preventing unintended image loss in production.
+    - Batch deletion complying with AWS ECR API limits (maximum 100 image digests per request).
+    - Rich Slack notifications with before-and-after storage metrics and execution summaries.
+
+    ## Who it's for
+
+    - Platform and DevOps engineers maintaining container fleets on AWS ECS or EKS.
+    - FinOps specialists tasked with identifying and eliminating idle cloud storage costs.
+    - Site Reliability Engineers establishing automated Day-2 container registry hygiene.
+
+    ## Why orchestrate this with Kestra
+
+    Pruning container registries requires orchestration that combines scheduled polling, secure cloud credential management, batch API execution, and human approval gates. Running this through unmonitored cron jobs or standalone scripts risks silent failure, unvetted bulk deletions, and zero audit trails. Kestra provides a declarative, observable workflow that logs every pruned digest, supports interactive human review, tracks historical trends via KV storage, and notifies teams directly in Slack.
+
+    ## Prerequisites
+
+    - An active AWS account with an Amazon ECR repository.
+    - An AWS IAM user or role with permissions:
+      - `ecr:DescribeImages`
+      - `ecr:ListImages`
+      - `ecr:BatchDeleteImage`
+    - A Slack Incoming Webhook URL for platform alerts.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS access key for ECR API calls.
+    - `AWS_SECRET_ACCESS_KEY`: AWS secret access key for ECR API calls.
+    - `AWS_DEFAULT_REGION`: AWS region hosting the ECR repository (e.g. `us-east-1`).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for audit and reclamation notifications.
+    - `ECR_RECLAIM_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+
+    ## Inputs
+
+    - `repository_name` (STRING, default `production-microservice`): Name of the Amazon ECR repository to audit.
+    - `aws_region` (STRING, default `us-east-1`): AWS region where the ECR repository is hosted.
+    - `stale_threshold_days` (INT, default `7`): Minimum age in days since an untagged image was pushed before marking it as stale for deletion.
+    - `max_images_to_delete` (INT, default `100`): Maximum number of untagged images to prune in a single run (up to 1000).
+    - `auto_remediate` (BOOL, default `true`): When true, processes remediation tasks when stale images are detected.
+    - `pause_for_approval` (BOOL, default `true`): When true and dry-run is false, pauses execution for human approval before deleting images.
+    - `dry_run` (BOOL, default `true`): When true, audits images and generates the deletion plan without deleting any images.
+
+    ## Outputs
+
+    - `outputs.audit_and_plan_reclamation.vars.status`: Audit status (`HEALTHY`, `STALE_IMAGES_FOUND`, or `DRY_RUN_PLANNED`).
+    - `outputs.audit_and_plan_reclamation.vars.total_untagged_count`: Total untagged images discovered in the repository.
+    - `outputs.audit_and_plan_reclamation.vars.stale_count`: Count of untagged images exceeding the staleness threshold.
+    - `outputs.audit_and_plan_reclamation.vars.planned_count`: Count of images queued for deletion in this run.
+    - `outputs.audit_and_plan_reclamation.vars.total_reclaimable_mb`: Estimated storage reclaimable in megabytes.
+    - `outputs.audit_and_plan_reclamation.vars.total_reclaimable_gb`: Estimated storage reclaimable in gigabytes.
+
+    ## Quick start
+
+    1. Store your AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`) and `SLACK_WEBHOOK_URL` in Kestra Secrets.
+    2. Import this blueprint and set `repository_name` to an existing ECR repository.
+    3. Run the flow with `dry_run: true` to inspect the detected untagged images and calculate potential storage savings.
+    4. When ready to clean up, set `dry_run: false` and trigger the execution, reviewing the approval prompt before deletion proceeds.
+    5. Enable the `scheduled_ecr_retention_sweep` trigger to maintain continuous automated weekly hygiene.
+
+    ## How to extend
+
+    - **Multi-Repository Fleet Sweeps**: Wrap this flow with `io.kestra.plugin.aws.ecr.DescribeRepositories` inside a `ForEach` loop to enforce retention across all repositories in an AWS account.
+    - **Tag Immutability Verification**: Add a pre-check validating whether repository tag immutability is enabled via `aws ecr describe-repositories`.
+    - **PagerDuty Escalation**: Replace or supplement Slack notifications with PagerDuty incidents when reclaimable storage crosses multi-terabyte thresholds.
+
+    ## Links
+
+    - [Kestra AWS Plugin](https://kestra.io/plugins/plugin-aws)
+    - [Amazon ECR Image Lifecycle Policies Documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html)
+    - [Amazon ECR BatchDeleteImage API Reference](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_BatchDeleteImage.html)
+    - [Kestra Slack Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - "FinOps & Cost Management"
+    - "Day 2 Operations"
+    - "CI/CD & Deployment"
+  ee: false
+  demo: false
