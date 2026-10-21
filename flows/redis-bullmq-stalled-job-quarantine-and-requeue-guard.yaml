@@ -1,0 +1,573 @@
+id: redis-bullmq-stalled-job-quarantine-and-requeue-guard
+namespace: company.platform
+
+description: |
+  Inspects BullMQ queues in Redis for stalled jobs stranded in active state after worker crashes,
+  differentiates recoverable jobs from retry-exhausted poison pills, safely requeues recoverable
+  tasks while quarantining unprocessable jobs to dead-letter storage behind an operator approval gate,
+  verifies post-remediation queue state, and persists audit telemetry into Kestra KV.
+
+inputs:
+  - id: redis_host
+    type: STRING
+    displayName: Redis Host
+    description: Hostname or IP address of the target Redis server hosting BullMQ queues.
+    defaults: "localhost"
+
+  - id: redis_port
+    type: INT
+    displayName: Redis Port
+    description: Port number for Redis connection (default 6379).
+    defaults: 6379
+
+  - id: redis_password
+    type: STRING
+    displayName: Redis Password
+    description: Authentication credentials for the Redis instance. Read from secrets by default.
+    defaults: "{{ secret('REDIS_PASSWORD') }}"
+
+  - id: redis_database
+    type: INT
+    displayName: Redis Database Index
+    description: Numeric Redis logical database index.
+    defaults: 0
+
+  - id: queue_prefix
+    type: STRING
+    displayName: BullMQ Queue Prefix
+    description: Key prefix configured in BullMQ (default "bull").
+    defaults: "bull"
+
+  - id: queue_name
+    type: STRING
+    displayName: BullMQ Queue Name
+    description: Name of the BullMQ queue to audit for stalled active jobs.
+    defaults: "notifications"
+
+  - id: stalled_threshold_seconds
+    type: INT
+    displayName: Stalled Duration Threshold (Seconds)
+    description: Duration in seconds an active job must remain unacknowledged without a valid worker lock before being flagged as stalled.
+    defaults: 120
+
+  - id: max_scan
+    type: INT
+    displayName: Maximum Active Jobs to Scan
+    description: Upper limit on active job IDs inspected in a single audit pass.
+    defaults: 100
+
+  - id: default_max_attempts
+    type: INT
+    displayName: Default Max Retry Attempts
+    description: Fallback maximum attempt threshold used to classify poison pills if the job metadata opts object omits an attempts ceiling.
+    defaults: 3
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits stalled jobs and outputs remediation plans without altering Redis queue keys.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, pauses for operator verification before applying requeue and quarantine operations.
+    defaults: false
+
+variables:
+  detect_lua: |
+    local active_key = KEYS[1]
+    local base_prefix = ARGV[1]
+    local stalled_threshold_ms = tonumber(ARGV[2]) or 60000
+    local max_scan = tonumber(ARGV[3]) or 100
+    local default_max_attempts = tonumber(ARGV[4]) or 3
+
+    local time_res = redis.call('TIME')
+    local now_ms = (tonumber(time_res[1]) * 1000) + math.floor(tonumber(time_res[2]) / 1000)
+
+    local total_active = redis.call('LLEN', active_key)
+    local job_ids = redis.call('LRANGE', active_key, 0, max_scan - 1)
+
+    local stalled_jobs = {}
+    local requeue_candidates = {}
+    local quarantine_candidates = {}
+
+    for i, job_id in ipairs(job_ids) do
+        local lock_key = base_prefix .. ':' .. job_id .. ':lock'
+        local has_lock = redis.call('EXISTS', lock_key)
+
+        if has_lock == 0 then
+            local job_hash_key = base_prefix .. ':' .. job_id
+            -- BullMQ's Redis hash uses abbreviated internal field names to save space.
+            -- The attempt counter is written as "atm" by current BullMQ versions; "attemptsMade"
+            -- is kept only as a read-side fallback for jobs written by legacy BullMQ releases.
+            -- BullMQ's own client reads raw.attemptsMade || raw.atm, so we mirror that precedence.
+            local job_data = redis.call('HMGET', job_hash_key, 'name', 'processedOn', 'attemptsMade', 'opts', 'atm')
+            local job_name = job_data[1] or 'unknown'
+            local processed_on = tonumber(job_data[2]) or 0
+            local attempts_made = tonumber(job_data[3]) or tonumber(job_data[5]) or 0
+            local opts_raw = job_data[4] or '{}'
+
+            local max_attempts = default_max_attempts
+            local attempts_match = string.match(opts_raw, '"attempts"%s*:%s*(%d+)')
+            if attempts_match then
+                max_attempts = tonumber(attempts_match)
+            end
+
+            local elapsed_ms = 0
+            if processed_on > 0 then
+                elapsed_ms = now_ms - processed_on
+            end
+
+            if elapsed_ms >= stalled_threshold_ms then
+                local classification = "RECOVERABLE"
+                if attempts_made >= max_attempts then
+                    classification = "POISON_EXHAUSTED"
+                    table.insert(quarantine_candidates, job_id)
+                else
+                    table.insert(requeue_candidates, job_id)
+                end
+
+                table.insert(stalled_jobs, {
+                    job_id = job_id,
+                    name = job_name,
+                    processed_on = processed_on,
+                    elapsed_ms = elapsed_ms,
+                    attempts_made = attempts_made,
+                    max_attempts = max_attempts,
+                    classification = classification
+                })
+            end
+        end
+    end
+
+    return cjson.encode({
+        server_time_ms = now_ms,
+        total_active = total_active,
+        scanned_count = #job_ids,
+        stalled_count = #stalled_jobs,
+        requeue_count = #requeue_candidates,
+        quarantine_count = #quarantine_candidates,
+        stalled_jobs = stalled_jobs,
+        requeue_candidates = requeue_candidates,
+        quarantine_candidates = quarantine_candidates
+    })
+
+  remediate_lua: |
+    local active_key = KEYS[1]
+    local wait_key = KEYS[2]
+    local failed_key = KEYS[3]
+
+    local base_prefix = ARGV[1]
+    local requeue_ids = cjson.decode(ARGV[2] or '[]')
+    local quarantine_ids = cjson.decode(ARGV[3] or '[]')
+
+    local time_res = redis.call('TIME')
+    local now_ms = (tonumber(time_res[1]) * 1000) + math.floor(tonumber(time_res[2]) / 1000)
+
+    local requeued = {}
+    local quarantined = {}
+
+    for i, job_id in ipairs(requeue_ids) do
+        local job_hash_key = base_prefix .. ':' .. job_id
+        local lock_key = base_prefix .. ':' .. job_id .. ':lock'
+
+        if redis.call('EXISTS', lock_key) == 0 then
+            local removed = redis.call('LREM', active_key, 1, job_id)
+            if removed > 0 then
+                redis.call('LPUSH', wait_key, job_id)
+                -- Write to "atm", the field current BullMQ versions actually read/write for the
+                -- attempt counter. Writing to "attemptsMade" instead would create a second,
+                -- permanently-stale field that BullMQ's own raw.attemptsMade || raw.atm fallback
+                -- would prefer forever after, silently desyncing the visible attempt count from
+                -- the real counter BullMQ keeps incrementing in "atm".
+                redis.call('HINCRBY', job_hash_key, 'atm', 1)
+                redis.call('HSET', job_hash_key, 'lastStalledAt', now_ms, 'lastRemediatedAction', 'REQUEUED')
+                table.insert(requeued, job_id)
+            end
+        end
+    end
+
+    for i, job_id in ipairs(quarantine_ids) do
+        local job_hash_key = base_prefix .. ':' .. job_id
+        local lock_key = base_prefix .. ':' .. job_id .. ':lock'
+
+        if redis.call('EXISTS', lock_key) == 0 then
+            local removed = redis.call('LREM', active_key, 1, job_id)
+            if removed > 0 then
+                redis.call('ZADD', failed_key, now_ms, job_id)
+                redis.call('HSET', job_hash_key,
+                    'failedReason', 'STALLED_WORKER_TIMEOUT_EXHAUSTED_BY_KESTRA_GUARD',
+                    'finishedOn', now_ms,
+                    'lastRemediatedAction', 'QUARANTINED_DLQ'
+                )
+                table.insert(quarantined, job_id)
+            end
+        end
+    end
+
+    return cjson.encode({
+        requeued_count = #requeued,
+        requeued_ids = requeued,
+        quarantined_count = #quarantined,
+        quarantined_ids = quarantined,
+        timestamp_ms = now_ms
+    })
+
+  verify_lua: |
+    local active_key = KEYS[1]
+    local targeted_ids = cjson.decode(ARGV[1] or '[]')
+
+    local current_active = redis.call('LRANGE', active_key, 0, -1)
+    local active_set = {}
+    for i, id in ipairs(current_active) do
+        active_set[id] = true
+    end
+
+    local lingering_in_active = {}
+    for i, id in ipairs(targeted_ids) do
+        if active_set[id] then
+            table.insert(lingering_in_active, id)
+        end
+    end
+
+    local verified = (#lingering_in_active == 0)
+
+    return cjson.encode({
+        verified = verified,
+        lingering_count = #lingering_in_active,
+        lingering_ids = lingering_in_active,
+        remaining_active_count = #current_active
+    })
+
+triggers:
+  - id: periodic_stalled_job_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic health inspection executed every 10 minutes to detect and remediate stalled BullMQ jobs.
+    cron: "*/10 * * * *"
+    disabled: true
+
+  - id: on_demand_guard_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by Kubernetes worker crash probes, Prometheus Alertmanager, or SRE runbooks.
+    key: "{{ secret('BULLMQ_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert queue parameters meet operational safety thresholds.
+    conditions:
+      - "{{ inputs.queue_name | length > 0 }}"
+      - "{{ inputs.stalled_threshold_seconds >= 10 }}"
+      - "{{ inputs.max_scan >= 1 }}"
+      - "{{ inputs.default_max_attempts >= 1 }}"
+    errorMessage: "Invalid configuration inputs. Provide a valid queue name, stalled threshold >= 10 seconds, and positive attempt ceilings."
+
+  - id: detect_stalled_jobs
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: Atomic Lua evaluation scanning active list, checking worker lock keys, and classifying unacknowledged stalled jobs.
+    host: "{{ inputs.redis_host }}"
+    port: "{{ inputs.redis_port }}"
+    database: "{{ inputs.redis_database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      detect.lua: "{{ vars.detect_lua }}"
+    commands:
+      - "--eval detect.lua {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:active , {{ inputs.queue_prefix }}:{{ inputs.queue_name }} {{ inputs.stalled_threshold_seconds * 1000 }} {{ inputs.max_scan }} {{ inputs.default_max_attempts }}"
+
+  - id: evaluate_stalled_trend
+    type: io.kestra.plugin.scripts.python.Script
+    description: Correlate detected stalled jobs against historical KV state, evaluate trend progression, and prepare remediation manifest.
+    containerImage: python:3.11-slim
+    env:
+      QUEUE_PREFIX: "{{ inputs.queue_prefix }}"
+      QUEUE_NAME: "{{ inputs.queue_name }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      AUTO_REMEDIATE: "{{ inputs.auto_remediate }}"
+      DETECT_OUTPUT_RAW: "{{ outputs.detect_stalled_jobs.vars.command_1 }}"
+      PREVIOUS_STATE_JSON: "{{ kv('bullmq_stalled_tracker_' ~ (inputs.queue_name | slugify), errorOnMissing=false) ?? '{}' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      queue_name = os.environ.get("QUEUE_NAME", "notifications")
+      dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+      auto_remediate = os.environ.get("AUTO_REMEDIATE", "false").lower() == "true"
+      execution_id = os.environ.get("EXECUTION_ID", "local-test")
+
+      raw_detect = os.environ.get("DETECT_OUTPUT_RAW", "{}").strip()
+      try:
+          detect_data = json.loads(raw_detect) if raw_detect else {}
+      except Exception:
+          detect_data = {}
+
+      raw_prev = os.environ.get("PREVIOUS_STATE_JSON", "{}").strip()
+      try:
+          prev_state = json.loads(raw_prev) if raw_prev else {}
+      except Exception:
+          prev_state = {}
+
+      stalled_jobs = detect_data.get("stalled_jobs", [])
+      requeue_candidates = detect_data.get("requeue_candidates", [])
+      quarantine_candidates = detect_data.get("quarantine_candidates", [])
+      total_active = detect_data.get("total_active", 0)
+      stalled_count = len(stalled_jobs)
+
+      prev_stalled_ids = set(prev_state.get("stalled_ids", []))
+      current_stalled_ids = set(j.get("job_id") for j in stalled_jobs)
+
+      persistent_stalled_ids = list(current_stalled_ids.intersection(prev_stalled_ids))
+      new_stalled_ids = list(current_stalled_ids - prev_stalled_ids)
+
+      overall_status = "CRITICAL" if len(quarantine_candidates) > 0 else ("WARNING" if stalled_count > 0 else "HEALTHY")
+
+      summary = (
+          f"BullMQ Queue '{queue_name}': {overall_status} | Active jobs: {total_active}, "
+          f"Stalled jobs: {stalled_count} (Requeue: {len(requeue_candidates)}, Quarantine DLQ: {len(quarantine_candidates)}, "
+          f"Persistent from prior cycle: {len(persistent_stalled_ids)}). Dry run: {dry_run}."
+      )
+      print(summary)
+
+      new_snapshot = {
+          "queue_name": queue_name,
+          "total_active": total_active,
+          "stalled_count": stalled_count,
+          "stalled_ids": list(current_stalled_ids),
+          "requeue_ids": requeue_candidates,
+          "quarantine_ids": quarantine_candidates,
+          "timestamp": now_iso
+      }
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "queue_name": queue_name,
+          "total_active": total_active,
+          "stalled_count": stalled_count,
+          "persistent_count": len(persistent_stalled_ids),
+          "new_stalled_count": len(new_stalled_ids),
+          "requeue_candidates": requeue_candidates,
+          "quarantine_candidates": quarantine_candidates,
+          "stalled_jobs": stalled_jobs,
+          "dry_run": dry_run,
+          "auto_remediate": auto_remediate,
+          "evaluated_at": now_iso,
+          "execution_id": execution_id,
+          "summary": summary
+      }
+
+      print("::" + json.dumps({
+          "outputs": {
+              "overall_status": overall_status,
+              "has_stalled": (stalled_count > 0),
+              "stalled_count": stalled_count,
+              "active_count": total_active,
+              "requeue_ids": requeue_candidates,
+              "quarantine_ids": quarantine_candidates,
+              "persistent_count": len(persistent_stalled_ids),
+              "new_snapshot": new_snapshot,
+              "audit_manifest": audit_manifest,
+              "summary": summary
+          }
+      }) + "::")
+
+  - id: save_state_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist queue stalled job ID snapshot in Kestra KV store for sequential cycle differential analysis.
+    key: "bullmq_stalled_tracker_{{ inputs.queue_name | slugify }}"
+    value: "{{ outputs.evaluate_stalled_trend.vars.new_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: handle_stalled_jobs_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Branch based on whether unacknowledged stalled jobs without worker locks were detected in the queue.
+    condition: "{{ outputs.evaluate_stalled_trend.vars.has_stalled == true }}"
+    then:
+      - id: remediation_mode_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Execute safe mutation when auto_remediate is enabled and dry_run is disabled.
+        condition: "{{ not inputs.dry_run and inputs.auto_remediate }}"
+        then:
+          - id: pause_for_remediation_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause execution for operator verification before altering Redis queue state. Resume to execute requeue and DLQ quarantine or kill to abort.
+
+          - id: remediate_stalled_jobs
+            type: io.kestra.plugin.redis.cli.RedisCLI
+            description: Atomically evacuate stalled jobs from active list, requeue recoverable items, and isolate poison pills to failed DLQ.
+            host: "{{ inputs.redis_host }}"
+            port: "{{ inputs.redis_port }}"
+            database: "{{ inputs.redis_database }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            inputFiles:
+              remediate.lua: "{{ vars.remediate_lua }}"
+            commands:
+              - "--eval remediate.lua {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:active {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:wait {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:failed , {{ inputs.queue_prefix }}:{{ inputs.queue_name }} '{{ outputs.evaluate_stalled_trend.vars.requeue_ids | toJson }}' '{{ outputs.evaluate_stalled_trend.vars.quarantine_ids | toJson }}'"
+
+          - id: verify_remediation
+            type: io.kestra.plugin.redis.cli.RedisCLI
+            description: Post-remediation verification re-querying active list to assert all targeted stalled jobs have been removed.
+            host: "{{ inputs.redis_host }}"
+            port: "{{ inputs.redis_port }}"
+            database: "{{ inputs.redis_database }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            inputFiles:
+              verify.lua: "{{ vars.verify_lua }}"
+            commands:
+              - "--eval verify.lua {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:active {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:wait {{ inputs.queue_prefix }}:{{ inputs.queue_name }}:failed , '{{ (outputs.evaluate_stalled_trend.vars.requeue_ids + outputs.evaluate_stalled_trend.vars.quarantine_ids) | toJson }}'"
+
+          - id: assert_remediation_success
+            type: io.kestra.plugin.core.execution.Assert
+            description: Fail execution if post-remediation verification reveals any targeted stalled jobs survived in active list.
+            conditions:
+              - "{{ fromJson(outputs.verify_remediation.vars.command_1).verified == true }}"
+            errorMessage: "Post-remediation verification failed! Targeted stalled jobs remain lingering in active list."
+
+          - id: log_remediation_success
+            type: io.kestra.plugin.core.log.Log
+            description: Log verified remediation results.
+            message: "Remediation verified for queue '{{ inputs.queue_name }}'. Requeued: {{ fromJson(outputs.remediate_stalled_jobs.vars.command_1).requeued_count }}, Quarantined DLQ: {{ fromJson(outputs.remediate_stalled_jobs.vars.command_1).quarantined_count }}."
+
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log planned remediation actions without altering Redis queue state.
+            message: "Dry run mode active. No Redis keys modified. Planned requeue: {{ outputs.evaluate_stalled_trend.vars.requeue_ids | toJson }}. Planned quarantine DLQ: {{ outputs.evaluate_stalled_trend.vars.quarantine_ids | toJson }}."
+
+      - id: save_recovery_audit_kv
+        type: io.kestra.plugin.core.kv.Set
+        description: Record complete incident forensics and remediation audit manifest into Kestra KV store.
+        key: "bullmq_stalled_audit_{{ inputs.queue_name | slugify }}"
+        value: "{{ outputs.evaluate_stalled_trend.vars.audit_manifest | toJson }}"
+        kvType: JSON
+
+      - id: notify_slack_stalled_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Deliver prioritized incident notification to Slack with stalled job counts, classifications, and remediation state.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.evaluate_stalled_trend.vars.overall_status == 'CRITICAL' ? 'danger' : 'warning' }}",
+                "title": ":warning: BullMQ Stalled Job Incident Alert",
+                "text": "*Queue Name:* `{{ inputs.queue_name }}`\n*Overall Status:* `{{ outputs.evaluate_stalled_trend.vars.overall_status }}`\n*Stalled Active Jobs:* {{ outputs.evaluate_stalled_trend.vars.stalled_count }}\n*Requeue Candidates:* {{ (outputs.evaluate_stalled_trend.vars.requeue_ids ?? []) | length }}\n*Quarantine DLQ Candidates:* {{ (outputs.evaluate_stalled_trend.vars.quarantine_ids ?? []) | length }}\n*Mode:* `auto_remediate={{ inputs.auto_remediate }}`, `dry_run={{ inputs.dry_run }}`\n*Execution ID:* `{{ execution.id }}`\n\n*Summary:* {{ outputs.evaluate_stalled_trend.vars.summary }}"
+              }
+            ]
+          }
+
+    else:
+      - id: log_healthy_queue
+        type: io.kestra.plugin.core.log.Log
+        description: Log healthy queue status when no stalled jobs without active worker locks are detected.
+        message: "BullMQ queue '{{ inputs.queue_name }}' is healthy. All {{ outputs.evaluate_stalled_trend.vars.active_count }} active job(s) hold active worker leases."
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Deliver emergency notification if workflow execution fails unexpectedly.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: BullMQ Stalled Job Guard Execution Failed",
+            "text": "Failed execution `{{ execution.id }}` while evaluating BullMQ queue `{{ inputs.queue_name }}` on `{{ inputs.redis_host }}:{{ inputs.redis_port }}`.\nCheck Redis connectivity, worker permissions, or Kestra worker logs."
+          }
+        ]
+      }
+
+extend:
+  title: BullMQ Stalled Job Recovery, Requeue and Dead-Letter Quarantine Guard
+  metaTitle: BullMQ Stalled Job Recovery & Dead-Letter Quarantine Guard | Kestra
+  shortDescription: Detect abandoned BullMQ jobs stranded in active state after worker crashes, safely requeue recoverable tasks, isolate poison pills to dead-letter quarantine, and audit recovery.
+  metaDescription: Recover stalled BullMQ jobs in Redis. Detect crashed worker locks, requeue recoverable jobs, isolate poison pills to dead-letter storage, and audit recovery.
+  description: |
+    Production Node.js and TypeScript microservices frequently rely on BullMQ and Redis for background job execution, including payment webhooks, notifications, PDF generation, and asynchronous AI inference pipelines. Under normal conditions, a worker process claims a job from the `bull:<queue>:wait` list, moves it to `bull:<queue>:active`, and acquires a lock key (`bull:<queue>:<jobId>:lock`) that it renews periodically until execution completes.
+
+    When a worker process crashes abruptly due to out-of-memory (OOM) killer terminations, unhandled promise rejections, native binary segmentation faults, or node redeployments, the worker vanishes without acknowledging or releasing the job. The lock key expires, but the job identifier remains stranded in `bull:<queue>:active`. Because BullMQ's built-in stalled-job recovery runs exclusively inside active worker processes, an outage that terminates workers leaves these jobs frozen indefinitely. Furthermore, if a job failed due to a poison-pill payload that crashes any worker attempting to process it, standard worker restarts trigger an infinite crash-and-restart loop.
+
+    This blueprint provides an external, declarative BullMQ stalled job supervisor. It inspects the `active` list, verifies worker lock status, classifies stranded jobs into recoverable versus poison-pill candidates, safely requeues recoverable items back to `wait`, isolates retry-exhausted poison jobs to the dead-letter `failed` storage, verifies post-remediation queue clearance, records audit history in Kestra KV, and alerts on Slack.
+
+    ## How it works
+
+    1. **Pre-flight Parameter Assertion**: The `validate_inputs` task (`io.kestra.plugin.core.execution.Assert`) verifies that input arguments meet operational limits, including a non-empty queue name and positive thresholds.
+    2. **Active Job & Lock Inspection**: The `detect_stalled_jobs` task (`io.kestra.plugin.redis.cli.RedisCLI`) executes an atomic Lua script that reads `bull:<queue>:active`, checks the existence of `bull:<queue>:<jobId>:lock`, and inspects each unleased job's metadata hash (`processedOn`, `attemptsMade`, and `opts`).
+    3. **Differential Trend Analysis & KV History**: The `evaluate_stalled_trend` task (`io.kestra.plugin.scripts.python.Script`) correlates current unacknowledged jobs against historical snapshots stored in Kestra KV under `bullmq_stalled_tracker_{queue_name}`. It identifies whether stalled jobs have persisted across multiple audit cycles and partitions items into `requeue_candidates` and `quarantine_candidates`.
+    4. **KV Snapshot Persistence**: The `save_state_tracker_kv` task (`io.kestra.plugin.core.kv.Set`) writes the updated snapshot into Kestra KV.
+    5. **Stalled Jobs Gate**: The `handle_stalled_jobs_gate` task (`io.kestra.plugin.core.flow.If`) branches based on whether any unleased stalled jobs were identified.
+    6. **Approval Gate & Dry-Run Protection**: When `dry_run` is disabled and `auto_remediate` is enabled, the workflow pauses execution (`io.kestra.plugin.core.flow.Pause`) for operator sign-off before modifying Redis queue keys.
+    7. **Safe Remediation Execution**: The `remediate_stalled_jobs` task (`io.kestra.plugin.redis.cli.RedisCLI`) runs `remediate.lua` to remove stranded jobs from `active` via `LREM`. Recoverable jobs are prepended to `bull:<queue>:wait` with incremented `attemptsMade`, while retry-exhausted poison items are moved to the `bull:<queue>:failed` ZSET with failure metadata.
+    8. **Post-Remediation Verification**: The `verify_remediation` task (`io.kestra.plugin.redis.cli.RedisCLI`) re-reads `bull:<queue>:active` and confirms that all remediated job IDs have been evacuated. The `assert_remediation_success` task fails the run if any targeted job remained in `active`.
+    9. **Audit Manifest & Slack Notification**: The recovery manifest is archived into Kestra KV under `bullmq_stalled_audit_{queue_name}`, and prioritized incident alerts are dispatched to Slack (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
+
+    ## What you get
+
+    - Automated detection of abandoned BullMQ jobs stranded in `active` state following worker crashes.
+    - Elimination of recursive worker crash loops by quarantining poison pills to the `failed` dead-letter queue.
+    - Differential trend tracking across consecutive runs using Kestra KV store to verify true worker abandonment.
+    - Human-in-the-loop approval gate (`io.kestra.plugin.core.flow.Pause`) preventing unintended mutations.
+    - Atomic Redis operations via Lua preventing race conditions with concurrently running workers.
+    - Post-remediation verification ensuring zero lingering targeted jobs remain in `active`.
+
+    ## Who it's for
+
+    - Platform Engineers and SREs maintaining production Redis and Node.js microservices infrastructure.
+    - Backend Engineers operating BullMQ, Bull, or Celery asynchronous task queues.
+    - Incident Response Teams triaging silent task processing delays and crashed worker workloads.
+
+    ## Why orchestrate this with Kestra
+
+    BullMQ's native stalled-check logic runs inside worker processes. If all workers on a queue crash or enter crash loops, BullMQ cannot heal itself from the outside.
+    Writing standalone shell scripts or cron jobs creates unmonitored points of failure without execution audit logs, secret masking, approval gates, or differential history tracking.
+    Orchestrating this guard with Kestra delivers a declarative workflow with native Redis CLI execution, atomic KV state tracking, interactive pause-for-approval mechanics, post-action verification, and automated Slack escalation.
+
+    ## Prerequisites
+
+    - An accessible Redis instance (version 6.2 or higher, Redis 7.x recommended) reachable from the Kestra worker.
+    - BullMQ queue keys created on the target Redis instance (e.g. `bull:notifications:active`, `bull:notifications:wait`).
+    - A Slack Incoming Webhook URL to receive triage alerts.
+    - Standalone queues without BullMQ Flows (parent/child job dependencies). This guard performs the minimal data-level mutation (list/ZSET membership, attempt counter, failure metadata) but does not replicate BullMQ's own internal event-stream emission or parent/child dependency bookkeeping, so `QueueEvents` listeners won't fire for its actions and a parent job waiting on a quarantined child's completion won't be unblocked by it.
+
+    ### Secrets
+
+    - `REDIS_PASSWORD`: Secret authentication password for Redis server access (leave empty if unauthenticated).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for operational notifications and alerts.
+    - `BULLMQ_GUARD_WEBHOOK_KEY`: Secret authentication token protecting the on-demand Webhook trigger.
+
+    ## Quick start
+
+    1. Configure `REDIS_PASSWORD`, `SLACK_WEBHOOK_URL`, and `BULLMQ_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `queue_name` to match your BullMQ queue (e.g. `notifications`, `orders-export`, `email-dispatch`).
+    3. Run a manual execution with `dry_run: true` to record an initial offset baseline and review detected active jobs.
+    4. When stalled jobs are detected, set `auto_remediate: true` and `dry_run: false` to execute verified recovery.
+    5. Enable the `periodic_stalled_job_guard` schedule trigger to monitor the queue continuously every 10 minutes.
+
+    ## How to extend
+
+    - **Automated Container Restart**: Add an `io.kestra.plugin.kubernetes.pod.Restart` task to bounce crashed worker pods once poison jobs have been quarantined.
+    - **Dead-Letter Storage S3 Archival**: Stream quarantined poison job payloads to Amazon S3 using `io.kestra.plugin.aws.s3.Upload` for developer debugging.
+    - **PagerDuty Incident Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` to trigger high-priority on-call pages for persistent queue stalls.
+
+    ## Links
+
+    - [BullMQ Documentation](https://docs.bullmq.io/)
+    - [Kestra Redis Plugin Documentation](https://kestra.io/plugins/plugin-redis)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Approval Gates
+  ee: false
+  demo: false
