@@ -1,0 +1,384 @@
+id: postgres-hot-update-starvation-fillfactor-tuning-with-outcome-review
+namespace: company.platform
+
+description: |
+  Find PostgreSQL tables whose updates keep spilling onto new heap pages (no room for HOT updates), lower their
+  fillfactor after approval, then judge the change on later runs from counter deltas and propose reverting it
+  if the HOT-update ratio did not improve.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: Must point at the database that holds the tables. PostgreSQL 16 or newer is required for pg_stat_user_tables.n_tup_newpage_upd.
+    defaults: "jdbc:postgresql://localhost:5432/app"
+
+  - id: schema_name
+    type: STRING
+    defaults: "public"
+
+  - id: target_fillfactor
+    type: INT
+    description: Heap fillfactor to set on qualifying tables (50 to 95). Only newly filled pages honour it.
+    defaults: 85
+
+  - id: min_updates
+    type: INT
+    displayName: Minimum updates per window
+    description: A table is judged only if it received at least this many UPDATEs since the previous run. Size it to your schedule interval.
+    defaults: 20000
+
+  - id: min_newpage_pct
+    type: INT
+    displayName: Minimum share of updates that moved to a new page
+    description: Updates whose new row version landed on a different page because the old page was full. A lower fillfactor gives them room to stay, but they only become HOT if no indexed column changed, which the outcome review checks.
+    defaults: 30
+
+  - id: max_indexed_update_pct
+    type: INT
+    displayName: Maximum share of same-page non-HOT updates
+    description: An update that stayed on its page but was not HOT must have changed an indexed column. Tables above this share are skipped, since more free space cannot help them.
+    defaults: 30
+
+  - id: min_live_rows
+    type: INT
+    defaults: 50000
+
+  - id: min_hot_gain_pct
+    type: INT
+    displayName: HOT ratio gain that counts as success
+    description: Percentage points of HOT updates gained over the window measured when the table was tuned.
+    defaults: 15
+
+  - id: evaluate_after_hours
+    type: INT
+    displayName: Hours before an unsuccessful change is proposed for revert
+    defaults: 24
+
+  - id: max_tables_per_run
+    type: INT
+    defaults: 3
+
+  - id: decline_snooze_hours
+    type: INT
+    description: After a rejected proposal, stay quiet about that table for this long.
+    defaults: 168
+
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT12H
+
+triggers:
+  - id: every_six_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Each run measures the counter deltas since the previous run, so the interval is the measurement window.
+    cron: "0 */6 * * *"
+    disabled: true
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Fail
+    description: The schema name is interpolated into SQL, so reject anything but a plain identifier, and keep the numeric knobs in range.
+    condition: "{{ not (inputs.schema_name matches '^[A-Za-z_][A-Za-z0-9_]*$') or inputs.target_fillfactor < 50 or inputs.target_fillfactor > 95 or inputs.min_newpage_pct < 1 or inputs.max_indexed_update_pct < 0 or inputs.max_indexed_update_pct > 100 or inputs.min_newpage_pct > 100 or inputs.max_tables_per_run < 1 or inputs.min_updates < 1 }}"
+    errorMessage: "Rejected inputs: schema_name must be a plain identifier, target_fillfactor 50-95, min_newpage_pct 1-100, max_tables_per_run and min_updates at least 1."
+
+  - id: server_facts
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Database name for the state key and the server version, because n_tup_newpage_upd only exists from PostgreSQL 16.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "SELECT current_database()::text AS db_name, current_setting('server_version_num')::int AS version_num"
+
+  - id: require_postgres_16
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (outputs.server_facts.row.version_num | number) < 160000 }}"
+    errorMessage: "Server version number {{ outputs.server_facts.row.version_num }} is older than 160000. Without n_tup_newpage_upd a page-full spill cannot be told apart from an indexed-column update."
+
+  - id: read_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Counter snapshot of the previous run, tables tuned by this flow and proposals that were declined.
+    key: "pg_hot_tuning_{{ outputs.server_facts.row.db_name }}_{{ inputs.schema_name }}"
+    errorOnMissing: false
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Join live pg_stat_user_tables counters with the previous snapshot and classify each table as TUNE, KEEP, REVERT, WAIT, SNOOZED or DRIFT. Deltas below zero (stats reset) are ignored.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH prev AS (
+        SELECT $kv${{ outputs.read_state.value ?? '{}' }}$kv$::jsonb AS s
+      ), cur AS (
+        SELECT st.schemaname::text AS schemaname, st.relname::text AS relname,
+               st.schemaname || '.' || st.relname AS fq,
+               st.n_tup_upd AS u, st.n_tup_hot_upd AS h, st.n_tup_newpage_upd AS p, st.n_live_tup AS live,
+               coalesce((SELECT split_part(o, '=', 2)::int FROM unnest(c.reloptions) AS o WHERE o LIKE 'fillfactor=%'), 100) AS ff
+          FROM pg_stat_user_tables st
+          JOIN pg_class c ON c.oid = st.relid
+         WHERE c.relkind = 'r'
+           AND st.schemaname = '{{ inputs.schema_name }}'
+           AND st.relname ~ '^[A-Za-z_][A-Za-z0-9_]*$'
+      ), win AS (
+        SELECT cur.*, prev.s -> 'tuned' -> cur.fq AS tuned,
+               (prev.s -> 'declined' ->> cur.fq)::timestamptz AS declined_at,
+               cur.u - (prev.s #>> ARRAY['snap', cur.fq, 'u'])::bigint AS du,
+               cur.h - (prev.s #>> ARRAY['snap', cur.fq, 'h'])::bigint AS dh,
+               cur.p - (prev.s #>> ARRAY['snap', cur.fq, 'p'])::bigint AS dp
+          FROM cur CROSS JOIN prev
+      ), ok AS (
+        SELECT win.*, coalesce(du >= 0 AND dh >= 0 AND dp >= 0, false) AS valid FROM win
+      ), cls AS (
+        SELECT ok.*,
+               CASE WHEN valid AND du > 0 THEN round(100.0 * dh / du, 1) END AS hot_pct,
+               CASE WHEN valid AND du > 0 THEN round(100.0 * dp / du, 1) END AS np_pct,
+               CASE
+                 WHEN declined_at IS NOT NULL AND declined_at + {{ inputs.decline_snooze_hours }} * interval '1 hour' > now() THEN 'SNOOZED'
+                 WHEN tuned IS NOT NULL AND ff <> (tuned ->> 'to')::int THEN 'DRIFT'
+                 WHEN tuned IS NOT NULL AND (NOT valid OR du < {{ inputs.min_updates }}) THEN 'WAIT'
+                 WHEN tuned IS NOT NULL AND 100.0 * dh / du >= (tuned ->> 'base_hot')::numeric + {{ inputs.min_hot_gain_pct }} THEN 'KEEP'
+                 WHEN tuned IS NOT NULL AND now() >= (tuned ->> 'at')::timestamptz + {{ inputs.evaluate_after_hours }} * interval '1 hour' THEN 'REVERT'
+                 WHEN tuned IS NOT NULL THEN 'WAIT'
+                 WHEN valid AND du >= {{ inputs.min_updates }} AND 100 * dp >= {{ inputs.min_newpage_pct }} * du
+                      AND 100 * (du - dh - dp) <= {{ inputs.max_indexed_update_pct }} * du
+                      AND live >= {{ inputs.min_live_rows }} AND ff > {{ inputs.target_fillfactor }} THEN 'TUNE'
+               END AS kind
+          FROM ok
+      ), ranked AS (
+        SELECT cls.*, row_number() OVER (PARTITION BY kind ORDER BY du DESC NULLS LAST) AS rn FROM cls WHERE kind IS NOT NULL
+      ), rep AS (
+        SELECT schemaname, relname, fq, kind, du, dh, dp, hot_pct, np_pct, ff, live,
+               CASE kind WHEN 'TUNE' THEN {{ inputs.target_fillfactor }}
+                         WHEN 'REVERT' THEN (tuned ->> 'from')::int END AS to_ff,
+               CASE kind
+                 WHEN 'TUNE' THEN format('ALTER TABLE %I.%I SET (fillfactor = %s)', schemaname, relname, {{ inputs.target_fillfactor }})
+                 WHEN 'REVERT' THEN CASE WHEN tuned ->> 'from' IS NULL
+                                         THEN format('ALTER TABLE %I.%I RESET (fillfactor)', schemaname, relname)
+                                         ELSE format('ALTER TABLE %I.%I SET (fillfactor = %s)', schemaname, relname, tuned ->> 'from') END
+               END AS ddl,
+               (tuned ->> 'base_hot')::numeric AS base_hot
+          FROM ranked
+         WHERE kind <> 'TUNE' OR rn <= {{ inputs.max_tables_per_run }}
+      )
+      SELECT coalesce((SELECT jsonb_agg(to_jsonb(rep) ORDER BY rep.kind, rep.du DESC NULLS LAST) FROM rep), '[]'::jsonb)::text AS report,
+             coalesce((SELECT jsonb_agg(to_jsonb(rep) ORDER BY rep.du DESC NULLS LAST) FROM rep WHERE rep.kind IN ('TUNE', 'REVERT')), '[]'::jsonb)::text AS actions,
+             (SELECT count(*) FROM rep WHERE rep.kind IN ('TUNE', 'REVERT'))::int AS action_count,
+             (SELECT count(*) FROM rep)::int AS report_count
+
+  - id: action_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only tables that need a fillfactor change, or a revert of one, reach the approval step.
+    condition: "{{ (outputs.plan.row.action_count | number) > 0 }}"
+    then:
+      - id: request_approval
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "PostgreSQL HOT-update plan for {{ outputs.server_facts.row.db_name }}.{{ inputs.schema_name }} waiting for approval (execution {{ execution.id }}, expires in {{ inputs.approval_timeout }}):\n{% for r in fromJson(outputs.plan.row.report) %}{{ r.kind }} {{ r.fq }}: {{ r.du }} updates, {{ r.hot_pct }}% HOT, {{ r.np_pct }}% moved to a new page, fillfactor {{ r.ff }}{% if r.kind == 'TUNE' or r.kind == 'REVERT' %} -> fillfactor {{ r.to_ff ?? 'default' }}{% endif %}\n{% endfor %}"}
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Hold the ALTER TABLE statements. FAIL on timeout, so an ignored request changes nothing.
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        behavior: FAIL
+        onResume:
+          - id: approved
+            type: BOOL
+            description: Run every TUNE and REVERT statement in the plan.
+            defaults: false
+          - id: note
+            type: STRING
+            description: Why the plan is approved or declined.
+            defaults: ""
+
+      - id: apply_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.approval.onResume.approved ~ '') == 'true' }}"
+        then:
+          - id: apply_fillfactor
+            type: io.kestra.plugin.core.flow.Loop
+            description: One metadata-only ALTER TABLE per table, serialized. It needs a SHARE UPDATE EXCLUSIVE lock and rewrites nothing.
+            values: "{{ outputs.plan.row.actions }}"
+            parseValues: true
+            concurrencyLimit: 1
+            tasks:
+              - id: alter_table
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                sql: "{{ item.value.ddl }}"
+
+          - id: verify_fillfactor
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Read pg_class.reloptions again and compare each table with the fillfactor the plan asked for.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT count(*) FILTER (WHERE x.actual IS DISTINCT FROM x.expected)::int AS mismatches,
+                     coalesce(string_agg(x.fq || ' expected ' || coalesce(x.expected::text, 'default') || ' found ' || coalesce(x.actual::text, 'default'), ', ')
+                              FILTER (WHERE x.actual IS DISTINCT FROM x.expected), '') AS detail
+                FROM (
+                  SELECT a.fq, a.to_ff AS expected,
+                         (SELECT split_part(o, '=', 2)::int FROM unnest(c.reloptions) AS o WHERE o LIKE 'fillfactor=%') AS actual
+                    FROM jsonb_to_recordset($act${{ outputs.plan.row.actions }}$act$::jsonb) AS a(schemaname text, relname text, fq text, to_ff int)
+                    JOIN pg_class c ON c.oid = to_regclass(quote_ident(a.schemaname) || '.' || quote_ident(a.relname))
+                ) x
+
+          - id: fail_on_fillfactor_mismatch
+            type: io.kestra.plugin.core.execution.Fail
+            condition: "{{ (outputs.verify_fillfactor.row.mismatches | number) > 0 }}"
+            errorMessage: "pg_class.reloptions does not match the plan after ALTER TABLE: {{ outputs.verify_fillfactor.row.detail }}. State was not saved."
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: "Plan declined for {{ outputs.server_facts.row.db_name }}.{{ inputs.schema_name }}. Note: {{ outputs.approval.onResume.note ?? '' }}. Proposals are snoozed for {{ inputs.decline_snooze_hours }} hours."
+
+  - id: decide_applied
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The plan counts as applied only if it needed no changes or an approved plan passed verification. A failed verification stops the flow before this point.
+    values:
+      applied: "{{ outputs.approval is defined and ((outputs.approval.onResume.approved ~ '') == 'true') }}"
+
+  - id: next_state
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Build the next state document inside PostgreSQL with jsonb. Fresh counters become the snapshot, finished or applied entries leave the tuned map, new ones enter it, and declined proposals are snoozed.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH prev AS (
+        SELECT $kv${{ outputs.read_state.value ?? '{}' }}$kv$::jsonb AS s
+      ), rep AS (
+        SELECT * FROM jsonb_to_recordset($rp${{ outputs.plan.row.report }}$rp$::jsonb)
+               AS x(fq text, kind text, ff int, to_ff int, hot_pct numeric)
+      ), snap AS (
+        SELECT coalesce(jsonb_object_agg(t.fq, jsonb_build_object('u', t.u, 'h', t.h, 'p', t.p)), '{}'::jsonb) AS j
+          FROM (SELECT schemaname || '.' || relname AS fq, n_tup_upd AS u, n_tup_hot_upd AS h, n_tup_newpage_upd AS p
+                  FROM pg_stat_user_tables
+                 WHERE schemaname = '{{ inputs.schema_name }}' AND relname ~ '^[A-Za-z_][A-Za-z0-9_]*$'
+                   AND (n_live_tup >= {{ inputs.min_live_rows }} OR schemaname || '.' || relname IN (SELECT jsonb_object_keys(coalesce(prev.s -> 'tuned', '{}'::jsonb)) FROM prev))
+                 ORDER BY n_live_tup DESC LIMIT 500) t
+      ), tuned_kept AS (
+        SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) AS j
+          FROM prev, jsonb_each(coalesce(prev.s -> 'tuned', '{}'::jsonb)) AS e
+         WHERE NOT EXISTS (SELECT 1 FROM rep WHERE rep.fq = e.key
+                            AND (rep.kind IN ('KEEP', 'DRIFT') OR (rep.kind = 'REVERT' AND {{ outputs.decide_applied.values.applied }})))
+      ), tuned_added AS (
+        SELECT coalesce(jsonb_object_agg(rep.fq, jsonb_build_object(
+                 'from', CASE WHEN rep.ff = 100 THEN NULL ELSE rep.ff END,
+                 'to', rep.to_ff, 'at', now(), 'base_hot', rep.hot_pct)), '{}'::jsonb) AS j
+          FROM rep WHERE rep.kind = 'TUNE' AND {{ outputs.decide_applied.values.applied }}
+      ), declined AS (
+        SELECT coalesce(jsonb_object_agg(k, v), '{}'::jsonb) AS j FROM (
+          SELECT e.key AS k, e.value AS v FROM prev, jsonb_each(coalesce(prev.s -> 'declined', '{}'::jsonb)) AS e
+           WHERE (e.value #>> '{}')::timestamptz + {{ inputs.decline_snooze_hours }} * interval '1 hour' > now()
+          UNION ALL
+          SELECT rep.fq, to_jsonb(now()) FROM rep WHERE rep.kind IN ('TUNE', 'REVERT') AND NOT {{ outputs.decide_applied.values.applied }}
+        ) d
+      )
+      SELECT jsonb_build_object('snap', snap.j, 'tuned', tuned_kept.j || tuned_added.j,
+                                'declined', declined.j, 'updated_at', now())::text AS state
+        FROM snap, tuned_kept, tuned_added, declined
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Saved last, after verification, so a failed run is measured again over a longer window instead of trusting unverified changes.
+    key: "pg_hot_tuning_{{ outputs.server_facts.row.db_name }}_{{ inputs.schema_name }}"
+    kvType: STRING
+    value: "{{ outputs.next_state.row.state }}"
+
+  - id: report_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Post the verdicts (applied changes, successes, reverts, waiting tables) when there is anything to report.
+    condition: "{{ (outputs.plan.row.report_count | number) > 0 }}"
+    then:
+      - id: notify_summary
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "PostgreSQL HOT-update review for {{ outputs.server_facts.row.db_name }}.{{ inputs.schema_name }} (execution {{ execution.id }}, changes applied: {{ outputs.decide_applied.values.applied }}):\n{% for r in fromJson(outputs.plan.row.report) %}{{ r.kind }} {{ r.fq }}: {{ r.du }} updates in window, {{ r.hot_pct }}% HOT{% if r.base_hot is not empty %} (was {{ r.base_hot }}% when tuned){% endif %}\n{% endfor %}"}
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "PostgreSQL fillfactor tuning failed (execution {{ execution.id }}). If an ALTER TABLE already ran, the tuned table was not recorded in KV and will not be reviewed. Compare pg_class.reloptions with the plan."}
+
+extend:
+  title: Lower fillfactor on tables whose updates spill to new pages, then revert it if HOT updates did not recover
+  metaTitle: PostgreSQL HOT Update Fillfactor Tuning with Outcome Review | Kestra
+  shortDescription: Detect tables where updates keep landing on new pages, lower fillfactor after approval, verify pg_class, and review the HOT-update ratio on later runs with an optional revert.
+  metaDescription: Tune PostgreSQL fillfactor for tables that starve HOT updates, using counter deltas kept in Kestra KV, an approval gate, verification and a revert proposal.
+  description: |
+    When a page has no free space, PostgreSQL cannot do a HOT update: the new row version moves to another page and every index gets a new entry. This blueprint finds tables where that happens, lowers their fillfactor after approval, and later checks whether the HOT-update ratio actually improved.
+
+    ## How it works
+
+    1. `require_postgres_16` stops on older servers, because `n_tup_newpage_upd` separates page-full spills from updates of indexed columns, which a lower fillfactor cannot fix.
+    2. `read_state` loads the previous counter snapshot, tuned tables and declined proposals from KV. `plan` joins them with live `pg_stat_user_tables` and computes per-table deltas, ignoring negative deltas after a stats reset.
+    3. A table becomes `TUNE` when its window has enough updates and live rows, a high share of new-page updates and a low share of same-page non-HOT updates (those can only come from indexed-column changes). A table already tuned becomes `KEEP` once its HOT ratio rose by `min_hot_gain_pct`, `REVERT` if it did not after `evaluate_after_hours`, and `DRIFT` if someone changed the fillfactor in between.
+    4. `request_approval` posts the plan and the `approval` Pause holds it. Timeout fails the run.
+    5. `apply_fillfactor` runs one `ALTER TABLE` per table. `verify_fillfactor` re-reads `pg_class.reloptions` and `fail_on_fillfactor_mismatch` stops the run on any difference.
+    6. `next_state` builds the next state document with jsonb inside PostgreSQL, and `save_state` stores it only after verification.
+
+    ## What you get
+
+    - A fillfactor change backed by measured evidence for each table.
+    - Follow-up judgement across runs and a revert path, instead of a one-off tweak nobody checks.
+    - Declined proposals stay quiet for a configurable period.
+
+    ## Who it's for
+
+    - DBAs and platform engineers running update-heavy OLTP tables on PostgreSQL 16 or newer.
+
+    ## Why orchestrate this with Kestra
+
+    The value is in the loop across runs: measure, ask a human, change, verify, then judge the outcome later. Kestra keeps the counter snapshots and tuning history in KV and holds the approval without a worker.
+
+    ## Prerequisites
+
+    - PostgreSQL 16+ and a role that can read `pg_stat_user_tables` and run `ALTER TABLE` on the target tables.
+    - The `postgres:16` Docker image is enough to test locally.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`: role used for reads and `ALTER TABLE`.
+    - `POSTGRES_PASSWORD`: its password.
+    - `SLACK_WEBHOOK_URL`: plan and result notifications.
+
+    ## Quick start
+
+    1. Create the secrets and run once to record the baseline snapshot.
+    2. Generate updates on a test table, run again, then resume the approval.
+    3. Run later windows to see `KEEP` or `REVERT`, then remove `disabled: true` from the trigger.
+
+    ## How to extend
+
+    - Follow an approved change with `pg_repack` or `VACUUM FULL` to repack existing pages.
+    - Raise `max_tables_per_run` once you trust the thresholds.
+
+    ## Links
+
+    - [PostgreSQL storage parameters](https://www.postgresql.org/docs/current/sql-createtable.html#RELOPTION-FILLFACTOR)
+    - [Heap-only tuples](https://www.postgresql.org/docs/current/storage-hot.html)
+    - [pg_stat_all_tables](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ALL-TABLES-VIEW)
+    - [Kestra PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
