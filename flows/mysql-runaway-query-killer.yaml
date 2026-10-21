@@ -1,0 +1,401 @@
+id: mysql-runaway-query-killer
+namespace: company.team
+description: Stop runaway MySQL statements with KILL QUERY, skip allowlisted users, hosts and digests, and keep a per-digest kill history in KV.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    defaults: jdbc:mysql://mysql-primary:3306/?connectTimeout=5000&socketTimeout=30000
+    description: JDBC URL of the MySQL 8.0 or 8.4 server to guard. Keep connectTimeout and socketTimeout so an unreachable server fails fast.
+
+  - id: max_query_seconds
+    type: INT
+    defaults: 300
+    min: 10
+    description: A top-level statement that runs longer than this number of seconds is a runaway candidate.
+
+  - id: killable_statement_types
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - select
+    description: >-
+      Statement types that the flow can stop, as the last part of the performance_schema event name
+      (select, update, delete, insert_select). The default stops only reads. A killed write must roll back,
+      and the rollback can take longer than the statement itself.
+
+  - id: max_kills_per_run
+    type: INT
+    defaults: 10
+    min: 1
+    max: 100
+    description: Upper limit of statements that one run stops. The flow stops the oldest statements first and reports the remainder.
+
+  - id: repeat_offender_kills
+    type: INT
+    defaults: 3
+    min: 2
+    description: When the kill count of one statement digest reaches this number, the alert marks the digest as a repeat offender.
+
+  - id: allowlist_kv_key
+    type: STRING
+    defaults: mysql_query_killer_allowlist
+    description: >-
+      KV key with the allowlist as JSON, for example {"users": ["backup"], "hosts": ["10.20.%"], "digests": []}.
+      Hosts are SQL LIKE patterns. The flow fails when the key does not exist.
+
+  - id: history_ttl
+    type: DURATION
+    defaults: P30D
+    description: The kill history of a digest expires after this period without a new kill.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, the flow reports the statements that it would stop and does not run KILL QUERY.
+
+variables:
+  statement_scope: >-
+    FROM performance_schema.threads t
+    JOIN performance_schema.events_statements_current e
+      ON e.THREAD_ID = t.THREAD_ID
+     AND e.END_EVENT_ID IS NULL
+     AND e.NESTING_EVENT_LEVEL = 0
+
+tasks:
+  - id: load_allowlist
+    type: io.kestra.plugin.core.kv.Get
+    description: Read the allowlist from KV. A missing key fails the run, so the flow never stops queries with an allowlist that nobody set.
+    key: "{{ inputs.allowlist_kv_key }}"
+    errorOnMissing: true
+
+  - id: preflight
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('MYSQL_KILLER_USERNAME') }}"
+    password: "{{ secret('MYSQL_KILLER_PASSWORD') }}"
+    connectionPoolSize: 2
+    timeout: PT30S
+    description: >-
+      Connect to the server and read the performance_schema settings that the detection needs.
+      It also counts long-running threads that performance_schema does not instrument, because the flow cannot see their statements.
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT @@hostname AS server_host,
+             @@version AS server_version,
+             LEFT(REPLACE(@@server_uuid, '-', ''), 12) AS server_key,
+             @@performance_schema AS ps_enabled,
+             (SELECT COUNT(*) FROM performance_schema.setup_consumers
+               WHERE NAME IN ('global_instrumentation', 'thread_instrumentation', 'events_statements_current')
+                 AND ENABLED = 'YES') AS consumers_enabled,
+             (SELECT COUNT(*) FROM performance_schema.threads
+               WHERE TYPE = 'FOREGROUND' AND PROCESSLIST_COMMAND = 'Query'
+                 AND INSTRUMENTED = 'NO' AND PROCESSLIST_TIME >= :max_seconds) AS uninstrumented_long
+    parameters:
+      max_seconds: "{{ inputs.max_query_seconds }}"
+
+  - id: require_instrumentation
+    type: io.kestra.plugin.core.execution.Fail
+    description: Stop the run when performance_schema cannot show running statements. Without it the flow would see nothing and report a quiet server.
+    condition: "{{ outputs.preflight.row.ps_enabled != 1 or outputs.preflight.row.consumers_enabled != 3 }}"
+    errorMessage: >-
+      performance_schema is off or a statement consumer is disabled on {{ outputs.preflight.row.server_host }}
+      (performance_schema={{ outputs.preflight.row.ps_enabled }}, enabled consumers {{ outputs.preflight.row.consumers_enabled }} of 3).
+      Enable global_instrumentation, thread_instrumentation and events_statements_current.
+
+  - id: find_runaway
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('MYSQL_KILLER_USERNAME') }}"
+    password: "{{ secret('MYSQL_KILLER_PASSWORD') }}"
+    connectionPoolSize: 2
+    timeout: PT30S
+    description: >-
+      Find top-level statements that run longer than the threshold. The query skips this connection,
+      allowlisted users, hosts and digests, and statement types that are not killable. The oldest statements come first.
+    fetchType: FETCH
+    sql: |
+      SELECT CONCAT(t.PROCESSLIST_ID, '-', t.THREAD_ID, '-', e.EVENT_ID) AS target_key,
+             t.PROCESSLIST_ID AS processlist_id,
+             t.PROCESSLIST_USER AS db_user,
+             COALESCE(t.PROCESSLIST_HOST, '') AS db_host,
+             COALESCE(t.PROCESSLIST_DB, '') AS db_schema,
+             SUBSTRING_INDEX(e.EVENT_NAME, '/', -1) AS statement_type,
+             FLOOR(e.TIMER_WAIT / 1000000000000) AS elapsed_s,
+             COALESCE(e.DIGEST, 'none') AS digest,
+             LEFT(COALESCE(e.DIGEST_TEXT, ''), 300) AS digest_text,
+             COUNT(*) OVER () AS total_candidates
+      {{ vars.statement_scope }}
+      WHERE t.TYPE = 'FOREGROUND'
+        AND t.PROCESSLIST_COMMAND = 'Query'
+        AND t.PROCESSLIST_ID <> CONNECTION_ID()
+        AND t.PROCESSLIST_USER IS NOT NULL
+        AND e.TIMER_WAIT >= :max_seconds * 1000000000000
+        AND JSON_CONTAINS(CAST(:types AS JSON), JSON_QUOTE(SUBSTRING_INDEX(e.EVENT_NAME, '/', -1)))
+        AND NOT JSON_CONTAINS(CAST(:users AS JSON), JSON_QUOTE(t.PROCESSLIST_USER))
+        AND NOT JSON_CONTAINS(CAST(:digests AS JSON), JSON_QUOTE(COALESCE(e.DIGEST, '')))
+        AND NOT EXISTS (
+              SELECT 1
+                FROM JSON_TABLE(CAST(:hosts AS JSON), '$[*]' COLUMNS (pattern VARCHAR(255) PATH '$')) h
+               WHERE COALESCE(t.PROCESSLIST_HOST, '') LIKE h.pattern)
+      ORDER BY e.TIMER_WAIT DESC
+      LIMIT {{ inputs.max_kills_per_run }}
+    parameters:
+      max_seconds: "{{ inputs.max_query_seconds }}"
+      types: "{{ inputs.killable_statement_types | toJson }}"
+      users: "{{ (outputs.load_allowlist.value.users ?? []) | toJson }}"
+      hosts: "{{ (outputs.load_allowlist.value.hosts ?? []) | toJson }}"
+      digests: "{{ (outputs.load_allowlist.value.digests ?? []) | toJson }}"
+
+  - id: log_plan
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      MySQL {{ outputs.preflight.row.server_version }} on {{ outputs.preflight.row.server_host }}:
+      {{ outputs.find_runaway.size > 0 ? outputs.find_runaway.rows[0].total_candidates : 0 }} statement(s) over {{ inputs.max_query_seconds }} s,
+      {{ outputs.find_runaway.size }} selected for this run (limit {{ inputs.max_kills_per_run }}).
+      Uninstrumented long-running threads: {{ outputs.preflight.row.uninstrumented_long }}.
+      Mode dry_run={{ inputs.dry_run }}. Targets: {{ outputs.find_runaway.rows | toJson }}
+
+  - id: handle_runaway
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.find_runaway.size > 0 }}"
+    then:
+      - id: by_mode
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.dry_run }}"
+        then:
+          - id: dry_run_alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: In dry-run mode, report the statements that the flow would stop.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+            messageText: |-
+              DRY RUN. MySQL runaway query killer would stop {{ outputs.find_runaway.size }} of {{ outputs.find_runaway.rows[0].total_candidates }} statement(s) over {{ inputs.max_query_seconds }} s on {{ outputs.preflight.row.server_host }}.{% for r in outputs.find_runaway.rows %}
+              - id {{ r.processlist_id }} {{ r.db_user }}@{{ r.db_host }} schema={{ r.db_schema }} {{ r.statement_type }} {{ r.elapsed_s }} s digest {{ r.digest | slice(0, 12) }}: {{ r.digest_text }}{% endfor %}
+              Set dry_run to false to stop these statements. Execution {{ execution.id }}.
+        else:
+          - id: kill_each
+            type: io.kestra.plugin.core.flow.Loop
+            description: Stop the targets one at a time. Each iteration confirms that the same statement still runs before it sends KILL QUERY.
+            values: "{{ outputs.find_runaway.rows }}"
+            concurrencyLimit: 1
+            fetchType: FETCH
+            outputs:
+              - id: killed_key
+                type: STRING
+                value: "{{ outputs.recheck.row.still_running == 1 ? fromJson(item.value).target_key : '' }}"
+              - id: record
+                type: JSON
+                value: "{{ outputs.history.values.entry ?? '{}' }}"
+            tasks:
+              - id: recheck
+                type: io.kestra.plugin.jdbc.mysql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('MYSQL_KILLER_USERNAME') }}"
+                password: "{{ secret('MYSQL_KILLER_PASSWORD') }}"
+                connectionPoolSize: 2
+                timeout: PT30S
+                description: >-
+                  Confirm that the thread still runs the same statement event. A finished statement frees the thread,
+                  and KILL QUERY on that thread would then stop an unrelated statement.
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT COUNT(*) AS still_running,
+                         COALESCE(MAX(t.PROCESSLIST_ID), 0) AS processlist_id,
+                         COALESCE(MAX(FLOOR(e.TIMER_WAIT / 1000000000000)), 0) AS elapsed_s
+                  {{ vars.statement_scope }}
+                  WHERE CONCAT(t.PROCESSLIST_ID, '-', t.THREAD_ID, '-', e.EVENT_ID) = :target_key
+                parameters:
+                  target_key: "{{ fromJson(item.value).target_key }}"
+
+              - id: still_running
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.recheck.row.still_running == 1 }}"
+                then:
+                  - id: kill_query
+                    type: io.kestra.plugin.jdbc.mysql.Query
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('MYSQL_KILLER_USERNAME') }}"
+                    password: "{{ secret('MYSQL_KILLER_PASSWORD') }}"
+                    connectionPoolSize: 2
+                    timeout: PT30S
+                    description: Stop the statement and keep the connection open, so the application connection pool stays intact.
+                    sql: KILL QUERY {{ outputs.recheck.row.processlist_id }}
+
+                  - id: history
+                    type: io.kestra.plugin.core.output.OutputValues
+                    description: Build the new history record of this digest from the previous record in KV.
+                    values:
+                      key: "mysql_runaway_{{ outputs.preflight.row.server_key }}_{{ fromJson(item.value).digest }}"
+                      entry: >-
+                        {% set prev = kv('mysql_runaway_' ~ outputs.preflight.row.server_key ~ '_' ~ fromJson(item.value).digest, errorOnMissing=false) ?? {} %}
+                        {{ {
+                          'digest': fromJson(item.value).digest,
+                          'digest_text': fromJson(item.value).digest_text,
+                          'statement_type': fromJson(item.value).statement_type,
+                          'kills': (prev.kills ?? 0) + 1,
+                          'first_killed_at': prev.first_killed_at ?? now(),
+                          'last_killed_at': now(),
+                          'last_user': fromJson(item.value).db_user,
+                          'last_host': fromJson(item.value).db_host,
+                          'last_schema': fromJson(item.value).db_schema,
+                          'last_elapsed_s': outputs.recheck.row.elapsed_s,
+                          'last_processlist_id': outputs.recheck.row.processlist_id,
+                          'server_host': outputs.preflight.row.server_host,
+                          'last_execution_id': execution.id
+                        } | toJson }}
+
+                  - id: save_history
+                    type: io.kestra.plugin.core.kv.Set
+                    key: "{{ outputs.history.values.key }}"
+                    value: "{{ outputs.history.values.entry }}"
+                    kvType: JSON
+                    ttl: "{{ inputs.history_ttl }}"
+                    kvDescription: Runaway query kill history for one MySQL statement digest.
+                else:
+                  - id: already_finished
+                    type: io.kestra.plugin.core.log.Log
+                    message: Statement {{ fromJson(item.value).target_key }} finished before the kill. The flow did not send KILL QUERY.
+
+          - id: settle
+            type: io.kestra.plugin.core.flow.Sleep
+            description: Give the server time to abort the killed statements before the verification.
+            duration: PT5S
+
+          - id: verify
+            type: io.kestra.plugin.jdbc.mysql.Query
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('MYSQL_KILLER_USERNAME') }}"
+            password: "{{ secret('MYSQL_KILLER_PASSWORD') }}"
+            connectionPoolSize: 2
+            timeout: PT30S
+            description: Count the killed statement events that still run. A count above zero means the server did not abort them yet.
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT JSON_LENGTH(CAST(:keys AS JSON)) AS killed,
+                     (SELECT COUNT(*)
+                      {{ vars.statement_scope }}
+                      WHERE JSON_CONTAINS(CAST(:keys AS JSON),
+                            JSON_QUOTE(CONCAT(t.PROCESSLIST_ID, '-', t.THREAD_ID, '-', e.EVENT_ID)))) AS still_running
+            parameters:
+              keys: "{{ loopOutputs(outputs.kill_each.outputs, 'killed_key') | jq('map(select(length > 0))') | first | toJson }}"
+
+          - id: kill_alert
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert only when the run stopped at least one statement.
+            runIf: "{{ outputs.verify.row.killed > 0 }}"
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+            messageText: |-
+              MySQL runaway query killer stopped {{ outputs.verify.row.killed }} statement(s) over {{ inputs.max_query_seconds }} s on {{ outputs.preflight.row.server_host }}. Still running after KILL QUERY: {{ outputs.verify.row.still_running }}.{% for r in loopOutputs(outputs.kill_each.outputs, 'record') %}{% if r.digest is defined %}
+              - {{ r.last_user }}@{{ r.last_host }} schema={{ r.last_schema }} id {{ r.last_processlist_id }} {{ r.statement_type }} {{ r.last_elapsed_s }} s. Digest {{ r.digest | slice(0, 12) }} killed {{ r.kills }} time(s) since {{ r.first_killed_at }}{{ r.kills >= inputs.repeat_offender_kills ? '. REPEAT OFFENDER: fix the query or add an index.' : '.' }}
+                {{ r.digest_text }}{% endif %}{% endfor %}
+              {{ outputs.find_runaway.rows[0].total_candidates > outputs.find_runaway.size ? 'The run limit left ' ~ (outputs.find_runaway.rows[0].total_candidates - outputs.find_runaway.size) ~ ' statement(s) for the next run.' : '' }} Execution {{ execution.id }}.
+
+errors:
+  - id: failure_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      MySQL runaway query killer failed on {{ inputs.jdbc_url }}. Runaway statements are not controlled until this is fixed.
+      Check the logs of execution {{ execution.id }} in namespace {{ flow.namespace }}.
+
+triggers:
+  - id: every_two_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/2 * * * *"
+    description: Check the server every two minutes. Set dry_run to false here after you review the dry-run alerts.
+    inputs:
+      dry_run: true
+
+extend:
+  title: Stop Runaway MySQL Queries with KILL QUERY and Track Repeat Offenders
+  metaTitle: MySQL Runaway Query Killer with Allowlist and Digest History | Kestra
+  shortDescription: Find MySQL statements that run longer than a threshold, stop them with KILL QUERY, and keep a per-digest kill history in KV.
+  metaDescription: Stop long-running MySQL statements with KILL QUERY, skip allowlisted users, hosts and digests, and track repeat offenders by statement digest.
+  description: |
+    A runaway query holds CPU and locks. The max_execution_time setting has no allowlist. This flow stops runaway statements with KILL QUERY and keeps the connection open. Each kill goes into a KV history per statement digest.
+
+    ## How it works
+
+    1. A Schedule trigger starts the flow every two minutes.
+    2. `load_allowlist` reads users, host LIKE patterns and digests from KV. A missing key fails the run.
+    3. `require_instrumentation` fails the run when the performance_schema statement consumers are off.
+    4. `find_runaway` reads `threads` and `events_statements_current`. It selects killable statements over the threshold.
+    5. In dry-run mode, a Slack message lists the statements that the flow would stop.
+    6. Otherwise a `Loop` rechecks each statement event, runs KILL QUERY and writes the digest record to KV.
+    7. `verify` counts the killed statements that still run. `kill_alert` sends Slack only when the run stopped a statement.
+
+    ## What you get
+
+    - Kills of statements, not of connections.
+    - A recheck before each kill to cut the risk of a hit on a reused thread.
+    - Reads only by default, because a killed write must roll back.
+    - Normalized digest text in alerts, without literal values.
+    - A kill count per digest with repeat offender marks.
+
+    ## Who it's for
+
+    - DBAs and SREs who run shared MySQL servers.
+
+    ## Why orchestrate this with Kestra
+
+    - KV keeps the allowlist and the kill history outside the database.
+    - Concurrency control prevents two runs from killing at the same time.
+    - A failure alert shows a broken guard.
+
+    ## Prerequisites
+
+    - MySQL 8.0 or 8.4 with performance_schema on.
+    - An account with PROCESS, CONNECTION_ADMIN and SELECT on performance_schema.
+
+    ### Secrets
+
+    - `MYSQL_KILLER_USERNAME`: MySQL account that runs KILL QUERY.
+    - `MYSQL_KILLER_PASSWORD`: Password of that account.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for all alerts.
+
+    ## Quick start
+
+    1. Grant the privileges above to a dedicated account.
+    2. Add the three secrets to your namespace.
+    3. Set the KV key `mysql_query_killer_allowlist`, for example `{"users": ["backup"], "hosts": ["10.20.%"], "digests": []}`.
+    4. Set `jdbc_url` and run the flow with `dry_run` set to true.
+    5. Review the alerts. Then set `dry_run` to false in the trigger inputs.
+
+    ## How to extend
+
+    - Add `update` to `killable_statement_types` where writes are safe to stop.
+    - Escalate to KILL CONNECTION when `verify` shows statements that still run.
+
+    ## Links
+
+    - [MySQL Query task](https://kestra.io/plugins/plugin-jdbc-mysql/io.kestra.plugin.jdbc.mysql.query)
+    - [Loop task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [KV Set task](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Slack webhook task](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [MySQL KILL](https://dev.mysql.com/doc/refman/8.4/en/kill.html)
+    - [Statement digests](https://dev.mysql.com/doc/refman/8.4/en/performance-schema-statement-digests.html)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
