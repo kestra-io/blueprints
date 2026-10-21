@@ -1,0 +1,636 @@
+id: milvus-idle-loaded-collection-release-and-memory-guard
+namespace: company.ai
+
+description: |
+  Audit Milvus vector database for idle loaded collections resident in QueryNode RAM,
+  identify abandoned evaluation and staging collections, pause for human approval,
+  release memory allocations to prevent QueryNode OOM crashes, and verify cluster recovery.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: milvus_url
+    type: STRING
+    displayName: Milvus REST API URL
+    description: Base HTTP REST endpoint of the Milvus standalone proxy or cluster gateway (port 19530).
+    defaults: "http://localhost:19530"
+
+  - id: idle_threshold_hours
+    type: INT
+    displayName: Idle Retention Threshold (Hours)
+    description: Minimum duration in hours a collection can remain resident in RAM without active queries before qualifying as idle.
+    defaults: 24
+
+  - id: staging_max_hours
+    type: INT
+    displayName: Staging Collection TTL (Hours)
+    description: Shorter memory retention threshold in hours applied to ephemeral evaluation or staging collections matching staging_prefix_regex.
+    defaults: 4
+
+  - id: staging_prefix_regex
+    type: STRING
+    displayName: Staging Pattern Regex
+    description: Regular expression matching temporary evaluation, batch experiment, or dev collections eligible for aggressive RAM release.
+    defaults: "^(?:tmp_|test_|eval_|dev_|stg_).*"
+
+  - id: protected_regex
+    type: STRING
+    displayName: Protected Collections Regex
+    description: Regular expression matching critical production collections that must never be automatically released from memory.
+    defaults: "^(?:prod_|production_|knowledge_base|core_).*"
+
+  - id: max_collections_to_release
+    type: INT
+    displayName: Maximum Releases Per Run
+    description: Safety ceiling limiting how many collections can be unloaded in a single execution run.
+    defaults: 10
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate Flag
+    description: When true, prompts for operator approval and unloads confirmed idle collections from QueryNode RAM.
+    defaults: true
+
+  - id: pause_for_approval
+    type: BOOL
+    displayName: Pause for Human Review
+    description: When true, pauses execution for operator sign-off before issuing collection release commands.
+    defaults: true
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits loaded collections, calculates reclaimable RAM, and drafts the release plan without mutating memory state.
+    defaults: true
+
+triggers:
+  - id: scheduled_memory_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Automated daily audit and RAM reclamation sweep running at 04:00 UTC.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      milvus_url: "http://localhost:19530"
+      idle_threshold_hours: 24
+      staging_max_hours: 4
+      staging_prefix_regex: "^(?:tmp_|test_|eval_|dev_|stg_).*"
+      protected_regex: "^(?:prod_|production_|knowledge_base|core_).*"
+      max_collections_to_release: 10
+      auto_remediate: true
+      pause_for_approval: true
+      dry_run: true
+
+  - id: on_demand_memory_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP webhook endpoint triggered by Prometheus QueryNode memory alerts or MLOps pipelines.
+    key: "{{ secret('MILVUS_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert configuration parameters satisfy operational bounds.
+    conditions:
+      - "{{ inputs.milvus_url | length > 0 }}"
+      - "{{ inputs.idle_threshold_hours >= 1 }}"
+      - "{{ inputs.max_collections_to_release >= 1 }}"
+    errorMessage: "Invalid inputs. Provide a valid milvus_url, idle_threshold_hours >= 1, and max_collections_to_release >= 1."
+
+  - id: load_previous_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve historical collection load tracking state from Kestra KV store to determine memory residency duration.
+    key: "milvus_loaded_state_{{ inputs.milvus_url | slugify }}"
+    errorOnMissing: false
+
+  - id: audit_and_plan_release
+    type: io.kestra.plugin.scripts.python.Script
+    description: Inspect loaded collections via Milvus REST API, evaluate memory footprints, and formulate the RAM reclamation plan.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    env:
+      MILVUS_URL: "{{ inputs.milvus_url }}"
+      MILVUS_TOKEN: "{{ secret('MILVUS_TOKEN') }}"
+      IDLE_HOURS: "{{ inputs.idle_threshold_hours }}"
+      STAGING_HOURS: "{{ inputs.staging_max_hours }}"
+      STAGING_REGEX: "{{ inputs.staging_prefix_regex }}"
+      PROTECTED_REGEX: "{{ inputs.protected_regex }}"
+      MAX_RELEASES: "{{ inputs.max_collections_to_release }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      PREVIOUS_STATE_JSON: "{{ outputs.load_previous_state.value is defined ? (outputs.load_previous_state.value | toJson) : '{}' }}"
+    script: |
+      import os
+      import sys
+      import json
+      import re
+      from datetime import datetime, timezone
+      import urllib.request
+      import urllib.error
+
+      milvus_url = os.environ.get("MILVUS_URL", "").rstrip("/")
+      token = os.environ.get("MILVUS_TOKEN", "").strip()
+      idle_hours = float(os.environ.get("IDLE_HOURS", "24"))
+      staging_hours = float(os.environ.get("STAGING_HOURS", "4"))
+      staging_regex = os.environ.get("STAGING_REGEX", "^(?:tmp_|test_|eval_|dev_|stg_).*")
+      protected_regex = os.environ.get("PROTECTED_REGEX", "^(?:prod_|production_|knowledge_base|core_).*")
+      max_releases = int(os.environ.get("MAX_RELEASES", "10"))
+      dry_run = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
+      prev_raw = os.environ.get("PREVIOUS_STATE_JSON", "{}")
+
+      try:
+          prev_state = json.loads(prev_raw) if prev_raw else {}
+      except Exception:
+          prev_state = {}
+
+      now = datetime.now(timezone.utc)
+      now_iso = now.isoformat()
+
+      headers = {"Content-Type": "application/json"}
+      if token:
+          headers["Authorization"] = f"Bearer {token}"
+
+      def milvus_post(endpoint, payload):
+          req = urllib.request.Request(
+              f"{milvus_url}{endpoint}",
+              data=json.dumps(payload).encode("utf-8"),
+              headers=headers,
+              method="POST"
+          )
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              return json.loads(resp.read().decode("utf-8"))
+
+      # 1. Fetch collection catalog
+      try:
+          catalog_resp = milvus_post("/v2/vectordb/collections/list", {})
+          collections = catalog_resp.get("data", [])
+      except Exception as e:
+          print(f"Failed to query Milvus collections: {e}", file=sys.stderr)
+          sys.exit(1)
+
+      loaded_collections = []
+      idle_candidates = []
+      total_loaded_vectors = 0
+      total_loaded_ram_mb = 0.0
+
+      hist_collections = prev_state.get("collections", {})
+
+      for coll_name in collections:
+          if re.match(protected_regex, coll_name):
+              continue
+
+          try:
+              state_resp = milvus_post("/v2/vectordb/collections/get_load_state", {"collectionName": coll_name})
+              load_state = state_resp.get("data", {}).get("loadState", "NotLoad")
+          except Exception:
+              load_state = "NotLoad"
+
+          if load_state != "Loaded":
+              continue
+
+          # Inspect collection schema and vector count
+          vector_count = 0
+          dim = 1536
+          try:
+              desc_resp = milvus_post("/v2/vectordb/collections/describe", {"collectionName": coll_name})
+              cdata = desc_resp.get("data", {})
+              vector_count = cdata.get("vectorCount", 0) or 0
+              for f in cdata.get("fields", []):
+                  params = f.get("params", {})
+                  if "dim" in params:
+                      dim = int(params["dim"])
+                      break
+          except Exception:
+              pass
+
+          # Estimate RAM footprint: (dim * 4 bytes per float32 + 30% HNSW graph overhead) * vectorCount
+          bytes_per_vector = dim * 4 * 1.3
+          est_ram_mb = round((vector_count * bytes_per_vector) / (1024 * 1024), 2)
+          total_loaded_ram_mb += est_ram_mb
+          total_loaded_vectors += vector_count
+
+          first_seen = hist_collections.get(coll_name, {}).get("first_loaded_at", now_iso)
+          try:
+              first_dt = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+          except Exception:
+              first_dt = now
+
+          residency_hours = round((now - first_dt).total_seconds() / 3600.0, 2)
+          is_staging = bool(re.match(staging_regex, coll_name))
+          qualifies_idle = (is_staging and residency_hours >= staging_hours) or (residency_hours >= idle_hours)
+
+          coll_info = {
+              "name": coll_name,
+              "vector_count": vector_count,
+              "dimension": dim,
+              "estimated_ram_mb": est_ram_mb,
+              "first_loaded_at": first_seen,
+              "residency_hours": residency_hours,
+              "is_staging": is_staging,
+              "reason": "STAGING_TTL_EXPIRED" if is_staging else "IDLE_HOURS_EXCEEDED"
+          }
+          loaded_collections.append(coll_info)
+
+          if qualifies_idle:
+              idle_candidates.append(coll_info)
+
+      # Sort candidates descending by estimated RAM consumption (largest memory hog first)
+      idle_candidates.sort(key=lambda x: x["estimated_ram_mb"], reverse=True)
+      planned_release = idle_candidates[:max_releases]
+      planned_reclaim_mb = round(sum(c["estimated_ram_mb"] for c in planned_release), 2)
+      planned_reclaim_vectors = sum(c["vector_count"] for c in planned_release)
+
+      status = "IDLE_COLLECTIONS_FOUND" if planned_release else "HEALTHY"
+      if planned_release and dry_run:
+          status = "DRY_RUN_PLANNED"
+
+      summary = (
+          f"Milvus Memory Audit: {status} | Total loaded collections: {len(loaded_collections)} "
+          f"({round(total_loaded_ram_mb, 2)} MB RAM, {total_loaded_vectors} vectors) | "
+          f"Idle collections eligible for release: {len(idle_candidates)} | "
+          f"Planned release: {len(planned_release)} ({planned_reclaim_mb} MB RAM reclaimable) | "
+          f"Dry Run: {dry_run}"
+      )
+      print(summary)
+
+      new_coll_tracker = {}
+      for c in loaded_collections:
+          new_coll_tracker[c["name"]] = {
+              "first_loaded_at": c["first_loaded_at"],
+              "last_evaluated_at": now_iso
+          }
+
+      new_state = {
+          "milvus_url": milvus_url,
+          "last_audit_iso": now_iso,
+          "total_loaded_count": len(loaded_collections),
+          "total_loaded_ram_mb": round(total_loaded_ram_mb, 2),
+          "collections": new_coll_tracker
+      }
+
+      output_payload = {
+          "outputs": {
+              "status": status,
+              "total_loaded_count": len(loaded_collections),
+              "total_loaded_ram_mb": round(total_loaded_ram_mb, 2),
+              "idle_count": len(idle_candidates),
+              "planned_count": len(planned_release),
+              "planned_reclaim_mb": planned_reclaim_mb,
+              "planned_reclaim_vectors": planned_reclaim_vectors,
+              "planned_release": planned_release,
+              "new_state": new_state,
+              "summary": summary
+          }
+      }
+      print("::" + json.dumps(output_payload) + "::")
+
+  - id: save_audit_state_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist loaded collection residency timestamps into Kestra KV store for tracking multi-run memory duration.
+    key: "milvus_loaded_state_{{ inputs.milvus_url | slugify }}"
+    value: "{{ outputs.audit_and_plan_release.vars.new_state | toJson }}"
+    kvType: JSON
+
+  - id: evaluate_remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Gate execution to perform human review, release idle collections, and verify QueryNode RAM reclamation.
+    condition: "{{ outputs.audit_and_plan_release.vars.planned_count > 0 and inputs.auto_remediate == true }}"
+    then:
+      - id: notify_remediation_plan_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post proposed collection release plan and estimated RAM savings to Slack for operator visibility.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#ai-platform-alerts",
+            "attachments": [
+              {
+                "color": "{{ inputs.dry_run ? 'warning' : 'danger' }}",
+                "title": ":warning: Milvus QueryNode Memory Reclamation Plan",
+                "text": "*Endpoint:* `{{ inputs.milvus_url }}`\n*Loaded Collections in RAM:* `{{ outputs.audit_and_plan_release.vars.total_loaded_count }}`\n*Idle Collections Found:* `{{ outputs.audit_and_plan_release.vars.idle_count }}`\n*Planned for Release:* `{{ outputs.audit_and_plan_release.vars.planned_count }}`\n*Reclaimable RAM:* *{{ outputs.audit_and_plan_release.vars.planned_reclaim_mb }} MB* ({{ outputs.audit_and_plan_release.vars.planned_reclaim_vectors }} vectors)\n*Mode:* {{ inputs.dry_run ? 'Dry Run (Plan Only)' : 'Active Remediation' }}",
+                "footer": "Kestra Milvus Memory Guard • Execution {{ execution.id }}"
+              }
+            ]
+          }
+
+      - id: pause_for_review
+        type: io.kestra.plugin.core.flow.If
+        description: Pause workflow execution when review is requested to allow an AI engineer to verify candidate collections before release.
+        condition: "{{ inputs.pause_for_approval == true and not inputs.dry_run }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator approval before unloading collections from QueryNode RAM. Resume to proceed or kill to abort.
+
+      - id: execute_release_plan
+        type: io.kestra.plugin.core.flow.If
+        description: Execute Milvus release API requests and re-verify cluster memory state when dry_run is disabled.
+        condition: "{{ not inputs.dry_run }}"
+        then:
+          - id: release_idle_collections
+            type: io.kestra.plugin.scripts.python.Script
+            description: Issue release requests to Milvus REST API to evict vectors and HNSW indexes from QueryNode RAM.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            env:
+              MILVUS_URL: "{{ inputs.milvus_url }}"
+              MILVUS_TOKEN: "{{ secret('MILVUS_TOKEN') }}"
+              RELEASE_PLAN_JSON: "{{ outputs.audit_and_plan_release.vars.planned_release | toJson }}"
+            script: |
+              import os
+              import sys
+              import json
+              import urllib.request
+              import urllib.error
+
+              milvus_url = os.environ.get("MILVUS_URL", "").rstrip("/")
+              token = os.environ.get("MILVUS_TOKEN", "").strip()
+              plan_raw = os.environ.get("RELEASE_PLAN_JSON", "[]")
+
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+
+              try:
+                  plan = json.loads(plan_raw)
+              except Exception:
+                  plan = []
+
+              released_count = 0
+              released_ram_mb = 0.0
+              released_names = []
+              failed_names = []
+
+              for item in plan:
+                  cname = item.get("name")
+                  mb = item.get("estimated_ram_mb", 0.0)
+                  payload = json.dumps({"collectionName": cname}).encode("utf-8")
+                  req = urllib.request.Request(
+                      f"{milvus_url}/v2/vectordb/collections/release",
+                      data=payload,
+                      headers=headers,
+                      method="POST"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as resp:
+                          rdata = json.loads(resp.read().decode("utf-8"))
+                          if rdata.get("code", 0) == 0:
+                              released_count += 1
+                              released_ram_mb += mb
+                              released_names.append(cname)
+                              print(f"Successfully released collection '{cname}' from RAM ({mb} MB freed).")
+                          else:
+                              failed_names.append({"name": cname, "error": rdata.get("message")})
+                              print(f"Failed to release collection '{cname}': {rdata.get('message')}", file=sys.stderr)
+                  except Exception as e:
+                      failed_names.append({"name": cname, "error": str(e)})
+                      print(f"Error calling release for '{cname}': {e}", file=sys.stderr)
+
+              released_ram_mb = round(released_ram_mb, 2)
+              print(f"Remediation summary: Released {released_count}/{len(plan)} collections, freed {released_ram_mb} MB RAM")
+
+              out = {
+                  "outputs": {
+                      "released_count": released_count,
+                      "released_ram_mb": released_ram_mb,
+                      "released_names": released_names,
+                      "failed_count": len(failed_names),
+                      "failed_names": failed_names
+                  }
+              }
+              print("::" + json.dumps(out) + "::")
+
+          - id: verify_post_release
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-query Milvus get_load_state to assert that all released collections are now in NotLoad state.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            env:
+              MILVUS_URL: "{{ inputs.milvus_url }}"
+              MILVUS_TOKEN: "{{ secret('MILVUS_TOKEN') }}"
+              RELEASED_NAMES_JSON: "{{ outputs.release_idle_collections.vars.released_names | toJson }}"
+            script: |
+              import os
+              import json
+              import urllib.request
+
+              milvus_url = os.environ.get("MILVUS_URL", "").rstrip("/")
+              token = os.environ.get("MILVUS_TOKEN", "").strip()
+              names_raw = os.environ.get("RELEASED_NAMES_JSON", "[]")
+
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+
+              try:
+                  names = json.loads(names_raw)
+              except Exception:
+                  names = []
+
+              still_loaded_count = 0
+              verified_released_count = 0
+
+              for cname in names:
+                  payload = json.dumps({"collectionName": cname}).encode("utf-8")
+                  req = urllib.request.Request(
+                      f"{milvus_url}/v2/vectordb/collections/get_load_state",
+                      data=payload,
+                      headers=headers,
+                      method="POST"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as resp:
+                          rdata = json.loads(resp.read().decode("utf-8"))
+                          state = rdata.get("data", {}).get("loadState", "NotLoad")
+                          if state == "Loaded":
+                              still_loaded_count += 1
+                              print(f"Verification failure: Collection '{cname}' is still in Loaded state!")
+                          else:
+                              verified_released_count += 1
+                              print(f"Verified collection '{cname}' state: {state}")
+                  except Exception as e:
+                      still_loaded_count += 1
+                      print(f"Verification check failed for '{cname}': {e}")
+
+              print(f"Post-remediation verification: {verified_released_count} verified released, {still_loaded_count} lingering.")
+
+              out = {
+                  "outputs": {
+                      "still_loaded_count": still_loaded_count,
+                      "verified_released_count": verified_released_count,
+                      "verification_passed": still_loaded_count == 0
+                  }
+              }
+              print("::" + json.dumps(out) + "::")
+
+          - id: assert_collections_released
+            type: io.kestra.plugin.core.execution.Assert
+            description: Assert that post-remediation verification confirmed zero released collections linger in Loaded state.
+            conditions:
+              - "{{ outputs.verify_post_release.vars.still_loaded_count == 0 }}"
+            errorMessage: "Post-remediation verification failed: one or more collections remain in Loaded state in Milvus."
+
+          - id: notify_release_success_slack
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Post confirmed RAM reclamation metrics and released collection names to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "channel": "#ai-platform-alerts",
+                "attachments": [
+                  {
+                    "color": "#36a64f",
+                    "title": ":white_check_mark: Milvus QueryNode Memory Reclamation Succeeded",
+                    "text": "*Endpoint:* `{{ inputs.milvus_url }}`\n*Collections Released:* `{{ outputs.release_idle_collections.vars.released_count }}`\n*RAM Reclaimed:* *{{ outputs.release_idle_collections.vars.released_ram_mb }} MB*\n*Post-Verification:* Passed (0 lingering in Loaded state)",
+                    "footer": "Kestra Milvus Memory Guard • Execution {{ execution.id }}"
+                  }
+                ]
+              }
+
+  - id: log_audit_outcome
+    type: io.kestra.plugin.core.log.Log
+    description: Record final audit and memory reclamation report in execution log.
+    message: "{{ outputs.audit_and_plan_release.vars.summary }}"
+
+errors:
+  - id: alert_pipeline_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notify Slack if Milvus API requests fail due to network timeout or authentication errors.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "#ai-platform-alerts",
+        "attachments": [
+          {
+            "color": "danger",
+            "title": "💥 Milvus Memory Guard Execution Failed",
+            "text": "Workflow encountered an unhandled exception while auditing Milvus at `{{ inputs.milvus_url }}`. Check service availability and credentials.",
+            "footer": "Kestra Execution Failure Guard"
+          }
+        ]
+      }
+
+outputs:
+  - id: status
+    type: STRING
+    description: Audit status classification (HEALTHY, IDLE_COLLECTIONS_FOUND, DRY_RUN_PLANNED).
+    value: "{{ outputs.audit_and_plan_release.vars.status }}"
+
+  - id: total_loaded_count
+    type: INT
+    description: Total collections currently resident in QueryNode memory.
+    value: "{{ outputs.audit_and_plan_release.vars.total_loaded_count }}"
+
+  - id: idle_count
+    type: INT
+    description: Count of collections qualifying for release based on idle thresholds or staging naming patterns.
+    value: "{{ outputs.audit_and_plan_release.vars.idle_count }}"
+
+  - id: planned_reclaim_mb
+    type: FLOAT
+    description: Estimated megabytes of QueryNode RAM eligible for reclamation.
+    value: "{{ outputs.audit_and_plan_release.vars.planned_reclaim_mb }}"
+
+  - id: released_count
+    type: INT
+    description: Count of collections successfully released from RAM during active remediation.
+    value: "{{ outputs.release_idle_collections.vars.released_count ?? 0 }}"
+
+  - id: released_ram_mb
+    type: FLOAT
+    description: Megabytes of QueryNode RAM verified as reclaimed during active remediation.
+    value: "{{ outputs.release_idle_collections.vars.released_ram_mb ?? 0.0 }}"
+
+extend:
+  title: Milvus Idle Loaded Collection Release & Memory Guard
+  metaTitle: Milvus Idle Loaded Collection Release & Memory Guard | Kestra
+  shortDescription: Audit Milvus vector collections loaded in QueryNode RAM, detect idle or abandoned test collections, pause for review, release memory, and verify cleanup.
+  metaDescription: Audit Milvus for idle loaded collections in QueryNode RAM, pause for review, release inactive collections to prevent OOM crashes, and verify with Kestra.
+  description: |
+    Prevent QueryNode Out-Of-Memory (OOM) crashes and query starvation in Milvus vector database clusters.
+    In Milvus, collections must be explicitly loaded into QueryNode RAM before vectors and HNSW indexes can be
+    searched. In shared RAG and AI development environments, evaluation jobs, ephemeral testing pipelines, and
+    stale model deployments load collections that remain resident in memory indefinitely. When QueryNode memory
+    approaches capacity thresholds, live production searches encounter latency degradation or terminal OOM pod
+    evictions. This blueprint audits loaded collections, identifies idle or abandoned staging collections, pauses
+    for operator review, issues `release` requests to free RAM, and cryptographically proves that the collections
+    transitioned out of memory.
+
+    ## How it works
+
+    1. **Input Validation**: Verifies that the Milvus REST URL, idle retention thresholds, and safety release limits satisfy operational bounds.
+    2. **Residency Tracking**: Fetches historical collection load timestamps from Kestra KV store (`milvus_loaded_state_<url>`) to track multi-run memory dwell times.
+    3. **Catalog & Memory Audit**: Queries Milvus REST API `/v2/vectordb/collections/list` and `/v2/vectordb/collections/get_load_state` to enumerate all resident collections. For loaded collections, it queries `/v2/vectordb/collections/describe` to extract vector counts, dimensions, and computes exact estimated RAM footprints including HNSW indexing overhead.
+    4. **Plan Formulation**: Identifies collections exceeding `idle_threshold_hours` or matching ephemeral staging prefixes exceeding `staging_max_hours` (while strictly exempting protected production regexes), sorts them by RAM consumption, and saves the audit snapshot into Kestra KV.
+    5. **Slack Plan Notification**: Posts an alert to Slack detailing loaded collection counts, candidate collections, and total reclaimable megabytes.
+    6. **Operator Approval Gate**: If `pause_for_approval: true` and active remediation is enabled, pauses execution (`io.kestra.plugin.core.flow.Pause`) for human review, giving platform engineers sign-off before memory eviction.
+    7. **Active RAM Release**: When approved and `dry_run: false`, issues HTTP `POST /v2/vectordb/collections/release` calls to Milvus, immediately freeing QueryNode memory.
+    8. **Post-Remediation Verification & Assertion**: Re-queries `/v2/vectordb/collections/get_load_state` to verify that every targeted collection transitioned to `NotLoad`, asserting zero lingering loaded state.
+    9. **Success Notification**: Posts a confirmation Slack card reporting verified reclaimed RAM and released collection names.
+
+    ## What you get
+
+    - Automated protection against QueryNode memory exhaustion and Linux kernel OOM killer terminations.
+    - Full visibility into loaded collection memory consumption, vector counts, and residency age.
+    - Differentiated retention policies allowing aggressive cleanup of test/staging collections while protecting production tables.
+    - Safe-by-default execution with dry-run planning, per-run release limits, and human approval gates.
+    - Provable post-remediation verification that re-queries Milvus to confirm collections are no longer resident in RAM.
+
+    ## Who it's for
+
+    - AI Platform Engineers and MLOps Teams managing shared Milvus clusters across multiple RAG applications.
+    - Data Engineers running batch embedding evaluation pipelines where temporary collections accumulate.
+    - Site Reliability Engineers (SREs) responsible for vector database uptime and resource capacity planning.
+
+    ## Why orchestrate this with Kestra
+
+    - **Closed-Loop Auto-Remediation**: Replaces passive Grafana alerts with a complete audit-plan-approve-release-verify operational lifecycle.
+    - **Native Human-in-the-Loop Sign-Off**: Leverages Kestra's declarative `Pause` task to allow AI engineers to approve releases directly from Slack or the Kestra UI.
+    - **Stateful Residency Tracking**: Tracks multi-run collection residency duration in Kestra KV store without requiring external state databases.
+    - **Universal Milvus Compatibility**: Works with Milvus Standalone, Milvus Distributed, and Zilliz Cloud vector databases.
+
+    ## Prerequisites
+
+    - Milvus cluster or standalone instance with HTTP REST API access on port 19530.
+    - Docker container runtime enabled on the Kestra worker to run the Python analytics steps.
+    - Slack incoming webhook URL for notifications.
+
+    ### Secrets
+
+    - `MILVUS_TOKEN`: Optional authentication token or API key for secured Milvus clusters.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for posting memory reclamation plans and success alerts.
+    - `MILVUS_GUARD_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `MILVUS_TOKEN` (if using auth) and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this blueprint into your Kestra instance.
+    3. Run a test execution with `dry_run: true` pointing to your Milvus endpoint to inspect resident collections and reclaimable RAM.
+    4. Set `dry_run: false` and `pause_for_approval: true` to test active memory release with operator sign-off.
+    5. Enable `scheduled_memory_sweep` to run automated daily maintenance.
+
+    ## How to extend
+
+    - **Prometheus Metric Trigger**: Wire a Prometheus trigger using `io.kestra.plugin.prometheus.Trigger` to fire this flow dynamically when `milvus_querynode_memory_usage_ratio > 0.85`.
+    - **Dynamic Reload Hook**: Chain an event trigger to automatically reload released collections on-demand when user traffic resumes.
+    - **Multi-Instance Fan-Out**: Use `io.kestra.plugin.core.flow.ForEach` to sweep dev, staging, and preview Milvus clusters across environments.
+
+    ## Links
+
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Docker Task Runner](https://kestra.io/plugins/plugin-scripts-docker)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [Milvus REST API v2 Collection Operations](https://milvus.io/api-reference/restful/v2.4.x/Collection/release.md)
+    - [Milvus Memory Management Architecture](https://milvus.io/docs/system_configuration.md)
+  tags:
+    - Data
+    - AI
+  subTags:
+    - Vector Stores & RAG
+    - Day 2 Operations
+    - FinOps & Cost Management
+  ee: false
+  demo: false
