@@ -1,0 +1,370 @@
+id: postgres-leaked-advisory-lock-blocking-migrations-session-terminate
+namespace: company.platform
+
+description: |
+  Find PostgreSQL advisory locks that an idle session still holds while other sessions wait for them, the classic
+  leak from a crashed migrator or a pooled connection that kept a session-level lock. After approval, terminate
+  exactly that backend (guarded against pid reuse and against sessions used since the scan), confirm it is gone and
+  remember repeat offenders across runs.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: Database that holds the contended advisory locks. Advisory locks are scoped per database.
+    defaults: "jdbc:postgresql://localhost:5432/app"
+
+  - id: min_idle_seconds
+    type: INT
+    description: A holder in state idle (not inside a transaction) has no way to be holding a transaction-level lock, so it is a leaked session-level lock after this long.
+    defaults: 300
+
+  - id: min_idle_in_transaction_seconds
+    type: INT
+    description: A holder idle in transaction may legitimately hold a transaction-level advisory lock, so it needs a much longer idle time.
+    defaults: 1800
+
+  - id: min_wait_seconds
+    type: INT
+    description: Somebody must have been waiting for the lock at least this long. Locks nobody waits for are never touched.
+    defaults: 120
+
+  - id: protected_application_pattern
+    type: STRING
+    description: Regular expression of application_name values that are never terminated, such as backup tools. PostgreSQL cannot tell a leaked lock from a leader that holds one on purpose, so add every leader-election or singleton client here.
+    defaults: "^(pg_dump|pg_restore|pg_basebackup|pgbackrest)"
+
+  - id: max_terminations_per_run
+    type: INT
+    defaults: 3
+
+  - id: decline_snooze_hours
+    type: INT
+    description: After a rejected proposal, stay quiet about the same application and lock keys for this long.
+    defaults: 24
+
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT2H
+
+triggers:
+  - id: every_five_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    disabled: true
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ inputs.min_idle_seconds < 1 or inputs.min_idle_in_transaction_seconds < inputs.min_idle_seconds or inputs.min_wait_seconds < 0 or inputs.max_terminations_per_run < 1 or inputs.decline_snooze_hours < 0 or (inputs.protected_application_pattern | length) == 0 }}"
+    errorMessage: "Rejected inputs: min_idle_in_transaction_seconds must be at least min_idle_seconds, max_terminations_per_run at least 1 and the protected pattern must not be empty."
+
+  - id: server_facts
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "SELECT current_database()::text AS db_name"
+
+  - id: read_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Proposals that were declined, and the sessions this flow terminated before.
+    key: "pg_advisory_lock_watch_{{ outputs.server_facts.row.db_name }}"
+    errorOnMissing: false
+
+  - id: scan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Join granted and waiting advisory locks of this database with pg_stat_activity, decode the lock keys and classify each holder.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH prev AS (
+        SELECT $kv${{ outputs.read_state.value ?? '{}' }}$kv$::jsonb AS s
+      ), me AS (
+        SELECT oid AS dboid FROM pg_database WHERE datname = current_database()
+      ), held AS (
+        SELECT l.pid, l.mode, l.classid, l.objid, l.objsubid,
+               CASE WHEN l.objsubid = 1 THEN ((l.classid::bigint << 32) | l.objid::bigint)::text
+                    ELSE '(' || l.classid::text || ',' || l.objid::text || ')' END AS lock_key
+          FROM pg_locks l, me
+         WHERE l.locktype = 'advisory' AND l.granted AND l.database = me.dboid AND l.pid <> pg_backend_pid()
+      ), waiting AS (
+        SELECT w.classid, w.objid, w.objsubid, count(*) AS waiters,
+               array_agg(DISTINCT regexp_replace(coalesce(nullif(a.application_name, ''), '(unnamed)'), '[\\"[:cntrl:]]+', ' ', 'g')) AS waiter_apps,
+               max(extract(epoch FROM now() - a.query_start))::int AS longest_wait_s
+          FROM pg_locks w
+          CROSS JOIN me
+          JOIN pg_stat_activity a ON a.pid = w.pid
+         WHERE w.locktype = 'advisory' AND NOT w.granted AND w.database = me.dboid
+         GROUP BY w.classid, w.objid, w.objsubid
+      ), held_keys AS (
+        SELECT DISTINCT pid, classid, objid, objsubid, lock_key FROM held
+      ), per_pid AS (
+        SELECT k.pid,
+               array_agg(DISTINCT k.lock_key ORDER BY k.lock_key) AS lock_keys,
+               (SELECT array_agg(DISTINCT h2.mode ORDER BY h2.mode) FROM held h2 WHERE h2.pid = k.pid) AS modes,
+               sum(w.waiters)::int AS waiters,
+               max(w.longest_wait_s) AS longest_wait_s
+          FROM held_keys k
+          JOIN waiting w ON w.classid = k.classid AND w.objid = k.objid AND w.objsubid = k.objsubid
+         GROUP BY k.pid
+      ), apps AS (
+        SELECT k.pid, array_agg(DISTINCT x ORDER BY x) AS waiter_apps
+          FROM held_keys k
+          JOIN waiting w ON w.classid = k.classid AND w.objid = k.objid AND w.objsubid = k.objsubid
+          CROSS JOIN LATERAL unnest(w.waiter_apps) AS x
+         GROUP BY k.pid
+      ), cand AS (
+        SELECT p.*, ap.waiter_apps, a.application_name::text AS application_name, a.usename::text AS usename, a.client_addr::text AS client_addr,
+               regexp_replace(a.application_name, '[\\"[:cntrl:]]+', ' ', 'g') AS app_label,
+               regexp_replace(a.usename, '[\\"[:cntrl:]]+', ' ', 'g') AS user_label,
+               a.backend_start, a.state_change, a.state, a.backend_type,
+               extract(epoch FROM now() - a.state_change)::int AS idle_s,
+               regexp_replace(left(a.query, 100), '[\\"[:cntrl:]]+', ' ', 'g') AS last_query,
+               array_to_string(p.lock_keys, ',') AS key_list
+          FROM per_pid p
+          JOIN apps ap ON ap.pid = p.pid
+          JOIN pg_stat_activity a ON a.pid = p.pid
+      ), cls AS (
+        SELECT c.*,
+               (SELECT count(*) FROM jsonb_array_elements(coalesce(prev.s -> 'terminated', '[]'::jsonb)) t
+                 WHERE t ->> 'app' = c.application_name AND (t ->> 'at')::timestamptz > now() - interval '30 days')::int AS repeats,
+               CASE
+                 WHEN c.backend_type <> 'client backend' OR c.application_name ~ $pat${{ inputs.protected_application_pattern }}$pat$ THEN 'PROTECTED'
+                 WHEN (prev.s -> 'declined' ->> (c.application_name || '|' || c.key_list))::timestamptz
+                      + {{ inputs.decline_snooze_hours }} * interval '1 hour' > now() THEN 'SNOOZED'
+                 WHEN c.state = 'idle' AND c.idle_s >= {{ inputs.min_idle_seconds }} AND c.longest_wait_s >= {{ inputs.min_wait_seconds }} THEN 'TERMINATE'
+                 WHEN c.state LIKE 'idle in transaction%' AND c.idle_s >= {{ inputs.min_idle_in_transaction_seconds }} AND c.longest_wait_s >= {{ inputs.min_wait_seconds }} THEN 'TERMINATE'
+                 ELSE 'WATCH'
+               END AS kind
+          FROM cand c CROSS JOIN prev
+      ), ranked AS (
+        SELECT cls.*, row_number() OVER (PARTITION BY kind ORDER BY longest_wait_s DESC) AS rn FROM cls
+      ), rep AS (
+        SELECT pid, backend_start, state_change, application_name, app_label, user_label, usename, client_addr, state, idle_s, last_query,
+               lock_keys, modes, waiters, waiter_apps, longest_wait_s, repeats, key_list, kind
+          FROM ranked WHERE kind <> 'TERMINATE' OR rn <= {{ inputs.max_terminations_per_run }}
+      )
+      SELECT coalesce((SELECT jsonb_agg(to_jsonb(rep) ORDER BY rep.kind, rep.longest_wait_s DESC) FROM rep), '[]'::jsonb)::text AS report,
+             coalesce((SELECT jsonb_agg(to_jsonb(rep) ORDER BY rep.longest_wait_s DESC) FROM rep WHERE rep.kind = 'TERMINATE'), '[]'::jsonb)::text AS actions,
+             (SELECT count(*) FROM rep WHERE rep.kind = 'TERMINATE')::int AS action_count,
+             (SELECT count(*) FROM rep)::int AS report_count
+
+  - id: action_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only leaked locks that somebody has waited on long enough reach the approval step.
+    condition: "{{ (outputs.scan.row.action_count | number) > 0 }}"
+    then:
+      - id: request_approval
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "Advisory lock leak in {{ outputs.server_facts.row.db_name }}: {{ outputs.scan.row.action_count }} idle session(s) hold locks that others wait for. Approve execution {{ execution.id }} within {{ inputs.approval_timeout }} to terminate them.\n{% for r in fromJson(outputs.scan.row.actions) %}pid {{ r.pid }} app {{ r.app_label }} user {{ r.user_label }} from {{ r.client_addr }} is {{ r.state }} for {{ r.idle_s }}s holding {{ r.lock_keys | join(', ') }}; {{ r.waiters }} waiter(s) ({{ r.waiter_apps | join(', ') }}) for up to {{ r.longest_wait_s }}s{% if r.repeats > 0 %}; REPEAT OFFENDER, terminated {{ r.repeats }} time(s) in 30 days{% endif %}. Last query: {{ r.last_query }}\n{% endfor %}"}
+
+      - id: approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: Hold the terminations. FAIL on timeout, so an ignored request kills nothing.
+        pauseDuration: "{{ inputs.approval_timeout }}"
+        behavior: FAIL
+        onResume:
+          - id: approved
+            type: BOOL
+            description: Terminate every listed backend.
+            defaults: false
+          - id: note
+            type: STRING
+            defaults: ""
+
+      - id: apply_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.approval.onResume.approved ~ '') == 'true' }}"
+        then:
+          - id: terminate_holders
+            type: io.kestra.plugin.core.flow.Loop
+            description: One guarded termination per holder. The statement matches pid, backend_start and state_change, so a reused pid or a session that did anything since the scan, such as a pooled connection that was handed out again during the approval wait, is left alone.
+            values: "{{ outputs.scan.row.actions }}"
+            parseValues: true
+            concurrencyLimit: 1
+            tasks:
+              - id: terminate_backend
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('POSTGRES_USERNAME') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT coalesce(bool_or(pg_terminate_backend(a.pid)), false) AS signalled
+                    FROM pg_stat_activity a
+                   WHERE a.pid = {{ item.value.pid }}
+                     AND a.backend_start = '{{ item.value.backend_start }}'::timestamptz
+                     AND a.state_change = '{{ item.value.state_change }}'::timestamptz
+                     AND a.backend_type = 'client backend'
+                     AND a.state LIKE 'idle%'
+
+          - id: settle
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: pg_terminate_backend only signals the backend, so give it a moment to exit before checking.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            sql: "SELECT pg_sleep(2)"
+
+          - id: verify_terminated
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Look for the same pid with the same backend_start, and for waiters still queued on the freed keys.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('POSTGRES_USERNAME') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: |
+              WITH acts AS (
+                SELECT * FROM jsonb_to_recordset($act${{ outputs.scan.row.actions }}$act$::jsonb)
+                       AS x(pid int, backend_start timestamptz, lock_keys text[])
+              )
+              SELECT (SELECT count(*) FROM acts JOIN pg_stat_activity a ON a.pid = acts.pid AND a.backend_start = acts.backend_start)::int AS still_alive,
+                     (SELECT count(*) FROM pg_locks l WHERE l.locktype = 'advisory' AND NOT l.granted
+                         AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()))::int AS still_waiting
+
+          - id: fail_if_still_alive
+            type: io.kestra.plugin.core.execution.Fail
+            condition: "{{ (outputs.verify_terminated.row.still_alive | number) > 0 }}"
+            errorMessage: "{{ outputs.verify_terminated.row.still_alive }} backend(s) still alive after pg_terminate_backend. The user running the flow needs superuser or the pg_signal_backend role. A session that was used again after the scan is left alone on purpose."
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: "Termination declined in {{ outputs.server_facts.row.db_name }}. Note: {{ outputs.approval.onResume.note ?? '' }}. The same application and lock keys are snoozed for {{ inputs.decline_snooze_hours }} hours."
+
+  - id: decide_applied
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      applied: "{{ outputs.approval is defined and ((outputs.approval.onResume.approved ~ '') == 'true') }}"
+
+  - id: next_state
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Build the next state in PostgreSQL. Terminated sessions are journaled for 90 days to spot repeat offenders, and declined proposals are snoozed.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH prev AS (
+        SELECT $kv${{ outputs.read_state.value ?? '{}' }}$kv$::jsonb AS s
+      ), acts AS (
+        SELECT * FROM jsonb_to_recordset($act${{ outputs.scan.row.actions }}$act$::jsonb)
+               AS x(pid int, application_name text, key_list text, lock_keys text[], waiters int)
+      ), terminated AS (
+        SELECT coalesce(jsonb_agg(e), '[]'::jsonb) AS j FROM (
+          SELECT e FROM prev, jsonb_array_elements(coalesce(prev.s -> 'terminated', '[]'::jsonb)) AS e
+           WHERE (e ->> 'at')::timestamptz > now() - interval '90 days'
+          UNION ALL
+          SELECT jsonb_build_object('at', now(), 'app', acts.application_name, 'keys', acts.key_list, 'waiters', acts.waiters, 'execution', '{{ execution.id }}')
+            FROM acts WHERE {{ outputs.decide_applied.values.applied }}
+        ) t
+      ), declined AS (
+        SELECT coalesce(jsonb_object_agg(k, v), '{}'::jsonb) AS j FROM (
+          SELECT e.key AS k, e.value AS v FROM prev, jsonb_each(coalesce(prev.s -> 'declined', '{}'::jsonb)) AS e
+           WHERE (e.value #>> '{}')::timestamptz + {{ inputs.decline_snooze_hours }} * interval '1 hour' > now()
+          UNION ALL
+          SELECT acts.application_name || '|' || acts.key_list, to_jsonb(now()) FROM acts WHERE NOT {{ outputs.decide_applied.values.applied }}
+        ) d
+      )
+      SELECT jsonb_build_object('terminated', terminated.j, 'declined', declined.j, 'updated_at', now())::text AS state
+        FROM terminated, declined
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: "pg_advisory_lock_watch_{{ outputs.server_facts.row.db_name }}"
+    kvType: STRING
+    value: "{{ outputs.next_state.row.state }}"
+
+  - id: report_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Report the outcome, including locks that are still only being watched.
+    condition: "{{ (outputs.scan.row.report_count | number) > 0 }}"
+    then:
+      - id: notify_summary
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "Advisory lock review for {{ outputs.server_facts.row.db_name }} (execution {{ execution.id }}, terminations applied: {{ outputs.decide_applied.values.applied }}):\n{% for r in fromJson(outputs.scan.row.report) %}{{ r.kind }} pid {{ r.pid }} app {{ r.app_label }} {{ r.state }} {{ r.idle_s }}s keys {{ r.lock_keys | join(', ') }} waiters {{ r.waiters }}\n{% endfor %}"}
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "Advisory lock review failed in {{ outputs.server_facts.row.db_name ?? 'the target database' }} (execution {{ execution.id }}). State was not saved, so the next run starts from the previous journal."}
+
+extend:
+  title: Free PostgreSQL advisory locks that an idle session leaked and that other sessions are waiting on
+  metaTitle: PostgreSQL Leaked Advisory Lock Cleanup with Approval | Kestra
+  shortDescription: Find advisory locks held by idle sessions while others wait, terminate those backends after approval with a pid-reuse guard, verify, and track repeat offenders.
+  metaDescription: Detect leaked PostgreSQL advisory locks that block migrations or workers, terminate the idle holder after approval, verify it and flag repeat offenders.
+  description: |
+    Applications use advisory locks for migrations and leader election. When a migrator crashes or a pooled connection returns to the pool still holding a session-level lock, every later run waits forever. PostgreSQL cannot release another session's advisory lock, only end that session. This blueprint finds holders that look leaked (idle for a long time while others wait on their lock) and, after approval, ends only them. A leader that holds a lock on purpose looks the same to PostgreSQL, so list such clients in `protected_application_pattern`.
+
+    ## How it works
+
+    1. `read_state` loads declined proposals and the journal of earlier terminations from KV.
+    2. `scan` joins granted and waiting advisory locks of the current database with `pg_stat_activity`. It decodes bigint keys from `classid` and `objid` and classifies each holder. A holder in state `idle` cannot hold a transaction-level lock, so it is a leaked session-level lock. A holder idle in transaction needs a much longer idle time. Only locks someone has waited on are considered.
+    3. `request_approval` posts the holders, locks, waiters and repeat-offender counts, and the `approval` Pause holds the run. Timeout fails it.
+    4. `terminate_holders` runs one `pg_terminate_backend` per holder, matched on pid, `backend_start` and `state_change`, so a session that was used again after the scan is skipped.
+    5. `settle` and `verify_terminated` confirm the backend is gone, and `fail_if_still_alive` stops the run otherwise.
+    6. `next_state` and `save_state` journal the termination and snooze declined proposals.
+
+    ## What you get
+
+    - Only idle holders that block waiting sessions are ended, never active or protected ones.
+    - A guard against pid reuse and against sessions that became busy after the scan.
+    - Repeat offenders by application name, so the leak gets fixed in code.
+
+    ## Who it's for
+
+    - DBAs and platform engineers whose deploys wait on migration or leader-election advisory locks.
+
+    ## Why orchestrate this with Kestra
+
+    The safe order is find, ask, act on exactly that session, verify and remember. Kestra holds the approval without a worker and keeps the offender journal in KV.
+
+    ## Prerequisites
+
+    - PostgreSQL 12+. The role needs `pg_read_all_stats` to see other users' session state and `pg_signal_backend` (or superuser) to terminate them.
+    - The `postgres` Docker image is enough to test locally.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`: role that reads `pg_locks` and may terminate backends.
+    - `POSTGRES_PASSWORD`: its password.
+    - `SLACK_WEBHOOK_URL`: approval requests and results.
+
+    ## Quick start
+
+    1. Create the secrets and set `jdbc_url` to the database that holds the locks.
+    2. Hold a lock from an idle `psql` session, wait on it from another and execute the flow.
+    3. Resume the Pause, then remove `disabled: true` from the trigger.
+
+    ## How to extend
+
+    - Page the owning team when `repeats` reaches a limit.
+    - Also release long-held transaction-level locks from sessions idle in transaction with `pg_cancel_backend`.
+
+    ## Links
+
+    - [Explicit locking: advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)
+    - [pg_locks](https://www.postgresql.org/docs/current/view-pg-locks.html)
+    - [pg_terminate_backend](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL)
+    - [Kestra PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
