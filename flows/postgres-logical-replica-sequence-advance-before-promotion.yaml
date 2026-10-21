@@ -1,0 +1,448 @@
+id: postgres-logical-replica-sequence-advance-before-promotion
+namespace: company.team
+
+description: |
+  Logical replication copies rows but not sequence state. This flow compares every sequence on the publisher with
+  the matching sequence on the logical subscriber, learns the publisher's burn rate across runs, and after operator
+  approval advances the subscriber's sequences past what the publisher can hand out before a failover window.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: publisher_url
+    type: STRING
+    displayName: Publisher JDBC URL
+    description: JDBC URL of the logical replication publisher (the primary that applications write to).
+    defaults: "jdbc:postgresql://localhost:5432/app"
+
+  - id: subscriber_url
+    type: STRING
+    displayName: Subscriber JDBC URL
+    description: JDBC URL of the logical subscriber that would be promoted. It must accept writes, which a subscriber does.
+    defaults: "jdbc:postgresql://localhost:5433/app"
+
+  - id: publisher_username
+    type: STRING
+    description: Role on the publisher with SELECT or USAGE on the sequences. Read-only access is enough.
+    defaults: "seq_reader"
+
+  - id: subscriber_username
+    type: STRING
+    description: Role on the subscriber with SELECT on the owning tables and UPDATE on the sequences (needed for setval).
+    defaults: "seq_admin"
+
+  - id: schemas
+    type: STRING
+    displayName: Schemas to inspect
+    description: Comma-separated schema names, without spaces.
+    defaults: "public"
+    validator: '^[A-Za-z_][A-Za-z0-9_$]*(,[A-Za-z_][A-Za-z0-9_$]*)*$'
+
+  - id: headroom_hours
+    type: INT
+    displayName: Headroom window in hours
+    description: The subscriber is advanced past the publisher by this many hours of observed publisher consumption, covering the longest gap between the last sync and the promotion.
+    defaults: 24
+
+  - id: min_headroom
+    type: INT
+    displayName: Minimum headroom in values
+    description: Floor for the headroom, used on the first run (no burn rate learned yet) and for sequences that are barely used.
+    defaults: 10000
+
+  - id: apply_after_approval
+    type: BOOL
+    displayName: Apply after approval
+    description: When false the flow only reports. When true it pauses for an operator and then runs setval on the subscriber.
+    defaults: true
+
+triggers:
+  - id: every_30_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Re-sample the publisher often enough to keep the learned burn rate fresh.
+    cron: "*/30 * * * *"
+    disabled: true
+
+tasks:
+  - id: read_publisher_sequences
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read last_value of every sequence on the publisher. last_value is NULL both for unused sequences and for sequences the role cannot read, so readability is reported separately.
+    url: "{{ inputs.publisher_url }}"
+    username: "{{ inputs.publisher_username }}"
+    password: "{{ secret('PUBLISHER_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT schemaname AS schema_name,
+             sequencename AS sequence_name,
+             last_value::text AS last_value,
+             has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'SELECT,USAGE') AS readable
+      FROM pg_sequences
+      WHERE schemaname = ANY(string_to_array('{{ inputs.schemas }}', ','))
+      ORDER BY 1, 2
+
+  - id: read_subscriber_sequences
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read each subscriber sequence together with max() of the column that owns it. max() is only evaluated when an index leads with that column, so the query never scans a large table.
+    url: "{{ inputs.subscriber_url }}"
+    username: "{{ inputs.subscriber_username }}"
+    password: "{{ secret('SUBSCRIBER_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT ps.schemaname AS schema_name,
+             ps.sequencename AS sequence_name,
+             ps.last_value::text AS last_value,
+             ps.increment_by::text AS increment_by,
+             ps.max_value::text AS max_value,
+             ps.cycle AS cycle,
+             has_sequence_privilege(quote_ident(ps.schemaname) || '.' || quote_ident(ps.sequencename), 'UPDATE') AS writable,
+             CASE WHEN o.indexed THEN
+               (xpath('/row/m/text()', query_to_xml(
+                 format('SELECT max(%I) AS m FROM %I.%I', o.col_name, o.tbl_schema, o.tbl_name),
+                 false, true, '')))[1]::text
+             END AS max_column_value
+      FROM pg_sequences ps
+      LEFT JOIN LATERAL (
+        SELECT tn.nspname AS tbl_schema, t.relname AS tbl_name, a.attname AS col_name,
+               has_table_privilege(t.oid, 'SELECT')
+                 AND EXISTS (SELECT 1 FROM pg_index i
+                             WHERE i.indrelid = t.oid AND i.indisvalid AND i.indpred IS NULL AND i.indkey[0] = a.attnum) AS indexed
+        FROM pg_class sc
+        JOIN pg_namespace sn ON sn.oid = sc.relnamespace
+        JOIN pg_depend d ON d.objid = sc.oid AND d.classid = 'pg_class'::regclass
+                        AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+        JOIN pg_class t ON t.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+        WHERE sc.relkind = 'S' AND sn.nspname = ps.schemaname AND sc.relname = ps.sequencename
+        LIMIT 1
+      ) o ON true
+      WHERE ps.schemaname = ANY(string_to_array('{{ inputs.schemas }}', ','))
+      ORDER BY 1, 2
+
+  - id: plan_sequence_advances
+    type: io.kestra.plugin.scripts.node.Script
+    description: Diff publisher against subscriber, derive the publisher burn rate from the previous run's snapshot in KV, and build one guarded setval statement per lagging sequence.
+    containerImage: node:20-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      publisher.json: "{{ outputs.read_publisher_sequences.rows | toJson }}"
+      subscriber.json: "{{ outputs.read_subscriber_sequences.rows | toJson }}"
+      previous.json: "{{ (kv('pg_seq_burn_' ~ (inputs.subscriber_url | slugify), errorOnMissing=false) ?? '{}') | toJson }}"
+    env:
+      HEADROOM_HOURS: "{{ inputs.headroom_hours }}"
+      MIN_HEADROOM: "{{ inputs.min_headroom }}"
+    script: |
+      const fs = require('fs');
+
+      const HEADROOM_HOURS = Number(process.env.HEADROOM_HOURS);
+      const MIN_HEADROOM = BigInt(process.env.MIN_HEADROOM);
+      const now = new Date();
+
+      // Sequence values arrive as strings (::text in SQL) so bigint values never lose precision.
+      const load = (path) => {
+        let data = JSON.parse(fs.readFileSync(path, 'utf8'));
+        while (typeof data === 'string') data = data.trim() ? JSON.parse(data) : {};
+        return data;
+      };
+      const fq = (r) => `${r.schema_name}.${r.sequence_name}`;
+      const qi = (n) => '"' + n.replace(/"/g, '""') + '"';
+      const ql = (n) => "'" + n.replace(/'/g, "''") + "'";
+      const big = (v) => (v === null || v === undefined || v === '' ? null : BigInt(v));
+      const max = (a, b) => (a > b ? a : b);
+
+      const pub = Object.fromEntries(load('publisher.json').map((r) => [fq(r), r]));
+      const sub = Object.fromEntries(load('subscriber.json').map((r) => [fq(r), r]));
+      const prev = load('previous.json') || {};
+
+      const snapshot = {};
+      const advances = [];
+      const blocked = [];
+      let healthy = 0;
+
+      for (const name of Object.keys(pub).sort()) {
+        const p = pub[name];
+        if (!p.readable) {
+          blocked.push({ sequence: name, reason: 'publisher role has no USAGE/SELECT on the sequence, so last_value is hidden' });
+          continue;
+        }
+        const pubLast = big(p.last_value);
+        if (pubLast === null) continue; // never used on the publisher, nothing to protect
+
+        // Cross-run state: publisher burn rate (values/hour) from the previous run's snapshot, smoothed.
+        const old = prev[name] || {};
+        let rate = Number(old.rate_per_hour || 0);
+        if (old.last_value !== undefined && old.ts) {
+          const elapsedH = (now - new Date(old.ts)) / 3600000;
+          const delta = Number(pubLast - BigInt(old.last_value));
+          if (elapsedH >= 1 / 60 && delta >= 0) {
+            const instant = delta / elapsedH;
+            rate = old.rate_per_hour ? 0.5 * rate + 0.5 * instant : instant;
+          }
+        }
+        snapshot[name] = { last_value: pubLast.toString(), ts: now.toISOString(), rate_per_hour: Math.round(rate * 1000) / 1000 };
+
+        const s = sub[name];
+        if (!s) {
+          blocked.push({ sequence: name, reason: 'sequence does not exist on the subscriber (schema not synced)' });
+          continue;
+        }
+        if (BigInt(s.increment_by) <= 0n || s.cycle) {
+          blocked.push({ sequence: name, reason: 'descending or cycling sequence, setval cannot make it safe' });
+          continue;
+        }
+        if (!s.writable) {
+          blocked.push({ sequence: name, reason: 'subscriber role has no UPDATE on the sequence, setval would fail' });
+          continue;
+        }
+
+        const subLast = big(s.last_value);
+        const colMax = big(s.max_column_value);
+        const headroom = max(MIN_HEADROOM, BigInt(Math.ceil(rate * HEADROOM_HOURS)));
+        const floor = max(pubLast, colMax ?? 0n);
+        const target = floor + headroom;
+        if (subLast !== null && subLast >= floor + headroom / 2n) {
+          healthy += 1;
+          continue;
+        }
+        if (target >= BigInt(s.max_value)) {
+          blocked.push({ sequence: name, reason: `target ${target} reaches max_value ${s.max_value}; widen the column to bigint instead` });
+          continue;
+        }
+        const collides = subLast === null || subLast < floor;
+        // GREATEST keeps a concurrent writer on the subscriber from being moved backwards.
+        const sql =
+          `SELECT setval(${ql(qi(s.schema_name) + '.' + qi(s.sequence_name))}::regclass, GREATEST(${target}, ` +
+          `COALESCE((SELECT last_value FROM pg_sequences WHERE schemaname = ${ql(s.schema_name)} ` +
+          `AND sequencename = ${ql(s.sequence_name)}), 0)), true) AS new_value`;
+        advances.push({
+          sequence: name,
+          publisher_last: pubLast.toString(),
+          subscriber_last: subLast === null ? null : subLast.toString(),
+          subscriber_column_max: colMax === null ? null : colMax.toString(),
+          burn_per_hour: Math.round(rate * 10) / 10,
+          headroom: headroom.toString(),
+          target: target.toString(),
+          severity: collides ? 'COLLIDES_ON_NEXT_INSERT' : 'THIN_HEADROOM',
+          sql,
+        });
+      }
+
+      advances.sort((a, b) => (a.severity === b.severity ? a.sequence.localeCompare(b.sequence) : a.severity === 'COLLIDES_ON_NEXT_INSERT' ? -1 : 1));
+      const lines = [
+        ...advances.map((a) => `- \`${a.sequence}\` [${a.severity}]: publisher ${a.publisher_last}, subscriber ${a.subscriber_last}, max(col) ${a.subscriber_column_max} -> setval ${a.target} (headroom ${a.headroom} at ${a.burn_per_hour}/h)`),
+        ...blocked.map((b) => `- \`${b.sequence}\` [BLOCKED]: ${b.reason}`),
+      ];
+
+      const outputs = {
+        advance_count: advances.length,
+        blocked_count: blocked.length,
+        healthy_count: healthy,
+        collision_count: advances.filter((a) => a.severity === 'COLLIDES_ON_NEXT_INSERT').length,
+        statements: advances.map((a) => a.sql),
+        expected: Object.fromEntries(advances.map((a) => [a.sequence, a.target])),
+        report: lines.length ? lines.join('\n') : 'All inspected sequences have headroom.',
+        snapshot,
+      };
+      console.log('::' + JSON.stringify({ outputs }) + '::');
+
+  - id: save_publisher_snapshot
+    type: io.kestra.plugin.core.kv.Set
+    description: Store this run's publisher last_value and smoothed burn rate so the next run can measure consumption over the elapsed time.
+    key: "pg_seq_burn_{{ inputs.subscriber_url | slugify }}"
+    kvType: JSON
+    overwrite: true
+    value: "{{ outputs.plan_sequence_advances.vars.snapshot | toJson }}"
+
+  - id: gate_on_findings
+    type: io.kestra.plugin.core.flow.If
+    description: Only act when at least one sequence lags or cannot be handled.
+    condition: "{{ outputs.plan_sequence_advances.vars.advance_count > 0 or outputs.plan_sequence_advances.vars.blocked_count > 0 }}"
+    then:
+      - id: notify_plan
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the on-call which subscriber sequences would collide with publisher rows after a promotion.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Logical replica `{{ inputs.subscriber_url }}`: {{ outputs.plan_sequence_advances.vars.advance_count }} sequence(s) behind the publisher ({{ outputs.plan_sequence_advances.vars.collision_count }} would raise duplicate key on the first insert after promotion), {{ outputs.plan_sequence_advances.vars.blocked_count }} blocked.
+          {{ outputs.plan_sequence_advances.vars.report }}
+          Execution `{{ execution.id }}`{{ (inputs.apply_after_approval and outputs.plan_sequence_advances.vars.advance_count > 0) ? ' is waiting for approval.' : ' is report-only.' }}
+
+      - id: gate_on_apply
+        type: io.kestra.plugin.core.flow.If
+        description: Skip the write path in report-only mode or when every finding is blocked.
+        condition: "{{ inputs.apply_after_approval and outputs.plan_sequence_advances.vars.advance_count > 0 }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Operator reviews the listed setval targets before anything is written to the subscriber. Not approving within 4 hours cancels the run, and the next schedule tick re-plans from fresh numbers.
+            pauseDuration: PT4H
+            behavior: CANCEL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set to true to run setval on the subscriber for the listed sequences.
+
+          - id: gate_on_approval
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approval_gate.onResume.approved == true or outputs.approval_gate.onResume.approved == 'true' }}"
+            then:
+              - id: advance_sequences
+                type: io.kestra.plugin.core.flow.Loop
+                description: Run the guarded setval statements one at a time on the subscriber.
+                values: "{{ outputs.plan_sequence_advances.vars.statements }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: setval_one
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ inputs.subscriber_url }}"
+                    username: "{{ inputs.subscriber_username }}"
+                    password: "{{ secret('SUBSCRIBER_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    sql: "{{ item.value }}"
+
+              - id: read_subscriber_after
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Re-read the subscriber sequences from the catalog instead of trusting the setval return values.
+                url: "{{ inputs.subscriber_url }}"
+                username: "{{ inputs.subscriber_username }}"
+                password: "{{ secret('SUBSCRIBER_PASSWORD') }}"
+                fetchType: FETCH
+                sql: |
+                  SELECT schemaname || '.' || sequencename AS sequence, last_value::text AS last_value
+                  FROM pg_sequences
+                  WHERE schemaname = ANY(string_to_array('{{ inputs.schemas }}', ','))
+
+              - id: verify_advance
+                type: io.kestra.plugin.scripts.node.Script
+                description: Fail the run if any advanced sequence is still below its planned target.
+                containerImage: node:20-slim
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                inputFiles:
+                  expected.json: "{{ outputs.plan_sequence_advances.vars.expected | toJson }}"
+                  after.json: "{{ outputs.read_subscriber_after.rows | toJson }}"
+                script: |
+                  const fs = require('fs');
+
+                  const load = (path) => {
+                    let data = JSON.parse(fs.readFileSync(path, 'utf8'));
+                    while (typeof data === 'string') data = data.trim() ? JSON.parse(data) : {};
+                    return data;
+                  };
+
+                  const expected = load('expected.json');
+                  const after = Object.fromEntries(load('after.json').map((r) => [r.sequence, r.last_value]));
+
+                  const failed = [];
+                  for (const [name, target] of Object.entries(expected)) {
+                    const got = after[name] === null || after[name] === undefined ? null : BigInt(after[name]);
+                    if (got === null || got < BigInt(target)) failed.push({ sequence: name, expected_at_least: target, found: got === null ? null : got.toString() });
+                  }
+
+                  const outputs = { verified_count: Object.keys(expected).length - failed.length, failed };
+                  console.log('::' + JSON.stringify({ outputs }) + '::');
+                  if (failed.length) {
+                    console.error('setval did not take effect on: ' + JSON.stringify(failed));
+                    process.exit(1);
+                  }
+
+              - id: save_advance_audit
+                type: io.kestra.plugin.core.kv.Set
+                description: Keep a record of what was advanced, by whom and when.
+                key: "pg_seq_advance_audit_{{ inputs.subscriber_url | slugify }}"
+                kvType: JSON
+                overwrite: true
+                value: "{{ {'execution': execution.id, 'resumed_by': (outputs.approval_gate.resumed.by ?? 'unknown'), 'targets': outputs.plan_sequence_advances.vars.expected} | toJson }}"
+
+              - id: notify_advanced
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: "Advanced {{ outputs.verify_advance.vars.verified_count }} sequence(s) on `{{ inputs.subscriber_url }}` and confirmed them in pg_sequences (execution `{{ execution.id }}`)."
+            else:
+              - id: log_not_approved
+                type: io.kestra.plugin.core.log.Log
+                message: "Not approved; the subscriber was left unchanged."
+        else:
+          - id: log_report_only
+            type: io.kestra.plugin.core.log.Log
+            message: "No write performed (apply_after_approval={{ inputs.apply_after_approval }}, advances={{ outputs.plan_sequence_advances.vars.advance_count }})."
+    else:
+      - id: log_all_clear
+        type: io.kestra.plugin.core.log.Log
+        message: "All {{ outputs.plan_sequence_advances.vars.healthy_count }} inspected sequence(s) on the subscriber are ahead of the publisher."
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "Sequence advance for `{{ inputs.subscriber_url }}` failed (execution `{{ execution.id }}`). If it failed after approval, check the subscriber: some sequences may already be advanced."
+
+extend:
+  title: Stop Duplicate-Key Errors After Failover by Advancing Logical Replica Sequences
+  metaTitle: Advance Postgres Logical Replica Sequences Before Promotion | Kestra
+  shortDescription: Compare publisher and subscriber sequences, learn the publisher's burn rate across runs, and after approval advance lagging subscriber sequences with setval, then verify.
+  metaDescription: Prevent duplicate key errors after promoting a Postgres logical replica. Learn burn rate, approve a guarded setval, and verify sequences in pg_sequences.
+  description: |
+    Postgres logical replication copies rows but never sequence state. The subscriber's sequences stay near their start values while its tables fill up, so the first insert after a promotion fails with a duplicate key error on a primary key the publisher already used. This blueprint keeps subscriber sequences ahead of the publisher and repairs the ones that fall behind, after a human approves.
+
+    ## How it works
+
+    1. `read_publisher_sequences` and `read_subscriber_sequences` read `pg_sequences` on both servers. The subscriber query also returns `max()` of each owning column, only when an index leads with it.
+    2. `plan_sequence_advances` (Node, BigInt) loads the previous run's snapshot from Kestra KV, measures the publisher's consumption per hour, and targets the higher of the publisher value and the column maximum plus `headroom_hours` of consumption. A sequence is touched only when it is under half that headroom ahead.
+    3. `save_publisher_snapshot` stores the observations for the next run, and `notify_plan` posts the plan to Slack, flagging sequences that would collide on the next insert. Sequences setval cannot fix are listed as blocked (unreadable, missing on the subscriber, descending or cycling, target above `max_value`).
+    4. `approval_gate` (`Pause`) waits up to 4 hours. On approval, `advance_sequences` runs one guarded `setval` per sequence; `GREATEST` stops a concurrent writer being moved backwards.
+    5. `read_subscriber_after` re-reads the catalog and `verify_advance` fails the run if any sequence is below target.
+
+    ## What you get
+
+    - Subscriber sequences kept ahead of the publisher by a margin sized from real consumption.
+    - No write without approval, and a catalog check after it.
+
+    ## Who it's for
+
+    - DBAs and platform teams using logical replication for migrations, blue/green cutovers or standby promotion.
+
+    ## Why orchestrate this with Kestra
+
+    The burn rate exists only because state survives between runs, and the write sits behind a native approval. A cron script has neither, and a one-time copy at cutover cannot know how far the publisher moves before the switch.
+
+    ## Prerequisites
+
+    - A publisher and a logical subscriber reachable from the worker, plus Docker for the script tasks.
+    - Publisher role with SELECT or USAGE on the sequences; subscriber role with SELECT on the owning tables and UPDATE on the sequences.
+
+    ### Secrets
+
+    - `PUBLISHER_PASSWORD`: publisher role password.
+    - `SUBSCRIBER_PASSWORD`: subscriber role password.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for plan and result messages.
+
+    ## Quick start
+
+    1. Create the three secrets in your namespace.
+    2. To test locally, start two `postgres:16` containers with `wal_level=logical`, create a publication and a subscription and execute with `apply_after_approval: false`.
+    3. Run again with it true, resume the paused execution with `approved` set to true, and check `pg_sequences` on the subscriber.
+    4. Enable the `every_30_minutes` trigger.
+
+    ## How to extend
+
+    - Page the on-call when `collision_count` is above zero and a switchover is scheduled.
+    - Run one parent flow per subscriber, passing `subscriber_url`.
+
+    ## Links
+
+    - [Logical replication restrictions](https://www.postgresql.org/docs/current/logical-replication-restrictions.html)
+    - [Sequence manipulation functions](https://www.postgresql.org/docs/current/functions-sequence.html)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
