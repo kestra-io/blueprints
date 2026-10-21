@@ -1,0 +1,559 @@
+id: activemq-artemis-poison-message-quarantine
+namespace: company.messaging
+
+description: |
+  Drain a batch from an ActiveMQ Artemis inbound queue over JMS and validate each message body
+  against a JSON Schema. Valid messages go to the processing queue without changes. Invalid
+  messages go to a quarantine queue with the original body and JMS properties that explain the
+  validation error. The flow keeps a rolling quarantine rate in the KV store and sends one Slack
+  alert when the rate goes above the threshold, and one more alert when it recovers.
+
+inputs:
+  - id: broker_url
+    type: STRING
+    displayName: Artemis broker URL
+    description: Core protocol URL of the Artemis acceptor, for example tcp://artemis:61616 or a failover list.
+    defaults: tcp://artemis:61616
+
+  - id: provider_jar_url
+    type: STRING
+    displayName: Artemis JMS client JAR
+    description: >-
+      URL of the Artemis Jakarta JMS client JAR that the plugin loads. Use the version of your broker.
+      On a worker without internet access, copy the JAR to the worker and use a file:/// URL.
+    defaults: https://repo1.maven.org/maven2/org/apache/activemq/artemis-jakarta-client-all/2.44.0/artemis-jakarta-client-all-2.44.0.jar
+
+  - id: inbound_queue
+    type: STRING
+    displayName: Inbound queue
+    description: Anycast queue that producers write to. The flow consumes from this queue.
+    defaults: orders.inbound
+
+  - id: processing_queue
+    type: STRING
+    displayName: Processing queue
+    description: Queue that receives the messages that pass validation. The business consumers read this queue.
+    defaults: orders.processing
+
+  - id: quarantine_queue
+    type: STRING
+    displayName: Quarantine queue
+    description: Queue that receives the messages that fail validation, with the error in JMS properties.
+    defaults: orders.quarantine
+
+  - id: message_schema
+    type: JSON
+    displayName: Message JSON Schema
+    description: JSON Schema that every message body must match. Draft 2020-12, 2019-09, 7, 6 and 4 are supported.
+    defaults: |
+      {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "order.created",
+        "type": "object",
+        "required": ["order_id", "customer_id", "currency", "total_amount", "items", "created_at"],
+        "properties": {
+          "order_id": {"type": "string", "pattern": "^ORD-[0-9]{8}$"},
+          "customer_id": {"type": "string", "minLength": 1},
+          "currency": {"type": "string", "enum": ["EUR", "USD", "GBP"]},
+          "total_amount": {"type": "number", "exclusiveMinimum": 0},
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["sku", "quantity"],
+              "properties": {
+                "sku": {"type": "string", "minLength": 1},
+                "quantity": {"type": "integer", "minimum": 1}
+              }
+            }
+          },
+          "created_at": {"type": "string", "format": "date-time"}
+        }
+      }
+
+  - id: schema_version
+    type: STRING
+    displayName: Schema version label
+    description: Label of the schema. The flow writes it into the schema_version property of forwarded and quarantined messages.
+    defaults: order.created/1.0.0
+
+  - id: batch_size
+    type: INT
+    displayName: Messages per run
+    description: Upper limit of messages that one run consumes from the inbound queue.
+    defaults: 500
+    min: 1
+    max: 5000
+
+  - id: poll_timeout_ms
+    type: INT
+    displayName: Receive timeout (ms)
+    description: The consumer stops when no message arrives within this time. Keep it above 0, because 0 waits forever.
+    defaults: 5000
+    min: 500
+    max: 60000
+
+  - id: max_message_kb
+    type: INT
+    displayName: Maximum body size (KB)
+    description: Bodies larger than this size go to quarantine with the reason TOO_LARGE and the flow does not parse them.
+    defaults: 256
+    min: 1
+
+  - id: rate_window_minutes
+    type: INT
+    displayName: Rate window (minutes)
+    description: The quarantine rate uses the batches of the runs in this time window.
+    defaults: 60
+    min: 5
+    max: 1440
+
+  - id: quarantine_rate_alert_pct
+    type: FLOAT
+    displayName: Quarantine rate alert (%)
+    description: Send a Slack alert when the quarantine rate in the window goes above this percentage.
+    defaults: 5.0
+    min: 0.0
+    max: 100.0
+
+  - id: min_window_messages
+    type: INT
+    displayName: Minimum messages in the window
+    description: The flow does not alert until the window holds this number of messages. This prevents alerts on low traffic.
+    defaults: 50
+    min: 1
+
+variables:
+  window_key: "artemis_quarantine_window_{{ inputs.inbound_queue | slugify }}"
+  alert_key: "artemis_quarantine_alert_{{ inputs.inbound_queue | slugify }}"
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+tasks:
+  - id: consume_inbound
+    type: io.kestra.plugin.jms.Consume
+    description: >-
+      Read up to batch_size messages as raw text. The STRING serde keeps bodies that are not JSON, so
+      the flow can quarantine them. The task acknowledges each message after it writes the message to
+      the batch file in internal storage.
+    connectionFactoryConfig:
+      type: DIRECT
+      connectionFactoryClass: org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory
+      providerJarPaths:
+        - "{{ inputs.provider_jar_url }}"
+      username: "{{ secret('ARTEMIS_USERNAME') }}"
+      password: "{{ secret('ARTEMIS_PASSWORD') }}"
+      connectionProperties:
+        brokerURL: "{{ inputs.broker_url }}"
+    destination:
+      destinationName: "{{ inputs.inbound_queue }}"
+      destinationType: QUEUE
+    serdeType: STRING
+    maxMessages: "{{ inputs.batch_size }}"
+    maxWaitTimeout: "{{ inputs.poll_timeout_ms }}"
+    timeout: PT10M
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT1M
+      maxAttempts: 3
+
+  - id: check_batch
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.consume_inbound.count > 0 }}"
+    then:
+      - id: batch_to_jsonl
+        type: io.kestra.plugin.serdes.json.IonToJson
+        description: Convert the Ion batch file to JSON Lines for the validation script.
+        from: "{{ outputs.consume_inbound.uri }}"
+        newLine: true
+
+      - id: validate_batch
+        type: io.kestra.plugin.scripts.python.Script
+        description: >-
+          Validate each body with the jsonschema library and write valid.jsonl and quarantine.jsonl.
+          An invalid schema fails the task, so a bad schema never sends all traffic to quarantine.
+          The task also updates the rolling window and decides if the alert state changes.
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install --quiet --disable-pip-version-check --root-user-action=ignore jsonschema==4.23.0 rfc3339-validator==0.1.4
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          memory:
+            memory: 512MB
+        timeout: PT15M
+        inputFiles:
+          messages.jsonl: "{{ outputs.batch_to_jsonl.uri }}"
+          schema.json: "{{ inputs.message_schema | toJson }}"
+        outputFiles:
+          - valid.jsonl
+          - quarantine.jsonl
+        env:
+          INBOUND_QUEUE: "{{ inputs.inbound_queue }}"
+          SCHEMA_VERSION: "{{ inputs.schema_version }}"
+          MAX_MESSAGE_KB: "{{ inputs.max_message_kb }}"
+          WINDOW_MINUTES: "{{ inputs.rate_window_minutes }}"
+          RATE_ALERT_PCT: "{{ inputs.quarantine_rate_alert_pct }}"
+          MIN_WINDOW_MESSAGES: "{{ inputs.min_window_messages }}"
+          EXECUTION_ID: "{{ execution.id }}"
+          PREVIOUS_WINDOW: "{{ (kv(render(vars.window_key), errorOnMissing=false) ?? []) | toJson }}"
+          PREVIOUS_ALERT_STATE: "{{ kv(render(vars.alert_key), errorOnMissing=false) ?? 'OK' }}"
+        script: |
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          from jsonschema import FormatChecker
+          from jsonschema.exceptions import best_match
+          from jsonschema.validators import validator_for
+
+          with open("schema.json", encoding="utf-8") as f:
+              schema = json.load(f)
+          validator_class = validator_for(schema)
+          validator_class.check_schema(schema)
+          validator = validator_class(schema, format_checker=FormatChecker())
+
+          max_bytes = int(os.environ["MAX_MESSAGE_KB"]) * 1024
+          source_queue = os.environ["INBOUND_QUEUE"]
+          schema_version = os.environ["SCHEMA_VERSION"]
+          execution_id = os.environ["EXECUTION_ID"]
+          now = datetime.now(timezone.utc)
+          now_iso = now.isoformat(timespec="seconds")
+
+          # JMS and Artemis set these properties. A producer must not set them again.
+          RESERVED = ("JMS", "_AMQ", "__AMQ")
+
+
+          def app_properties(headers):
+              out = {}
+              for key, value in (headers or {}).items():
+                  if key.startswith(RESERVED) or value is None or isinstance(value, (dict, list)):
+                      continue
+                  out[key] = value
+              return out
+
+
+          def check(body):
+              size = len(body.encode("utf-8"))
+              if size > max_bytes:
+                  return "TOO_LARGE", "body has %d bytes, the limit is %d" % (size, max_bytes), ""
+              try:
+                  document = json.loads(body)
+              except ValueError as exc:
+                  return "INVALID_JSON", str(exc), ""
+              errors = list(validator.iter_errors(document))
+              if not errors:
+                  return None, None, None
+              first = best_match(errors)
+              message = first.message
+              if len(errors) > 1:
+                  message += " (%d more errors)" % (len(errors) - 1)
+              path = "/" + "/".join(str(p) for p in first.absolute_path)
+              return "SCHEMA_VIOLATION", message, path
+
+
+          consumed = 0
+          valid = 0
+          reasons = {}
+          samples = []
+          with open("messages.jsonl", encoding="utf-8") as src, \
+                  open("valid.jsonl", "w", encoding="utf-8") as ok_file, \
+                  open("quarantine.jsonl", "w", encoding="utf-8") as bad_file:
+              for line in src:
+                  if not line.strip():
+                      continue
+                  message = json.loads(line)
+                  consumed += 1
+                  body = message.get("data")
+                  body = "" if body is None else str(body)
+                  raw_headers = message.get("headers") or {}
+                  properties = app_properties(raw_headers)
+                  properties["original_message_id"] = message.get("messageId") or ""
+                  properties["schema_version"] = schema_version
+                  reason, error, path = check(body)
+                  if reason is None:
+                      valid += 1
+                      ok_file.write(json.dumps({"data": body, "headers": properties}) + "\n")
+                      continue
+                  reasons[reason] = reasons.get(reason, 0) + 1
+                  properties["quarantine_reason"] = reason
+                  properties["quarantine_error"] = error[:1000]
+                  properties["quarantine_error_path"] = path
+                  properties["quarantine_source_queue"] = source_queue
+                  properties["quarantine_execution_id"] = execution_id
+                  properties["quarantined_at"] = now_iso
+                  properties["original_delivery_count"] = int(raw_headers.get("JMSXDeliveryCount") or 0)
+                  bad_file.write(json.dumps({"data": body, "headers": properties}) + "\n")
+                  if len(samples) < 5:
+                      samples.append("%s %s %s %s" % (properties["original_message_id"], reason, path, error[:160]))
+
+          quarantined = consumed - valid
+          now_ms = int(now.timestamp() * 1000)
+          window_ms = int(os.environ["WINDOW_MINUTES"]) * 60000
+          previous = json.loads(os.environ.get("PREVIOUS_WINDOW") or "[]") or []
+          window = [e for e in previous if now_ms - int(e.get("at", 0)) < window_ms]
+          window.append({"at": now_ms, "total": consumed, "quarantined": quarantined})
+          window_total = sum(int(e["total"]) for e in window)
+          window_quarantined = sum(int(e["quarantined"]) for e in window)
+          window_rate = round(100.0 * window_quarantined / window_total, 2) if window_total else 0.0
+          breach = window_total >= int(os.environ["MIN_WINDOW_MESSAGES"]) and window_rate > float(os.environ["RATE_ALERT_PCT"])
+          previous_state = os.environ.get("PREVIOUS_ALERT_STATE") or "OK"
+          if breach and previous_state != "FIRING":
+              transition = "FIRE"
+          elif not breach and previous_state == "FIRING":
+              transition = "RECOVER"
+          else:
+              transition = "NONE"
+
+          outputs = {
+              "consumed": consumed,
+              "valid": valid,
+              "quarantined": quarantined,
+              "reasons": ", ".join("%s=%d" % item for item in sorted(reasons.items())) or "none",
+              "samples": " | ".join(samples) or "none",
+              "window": window,
+              "window_total": window_total,
+              "window_quarantined": window_quarantined,
+              "window_rate_pct": window_rate,
+              "alert_state": "FIRING" if breach else "OK",
+              "transition": transition,
+          }
+          print("::" + json.dumps({"outputs": outputs}) + "::")
+
+      - id: route_messages
+        type: io.kestra.plugin.core.flow.Parallel
+        description: Publish both groups at the same time. Each publish runs only when its group has messages.
+        tasks:
+          - id: forward_valid
+            type: io.kestra.plugin.jms.Produce
+            connectionFactoryConfig:
+              type: DIRECT
+              connectionFactoryClass: org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory
+              providerJarPaths:
+                - "{{ inputs.provider_jar_url }}"
+              username: "{{ secret('ARTEMIS_USERNAME') }}"
+              password: "{{ secret('ARTEMIS_PASSWORD') }}"
+              connectionProperties:
+                brokerURL: "{{ inputs.broker_url }}"
+            runIf: "{{ outputs.validate_batch.vars.valid > 0 }}"
+            destination:
+              destinationName: "{{ inputs.processing_queue }}"
+              destinationType: QUEUE
+            serdeType: STRING
+            from: "{{ outputs.validate_batch.outputFiles['valid.jsonl'] }}"
+            timeout: PT10M
+
+          - id: quarantine_invalid
+            type: io.kestra.plugin.jms.Produce
+            connectionFactoryConfig:
+              type: DIRECT
+              connectionFactoryClass: org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory
+              providerJarPaths:
+                - "{{ inputs.provider_jar_url }}"
+              username: "{{ secret('ARTEMIS_USERNAME') }}"
+              password: "{{ secret('ARTEMIS_PASSWORD') }}"
+              connectionProperties:
+                brokerURL: "{{ inputs.broker_url }}"
+            runIf: "{{ outputs.validate_batch.vars.quarantined > 0 }}"
+            destination:
+              destinationName: "{{ inputs.quarantine_queue }}"
+              destinationType: QUEUE
+            serdeType: STRING
+            from: "{{ outputs.validate_batch.outputFiles['quarantine.jsonl'] }}"
+            timeout: PT10M
+
+      - id: verify_routing
+        type: io.kestra.plugin.core.execution.Assert
+        description: Fail the run if the broker did not accept exactly one copy of every consumed message.
+        errorMessage: >-
+          Routing mismatch for {{ inputs.inbound_queue }}: consumed {{ outputs.consume_inbound.count }},
+          valid {{ outputs.validate_batch.vars.valid }}, quarantined {{ outputs.validate_batch.vars.quarantined }}.
+        conditions:
+          - "{{ outputs.validate_batch.vars.consumed == outputs.consume_inbound.count }}"
+          - "{{ (outputs.forward_valid.messagesCount ?? 0) == outputs.validate_batch.vars.valid }}"
+          - "{{ (outputs.quarantine_invalid.messagesCount ?? 0) == outputs.validate_batch.vars.quarantined }}"
+
+      - id: save_rate_window
+        type: io.kestra.plugin.core.kv.Set
+        description: Store the batches of the rate window for the next run.
+        key: "{{ render(vars.window_key) }}"
+        kvType: JSON
+        value: "{{ outputs.validate_batch.vars.window | toJson }}"
+
+      - id: alert_on_change
+        type: io.kestra.plugin.core.flow.Switch
+        value: "{{ outputs.validate_batch.vars.transition }}"
+        cases:
+          FIRE:
+            - id: alert_rate_breach
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: exponential
+                interval: PT5S
+                maxInterval: PT1M
+                maxAttempts: 3
+              messageText: >-
+                Artemis quarantine rate for {{ inputs.inbound_queue }} is {{ outputs.validate_batch.vars.window_rate_pct }}%
+                in the last {{ inputs.rate_window_minutes }} min
+                ({{ outputs.validate_batch.vars.window_quarantined }} of {{ outputs.validate_batch.vars.window_total }} messages,
+                alert above {{ inputs.quarantine_rate_alert_pct }}%).
+                This run: {{ outputs.validate_batch.vars.quarantined }} of {{ outputs.validate_batch.vars.consumed }} quarantined,
+                reasons {{ outputs.validate_batch.vars.reasons }}.
+                Samples: {{ outputs.validate_batch.vars.samples }}.
+                Read the quarantine_reason and quarantine_error properties on {{ inputs.quarantine_queue }}.
+                Schema {{ inputs.schema_version }}. Execution {{ execution.id }}.
+          RECOVER:
+            - id: alert_rate_recovered
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: exponential
+                interval: PT5S
+                maxInterval: PT1M
+                maxAttempts: 3
+              messageText: >-
+                Artemis quarantine rate for {{ inputs.inbound_queue }} is back to {{ outputs.validate_batch.vars.window_rate_pct }}%
+                in the last {{ inputs.rate_window_minutes }} min (alert above {{ inputs.quarantine_rate_alert_pct }}%).
+                {{ inputs.quarantine_queue }} still holds the quarantined messages. Execution {{ execution.id }}.
+        defaults:
+          - id: log_batch
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              {{ inputs.inbound_queue }}: {{ outputs.validate_batch.vars.valid }} forwarded to {{ inputs.processing_queue }},
+              {{ outputs.validate_batch.vars.quarantined }} quarantined to {{ inputs.quarantine_queue }}
+              ({{ outputs.validate_batch.vars.reasons }}). Window rate {{ outputs.validate_batch.vars.window_rate_pct }}%
+              over {{ outputs.validate_batch.vars.window_total }} messages, alert state {{ outputs.validate_batch.vars.alert_state }}.
+
+      - id: save_alert_state
+        type: io.kestra.plugin.core.kv.Set
+        description: Store the alert state after the alert is sent, so a failed alert is sent again in the next run.
+        key: "{{ render(vars.alert_key) }}"
+        kvType: STRING
+        value: "{{ outputs.validate_batch.vars.alert_state }}"
+    else:
+      - id: log_empty
+        type: io.kestra.plugin.core.log.Log
+        message: No message arrived on {{ inputs.inbound_queue }} within {{ inputs.poll_timeout_ms }} ms. Nothing to route.
+
+errors:
+  - id: return_unrouted_batch
+    type: io.kestra.plugin.core.flow.If
+    description: >-
+      When the run failed after the consume step and before the publish steps, no message reached
+      the processing or quarantine queue. Send the batch back to the inbound queue, so no message is lost.
+    condition: "{{ (outputs.consume_inbound.count ?? 0) > 0 and (outputs.validate_batch.vars.consumed ?? -1) == -1 }}"
+    then:
+      - id: requeue_batch
+        type: io.kestra.plugin.jms.Produce
+        allowFailure: true
+        connectionFactoryConfig:
+          type: DIRECT
+          connectionFactoryClass: org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory
+          providerJarPaths:
+            - "{{ inputs.provider_jar_url }}"
+          username: "{{ secret('ARTEMIS_USERNAME') }}"
+          password: "{{ secret('ARTEMIS_PASSWORD') }}"
+          connectionProperties:
+            brokerURL: "{{ inputs.broker_url }}"
+        destination:
+          destinationName: "{{ inputs.inbound_queue }}"
+          destinationType: QUEUE
+        serdeType: STRING
+        from: "{{ outputs.consume_inbound.uri }}"
+        timeout: PT10M
+
+  - id: alert_run_failed
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Artemis quarantine flow {{ flow.namespace }}.{{ flow.id }} failed for {{ inputs.inbound_queue }}. Execution {{ execution.id }}.
+      {{ (outputs.consume_inbound.count ?? 0) == 0
+         ? 'The run consumed no message. All messages stay on ' ~ inputs.inbound_queue ~ '. Check the broker connection and the credentials.'
+         : ((outputs.requeue_batch.messagesCount ?? 0) == outputs.consume_inbound.count
+            ? 'The run sent its ' ~ outputs.consume_inbound.count ~ ' consumed messages back to ' ~ inputs.inbound_queue ~ '. Fix the cause before the next run.'
+            : 'The run consumed ' ~ outputs.consume_inbound.count ~ ' messages that are only in the batch file ' ~ outputs.consume_inbound.uri ~ '. Fix the cause and restart this execution from the failed task.') }}
+
+triggers:
+  - id: every_five_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+
+extend:
+  title: Quarantine Invalid ActiveMQ Artemis Messages with JSON Schema and a Rate Alert
+  metaTitle: ActiveMQ Artemis JSON Schema Poison Message Quarantine | Kestra
+  shortDescription: >-
+    Consume an ActiveMQ Artemis queue over JMS, validate each body against a JSON Schema, forward
+    valid messages and quarantine invalid ones with the error attached. Alert on a high rolling quarantine rate.
+  metaDescription: Validate ActiveMQ Artemis messages against a JSON Schema, route invalid ones to a quarantine queue with the error, and alert on the quarantine rate.
+  description: |
+    A malformed message can block a consumer or cause repeated redelivery. This flow puts a JSON Schema gate in front of the consumers of an ActiveMQ Artemis queue and alerts on a high rolling quarantine rate.
+
+    ## How it works
+
+    1. The Schedule trigger starts one run at a time, every 5 minutes.
+    2. `consume_inbound` (JMS `Consume`) reads up to `batch_size` messages as raw text. `check_batch` stops when the queue is empty.
+    3. `validate_batch` checks size, JSON syntax and the schema with the `jsonschema` library. An invalid schema fails the task, and the `errors` handler sends the batch back to the inbound queue.
+    4. `route_messages` (`Parallel`) publishes valid bodies to `processing_queue` without changes. Invalid bodies go to `quarantine_queue` with `quarantine_reason`, `quarantine_error`, `quarantine_error_path` and `original_message_id`.
+    5. `verify_routing` (`Assert`) fails the run if the broker did not accept one copy of each message.
+    6. The flow stores the rate window in KV. It sends one Slack alert when the rate goes above the threshold and one when it recovers.
+
+    ## What you get
+
+    - Each quarantined message tells why it failed. A selector such as `quarantine_reason = 'INVALID_JSON'` filters it.
+    - The original bodies stay in quarantine for a replay after the fix.
+    - One alert per incident, not one per run.
+
+    ## Who it's for
+
+    - Middleware engineers and integration teams who run ActiveMQ Artemis.
+
+    ## Why orchestrate this with Kestra
+
+    - The consumed batch stays in internal storage. If a publish fails, restart the run from the failed task.
+    - KV keeps the rate and the alert state across runs without a database.
+
+    ## Prerequisites
+
+    - ActiveMQ Artemis 2.x with a core acceptor that the worker can reach.
+    - A broker user that can consume the inbound queue and send to the two other queues.
+    - The Artemis Jakarta JMS client JAR at `provider_jar_url`.
+    - A Docker task runner for the Python step.
+
+    ### Secrets
+
+    - `ARTEMIS_USERNAME`: Broker user.
+    - `ARTEMIS_PASSWORD`: Password of that user.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for alerts and failures.
+
+    ## Quick start
+
+    1. Add the three secrets.
+    2. Set `broker_url`, the queues, `message_schema` and `schema_version`.
+    3. Send one valid and one invalid message to the inbound queue.
+    4. Execute the flow and examine the two queues.
+
+    ## How to extend
+
+    - Add a replay flow that reads the quarantine queue with a selector and sends fixed messages back after a `Pause` approval.
+    - Load the schema from a namespace file synced from Git.
+
+    ## Links
+
+    - [Kestra JMS plugin](https://kestra.io/plugins/plugin-jms)
+    - [Python Script task](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Artemis JMS documentation](https://activemq.apache.org/components/artemis/documentation/latest/using-jms.html)
+    - [jsonschema library](https://python-jsonschema.readthedocs.io/)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Testing & Quality
+    - Realtime & Streaming
+    - Monitoring & Alerting
+  ee: false
+  demo: false
