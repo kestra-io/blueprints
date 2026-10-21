@@ -1,0 +1,429 @@
+id: timescaledb-partial-chunk-recompression-guard
+namespace: company.team
+
+description: |
+  Find TimescaleDB chunks that were compressed and then received late rows. TimescaleDB keeps these
+  rows uncompressed in the chunk heap and marks the chunk as partially compressed. Recompress the
+  largest partial chunks in a bounded batch with compress_chunk, verify the result in the catalog
+  and report the size before and after per hypertable.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: TimescaleDB uses the PostgreSQL wire protocol, so this is a PostgreSQL JDBC URL.
+    defaults: "jdbc:postgresql://timescaledb:5432/metrics"
+
+  - id: schemas
+    type: STRING
+    displayName: Schemas to scan
+    description: Comma-separated list of schemas that contain the hypertables.
+    defaults: "public"
+
+  - id: min_backfill_mb
+    type: FLOAT
+    displayName: Minimum late data per chunk (MB)
+    description: >-
+      A partial chunk is recompressed only when its uncompressed heap is at least this size.
+      Smaller chunks stay for the next compression policy run.
+    defaults: 8
+
+  - id: max_chunks_per_run
+    type: INT
+    displayName: Chunk limit per run
+    description: The flow recompresses the largest partial chunks first and stops at this number.
+    defaults: 10
+
+  - id: approval_threshold_mb
+    type: INT
+    displayName: Approval threshold (MB)
+    description: >-
+      When the batch rewrites more than this size (compressed data plus late rows), the flow
+      pauses for a human approval before it recompresses.
+    defaults: 2048
+
+  - id: lock_timeout_seconds
+    type: INT
+    displayName: Lock timeout per chunk (seconds)
+    description: >-
+      compress_chunk must lock the chunk. When ingest holds the lock longer than this, the
+      statement stops so that inserts do not queue behind it.
+    defaults: 30
+
+  - id: chronic_after_runs
+    type: INT
+    displayName: Chronic backfill threshold (runs)
+    description: >-
+      A hypertable that needs recompression in this many consecutive runs is marked CHRONIC in
+      the report, because its ingest or its policy needs a fix.
+    defaults: 3
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true, the flow reports the plan and changes nothing.
+    defaults: false
+
+variables:
+  history_key: "timescaledb_partial_chunks_{{ inputs.jdbc_url | slugify }}"
+
+  scope_cte: |
+    WITH ht AS (
+      SELECT format('%I.%I', h.hypertable_schema, h.hypertable_name) AS hypertable,
+             h.hypertable_schema, h.hypertable_name
+        FROM timescaledb_information.hypertables h
+       WHERE h.compression_enabled
+         AND h.hypertable_schema = ANY (string_to_array(replace('{{ inputs.schemas }}', ' ', ''), ','))
+    ), ch AS (
+      SELECT ht.hypertable, i.chunk_schema, i.chunk_name, i.range_start, i.range_end,
+             format('%I.%I', i.chunk_schema, i.chunk_name) AS chunk,
+             (_timescaledb_functions.chunk_status(format('%I.%I', i.chunk_schema, i.chunk_name)::regclass) & 8) = 8 AS partial,
+             pg_relation_size(format('%I.%I', i.chunk_schema, i.chunk_name)::regclass) AS heap_bytes
+        FROM ht
+        JOIN timescaledb_information.chunks i
+          ON i.hypertable_schema = ht.hypertable_schema AND i.hypertable_name = ht.hypertable_name
+       WHERE i.is_compressed
+    )
+
+  audit_sql: |
+    {{ render(vars.scope_cte) }},
+    pol AS (
+      SELECT format('%I.%I', j.hypertable_schema, j.hypertable_name) AS hypertable, j.job_id, j.scheduled,
+             coalesce(j.config ->> 'recompress', 'true') AS recompress, s.last_run_status
+        FROM timescaledb_information.jobs j
+        LEFT JOIN timescaledb_information.job_stats s ON s.job_id = j.job_id
+       WHERE j.proc_name IN ('policy_compression', 'policy_columnstore')
+    ), agg AS (
+      SELECT ht.hypertable,
+             count(ch.chunk) AS compressed_chunks,
+             count(ch.chunk) FILTER (WHERE ch.partial) AS partial_chunks,
+             count(ch.chunk) FILTER (WHERE ch.partial AND ch.heap_bytes >= {{ inputs.min_backfill_mb }} * 1048576) AS eligible_chunks,
+             coalesce(sum(ch.heap_bytes) FILTER (WHERE ch.partial), 0) AS backfill_bytes
+        FROM ht
+        LEFT JOIN ch ON ch.hypertable = ht.hypertable
+       GROUP BY ht.hypertable
+    )
+    SELECT a.hypertable, a.compressed_chunks, a.partial_chunks, a.eligible_chunks,
+           a.backfill_bytes, pg_size_pretty(a.backfill_bytes) AS backfill_size,
+           hypertable_size(to_regclass(a.hypertable)) AS total_bytes, pg_size_pretty(hypertable_size(to_regclass(a.hypertable))) AS total_size,
+           p.job_id AS policy_job_id, coalesce(p.scheduled, false) AS policy_scheduled,
+           p.recompress AS policy_recompress, p.last_run_status AS policy_last_run,
+           CASE
+             WHEN a.partial_chunks = 0 THEN 'no partial chunks'
+             WHEN p.job_id IS NULL THEN 'no compression policy, so nothing recompresses late rows'
+             WHEN NOT p.scheduled THEN format('compression policy job %s is paused', p.job_id)
+             WHEN p.recompress = 'false' THEN format('compression policy job %s has recompress set to false', p.job_id)
+             WHEN p.last_run_status = 'Failed' THEN format('last run of compression policy job %s failed', p.job_id)
+             ELSE 'policy job is healthy, late rows arrive faster than it recompresses'
+           END AS likely_cause,
+           CASE WHEN a.eligible_chunks > 0
+                THEN coalesce(CAST(CAST('{{ (kv(render(vars.history_key), errorOnMissing=false) ?? {}) | toJson | replace({"'": "''"}) }}' AS jsonb) -> a.hypertable ->> 'streak' AS int), 0) + 1
+                ELSE 0
+           END AS streak,
+           to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS checked_at
+      FROM agg a
+      LEFT JOIN pol p ON p.hypertable = a.hypertable
+     ORDER BY a.backfill_bytes DESC, a.hypertable
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Returns one row per hypertable with compression enabled. Each row has the
+      partial chunk count, the late-row heap size, the total size, the policy job state and the
+      number of consecutive runs that found late data.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+    password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+    fetchType: FETCH
+    timeout: PT5M
+    retry:
+      type: constant
+      interval: PT20S
+      maxAttempts: 3
+    sql: "{{ render(vars.audit_sql) }}"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. Lists the partial chunks above the size floor, largest first, up to the chunk
+      limit. rewrite_bytes is the compressed chunk plus the late rows, which is the data a full
+      recompression rewrites.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+    password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+    fetchType: FETCH
+    timeout: PT5M
+    retry:
+      type: constant
+      interval: PT20S
+      maxAttempts: 3
+    sql: |
+      {{ render(vars.scope_cte) }},
+      cs AS (
+        SELECT format('%I.%I', s.chunk_schema, s.chunk_name) AS chunk, s.after_compression_total_bytes
+          FROM ht, LATERAL chunk_compression_stats(ht.hypertable::regclass) s
+      )
+      SELECT ch.hypertable, ch.chunk, ch.range_start, ch.range_end,
+             ch.heap_bytes, pg_size_pretty(ch.heap_bytes) AS heap_size,
+             coalesce(cs.after_compression_total_bytes, 0) AS compressed_bytes,
+             ch.heap_bytes + coalesce(cs.after_compression_total_bytes, 0) AS rewrite_bytes
+        FROM ch
+        LEFT JOIN cs ON cs.chunk = ch.chunk
+       WHERE ch.partial
+         AND ch.heap_bytes >= {{ inputs.min_backfill_mb }} * 1048576
+       ORDER BY ch.heap_bytes DESC, ch.chunk
+       LIMIT {{ inputs.max_chunks_per_run }}
+
+  - id: track_backfill
+    type: io.kestra.plugin.core.kv.Set
+    description: >-
+      Stores the consecutive-run count per hypertable. A hypertable without eligible partial
+      chunks drops out of the map, so its count starts again at zero.
+    key: "{{ render(vars.history_key) }}"
+    kvType: JSON
+    value: >-
+      {{ outputs.audit.rows | jq('map(select(.streak > 0) | {(.hypertable): {streak: .streak, backfill_bytes: .backfill_bytes, last_seen: .checked_at}}) | add // {}') | first | toJson }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      TimescaleDB {{ inputs.jdbc_url }}: {{ outputs.audit.size }} compressed hypertables scanned,
+      {{ outputs.audit.rows | jq('map(.partial_chunks) | add // 0') | first }} partial chunks,
+      {{ outputs.audit.rows | jq('map(.backfill_bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB of late rows on disk.
+      Plan: {{ outputs.plan.size }} chunks, {{ outputs.plan.rows | jq('map(.rewrite_bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB to rewrite.
+      {% for r in outputs.audit.rows %}{% if r.partial_chunks > 0 %}{{ r.hypertable }}: {{ r.partial_chunks }} partial of {{ r.compressed_chunks }} compressed chunks, {{ r.backfill_size }} late rows, streak {{ r.streak }}, cause: {{ r.likely_cause }}. {% endif %}{% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan.size > 0 and not inputs.dry_run }}"
+    then:
+      - id: approval_needed
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.plan.rows | jq('map(.rewrite_bytes) | add // 0') | first) > inputs.approval_threshold_mb * 1048576 }}"
+        then:
+          - id: request_approval
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: >-
+              TimescaleDB {{ inputs.jdbc_url }}: the recompression batch rewrites
+              {{ outputs.plan.rows | jq('map(.rewrite_bytes) | add // 0 | . / 1048576 | floor') | first }} MB in
+              {{ outputs.plan.size }} chunks, above the {{ inputs.approval_threshold_mb }} MB threshold.
+              Approve or reject execution {{ execution.id }} in Kestra within 4 hours.
+
+          - id: approve_batch
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Waits for a human decision. Without a decision in 4 hours the execution is
+              cancelled and no chunk changes.
+            pauseDuration: PT4H
+            behavior: CANCEL
+            onResume:
+              - id: approved
+                type: BOOL
+                description: Set to true to recompress the planned chunks.
+                defaults: false
+
+      - id: approval_result
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_batch.onResume.approved ?? true }}"
+        then:
+          - id: recompress
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One chunk at a time. Each compress_chunk call locks its chunk, so a parallel run
+              would compete with ingest on several chunks at once.
+            concurrencyLimit: 1
+            values: "{{ outputs.plan.rows | jq('map(.chunk)') | first | toJson }}"
+            tasks:
+              - id: recompress_chunk
+                type: io.kestra.plugin.jdbc.postgresql.Queries
+                description: >-
+                  compress_chunk merges the late rows of a partial chunk into its compressed data.
+                  SET LOCAL limits the lock wait to this transaction only.
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+                password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+                transaction: true
+                timeout: PT1H
+                retry:
+                  type: constant
+                  interval: PT1M
+                  maxAttempts: 3
+                sql: |
+                  SET LOCAL lock_timeout = '{{ inputs.lock_timeout_seconds }}s';
+                  SELECT compress_chunk('{{ item.value | replace({"'": "''"}) }}', if_not_compressed => true);
+
+              - id: vacuum_chunk
+                type: io.kestra.plugin.jdbc.postgresql.Queries
+                description: >-
+                  Recompression deletes the late rows from the chunk heap but leaves dead pages.
+                  VACUUM returns this space, so the size after the change is correct.
+                  VACUUM cannot run in a transaction, so transaction is false.
+                allowFailure: true
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+                password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+                transaction: false
+                timeout: PT30M
+                sql: "VACUUM (ANALYZE) {{ item.value }};"
+
+          - id: verify
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Reads the chunk catalog again for exactly the chunks in the plan.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+            password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            timeout: PT5M
+            retry:
+              type: constant
+              interval: PT20S
+              maxAttempts: 3
+            sql: |
+              SELECT count(*) AS targeted,
+                     count(*) FILTER (WHERE t.rel IS NOT NULL AND (_timescaledb_functions.chunk_status(t.rel) & 8) = 8) AS still_partial,
+                     coalesce(string_agg(t.chunk, ', ') FILTER (WHERE t.rel IS NOT NULL AND (_timescaledb_functions.chunk_status(t.rel) & 8) = 8), '') AS still_partial_chunks,
+                     coalesce(sum(pg_relation_size(t.rel)) FILTER (WHERE t.rel IS NOT NULL), 0) AS heap_bytes_after
+                FROM (
+                  SELECT u.chunk, to_regclass(u.chunk) AS rel
+                    FROM unnest(string_to_array('{{ outputs.plan.rows | jq('map(.chunk) | join(",")') | first | replace({"'": "''"}) }}', ',')) AS u(chunk)
+                ) t
+
+          - id: audit_after
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Measures every hypertable again with the same query as the audit task.
+            url: "{{ inputs.jdbc_url }}"
+            username: "{{ secret('TIMESCALEDB_USERNAME') }}"
+            password: "{{ secret('TIMESCALEDB_PASSWORD') }}"
+            fetchType: FETCH
+            timeout: PT5M
+            retry:
+              type: constant
+              interval: PT20S
+              maxAttempts: 3
+            sql: "{{ render(vars.audit_sql) }}"
+
+          - id: check_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.verify.row.still_partial > 0 }}"
+            then:
+              - id: recompression_incomplete
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  {{ outputs.verify.row.still_partial }} of {{ outputs.verify.row.targeted }} planned chunks are
+                  still partially compressed: {{ outputs.verify.row.still_partial_chunks }}.
+                  A lock timeout, an error or a concurrent write to the chunk can cause this.
+                  compress_chunk does not clear the partial flag while a writer holds the chunk.
+                  Check the recompress_chunk logs, then run the flow again after ingest stops.
+            else:
+              - id: report
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: >-
+                  TimescaleDB {{ inputs.jdbc_url }}: recompressed and verified {{ outputs.verify.row.targeted }} partial chunks.
+                  Late-row heap in these chunks went from
+                  {{ outputs.plan.rows | jq('map(.heap_bytes) | add // 0 | . / 1048576 | . * 10 | floor | . / 10') | first }} MB to
+                  {{ outputs.verify.row.heap_bytes_after | jq('. / 1048576 | . * 10 | floor | . / 10') | first }} MB.
+                  {{ {'b': outputs.audit.rows, 'a': outputs.audit_after.rows} | jq('.b as $b | .a | map(. as $x | ($b | map(select(.hypertable == $x.hypertable)) | first) as $y | select($y.eligible_chunks > 0) | "\($x.hypertable): partial chunks \($y.partial_chunks) to \($x.partial_chunks), late rows \($y.backfill_size) to \($x.backfill_size), hypertable \($y.total_size) to \($x.total_size)") | join("; ")') | first }}.
+                  {{ outputs.audit.rows | jq('map(select(.streak >= ' ~ inputs.chronic_after_runs ~ ') | "CHRONIC \(.hypertable): late data in \(.streak) runs in a row, cause: \(.likely_cause)") | join("; ")') | first }}
+        else:
+          - id: rejected
+            type: io.kestra.plugin.core.log.Log
+            message: "The approver rejected the batch. No chunk was recompressed."
+    else:
+      - id: nothing_to_do
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No change applied: {{ outputs.plan.size }} partial chunks above {{ inputs.min_backfill_mb }} MB,
+          dry_run={{ inputs.dry_run }}.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      TimescaleDB partial chunk recompression failed on {{ inputs.jdbc_url }}
+      (execution {{ execution.id }}). Read the execution logs.
+
+triggers:
+  - id: nightly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Runs after the nightly ingest backfill jobs end.
+    cron: "30 3 * * *"
+
+concurrency:
+  limit: 1
+
+extend:
+  title: Recompress TimescaleDB Chunks Left Partial by Late Data
+  metaTitle: TimescaleDB Partial Chunk Recompression Guard | Kestra
+  shortDescription: Find compressed TimescaleDB chunks that received late rows, recompress the largest in a bounded batch with compress_chunk and verify the result.
+  metaDescription: Recompress TimescaleDB chunks left partial by late rows, in a bounded batch with approval, catalog verification and size before and after.
+  description: |
+    Late rows that land in a compressed TimescaleDB chunk stay uncompressed in the chunk heap, and the chunk becomes partially compressed. Queries then read two formats. The policy job merges these rows only when it runs with `recompress` on. This flow finds partial chunks, recompresses them in a bounded batch and verifies the result.
+
+    ## How it works
+
+    1. The `nightly` Schedule trigger starts the flow. `concurrency.limit: 1` stops overlapping runs.
+    2. `audit` reads `timescaledb_information.chunks`, `chunk_status()` and the policy jobs. It returns per hypertable the partial chunks, sizes and the likely cause.
+    3. `plan` lists partial chunks above `min_backfill_mb`, largest first, up to `max_chunks_per_run`.
+    4. `track_backfill` stores in KV how many runs in a row each hypertable had late data.
+    5. Above `approval_threshold_mb`, Slack gets a message and a `Pause` waits 4 hours for approval.
+    6. A `Loop` runs `compress_chunk` and then `VACUUM` on one chunk at a time, with a lock timeout.
+    7. `verify` and `audit_after` read the catalog again. A chunk that stays partial fails the run. Else Slack gets the sizes before and after.
+
+    ## What you get
+
+    - Partial chunks, late-row size and total size per hypertable, before and after.
+    - A CHRONIC mark for hypertables with late data in many consecutive runs.
+    - A batch limit, a lock timeout and an approval gate.
+
+    ## Who it's for
+
+    - Database reliability engineers who operate TimescaleDB.
+    - Data teams with pipelines that send late data.
+
+    ## Why orchestrate this with Kestra
+
+    - Kestra logs each chunk and its result. The policy job does not report partial chunks.
+    - Retries, timeouts, approval and KV state are declared in YAML.
+
+    ## Prerequisites
+
+    - TimescaleDB 2.14 or later with compression enabled.
+    - A role that owns the hypertables.
+
+    ### Secrets
+
+    - `TIMESCALEDB_USERNAME`: role that owns the hypertables.
+    - `TIMESCALEDB_PASSWORD`: password of that role.
+    - `SLACK_WEBHOOK_URL`: Slack webhook for all messages.
+
+    ## Quick start
+
+    1. Add the three secrets.
+    2. Execute with `dry_run: true` and read the `summary` log.
+    3. Execute with `dry_run: false` and read the Slack report.
+    4. Set the trigger time after your backfill jobs.
+
+    ## How to extend
+
+    - Resume a paused policy job with `alter_job` when the cause shows it.
+    - Write the report to a history table.
+
+    ## Links
+
+    - [PostgreSQL Query task](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.query)
+    - [PostgreSQL Queries task](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.queries)
+    - [Slack Incoming Webhook task](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [TimescaleDB compress_chunk](https://github.com/timescale/docs/blob/latest/api/compression/compress_chunk.md)
+    - [TimescaleDB modify compressed data](https://github.com/timescale/docs/blob/latest/use-timescale/compression/modify-compressed-data.md)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false
