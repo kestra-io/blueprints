@@ -1,0 +1,342 @@
+id: mongodb-change-stream-to-postgres-upsert
+namespace: company.data
+
+description: |
+  Replicate the MongoDB shop.orders collection into the PostgreSQL table reporting.orders.
+  The Debezium change stream trigger captures inserts, updates and deletes.
+  Each document is mapped to a flat row and upserted with ON CONFLICT.
+  A delete becomes a tombstone row, and an older event never overwrites a newer one.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+variables:
+  mongo_database: shop
+  mongo_collection: orders
+  watermark_kv_key: mongodb_orders_reporting_watermark
+
+tasks:
+  - id: prepare_reporting_table
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: >-
+      Create the reporting table and the live view if they do not exist. The statements are idempotent.
+      The retry covers a short PostgreSQL restart before the batch fails.
+    url: "{{ secret('PG_REPORTING_JDBC_URL') }}"
+    username: "{{ secret('PG_REPORTING_USER') }}"
+    password: "{{ secret('PG_REPORTING_PASSWORD') }}"
+    retry:
+      type: constant
+      interval: PT20S
+      maxAttempts: 3
+    sql: |
+      CREATE SCHEMA IF NOT EXISTS reporting;
+
+      CREATE TABLE IF NOT EXISTS reporting.orders (
+        order_id text PRIMARY KEY,
+        source_key text NOT NULL,
+        customer_id text,
+        customer_country text,
+        status text,
+        currency text,
+        total_amount numeric(14, 2),
+        line_count integer,
+        placed_at timestamptz,
+        source_updated_at timestamptz,
+        document jsonb,
+        is_deleted boolean NOT NULL DEFAULT false,
+        deleted_at timestamptz,
+        cdc_ts_us bigint NOT NULL,
+        cdc_ord integer NOT NULL,
+        synced_at timestamptz NOT NULL DEFAULT now(),
+        synced_by_execution text NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS orders_synced_by_execution_idx
+        ON reporting.orders (synced_by_execution);
+
+      CREATE OR REPLACE VIEW reporting.orders_live AS
+        SELECT order_id, customer_id, customer_country, status, currency,
+               total_amount, line_count, placed_at, source_updated_at
+        FROM reporting.orders
+        WHERE NOT is_deleted;
+
+  - id: decode_change_events
+    type: io.kestra.plugin.serdes.json.IonToJson
+    description: The trigger writes binary Ion. Convert it to JSON lines so that the JSONata task can read it.
+    from: "{{ trigger.uris[vars.mongo_database ~ '.' ~ vars.mongo_collection] }}"
+
+  - id: map_change_events
+    type: io.kestra.plugin.transform.jsonata.TransformItems
+    description: >-
+      Map each change event to one flat row. Extended JSON values ($oid, $numberDecimal, $date) become plain values.
+      source_key keeps the _id as a JSON literal, so the MongoDB check can use it in a filter.
+      Stream events carry the cluster time (seconds, ord). Snapshot reads carry wall-clock microseconds and ord -1,
+      so they are cut to the second. A stream event of the same second then wins over the snapshot row.
+      A delete event without _id stops the run, because the collection has no pre-images.
+    from: "{{ outputs.decode_change_events.uri }}"
+    expression: |
+      (
+        $scalar := function($v) { $type($v) = 'object' ? $string($v.*[0]) : $exists($v) ? $string($v) : null };
+        $ts := function($v) {
+          $type($v) = 'object' ? (
+            $type($v.`$date`) = 'number' ? $fromMillis($v.`$date`) :
+            $type($v.`$date`) = 'string' ? $v.`$date` :
+            $fromMillis($number($v.`$date`.`$numberLong`))
+          ) : $type($v) = 'string' ? $v : null
+        };
+        $exists(_id) ? {
+          "order_id": $type(_id) = 'object' ? $scalar(_id) : $string(_id),
+          "source_key": $substring($string([_id]), 1, $length($string([_id])) - 2),
+          "customer_id": $scalar(customer.id),
+          "customer_country": $scalar(customer.country),
+          "status": $scalar(status),
+          "currency": $scalar(currency),
+          "total_amount": $scalar(total),
+          "line_count": $count(items),
+          "placed_at": $ts(placedAt),
+          "source_updated_at": $ts(updatedAt),
+          "document": $string($sift($, function($v, $k) { $k != 'metadata' and $k != 'deleted' })),
+          "is_deleted": deleted = true,
+          "deleted_at": deleted = true ? $fromMillis($floor(metadata.source.ts_us / 1000)) : null,
+          "cdc_ts_us": metadata.source.snapshot = 'false' ? metadata.source.ts_us : $floor(metadata.source.ts_us / 1000000) * 1000000,
+          "cdc_ord": metadata.source.ord
+        } : $error('Change event ' & metadata.operation & ' at ts_us ' & $string(metadata.source.ts_us) & ' has no _id. Enable changeStreamPreAndPostImages on the collection.')
+      )
+
+  - id: upsert_orders
+    type: io.kestra.plugin.jdbc.postgresql.Batch
+    description: >-
+      Upsert every event in capture order. The WHERE clause compares the MongoDB cluster time (ts_us, ord),
+      so a replayed or late event does not overwrite a newer row. A delete keeps the last values and sets is_deleted.
+    url: "{{ secret('PG_REPORTING_JDBC_URL') }}"
+    username: "{{ secret('PG_REPORTING_USER') }}"
+    password: "{{ secret('PG_REPORTING_PASSWORD') }}"
+    from: "{{ outputs.map_change_events.uri }}"
+    chunk: 500
+    timeout: PT15M
+    sql: |
+      INSERT INTO reporting.orders AS t (
+        order_id, source_key, customer_id, customer_country, status, currency,
+        total_amount, line_count, placed_at, source_updated_at, document,
+        is_deleted, deleted_at, cdc_ts_us, cdc_ord, synced_at, synced_by_execution
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?,
+        ?::text::numeric, ?::integer, ?::text::timestamptz, ?::text::timestamptz, ?::text::jsonb,
+        ?::boolean, ?::text::timestamptz, ?::bigint, ?::integer, now(), '{{ execution.id }}'
+      )
+      ON CONFLICT (order_id) DO UPDATE SET
+        source_key = EXCLUDED.source_key,
+        customer_id = EXCLUDED.customer_id,
+        customer_country = EXCLUDED.customer_country,
+        status = EXCLUDED.status,
+        currency = EXCLUDED.currency,
+        total_amount = EXCLUDED.total_amount,
+        line_count = EXCLUDED.line_count,
+        placed_at = EXCLUDED.placed_at,
+        source_updated_at = EXCLUDED.source_updated_at,
+        document = EXCLUDED.document,
+        is_deleted = EXCLUDED.is_deleted,
+        deleted_at = EXCLUDED.deleted_at,
+        cdc_ts_us = EXCLUDED.cdc_ts_us,
+        cdc_ord = EXCLUDED.cdc_ord,
+        synced_at = EXCLUDED.synced_at,
+        synced_by_execution = EXCLUDED.synced_by_execution
+      WHERE (t.cdc_ts_us, t.cdc_ord) < (EXCLUDED.cdc_ts_us, EXCLUDED.cdc_ord)
+    columns:
+      - order_id
+      - source_key
+      - customer_id
+      - customer_country
+      - status
+      - currency
+      - total_amount
+      - line_count
+      - placed_at
+      - source_updated_at
+      - document
+      - is_deleted
+      - deleted_at
+      - cdc_ts_us
+      - cdc_ord
+
+  - id: summarize_applied_rows
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read back the rows that this execution wrote. The tombstone keys feed the MongoDB check.
+    url: "{{ secret('PG_REPORTING_JDBC_URL') }}"
+    username: "{{ secret('PG_REPORTING_USER') }}"
+    password: "{{ secret('PG_REPORTING_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        count(*) FILTER (WHERE NOT is_deleted) AS upserted,
+        count(*) FILTER (WHERE is_deleted) AS tombstoned,
+        coalesce(string_agg(source_key, ',') FILTER (WHERE is_deleted), '') AS tombstone_keys,
+        max(cdc_ts_us) AS max_cdc_ts_us,
+        coalesce(extract(epoch FROM now() - to_timestamp(min(cdc_ts_us) / 1000000.0))::bigint, 0) AS oldest_change_age_s
+      FROM reporting.orders
+      WHERE synced_by_execution = '{{ execution.id }}'
+
+  - id: find_tombstoned_documents
+    type: io.kestra.plugin.mongodb.Find
+    description: Read MongoDB again. A document that this run marked as deleted must not exist in the collection.
+    connection:
+      uri: "{{ secret('MONGODB_CDC_URI') }}"
+    database: "{{ vars.mongo_database }}"
+    collection: "{{ vars.mongo_collection }}"
+    filter: '{"_id": {"$in": [{{ outputs.summarize_applied_rows.row.tombstone_keys }}]}}'
+    projection:
+      _id: 1
+    limit: 100
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+
+  - id: fail_on_live_tombstone
+    type: io.kestra.plugin.core.execution.Fail
+    description: Stop the run when an order that this run tombstoned still exists in MongoDB. The watermark does not move.
+    condition: "{{ outputs.find_tombstoned_documents.size > 0 }}"
+    errorMessage: >-
+      {{ outputs.find_tombstoned_documents.size }} order(s) are tombstoned in reporting.orders but still exist in
+      {{ vars.mongo_database }}.{{ vars.mongo_collection }}: {{ outputs.find_tombstoned_documents.rows | jq('map(._id | tostring) | join(", ")') | first }}.
+      If the documents were inserted again after the delete, the next batch restores them. Otherwise check the capture.mode property.
+
+  - id: watermark_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Move the watermark only when this batch changed at least one row. A duplicate delivery changes nothing.
+    condition: "{{ outputs.upsert_orders.updatedCount > 0 }}"
+    then:
+      - id: save_watermark
+        type: io.kestra.plugin.core.kv.Set
+        description: Store the last applied MongoDB cluster time. Dashboards and freshness checks read this key.
+        key: "{{ vars.watermark_kv_key }}"
+        kvType: JSON
+        value: |
+          {
+            "cdc_ts_us": {{ outputs.summarize_applied_rows.row.max_cdc_ts_us }},
+            "upserted": {{ outputs.summarize_applied_rows.row.upserted }},
+            "tombstoned": {{ outputs.summarize_applied_rows.row.tombstoned }},
+            "execution_id": "{{ execution.id }}",
+            "applied_at": "{{ now() }}"
+          }
+    else:
+      - id: log_duplicate_batch
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: >-
+          All {{ outputs.upsert_orders.rowCount }} events are older than the rows in reporting.orders.
+          This is a restart of a late batch or a repeated delivery. Nothing changed and the watermark stays at
+          {{ kv(vars.watermark_kv_key, errorOnMissing=false) ?? 'no value' }}.
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      reporting.orders: {{ trigger.size }} change events captured,
+      {{ outputs.upsert_orders.updatedCount }} applied,
+      {{ outputs.upsert_orders.rowCount - outputs.upsert_orders.updatedCount }} skipped as older than the stored row,
+      {{ outputs.summarize_applied_rows.row.upserted }} live and {{ outputs.summarize_applied_rows.row.tombstoned }} tombstoned keys,
+      {{ outputs.upsert_orders.updatedCount > 0 ? 'oldest applied change ' ~ outputs.summarize_applied_rows.row.oldest_change_age_s ~ ' s old' : 'no row changed' }}.
+
+errors:
+  - id: alert_sync_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Send one alert per failed batch. Upserts are idempotent, so a restart of the execution is safe.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{
+        {
+          "text": "MongoDB " ~ vars.mongo_database ~ "." ~ vars.mongo_collection ~ " to reporting.orders sync failed in execution " ~ execution.id ~ " at task " ~ ((errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown') ~ ". Restart the execution after you fix the cause. Error: " ~ ((errorLogs() | length) > 0 ? errorLogs()[0].message : 'no error log')
+        } | toJson
+      }}
+
+triggers:
+  - id: orders_change_stream
+    type: io.kestra.plugin.debezium.mongodb.Trigger
+    connectionString: "{{ secret('MONGODB_CDC_URI') }}"
+    includedCollections: shop.orders
+    snapshotMode: INITIAL
+    properties:
+      capture.mode: change_streams_update_full_with_pre_image
+    offsetsCommitMode: ON_EACH_BATCH
+    stateName: mongodb-orders-reporting
+    maxRecords: 5000
+    maxWait: PT10S
+    interval: PT1M
+
+extend:
+  title: Upsert MongoDB Change Stream Events into a PostgreSQL Reporting Table
+  metaTitle: MongoDB Change Stream to PostgreSQL Upsert with Tombstones | Kestra
+  shortDescription: Capture inserts, updates and deletes from a MongoDB collection with a change stream trigger. Upsert flat rows into PostgreSQL with ON CONFLICT, keep deletes as tombstones and verify them against MongoDB.
+  metaDescription: Replicate a MongoDB collection into a PostgreSQL reporting table with a change stream trigger, ON CONFLICT upserts, ordered tombstones and checks.
+  description: |
+    A nightly export of MongoDB orders is late and loses deletes. This flow reads the change stream and keeps `reporting.orders` in PostgreSQL current, with deletes kept as tombstones.
+
+    ## How it works
+
+    1. The Debezium MongoDB trigger reads the change stream of `shop.orders`. The first run takes a snapshot.
+    2. `prepare_reporting_table` creates the table and the `reporting.orders_live` view if they do not exist.
+    3. `decode_change_events` and `map_change_events` turn each document into one flat row and keep the full document as `jsonb`.
+    4. `upsert_orders` runs `INSERT ... ON CONFLICT DO UPDATE`. The `WHERE` clause compares the MongoDB cluster time, so a late or replayed event does not overwrite a newer row.
+    5. `find_tombstoned_documents` reads MongoDB again. The run fails if a tombstoned order still exists.
+    6. `watermark_gate` stores the last applied cluster time in the KV store only when rows changed.
+    7. `alert_sync_failure` sends a Slack message when a task fails.
+
+    ## What you get
+
+    - Upserted rows, and tombstones with `is_deleted` and `deleted_at`.
+    - Ordered, idempotent writes. A restart or replay is safe.
+    - A KV watermark for freshness checks.
+
+    ## Who it's for
+
+    - Data engineers who feed BI tools from MongoDB.
+    - Platform teams that want CDC without Kafka Connect.
+
+    ## Why orchestrate this with Kestra
+
+    - Kestra stores the change stream offset. You do not run a connector cluster.
+    - Each batch is one execution with logs and a restart button.
+    - `concurrency` with `QUEUE` applies batches in order.
+
+    ## Prerequisites
+
+    - MongoDB as a replica set, with `changeStreamPreAndPostImages` enabled on the collection.
+    - A PostgreSQL user that can create the `reporting` schema.
+
+    ### Secrets
+
+    - `MONGODB_CDC_URI`: MongoDB connection string with the replica set name.
+    - `PG_REPORTING_JDBC_URL`: JDBC URL of the reporting database.
+    - `PG_REPORTING_USER`: PostgreSQL user.
+    - `PG_REPORTING_PASSWORD`: PostgreSQL password.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for failure alerts.
+
+    ## Quick start
+
+    1. Add the five secrets to the namespace.
+    2. Change the collection variables and `includedCollections` if necessary.
+    3. Save the flow. The first execution starts within one minute.
+    4. Query `reporting.orders_live` and compare it with MongoDB.
+
+    ## How to extend
+
+    - Move order lines to a child table with a second `Batch` task.
+    - Add a schedule that purges old tombstones.
+
+    ## Links
+
+    - [Debezium MongoDB Trigger](https://kestra.io/plugins/plugin-debezium-mongodb/io.kestra.plugin.debezium.mongodb.trigger)
+    - [PostgreSQL Batch](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.batch)
+    - [MongoDB Find](https://kestra.io/plugins/plugin-mongodb/io.kestra.plugin.mongodb.find)
+    - [JSONata TransformItems](https://kestra.io/plugins/plugin-transform-json/io.kestra.plugin.transform.jsonata.transformitems)
+    - [Debezium MongoDB connector and capture.mode](https://debezium.io/documentation/reference/stable/connectors/mongodb.html)
+    - [MongoDB change streams](https://www.mongodb.com/docs/manual/changeStreams/)
+    - [PostgreSQL INSERT ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html)
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - ELT & Data Landing
+  ee: false
+  demo: false
