@@ -1,0 +1,564 @@
+# SPDX-License-Identifier: Apache-2.0
+id: oracle-to-postgres-scn-cutover
+namespace: company.team
+description: Replicate Oracle tables to PostgreSQL with log based change capture, then cut over at a frozen SCN once row counts and checksums match.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: mode
+    type: SELECT
+    values:
+      - SYNC
+      - CUTOVER
+      - ROLLBACK
+    defaults: SYNC
+    description: SYNC replicates changes. CUTOVER freezes the Oracle tables and proves the match. ROLLBACK makes them writable again.
+  - id: oracle_host
+    type: STRING
+    defaults: oracle
+  - id: oracle_port
+    type: STRING
+    defaults: "1521"
+    validator: ^[0-9]{2,5}$
+  - id: oracle_sid
+    type: STRING
+    defaults: XE
+  - id: oracle_pdb
+    type: STRING
+    defaults: XEPDB1
+  - id: cdc_user
+    type: STRING
+    defaults: c##dbzuser
+  - id: cdc_password
+    type: SECRET
+    defaults: "{{ secret('ORACLE_CDC_PASSWORD') }}"
+  - id: app_user
+    type: STRING
+    defaults: APP
+  - id: app_password
+    type: SECRET
+    defaults: "{{ secret('ORACLE_APP_PASSWORD') }}"
+  - id: pg_url
+    type: STRING
+    defaults: jdbc:postgresql://postgres:5432/target
+  - id: pg_user
+    type: STRING
+    defaults: postgres
+  - id: pg_password
+    type: SECRET
+    defaults: "{{ secret('POSTGRES_PASSWORD') }}"
+  - id: state_name
+    type: STRING
+    defaults: oracle-cutover
+  - id: capture_seconds
+    type: STRING
+    defaults: "300"
+    validator: ^[0-9]{1,4}$
+    description: Maximum seconds of one Capture run. The first run must finish the snapshot inside it.
+  - id: max_records
+    type: STRING
+    defaults: "1000000"
+    validator: ^[0-9]{1,7}$
+    description: Maximum events of one Capture run. Keep it above the largest table for the first run.
+  - id: drain_rounds
+    type: STRING
+    defaults: "6"
+    validator: ^[0-9]{1,2}$
+    description: Maximum Capture and apply rounds while draining a cutover.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true nothing is written to PostgreSQL and no capture offsets move.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: Must be true together with dry_run false for any change.
+variables:
+  oracle_url: "jdbc:oracle:thin:@//{{ inputs.oracle_host }}:{{ inputs.oracle_port }}/{{ inputs.oracle_pdb }}"
+  live: "{{ inputs.dry_run == false and inputs.auto_remediate == true }}"
+
+tasks:
+  - id: source_status
+    type: io.kestra.plugin.jdbc.oracle.Query
+    url: "{{ render(vars.oracle_url) }}"
+    username: "{{ inputs.cdc_user }}"
+    password: "{{ inputs.cdc_password }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT d.log_mode AS "log_mode",
+             d.supplemental_log_data_min AS "supplemental_min",
+             (SELECT COUNT(*) FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS')) AS "tables_found",
+             (SELECT COUNT(*) FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS') AND read_only = 'YES') AS "tables_read_only",
+             (SELECT COUNT(DISTINCT table_name) FROM all_log_groups WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS') AND log_group_type = 'ALL COLUMN LOGGING') AS "tables_logged",
+             (SELECT COUNT(*) FROM app.customers) AS "customers",
+             (SELECT COUNT(*) FROM app.orders) AS "orders",
+             TO_CHAR(d.current_scn, 'TM9') AS "current_scn"
+      FROM v$database d
+
+  - id: require_capture_ready
+    type: io.kestra.plugin.core.execution.Fail
+    condition: >-
+      {{ outputs.source_status.row.log_mode != 'ARCHIVELOG' or
+         outputs.source_status.row.supplemental_min != 'YES' or
+         outputs.source_status.row.tables_found != 2 or
+         outputs.source_status.row.tables_logged != 2 }}
+    errorMessage: Oracle must run in ARCHIVELOG mode with minimal supplemental logging and ALL COLUMN supplemental logging on APP.CUSTOMERS and APP.ORDERS before change capture can be trusted.
+
+  - id: plan
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Mode {{ inputs.mode }}. Oracle SCN {{ outputs.source_status.row.current_scn }} with
+      {{ outputs.source_status.row.customers }} customers and {{ outputs.source_status.row.orders }} orders;
+      {{ outputs.source_status.row.tables_read_only }} of 2 tables read only.
+      {{ render(vars.live) == 'true' ? 'Live run: changes will be applied.' : 'Dry run: nothing is written to PostgreSQL and no capture offsets move.' }}
+
+  - id: live_run
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ render(vars.live) == 'true' }}"
+    then:
+      - id: ensure_target
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        url: "{{ inputs.pg_url }}"
+        username: "{{ inputs.pg_user }}"
+        password: "{{ inputs.pg_password }}"
+        sql: |
+          CREATE TABLE IF NOT EXISTS customers (id BIGINT PRIMARY KEY, name VARCHAR(80) NOT NULL, tier VARCHAR(10), updated_at TIMESTAMP(6));
+          CREATE TABLE IF NOT EXISTS orders (id BIGINT PRIMARY KEY, customer_id BIGINT NOT NULL, amount NUMERIC(12,2) NOT NULL, status VARCHAR(12) NOT NULL);
+          CREATE TABLE IF NOT EXISTS cdc_stage_customers (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT, name TEXT, tier TEXT, updated_at TEXT, deleted BOOLEAN, op TEXT, scn TEXT, commit_scn TEXT);
+          CREATE TABLE IF NOT EXISTS cdc_stage_orders (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT, customer_id TEXT, amount TEXT, status TEXT, deleted BOOLEAN, op TEXT, scn TEXT, commit_scn TEXT);
+          CREATE TABLE IF NOT EXISTS cdc_progress (table_name TEXT PRIMARY KEY, applied_scn NUMERIC NOT NULL, rows_applied BIGINT NOT NULL, applied_at TIMESTAMPTZ NOT NULL);
+          CREATE TABLE IF NOT EXISTS cutover_log (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, execution_id TEXT NOT NULL, state TEXT NOT NULL, freeze_scn NUMERIC, applied_scn NUMERIC, details JSONB, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+      - id: cutover_state
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ inputs.pg_url }}"
+        username: "{{ inputs.pg_user }}"
+        password: "{{ inputs.pg_password }}"
+        fetchType: FETCH_ONE
+        sql: SELECT COALESCE((SELECT state FROM cutover_log ORDER BY id DESC LIMIT 1), 'NONE') AS state
+
+      - id: require_open_cutover
+        type: io.kestra.plugin.core.execution.Fail
+        condition: >-
+          {{ (inputs.mode == 'SYNC' and (outputs.cutover_state.row.state == 'FREEZING' or outputs.cutover_state.row.state == 'FROZEN' or outputs.cutover_state.row.state == 'COMPLETED')) or
+             (inputs.mode == 'CUTOVER' and outputs.cutover_state.row.state == 'COMPLETED') or
+             (inputs.mode == 'ROLLBACK' and (outputs.cutover_state.row.state == 'NONE' or outputs.cutover_state.row.state == 'ROLLED_BACK')) }}
+        errorMessage: "The recorded cutover state does not allow this mode. SYNC needs no cutover in progress, CUTOVER needs one that is not completed and ROLLBACK needs one to reopen."
+
+      - id: cutover_approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.mode == 'CUTOVER' and outputs.cutover_state.row.state != 'FROZEN' }}"
+        then:
+          - id: approve_cutover
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: PT1H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Approve making APP.CUSTOMERS and APP.ORDERS read only in Oracle and cutting over to PostgreSQL.
+              - id: writers_stopped
+                type: BOOL
+                defaults: false
+                description: Confirm that applications have stopped writing to these tables or can tolerate failed writes.
+
+      - id: cutover_prepare
+        type: io.kestra.plugin.core.flow.If
+        condition: >-
+          {{ inputs.mode == 'CUTOVER' and
+             (outputs.cutover_state.row.state == 'FROZEN' or
+              (outputs.approve_cutover.onResume.approved == true and outputs.approve_cutover.onResume.writers_stopped == true)) }}
+        then:
+          - id: recheck_source
+            type: io.kestra.plugin.jdbc.oracle.Query
+            url: "{{ render(vars.oracle_url) }}"
+            username: "{{ inputs.cdc_user }}"
+            password: "{{ inputs.cdc_password }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT (SELECT COUNT(*) FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS')) AS "tables_found",
+                     (SELECT COUNT(*) FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS') AND read_only = 'YES') AS "tables_read_only"
+              FROM dual
+
+          - id: recheck_state
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.pg_url }}"
+            username: "{{ inputs.pg_user }}"
+            password: "{{ inputs.pg_password }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT COALESCE((SELECT state FROM cutover_log ORDER BY id DESC LIMIT 1), 'NONE') AS state,
+                     (SELECT COUNT(*) FROM cdc_progress WHERE table_name = '_SYNC') AS synced
+
+          - id: require_unchanged_plan
+            type: io.kestra.plugin.core.execution.Fail
+            condition: >-
+              {{ outputs.recheck_state.row.state != outputs.cutover_state.row.state or
+                 outputs.recheck_state.row.synced != 1 or
+                 outputs.recheck_source.row.tables_found != 2 or
+                 (outputs.recheck_state.row.state != 'FROZEN' and outputs.recheck_source.row.tables_read_only != 0) }}
+            errorMessage: The cutover state, the sync progress or the source tables changed while the approval was pending or no SYNC run has completed yet. Nothing was frozen. Run again from the current state.
+
+          - id: freeze_begin
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.pg_url }}"
+            username: "{{ inputs.pg_user }}"
+            password: "{{ inputs.pg_password }}"
+            sql: >-
+              INSERT INTO cutover_log (execution_id, state)
+              SELECT '{{ execution.id }}', 'FREEZING'
+              WHERE NOT EXISTS (SELECT 1 FROM cutover_log WHERE state = 'FREEZING' AND id = (SELECT MAX(id) FROM cutover_log))
+                AND NOT EXISTS (SELECT 1 FROM cutover_log WHERE state = 'FROZEN' AND id = (SELECT MAX(id) FROM cutover_log))
+
+          - id: freeze_source
+            type: io.kestra.plugin.jdbc.oracle.Queries
+            url: "{{ render(vars.oracle_url) }}"
+            username: "{{ inputs.app_user }}"
+            password: "{{ inputs.app_password }}"
+            sql: |
+              ALTER TABLE app.customers READ ONLY;
+              ALTER TABLE app.orders READ ONLY
+
+          - id: verify_frozen
+            type: io.kestra.plugin.jdbc.oracle.Query
+            url: "{{ render(vars.oracle_url) }}"
+            username: "{{ inputs.cdc_user }}"
+            password: "{{ inputs.cdc_password }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT (SELECT COUNT(*) FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS') AND read_only = 'YES') AS "tables_read_only",
+                     TO_CHAR((SELECT current_scn FROM v$database), 'TM9') AS "freeze_scn"
+              FROM dual
+
+          - id: require_frozen
+            type: io.kestra.plugin.core.execution.Fail
+            condition: "{{ outputs.verify_frozen.row.tables_read_only != 2 }}"
+            errorMessage: The source tables are not read only after the freeze. Run ROLLBACK to reopen them.
+
+          - id: freeze_mark
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.pg_url }}"
+            username: "{{ inputs.pg_user }}"
+            password: "{{ inputs.pg_password }}"
+            sql: >-
+              UPDATE cutover_log SET state = 'FROZEN', freeze_scn = {{ outputs.verify_frozen.row.freeze_scn }}, updated_at = now()
+              WHERE id = (SELECT MAX(id) FROM cutover_log) AND state = 'FREEZING'
+
+      - id: sync_loop
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.mode == 'SYNC' or (inputs.mode == 'CUTOVER' and outputs.freeze_mark is defined) }}"
+        then:
+          - id: apply_changes
+            type: io.kestra.plugin.core.flow.LoopUntil
+            condition: "{{ inputs.mode == 'SYNC' or outputs.parity.row.match == true }}"
+            checkFrequency:
+              interval: PT5S
+              maxIterations: "{{ inputs.drain_rounds }}"
+            failOnMaxReached: true
+            tasks:
+              - id: capture
+                type: io.kestra.plugin.debezium.oracle.Capture
+                hostname: "{{ inputs.oracle_host }}"
+                port: "{{ inputs.oracle_port }}"
+                username: "{{ inputs.cdc_user }}"
+                password: "{{ inputs.cdc_password }}"
+                sid: "{{ inputs.oracle_sid }}"
+                pluggableDatabase: "{{ inputs.oracle_pdb }}"
+                snapshotMode: INITIAL
+                includedTables: APP.CUSTOMERS,APP.ORDERS
+                maxRecords: "{{ inputs.max_records }}"
+                maxDuration: "PT{{ inputs.capture_seconds }}S"
+                maxWait: PT10S
+                stateName: "{{ inputs.state_name }}"
+                format: INLINE
+                metadata: ADD_FIELD
+                deleted: ADD_FIELD
+                splitTable: TABLE
+                properties:
+                  decimal.handling.mode: string
+
+              - id: customers_changes
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.capture.uris['XEPDB1.CUSTOMERS'] is defined }}"
+                then:
+                  - id: customers_to_json
+                    type: io.kestra.plugin.serdes.json.IonToJson
+                    from: "{{ outputs.capture.uris['XEPDB1.CUSTOMERS'] }}"
+                  - id: flatten_customers
+                    type: io.kestra.plugin.transform.jsonata.TransformItems
+                    from: "{{ outputs.customers_to_json.uri }}"
+                    expression: >-
+                      {"id": ID, "name": NAME, "tier": TIER, "updated_at": UPDATED_AT, "deleted": deleted,
+                       "op": metadata.operation, "scn": metadata.source.scn, "commit_scn": metadata.source.commit_scn}
+                  - id: stage_customers
+                    type: io.kestra.plugin.jdbc.postgresql.Batch
+                    url: "{{ inputs.pg_url }}"
+                    username: "{{ inputs.pg_user }}"
+                    password: "{{ inputs.pg_password }}"
+                    from: "{{ outputs.flatten_customers.uri }}"
+                    sql: INSERT INTO cdc_stage_customers (id, name, tier, updated_at, deleted, op, scn, commit_scn) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    columns: [id, name, tier, updated_at, deleted, op, scn, commit_scn]
+                  - id: apply_customers
+                    type: io.kestra.plugin.jdbc.postgresql.Queries
+                    url: "{{ inputs.pg_url }}"
+                    username: "{{ inputs.pg_user }}"
+                    password: "{{ inputs.pg_password }}"
+                    sql: |
+                      WITH latest AS (
+                        SELECT DISTINCT ON (id) id::bigint AS id, name, tier, updated_at::timestamp AS updated_at, deleted
+                        FROM cdc_stage_customers ORDER BY id, seq DESC
+                      ), removed AS (
+                        DELETE FROM customers c USING latest l WHERE c.id = l.id AND l.deleted RETURNING c.id
+                      )
+                      INSERT INTO customers (id, name, tier, updated_at)
+                      SELECT id, name, tier, updated_at FROM latest WHERE NOT deleted
+                      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, tier = EXCLUDED.tier, updated_at = EXCLUDED.updated_at;
+                      INSERT INTO cdc_progress (table_name, applied_scn, rows_applied, applied_at)
+                      SELECT 'CUSTOMERS', MAX(COALESCE(commit_scn, scn)::numeric), COUNT(*), now() FROM cdc_stage_customers HAVING COUNT(*) > 0
+                      ON CONFLICT (table_name) DO UPDATE SET applied_scn = GREATEST(cdc_progress.applied_scn, EXCLUDED.applied_scn), rows_applied = cdc_progress.rows_applied + EXCLUDED.rows_applied, applied_at = EXCLUDED.applied_at;
+                      TRUNCATE cdc_stage_customers
+
+              - id: orders_changes
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.capture.uris['XEPDB1.ORDERS'] is defined }}"
+                then:
+                  - id: orders_to_json
+                    type: io.kestra.plugin.serdes.json.IonToJson
+                    from: "{{ outputs.capture.uris['XEPDB1.ORDERS'] }}"
+                  - id: flatten_orders
+                    type: io.kestra.plugin.transform.jsonata.TransformItems
+                    from: "{{ outputs.orders_to_json.uri }}"
+                    expression: >-
+                      {"id": ID, "customer_id": CUSTOMER_ID, "amount": AMOUNT, "status": STATUS, "deleted": deleted,
+                       "op": metadata.operation, "scn": metadata.source.scn, "commit_scn": metadata.source.commit_scn}
+                  - id: stage_orders
+                    type: io.kestra.plugin.jdbc.postgresql.Batch
+                    url: "{{ inputs.pg_url }}"
+                    username: "{{ inputs.pg_user }}"
+                    password: "{{ inputs.pg_password }}"
+                    from: "{{ outputs.flatten_orders.uri }}"
+                    sql: INSERT INTO cdc_stage_orders (id, customer_id, amount, status, deleted, op, scn, commit_scn) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    columns: [id, customer_id, amount, status, deleted, op, scn, commit_scn]
+                  - id: apply_orders
+                    type: io.kestra.plugin.jdbc.postgresql.Queries
+                    url: "{{ inputs.pg_url }}"
+                    username: "{{ inputs.pg_user }}"
+                    password: "{{ inputs.pg_password }}"
+                    sql: |
+                      WITH latest AS (
+                        SELECT DISTINCT ON (id) id::bigint AS id, customer_id::bigint AS customer_id, amount::numeric(12,2) AS amount, status, deleted
+                        FROM cdc_stage_orders ORDER BY id, seq DESC
+                      ), removed AS (
+                        DELETE FROM orders o USING latest l WHERE o.id = l.id AND l.deleted RETURNING o.id
+                      )
+                      INSERT INTO orders (id, customer_id, amount, status)
+                      SELECT id, customer_id, amount, status FROM latest WHERE NOT deleted
+                      ON CONFLICT (id) DO UPDATE SET customer_id = EXCLUDED.customer_id, amount = EXCLUDED.amount, status = EXCLUDED.status;
+                      INSERT INTO cdc_progress (table_name, applied_scn, rows_applied, applied_at)
+                      SELECT 'ORDERS', MAX(COALESCE(commit_scn, scn)::numeric), COUNT(*), now() FROM cdc_stage_orders HAVING COUNT(*) > 0
+                      ON CONFLICT (table_name) DO UPDATE SET applied_scn = GREATEST(cdc_progress.applied_scn, EXCLUDED.applied_scn), rows_applied = cdc_progress.rows_applied + EXCLUDED.rows_applied, applied_at = EXCLUDED.applied_at;
+                      TRUNCATE cdc_stage_orders
+
+              - id: mark_sync
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.pg_url }}"
+                username: "{{ inputs.pg_user }}"
+                password: "{{ inputs.pg_password }}"
+                sql: >-
+                  INSERT INTO cdc_progress (table_name, applied_scn, rows_applied, applied_at) VALUES ('_SYNC', 0, 0, now())
+                  ON CONFLICT (table_name) DO UPDATE SET applied_at = now()
+
+              - id: parity_check
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ inputs.mode == 'CUTOVER' }}"
+                then:
+                  - id: source_fingerprint
+                    type: io.kestra.plugin.jdbc.oracle.Query
+                    url: "{{ render(vars.oracle_url) }}"
+                    username: "{{ inputs.cdc_user }}"
+                    password: "{{ inputs.cdc_password }}"
+                    fetchType: FETCH_ONE
+                    sql: |
+                      SELECT (SELECT COUNT(*) FROM app.customers) AS "customers_count",
+                             (SELECT TO_CHAR(NVL(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH(t, 'MD5')), 1, 12), 'XXXXXXXXXXXX')), 0), 'TM9')
+                                FROM (SELECT id || '|' || name || '|' || NVL(tier, '') || '|' || TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF6') AS t FROM app.customers)) AS "customers_hash",
+                             (SELECT COUNT(*) FROM app.orders) AS "orders_count",
+                             (SELECT TO_CHAR(NVL(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH(t, 'MD5')), 1, 12), 'XXXXXXXXXXXX')), 0), 'TM9')
+                                FROM (SELECT id || '|' || customer_id || '|' || TO_CHAR(amount, 'FM999999999990.00') || '|' || status AS t FROM app.orders)) AS "orders_hash"
+                      FROM dual
+                  - id: parity
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ inputs.pg_url }}"
+                    username: "{{ inputs.pg_user }}"
+                    password: "{{ inputs.pg_password }}"
+                    fetchType: FETCH_ONE
+                    sql: |
+                      WITH c AS (
+                        SELECT COUNT(*) AS n,
+                               COALESCE(SUM(('x' || SUBSTR(MD5(id || '|' || name || '|' || COALESCE(tier, '') || '|' || TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US')), 1, 12))::bit(48)::bigint::numeric), 0) AS h
+                        FROM customers
+                      ), o AS (
+                        SELECT COUNT(*) AS n,
+                               COALESCE(SUM(('x' || SUBSTR(MD5(id || '|' || customer_id || '|' || TO_CHAR(amount, 'FM999999999990.00') || '|' || status), 1, 12))::bit(48)::bigint::numeric), 0) AS h
+                        FROM orders
+                      )
+                      SELECT (c.n = {{ outputs.source_fingerprint.row.customers_count }} AND c.h = {{ outputs.source_fingerprint.row.customers_hash }}
+                              AND o.n = {{ outputs.source_fingerprint.row.orders_count }} AND o.h = {{ outputs.source_fingerprint.row.orders_hash }}) AS match,
+                             c.n AS customers_target, o.n AS orders_target, c.h::text AS customers_hash_target, o.h::text AS orders_hash_target
+                      FROM c, o
+
+      - id: complete_cutover
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.mode == 'CUTOVER' and outputs.freeze_mark is defined }}"
+        then:
+          - id: record_cutover
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            url: "{{ inputs.pg_url }}"
+            username: "{{ inputs.pg_user }}"
+            password: "{{ inputs.pg_password }}"
+            fetchType: FETCH_ONE
+            sql: >-
+              UPDATE cutover_log SET state = 'COMPLETED', applied_scn = (SELECT MAX(applied_scn) FROM cdc_progress),
+                     details = jsonb_build_object('customers', {{ outputs.source_fingerprint.row.customers_count }}, 'orders', {{ outputs.source_fingerprint.row.orders_count }},
+                                                  'customers_hash', '{{ outputs.source_fingerprint.row.customers_hash }}', 'orders_hash', '{{ outputs.source_fingerprint.row.orders_hash }}',
+                                                  'completed_by', '{{ execution.id }}'),
+                     updated_at = now()
+              WHERE id = (SELECT MAX(id) FROM cutover_log) AND state = 'FROZEN'
+              RETURNING id, state, freeze_scn::text AS freeze_scn, applied_scn::text AS applied_scn
+
+          - id: require_recorded
+            type: io.kestra.plugin.core.execution.Fail
+            condition: "{{ outputs.record_cutover.row.state != 'COMPLETED' }}"
+            errorMessage: The cutover could not be recorded as completed.
+
+          - id: cutover_done
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Cutover recorded: freeze SCN {{ outputs.record_cutover.row.freeze_scn }}, last applied SCN {{ outputs.record_cutover.row.applied_scn }},
+              {{ outputs.source_fingerprint.row.customers_count }} customers and {{ outputs.source_fingerprint.row.orders_count }} orders match in PostgreSQL.
+              Repoint the applications now. The Oracle tables stay read only.
+
+      - id: rollback_approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.mode == 'ROLLBACK' }}"
+        then:
+          - id: approve_rollback
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: PT1H
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Approve making APP.CUSTOMERS and APP.ORDERS writable again in Oracle.
+
+          - id: reopen_source
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approve_rollback.onResume.approved == true }}"
+            then:
+              - id: make_writable
+                type: io.kestra.plugin.jdbc.oracle.Queries
+                url: "{{ render(vars.oracle_url) }}"
+                username: "{{ inputs.app_user }}"
+                password: "{{ inputs.app_password }}"
+                sql: |
+                  ALTER TABLE app.customers READ WRITE;
+                  ALTER TABLE app.orders READ WRITE
+              - id: verify_writable
+                type: io.kestra.plugin.jdbc.oracle.Query
+                url: "{{ render(vars.oracle_url) }}"
+                username: "{{ inputs.cdc_user }}"
+                password: "{{ inputs.cdc_password }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT COUNT(*) AS "tables_read_only" FROM all_tables WHERE owner = 'APP' AND table_name IN ('CUSTOMERS', 'ORDERS') AND read_only = 'YES'
+              - id: require_writable
+                type: io.kestra.plugin.core.execution.Fail
+                condition: "{{ outputs.verify_writable.row.tables_read_only != 0 }}"
+                errorMessage: The source tables are still read only after the rollback.
+              - id: record_rollback
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                url: "{{ inputs.pg_url }}"
+                username: "{{ inputs.pg_user }}"
+                password: "{{ inputs.pg_password }}"
+                sql: INSERT INTO cutover_log (execution_id, state, details) VALUES ('{{ execution.id }}', 'ROLLED_BACK', jsonb_build_object('rolled_back_by', '{{ execution.id }}'))
+
+errors:
+  - id: alert_cutover_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {'text': 'Oracle to PostgreSQL ' ~ inputs.mode ~ ' failed. Execution ' ~ execution.id ~ '. If the source tables are read only after a failed CUTOVER, run ROLLBACK to reopen them or fix the cause and run CUTOVER again.'} | toJson }}
+
+triggers:
+  - id: scheduled_sync
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "*/5 * * * *"
+    inputs:
+      mode: SYNC
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Cut over Oracle tables to PostgreSQL at a frozen SCN
+  metaTitle: Oracle to PostgreSQL cutover at a frozen SCN with Kestra
+  shortDescription: Replicate Oracle tables to PostgreSQL with Debezium LogMiner, then freeze the source, drain the changes and cut over only after a checksum match.
+  metaDescription: Replicate Oracle to PostgreSQL with Debezium LogMiner, freeze the source at a recorded SCN, drain the last changes and cut over after a checksum match.
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+  ee: false
+  demo: false
+  description: |
+    Polling copies miss hard deletes and intermediate updates, so a PostgreSQL replica drifts from Oracle. This flow follows the Oracle redo log and ends with a cutover that is proved instead of assumed.
+
+    ## How it works
+    SYNC runs the native Debezium Oracle Capture. The first run takes a consistent snapshot and later runs stream changes from offsets kept in the KV store. Each batch is flattened with JSONata and staged in PostgreSQL. One transaction applies the last event per key as an upsert or a delete.
+
+    CUTOVER asks for approval through a Pause and rechecks that nothing changed while it waited. It makes both Oracle tables READ ONLY and verifies that. It reads the freeze SCN and loops through Capture and apply until the row count and an MD5 sum of every row match in both databases. Then it writes a COMPLETED cutover record.
+
+    ROLLBACK makes the Oracle tables writable again after approval. Offsets stay valid, so SYNC can continue.
+
+    ## What you get
+    PostgreSQL tables that match Oracle at the freeze and a cutover_log row with the freeze SCN and the last applied SCN. A run that cannot prove the match fails and leaves the source read only.
+
+    ## Who it's for
+    Teams moving an Oracle schema to PostgreSQL that cannot accept a long read only window or trust a one-off copy.
+
+    ## Why orchestrate this with Kestra
+    The KV store carries offsets between runs. Pause holds the approval. LoopUntil keeps draining until the proof holds. Restarting a failed execution reuses the captured events, so a failure after Capture loses nothing.
+
+    ## Tested end to end
+    Kestra 2.0.6 and 2.0.5 with Oracle XE 21c and PostgreSQL 17.5. Writers ran during the snapshot. Updates, deletes and a delete followed by a reinsert arrived as changes. A failed apply was restarted and a killed capture was rerun. Declined and stale approvals, a refused freeze, a parity mismatch that resumed without a new approval and both rollback answers were exercised. Every result was compared row by row with sqlplus and psql.
+
+    ## Prerequisites
+    Oracle 19c or 21c in ARCHIVELOG mode with minimal and ALL COLUMN supplemental logging on each table. A capture user with the LogMiner grants from the Debezium documentation and an owner account that may run ALTER TABLE READ ONLY. PostgreSQL 13 or later. The Debezium Oracle, JDBC Oracle, JDBC PostgreSQL, Transform JSON, Serdes and Slack plugins.
+
+    ### Secrets
+    ORACLE_CDC_PASSWORD, ORACLE_APP_PASSWORD, POSTGRES_PASSWORD and SLACK_WEBHOOK_URL.
+
+    ### Inputs
+    mode selects SYNC, CUTOVER or ROLLBACK. dry_run defaults to true and auto_remediate to false, so nothing changes until both are flipped. capture_seconds and max_records bound each Capture run. The first run must finish the snapshot, so keep both above the largest table.
+
+    ## Quick start
+    1. Enable ARCHIVELOG and supplemental logging. Create the capture user.
+    2. Set the secrets. Run SYNC as a dry run and read the plan.
+    3. Run SYNC with dry_run false and auto_remediate true. Enable the schedule to keep it current.
+    4. Stop the writers. Run CUTOVER and approve it. Repoint the applications when it reports COMPLETED.
+
+    ## How to extend
+    Add a table by copying one table block and its fingerprint. Primary key updates, tables without a primary key and DDL are outside the flow. The fingerprint reads whole tables, so sample very large ones. LogMiner needs the archived logs to stay available between runs.
+
+    ## Links
+    - [Debezium Oracle plugin](https://kestra.io/plugins/plugin-debezium)
+    - [Debezium Oracle connector](https://debezium.io/documentation/reference/stable/connectors/oracle.html)
+    - [Oracle ALTER TABLE](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/ALTER-TABLE.html)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
