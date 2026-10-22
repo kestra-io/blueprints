@@ -1,0 +1,362 @@
+id: ml-feature-availability-contract-gate
+namespace: company.ml
+description: Validate per-feature completeness and freshness plus joint usable-row coverage before releasing a training dataset approval.
+
+inputs:
+  - id: candidate_csv
+    type: STRING
+    description: UTF-8 CSV with a unique header and one training example per row. Empty or whitespace-only feature values are null. Extra columns are allowed.
+    defaults: |
+      customer_id,customer_age,profile_updated_at,transaction_count_30d,transactions_updated_at
+      1,25,2026-01-01T12:00:00Z,5,2026-01-02T11:00:00Z
+      2,40,2026-01-01T12:00:00Z,0,2026-01-02T10:00:00Z
+      3,31,2026-01-01T12:00:00Z,2,2026-01-02T09:00:00Z
+      4,60,2026-01-01T12:00:00Z,8,2026-01-02T08:00:00Z
+  - id: feature_contract
+    type: JSON
+    description: Strict version-1 contract. All listed features are required; fractions are in [0,1], age hours are nonnegative, and min_rows is a positive integer.
+    defaults:
+      version: 1
+      min_rows: 4
+      min_joint_usable_fraction: 1.0
+      features:
+        - name: customer_age
+          timestamp_field: profile_updated_at
+          max_null_fraction: 0.0
+          max_age_hours: 720
+          max_stale_fraction: 0.0
+        - name: transaction_count_30d
+          timestamp_field: transactions_updated_at
+          max_null_fraction: 0.0
+          max_age_hours: 24
+          max_stale_fraction: 0.0
+  - id: evaluation_time
+    type: STRING
+    defaults: "2026-01-02T12:00:00Z"
+    description: RFC3339 timestamp with Z or numeric offset. Fixed default makes the demo reproducible; set empty to capture current UTC once for production.
+
+triggers:
+  - id: scheduled_readiness_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"
+    timezone: UTC
+    disabled: true
+
+tasks:
+  - id: stage_candidate
+    type: io.kestra.plugin.core.storage.Write
+    description: Freeze the submitted CSV in execution storage; approval references this exact artifact rather than a mutable source path.
+    extension: .csv
+    content: "{{ inputs.candidate_csv }}"
+
+  - id: validate_availability
+    type: io.kestra.plugin.scripts.python.Script
+    description: Stream the staged CSV, validate the contract, and persist a complete audit before the flow makes its approval decision.
+    timeout: PT5M
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      candidate.csv: "{{ outputs.stage_candidate.uri }}"
+      contract.json: "{{ inputs.feature_contract | toJson }}"
+    env:
+      EVALUATION_TIME: "{{ inputs.evaluation_time }}"
+      DATASET_URI: "{{ outputs.stage_candidate.uri }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    outputFiles:
+      - audit.json
+    script: |
+      import csv
+      import hashlib
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from decimal import Decimal
+      from pathlib import Path
+
+      def reject_constant(value):
+          raise ValueError("Non-finite JSON number")
+
+      def unique_object(pairs):
+          result = {}
+          for key, value in pairs:
+              if key in result:
+                  raise ValueError("Duplicate JSON key")
+              result[key] = value
+          return result
+
+      def timestamp(value):
+          if not isinstance(value, str) or not re.fullmatch(
+              r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", value
+          ) or value.endswith("-00:00"):
+              raise ValueError("Expected RFC3339 with a known offset")
+          return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+      def number(value, name, fraction=False):
+          if type(value) not in (int, float) or not Decimal(str(value)).is_finite():
+              raise ValueError(name + " must be a finite number")
+          if value < 0 or (fraction and value > 1):
+              raise ValueError(name + " is outside its allowed range")
+
+      def validate_contract(contract):
+          if not isinstance(contract, dict) or set(contract) != {
+              "version", "min_rows", "min_joint_usable_fraction", "features"
+          }:
+              raise ValueError("Contract must contain exactly the version-1 fields")
+          if type(contract["version"]) is not int or contract["version"] != 1:
+              raise ValueError("Unsupported contract version")
+          if type(contract["min_rows"]) is not int or contract["min_rows"] < 1:
+              raise ValueError("min_rows must be a positive integer")
+          number(contract["min_joint_usable_fraction"], "min_joint_usable_fraction", True)
+          features = contract["features"]
+          if not isinstance(features, list) or not features:
+              raise ValueError("features must be a nonempty list")
+          names = set()
+          for feature in features:
+              if not isinstance(feature, dict) or set(feature) != {
+                  "name", "timestamp_field", "max_null_fraction", "max_age_hours", "max_stale_fraction"
+              }:
+                  raise ValueError("Each feature must contain exactly the documented fields")
+              for key in ("name", "timestamp_field"):
+                  value = feature[key]
+                  if not isinstance(value, str) or not value.strip() or value != value.strip():
+                      raise ValueError(key + " must be a nonempty trimmed column name")
+              if feature["name"] in names or feature["name"] == feature["timestamp_field"]:
+                  raise ValueError("Duplicate feature or feature used as its own timestamp")
+              names.add(feature["name"])
+              number(feature["max_null_fraction"], "max_null_fraction", True)
+              number(feature["max_stale_fraction"], "max_stale_fraction", True)
+              number(feature["max_age_hours"], "max_age_hours")
+
+      report = {
+          "report_version": 1, "status": "REJECTED", "approved": False,
+          "execution_id": os.environ["EXECUTION_ID"],
+          "dataset": {"uri": os.environ["DATASET_URI"], "sha256": None},
+          "contract": None, "contract_sha256": None, "evaluation_time": None,
+          "row_count": 0, "joint_usable_rows": 0, "joint_usable_fraction": None,
+          "features": [], "failure_reasons": [], "evaluation_complete": False,
+      }
+
+      def fail(code, **details):
+          report["failure_reasons"].append({"code": code, **details})
+
+      def evaluate():
+          try:
+              raw_time = os.environ.get("EVALUATION_TIME", "")
+              evaluated_at = timestamp(raw_time) if raw_time else datetime.now(timezone.utc)
+          except (ValueError, OverflowError):
+              fail("INVALID_EVALUATION_TIME")
+              return
+          report["evaluation_time"] = evaluated_at.isoformat()
+          # Hash the same immutable staged file that the CSV reader consumes.
+          with open("candidate.csv", "rb") as source:
+              report["dataset"]["sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
+          raw_contract = Path("contract.json").read_bytes()
+          report["contract_sha256"] = hashlib.sha256(raw_contract).hexdigest()
+          try:
+              contract = json.loads(raw_contract, parse_constant=reject_constant, object_pairs_hook=unique_object)
+              validate_contract(contract)
+          except (ValueError, TypeError, UnicodeError) as error:
+              fail("INVALID_CONTRACT", detail=str(error))
+              return
+          report["contract"] = contract
+          features = contract["features"]
+          metrics = [{
+              "name": f["name"], "timestamp_field": f["timestamp_field"],
+              "thresholds": {k: f[k] for k in ("max_null_fraction", "max_age_hours", "max_stale_fraction")},
+              "null_count": 0, "stale_count": 0, "invalid_timestamp_count": 0,
+              "future_timestamp_count": 0, "usable_count": 0,
+          } for f in features]
+          report["features"] = metrics
+          with open("candidate.csv", encoding="utf-8-sig", newline="") as source:
+              reader = csv.reader(source, strict=True)
+              header = next(reader, [])
+              if not header:
+                  fail("EMPTY_DATASET")
+                  return
+              if len(set(header)) != len(header) or any(not c.strip() or c != c.strip() for c in header):
+                  fail("INVALID_HEADER")
+                  return
+              missing = sorted({f[k] for f in features for k in ("name", "timestamp_field")} - set(header))
+              if missing:
+                  fail("MISSING_COLUMNS", columns=missing)
+                  return
+              indices = [(header.index(f["name"]), header.index(f["timestamp_field"])) for f in features]
+              for row in reader:
+                  if len(row) != len(header):
+                      fail("INVALID_ROW_WIDTH", row=reader.line_num)
+                      return
+                  report["row_count"] += 1
+                  joint = True
+                  for f, m, (value_index, time_index) in zip(features, metrics, indices):
+                      is_null = not row[value_index].strip()
+                      m["null_count"] += int(is_null)
+                      usable = not is_null
+                      try:
+                          observed_at = timestamp(row[time_index])
+                          delta = evaluated_at - observed_at
+                          age_us = ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds)
+                          if age_us < 0:
+                              m["future_timestamp_count"] += 1
+                              usable = False
+                          elif Decimal(age_us) > Decimal(str(f["max_age_hours"])) * 3600000000:
+                              m["stale_count"] += 1
+                              usable = False
+                      except (ValueError, OverflowError):
+                          m["invalid_timestamp_count"] += 1
+                          usable = False
+                      m["usable_count"] += int(usable)
+                      joint = joint and usable
+                  report["joint_usable_rows"] += int(joint)
+          count = report["row_count"]
+          if count == 0:
+              fail("EMPTY_DATASET")
+          if count < contract["min_rows"]:
+              fail("INSUFFICIENT_ROWS", observed=count, threshold=contract["min_rows"])
+          for f, m in zip(features, metrics):
+              for metric in ("null", "stale", "usable"):
+                  m[metric + "_fraction"] = m[metric + "_count"] / count if count else None
+              for metric in ("null", "stale"):
+                  threshold = f["max_" + metric + "_fraction"]
+                  if count and Decimal(m[metric + "_count"]) > Decimal(str(threshold)) * count:
+                      fail("EXCESSIVE_" + metric.upper(), feature=f["name"], observed=m[metric + "_fraction"], threshold=threshold)
+              for metric in ("invalid_timestamp", "future_timestamp"):
+                  if m[metric + "_count"]:
+                      fail(metric.upper(), feature=f["name"], count=m[metric + "_count"])
+          report["joint_usable_fraction"] = report["joint_usable_rows"] / count if count else None
+          if count and Decimal(report["joint_usable_rows"]) < Decimal(str(contract["min_joint_usable_fraction"])) * count:
+              fail("INSUFFICIENT_JOINT_COVERAGE", observed=report["joint_usable_fraction"], threshold=contract["min_joint_usable_fraction"])
+          report["evaluation_complete"] = True
+          report["approved"] = not report["failure_reasons"]
+          report["status"] = "APPROVED" if report["approved"] else "REJECTED"
+
+      try:
+          evaluate()
+      except (OSError, UnicodeError, csv.Error) as error:
+          fail("DATASET_READ_ERROR", error_type=type(error).__name__)
+      except Exception as error:
+          # Unexpected validator failures must never become approval.
+          fail("VALIDATOR_ERROR", error_type=type(error).__name__)
+      if report["failure_reasons"]:
+          report["approved"] = False
+          report["status"] = "REJECTED"
+      Path("audit.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+      print("::" + json.dumps({"outputs": {"approved": report["approved"]}}) + "::")
+
+  - id: availability_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only an explicit successful validation can publish approval; the audit artifact has already been uploaded by the validator task.
+    condition: "{{ outputs.validate_availability.vars.approved == true }}"
+    then:
+      - id: release_approval
+        type: io.kestra.plugin.core.storage.Write
+        description: Publish an execution-scoped manifest binding approval to the exact staged dataset, its checksum, and the persisted audit.
+        extension: .json
+        content: |
+          {% set audit = fromJson(read(outputs.validate_availability.outputFiles['audit.json'])) %}
+          {
+            "manifest_version": 1,
+            "approved": true,
+            "execution_id": {{ execution.id | toJson }},
+            "dataset": {{ audit.dataset | toJson }},
+            "contract_version": {{ audit.contract.version }},
+            "contract_sha256": {{ audit.contract_sha256 | toJson }},
+            "evaluation_time": {{ audit.evaluation_time | toJson }},
+            "joint_usable_fraction": {{ audit.joint_usable_fraction }},
+            "audit_uri": {{ outputs.validate_availability.outputFiles['audit.json'] | toJson }}
+          }
+    else:
+      - id: reject_candidate
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Feature availability rejected. Inspect {{ outputs.validate_availability.outputFiles['audit.json'] }}. No approval was released."
+
+outputs:
+  - id: approval_manifest
+    type: FILE
+    value: "{{ outputs.release_approval.uri }}"
+  - id: audit_report
+    type: FILE
+    value: "{{ outputs.validate_availability.outputFiles['audit.json'] }}"
+
+extend:
+  title: ML Feature Availability Contract Gate
+  metaTitle: ML Feature Availability Contract Gate | Kestra
+  shortDescription: Validate required feature completeness, freshness, and joint row coverage before releasing a dataset-bound training approval.
+  metaDescription: Audit training feature nulls, freshness, and joint coverage in Kestra before issuing a dataset-bound ML approval.
+  description: |
+    Gate ML training batches on a versioned feature-availability contract. Validate
+    the submitted CSV rather than accepting a preset result; only an eligible batch
+    receives an execution-scoped approval tied to exact data and contract hashes.
+
+    ## How it works
+
+    1. A disabled daily UTC Schedule illustrates recurring use; execute manually
+       with a candidate CSV, JSON contract, and evaluation timestamp.
+    2. stage_candidate stores immutable execution input bytes.
+    3. validate_availability checks contract shape, required columns, null and
+       stale fractions, invalid/future timestamps, minimum rows, and the share
+       of rows where every required feature is present and fresh. It writes audit.json.
+    4. availability_gate writes a checksum-bound approval manifest only on an
+       explicit successful verdict. Otherwise it fails after preserving the audit.
+
+    ## What you get
+
+    - Per-feature counts and thresholds, joint usable-row coverage, failure reasons,
+      and dataset/contract SHA-256 fingerprints in audit.json.
+    - On success, an approval JSON manifest with the staged dataset URI, hashes,
+      evaluation time, execution ID, and audit location.
+    - Fail-closed behavior for missing columns, malformed inputs, or unsafe timestamps.
+      Approval covers the batch, not a filtered dataset of exclusively usable rows.
+
+    ## Who it's for
+
+    ML engineers, data engineers, and platform teams validating assembled feature
+    batches before downstream training or evaluation jobs.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra persists input artifacts and audit evidence, routes approval or rejection,
+    and makes the training dependency explicit. A training flow can call this gate
+    as a waiting Subflow with transmitFailed=true and verify the checksum before use.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with Core and the Python Script plugin.
+    - A Docker-capable worker able to pull python:3.13-slim.
+    - No network API, third-party Python packages, or external services required.
+    - The default timestamp is fixed for reproducible sample CSV execution; use
+      a current batch time or empty evaluation_time for real workloads.
+
+    ### Secrets
+
+    - None. The supplied sample data is illustrative and requires no credentials.
+
+    ## Quick start
+
+    1. Import the flow and execute with default CSV, contract, and evaluation_time.
+    2. Inspect the approval manifest and audit.json on success.
+    3. Blank one customer_age cell; rerun and inspect the rejected audit and absent
+       approval manifest. Try an outdated transaction timestamp for a stale failure.
+    4. Supply an actual CSV and contract. Wire a fresh upstream dataset source
+       before enabling the disabled illustrative daily Schedule.
+
+    ## How to extend
+
+    - Replace CSV STRING input with an object-storage ingestion task for large files.
+    - Add Slack or email notification on failure and archive audit reports.
+    - Integrate a waiting Subflow before training, and verify approved dataset bytes.
+    - Add feature type, range, or point-in-time correctness checks separately;
+      this workflow does not detect target leakage or sanitize unusable rows.
+
+    ## Links
+
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [Storage Write](https://kestra.io/plugins/core/storage/io.kestra.plugin.core.storage.write)
+    - [Subflow](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.subflow)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
