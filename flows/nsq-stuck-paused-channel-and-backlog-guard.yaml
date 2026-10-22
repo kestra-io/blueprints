@@ -1,0 +1,532 @@
+id: nsq-stuck-paused-channel-and-backlog-guard
+namespace: company.streaming
+
+description: |
+  Audit NSQ topic channels via the nsqd HTTP stats API for channels left paused with
+  an accumulating message backlog, a common incident-response mistake where a channel
+  is paused during a deploy or outage and never resumed. Track pause persistence across
+  runs in Kestra KV, pause for operator approval, unpause via the nsqd control API, and
+  verify the backlog actually started draining.
+
+inputs:
+  - id: nsqd_url
+    type: STRING
+    displayName: nsqd HTTP API URL
+    description: Base HTTP URL of the target nsqd instance's HTTP port (default 4151), e.g. http://nsqd.internal:4151. NSQ's own HTTP API has no built-in authentication; restrict network access to this port separately (VPN, firewall, reverse proxy).
+    defaults: "http://localhost:4151"
+
+  - id: topic_filter
+    type: STRING
+    displayName: Topic Filter
+    description: Optional topic name to scope the audit to. Leave empty to audit every topic's channels.
+    defaults: ""
+
+  - id: channel_filter
+    type: STRING
+    displayName: Channel Filter
+    description: Optional channel name to scope the audit to. Leave empty to audit every channel.
+    defaults: ""
+
+  - id: min_backlog_depth
+    type: INT
+    displayName: Minimum Backlog Depth
+    description: Minimum queue depth on a paused channel before it is treated as a candidate problem. A paused channel with zero depth is assumed intentional and is never flagged.
+    defaults: 1
+
+  - id: critical_backlog_depth
+    type: INT
+    displayName: Critical Backlog Depth
+    description: Queue depth on a paused channel at or above which it is escalated immediately, bypassing the consecutive-run confirmation.
+    defaults: 1000
+
+  - id: min_consecutive_paused_runs
+    type: INT
+    displayName: Minimum Consecutive Paused Runs
+    description: Number of consecutive audit passes a sub-critical paused backlog must persist before it is treated as stuck rather than an in-progress maintenance pause.
+    defaults: 2
+
+  - id: failure_ratio_threshold
+    type: FLOAT
+    displayName: Consumer Failure Ratio Threshold
+    description: On channels that are NOT paused, the (requeue_count + timeout_count) / message_count ratio at or above which consumer health is surfaced in the Slack alert as a diagnostic signal. There is no safe automated fix for failing consumers from the nsqd admin API, so this path is never auto-remediated.
+    defaults: 0.1
+
+  - id: cursor_key
+    type: STRING
+    displayName: KV Cursor Key
+    description: Kestra KV key used to persist per-channel pause-state trend across runs.
+    defaults: "nsq_channel_pause_tracker"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits and classifies channels and logs the proposed unpause calls without mutating any channel state.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, pauses for operator approval and then calls the nsqd unpause endpoint on verified stuck-paused channels.
+    defaults: false
+
+triggers:
+  - id: periodic_pause_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Audit NSQ channels for stuck paused state every 15 minutes. Shipped disabled so the flow can be verified manually in safe mode first.
+    cron: "*/15 * * * *"
+    disabled: true
+
+  - id: on_demand_pause_audit_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by monitoring alerts or incident runbooks.
+    key: "{{ secret('NSQ_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational thresholds satisfy sanity constraints before querying the nsqd HTTP API.
+    conditions:
+      - "{{ inputs.min_backlog_depth >= 1 }}"
+      - "{{ inputs.critical_backlog_depth >= inputs.min_backlog_depth }}"
+      - "{{ inputs.min_consecutive_paused_runs >= 1 }}"
+      - "{{ inputs.failure_ratio_threshold > 0 and inputs.failure_ratio_threshold <= 1 }}"
+    errorMessage: "Invalid configuration: critical_backlog_depth must be >= min_backlog_depth, min_consecutive_paused_runs must be positive, and failure_ratio_threshold must be between 0 and 1."
+
+  - id: fetch_nsqd_stats
+    type: io.kestra.plugin.core.http.Request
+    description: Fetch topic and channel statistics, including pause state and queue depth, from the nsqd HTTP stats endpoint.
+    uri: "{{ inputs.nsqd_url }}/stats?format=json"
+    method: GET
+    headers:
+      Accept: application/json
+
+  - id: triage_channels
+    type: io.kestra.plugin.scripts.python.Script
+    description: Classify channels into stuck-paused-with-backlog, diagnostic-only failing consumers, and healthy, diffed against historical KV state.
+    containerImage: python:3.11-slim
+    env:
+      STATS_BODY: "{{ outputs.fetch_nsqd_stats.body is defined ? outputs.fetch_nsqd_stats.body : '{}' }}"
+      TOPIC_FILTER: "{{ inputs.topic_filter }}"
+      CHANNEL_FILTER: "{{ inputs.channel_filter }}"
+      MIN_BACKLOG_DEPTH: "{{ inputs.min_backlog_depth }}"
+      CRITICAL_BACKLOG_DEPTH: "{{ inputs.critical_backlog_depth }}"
+      MIN_CONSECUTIVE_PAUSED_RUNS: "{{ inputs.min_consecutive_paused_runs }}"
+      FAILURE_RATIO_THRESHOLD: "{{ inputs.failure_ratio_threshold }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      PREVIOUS_STATE_JSON: "{{ kv(inputs.cursor_key, errorOnMissing=false) ?? '{}' }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      stats_body_raw = os.environ.get("STATS_BODY", "{}")
+      topic_filter = os.environ.get("TOPIC_FILTER", "").strip()
+      channel_filter = os.environ.get("CHANNEL_FILTER", "").strip()
+      min_backlog_depth = int(os.environ.get("MIN_BACKLOG_DEPTH", "1"))
+      critical_backlog_depth = int(os.environ.get("CRITICAL_BACKLOG_DEPTH", "1000"))
+      min_consecutive_paused_runs = int(os.environ.get("MIN_CONSECUTIVE_PAUSED_RUNS", "2"))
+      failure_ratio_threshold = float(os.environ.get("FAILURE_RATIO_THRESHOLD", "0.1"))
+      execution_id = os.environ.get("EXECUTION_ID", "manual")
+
+      prev_state_raw = os.environ.get("PREVIOUS_STATE_JSON", "{}")
+      try:
+          prev_state = json.loads(prev_state_raw) if prev_state_raw.strip() else {}
+      except Exception:
+          prev_state = {}
+
+      try:
+          stats = json.loads(stats_body_raw) if stats_body_raw.strip() else {}
+      except Exception:
+          stats = {}
+
+      topics = stats.get("topics", []) if isinstance(stats, dict) else []
+
+      new_state_snapshot = {}
+      stuck_paused_channels = []
+      failing_channels = []
+      healthy_channels = []
+
+      for topic in topics:
+          if not isinstance(topic, dict):
+              continue
+          topic_name = str(topic.get("topic_name", ""))
+          if topic_filter and topic_name != topic_filter:
+              continue
+
+          for channel in topic.get("channels", []):
+              if not isinstance(channel, dict):
+                  continue
+              channel_name = str(channel.get("channel_name", ""))
+              if not channel_name:
+                  continue
+              if channel_filter and channel_name != channel_filter:
+                  continue
+
+              key = f"{topic_name}/{channel_name}"
+              depth = int(channel.get("depth", 0) or 0)
+              in_flight = int(channel.get("in_flight_count", 0) or 0)
+              requeue_count = int(channel.get("requeue_count", 0) or 0)
+              timeout_count = int(channel.get("timeout_count", 0) or 0)
+              message_count = int(channel.get("message_count", 0) or 0)
+              client_count = int(channel.get("client_count", 0) or 0)
+              paused = bool(channel.get("paused", False))
+
+              prev_entry = prev_state.get(key, {})
+              prev_consecutive = int(prev_entry.get("consecutive_paused_runs", 0))
+
+              is_backlogged_pause = paused and depth >= min_backlog_depth
+              consecutive_paused_runs = prev_consecutive + 1 if is_backlogged_pause else 0
+
+              new_state_snapshot[key] = {
+                  "paused": paused,
+                  "depth": depth,
+                  "consecutive_paused_runs": consecutive_paused_runs,
+                  "last_evaluated_at": now_iso,
+              }
+
+              is_critical = paused and depth >= critical_backlog_depth
+              is_stuck = is_backlogged_pause and consecutive_paused_runs >= min_consecutive_paused_runs
+
+              failure_ratio = (requeue_count + timeout_count) / message_count if message_count > 0 else 0.0
+
+              if is_critical or is_stuck:
+                  stuck_paused_channels.append({
+                      "topic_name": topic_name,
+                      "channel_name": channel_name,
+                      "depth": depth,
+                      "in_flight_count": in_flight,
+                      "client_count": client_count,
+                      "consecutive_paused_runs": consecutive_paused_runs,
+                      "escalation_reason": "CRITICAL_BACKLOG_WHILE_PAUSED" if is_critical else "STUCK_PAUSED_CONSECUTIVE_RUNS",
+                  })
+              elif (not paused) and message_count > 0 and failure_ratio >= failure_ratio_threshold:
+                  # Diagnostic only: NSQ's admin API has no safe automated fix for failing
+                  # consumers (can't restart external consumer processes), so this is
+                  # surfaced for visibility in Slack, never auto-remediated.
+                  failing_channels.append({
+                      "topic_name": topic_name,
+                      "channel_name": channel_name,
+                      "depth": depth,
+                      "requeue_count": requeue_count,
+                      "timeout_count": timeout_count,
+                      "message_count": message_count,
+                      "failure_ratio": round(failure_ratio, 4),
+                      "client_count": client_count,
+                  })
+              else:
+                  healthy_channels.append({"topic_name": topic_name, "channel_name": channel_name, "depth": depth})
+
+      has_stuck = len(stuck_paused_channels) > 0
+      overall_status = "CRITICAL" if any(c["escalation_reason"] == "CRITICAL_BACKLOG_WHILE_PAUSED" for c in stuck_paused_channels) else ("WARNING" if (has_stuck or failing_channels) else "HEALTHY")
+
+      summary_lines = [
+          f"- `{c['topic_name']}/{c['channel_name']}`: paused with {c['depth']} message(s) backlog, "
+          f"reason={c['escalation_reason']}"
+          for c in stuck_paused_channels
+      ]
+      if failing_channels:
+          summary_lines.append("Diagnostic only (not auto-remediated, no safe automated fix exists):")
+          summary_lines.extend(
+              f"- `{c['topic_name']}/{c['channel_name']}`: failure ratio {c['failure_ratio']} "
+              f"(timeout={c['timeout_count']}, requeue={c['requeue_count']}, msgs={c['message_count']})"
+              for c in failing_channels
+          )
+
+      summary_text = (
+          f"NSQ Channel Guard: {overall_status} | "
+          f"Audited {sum(len(t.get('channels', [])) for t in topics if isinstance(t, dict))} channel(s). "
+          f"Stuck paused: {len(stuck_paused_channels)}. Failing (diagnostic only): {len(failing_channels)}. "
+          f"Healthy: {len(healthy_channels)}."
+      )
+      print(summary_text)
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "stuck_paused_count": len(stuck_paused_channels),
+          "failing_count": len(failing_channels),
+          "healthy_count": len(healthy_channels),
+          "stuck_paused_channels": stuck_paused_channels,
+          "failing_channels": failing_channels,
+          "execution_id": execution_id,
+          "evaluated_at": now_iso,
+          "summary": summary_text,
+      }
+
+      output_data = {
+          "has_stuck_paused_channels": has_stuck,
+          "stuck_paused_count": len(stuck_paused_channels),
+          "overall_status": overall_status,
+          "stuck_paused_channels": stuck_paused_channels,
+          "failing_channels": failing_channels,
+          "summary": summary_text,
+          "summary_details": "\n".join(summary_lines) if summary_lines else "None",
+          "new_state_snapshot": new_state_snapshot,
+          "audit_manifest": audit_manifest,
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print("::" + json.dumps({"outputs": output_data}) + "::")
+
+  - id: save_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist updated per-channel pause-state trend into Kestra KV for cross-run differential tracking.
+    key: "{{ inputs.cursor_key }}"
+    value: "{{ outputs.triage_channels.vars.new_state_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: evaluate_stuck_channels
+    type: io.kestra.plugin.core.flow.If
+    description: Branch execution based on whether any channel is flagged as stuck-paused with an accumulating backlog.
+    condition: "{{ outputs.triage_channels.vars.has_stuck_paused_channels == true }}"
+    then:
+      - id: dispatch_slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Deliver triage notification to Slack detailing stuck-paused channels and, for visibility only, any channels with failing consumers.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.triage_channels.vars.overall_status == 'CRITICAL' ? 'danger' : 'warning' }}",
+                "title": ":warning: NSQ Stuck Paused Channel Alert",
+                "text": "*Status:* `{{ outputs.triage_channels.vars.overall_status }}`\n*nsqd:* `{{ inputs.nsqd_url }}`\n*Stuck Paused Channels:* {{ outputs.triage_channels.vars.stuck_paused_count }}\n*Mode:* auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}\n*Execution:* `{{ execution.id }}`\n\n*Details:*\n{{ outputs.triage_channels.vars.summary_details }}\n\n*Summary:* {{ outputs.triage_channels.vars.summary }}"
+              }
+            ]
+          }
+
+      - id: remediation_mode_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Gate automated remediation behind auto_remediate and dry_run configuration flags.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator review before unpausing channels. Resume to apply or kill to abort; no timeout is set so this waits indefinitely for a human decision.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to confirm the nsqd unpause call should be issued against the flagged channels.
+
+          - id: branch_on_approval
+            type: io.kestra.plugin.core.flow.If
+            description: Execute remediation only if explicit human approval was provided during the pause gate.
+            condition: "{{ outputs.pause_for_operator_approval.onResume.approved == true }}"
+            then:
+              - id: remediate_stuck_channels
+                type: io.kestra.plugin.core.flow.Loop
+                description: Iterate sequentially over stuck-paused channels, unpause each one, and verify the backlog started draining.
+                concurrencyLimit: 1
+                values: "{{ outputs.triage_channels.vars.stuck_paused_channels | toJson }}"
+                tasks:
+                  - id: unpause_channel
+                    type: io.kestra.plugin.core.http.Request
+                    description: Call the nsqd channel/unpause control endpoint to resume message delivery on this channel.
+                    uri: "{{ inputs.nsqd_url }}/channel/unpause?topic={{ fromJson(item.value).topic_name }}&channel={{ fromJson(item.value).channel_name }}"
+                    method: POST
+
+                  - id: settle_unpause
+                    type: io.kestra.plugin.core.flow.Sleep
+                    description: Allow nsqd time to resume delivering messages to connected consumers before re-checking depth.
+                    duration: PT5S
+
+                  - id: verify_backlog_draining
+                    type: io.kestra.plugin.core.http.Request
+                    description: Re-fetch stats scoped to this channel's topic to confirm it is no longer paused.
+                    uri: "{{ inputs.nsqd_url }}/stats?format=json&topic={{ fromJson(item.value).topic_name }}&channel={{ fromJson(item.value).channel_name }}"
+                    method: GET
+                    headers:
+                      Accept: application/json
+
+                  - id: assert_channel_unpaused
+                    type: io.kestra.plugin.core.flow.If
+                    description: Fail loudly if the channel is still reported as paused after the unpause call.
+                    condition: "{{ (fromJson(outputs.verify_backlog_draining.body).topics[0].channels[0].paused ?? true) == true }}"
+                    then:
+                      - id: fail_still_paused
+                        type: io.kestra.plugin.core.execution.Fail
+                        description: Abort with explicit error details identifying the channel that did not resume.
+                        errorMessage: "nsqd reported channel {{ fromJson(item.value).topic_name }}/{{ fromJson(item.value).channel_name }} as still paused after an unpause call. Check nsqd connectivity and whether another operator re-paused it concurrently."
+                    else:
+                      - id: log_channel_unpaused
+                        type: io.kestra.plugin.core.log.Log
+                        description: Record successful unpause for this channel.
+                        message: "Unpaused {{ fromJson(item.value).topic_name }}/{{ fromJson(item.value).channel_name }} (backlog was {{ fromJson(item.value).depth }} message(s))."
+
+              - id: save_recovery_audit_kv
+                type: io.kestra.plugin.core.kv.Set
+                description: Persist the remediation audit manifest into Kestra KV for incident review.
+                key: "nsq_channel_pause_audit_{{ execution.id }}"
+                value: "{{ outputs.triage_channels.vars.audit_manifest | toJson }}"
+                kvType: JSON
+
+              - id: notify_resolution_slack
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Dispatch resolution confirmation to Slack once all flagged channels have been unpaused.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "attachments": [
+                      {
+                        "color": "#2EB67D",
+                        "title": ":white_check_mark: NSQ Stuck Paused Channels Resumed",
+                        "text": "*nsqd:* `{{ inputs.nsqd_url }}`\n*Channels Unpaused:* `{{ outputs.triage_channels.vars.stuck_paused_count }}`\n*Execution:* `{{ execution.id }}`"
+                      }
+                    ]
+                  }
+            else:
+              - id: log_approval_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Record that the operator declined approval for unpausing channels.
+                message: "Operator declined approval for NSQ channel unpause. Stuck-paused channels were left untouched."
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log the planned remediation without mutating any channel state.
+            message: |
+              Dry run active or auto_remediate disabled (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}).
+              Planned unpause for {{ outputs.triage_channels.vars.stuck_paused_count }} channel(s):
+              {{ outputs.triage_channels.vars.stuck_paused_channels | toJson }}
+    else:
+      - id: log_healthy_state
+        type: io.kestra.plugin.core.log.Log
+        description: Confirm nominal state when no channel has a stuck-paused backlog.
+        message: "NSQ channels nominal on {{ inputs.nsqd_url }}. No stuck-paused channels with an accumulating backlog detected."
+
+errors:
+  - id: alert_on_workflow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if the guard encounters an unhandled execution error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: NSQ Stuck Paused Channel Guard Execution Failed",
+            "text": "Failed execution `{{ execution.id }}` while auditing or remediating `{{ inputs.nsqd_url }}`. Check nsqd connectivity and worker logs."
+          }
+        ]
+      }
+
+outputs:
+  - id: stuck_paused_count
+    type: INT
+    value: "{{ outputs.triage_channels.vars.stuck_paused_count ?? 0 }}"
+
+  - id: failing_count
+    type: INT
+    value: "{{ outputs.triage_channels.vars.audit_manifest.failing_count ?? 0 }}"
+
+  - id: status
+    type: STRING
+    value: "{{ (outputs.triage_channels.vars.stuck_paused_count ?? 0) > 0 ? ((inputs.auto_remediate and not inputs.dry_run and (outputs.pause_for_operator_approval.onResume.approved ?? false)) ? 'REMEDIATED' : 'STUCK_PAUSED_CHANNELS') : 'HEALTHY' }}"
+
+extend:
+  title: Detect and Resume Stuck Paused NSQ Channels with Accumulating Backlog
+  metaTitle: NSQ Stuck Paused Channel and Backlog Guard | Kestra
+  shortDescription: Audit NSQ channels for paused state left on with a growing message backlog, track persistence across runs in KV, and safely unpause with operator approval and verification.
+  metaDescription: Detect NSQ channels stuck paused with a growing backlog, track trend in KV, and unpause with operator approval and verification in Kestra.
+  description: |
+    NSQ lets an operator pause a channel to stop message delivery during a deploy,
+    an incident, or while debugging a misbehaving consumer. Pausing is a deliberate,
+    manual action via the `/channel/pause` HTTP endpoint, and unpausing is just as
+    manual via `/channel/unpause`. There is no timeout and no automatic resume: a
+    channel paused during a 2am incident and never explicitly unpaused stays paused
+    indefinitely, silently accumulating a backlog that produces no consumer errors,
+    no failed deliveries, nothing but a quietly growing `depth` on a channel nobody
+    is looking at anymore.
+
+    This blueprint provides an automated guard that fetches channel statistics from
+    nsqd's HTTP stats API, flags channels that are paused AND accumulating a real
+    backlog (an intentionally paused, empty channel is left alone), correlates
+    against historical snapshots in Kestra KV to require the condition persist
+    across multiple audit passes before treating it as stuck, requests human
+    approval, calls the nsqd unpause endpoint, and re-verifies the channel actually
+    resumed. It also surfaces (without ever attempting to auto-fix) channels that
+    are not paused but show a high requeue/timeout ratio, since that usually means
+    a consumer process is unhealthy and nsqd's admin API has no safe way to restart
+    an external consumer.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) checks threshold ordering and bounds before calling nsqd.
+    2. **Stats Collection**: `fetch_nsqd_stats` (`io.kestra.plugin.core.http.Request`) calls `GET /stats?format=json` on the nsqd HTTP API, returning every topic's channels with `paused`, `depth`, `in_flight_count`, `requeue_count`, and `timeout_count`.
+    3. **Triage**: `triage_channels` (`io.kestra.plugin.scripts.python.Script`) classifies each channel: paused with backlog at or above `critical_backlog_depth` escalates immediately; paused with a smaller backlog persisting for `min_consecutive_paused_runs` consecutive audits (tracked via Kestra KV under `inputs.cursor_key`) escalates as stuck; a paused-but-empty channel is left alone as presumed-intentional; a non-paused channel with a high requeue/timeout ratio is recorded as a diagnostic-only signal.
+    4. **State Persistence**: `save_tracker_kv` (`io.kestra.plugin.core.kv.Set`) writes the updated per-channel pause trend back to Kestra KV.
+    5. **Slack Triage Alert**: When stuck-paused channels exist, `dispatch_slack_alert` posts affected channels, backlog depth, and escalation reason, plus any diagnostic-only failing-consumer signals.
+    6. **Human Approval Gate**: When `auto_remediate` is enabled and `dry_run` is false, `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) halts execution until an operator resumes with `approved: true`.
+    7. **Unpause and Verify**: `remediate_stuck_channels` (`io.kestra.plugin.core.flow.Loop`) calls `POST /channel/unpause` per approved channel, waits briefly, re-queries stats for that channel, and fails loudly via `io.kestra.plugin.core.execution.Fail` if it is still reported as paused.
+    8. **Resolution Notification**: A confirmation card is posted to Slack once remediation completes, and the full audit manifest is archived in Kestra KV.
+    9. **Failure Handling**: A flow-level `errors` block alerts Slack if nsqd connectivity or scripting fails unexpectedly.
+
+    ## What you get
+
+    - Automated detection of channels paused during an incident and forgotten, before their backlog grows unbounded.
+    - A safe-by-design heuristic that never touches an intentionally paused, empty channel.
+    - Historical trend tracking in Kestra KV to require persistence across runs before treating a pause as stuck.
+    - Human-in-the-loop approval before any unpause call touches live channel state.
+    - Post-remediation verification that fails loudly instead of assuming the unpause worked.
+    - Visibility into failing-consumer channels without falsely claiming an automated fix that doesn't exist.
+
+    ## Who it's for
+
+    - Platform Engineers and SREs operating NSQ clusters for event or job distribution.
+    - Backend Engineers who own NSQ consumers and need to know when a channel was paused and left that way.
+    - Incident responders cleaning up after a deploy or outage where a channel was paused as a mitigation step.
+
+    ## Why orchestrate this with Kestra
+
+    NSQ itself has no concept of "this channel has been paused too long" and no built-in alerting on pause state. A cron job calling unpause blindly on every paused channel it finds would also resume channels an operator is still intentionally debugging. Kestra adds declarative scheduling, KV-backed trend state so a pause has to persist before it is acted on, an interactive approval gate, and verified, auditable remediation on top of the raw nsqd API.
+
+    ## Prerequisites
+
+    - A reachable nsqd instance (NSQ 1.0 or higher) with its HTTP port (default 4151) reachable from the Kestra worker.
+    - Network-level access control on that port: nsqd's HTTP API has no built-in authentication, so restrict access via VPN, firewall, or a reverse proxy in front of it.
+    - A Slack Incoming Webhook URL for triage and resolution notifications.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint for triage and resolution alerts.
+    - `NSQ_GUARD_WEBHOOK_KEY`: Secret authentication token protecting the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `SLACK_WEBHOOK_URL` and `NSQ_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `nsqd_url` to your nsqd instance's HTTP endpoint.
+    3. Run a manual execution with the default `dry_run: true` to audit current channel pause state without mutating anything.
+    4. Review the execution logs, Slack triage card, and the KV entry under `inputs.cursor_key`.
+    5. Run with `auto_remediate: true` and `dry_run: false` to arm remediation; when stuck-paused channels are detected, approve the `pause_for_operator_approval` task with `approved: true` and observe the verified unpause.
+    6. Enable the `periodic_pause_audit` schedule trigger for continuous monitoring.
+
+    ## How to extend
+
+    - **Per-Channel Allowlist**: Add an `exempt_channels` input so long-lived, intentionally paused archival or debug channels never show up in triage at all.
+    - **Empty-and-Purge Path**: For channels confirmed to be holding unrecoverable messages (bad schema, deleted downstream target) rather than a backlog to replay, add a branch calling `POST /channel/empty` instead of unpause.
+    - **PagerDuty Escalation**: Add `io.kestra.plugin.pagerduty.PagerDutyAlert` when `overall_status` is `CRITICAL` to page the on-call engineer directly.
+
+    ## Links
+
+    - [NSQ HTTP API Reference](https://nsq.io/components/nsqd.html)
+    - [NSQ Design Overview](https://nsq.io/overview/design.html)
+    - [Kestra HTTP Request Task](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
