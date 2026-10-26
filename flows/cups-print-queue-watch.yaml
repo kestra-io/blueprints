@@ -1,0 +1,608 @@
+id: cups-print-queue-watch
+namespace: company.infrastructure
+description: Read-only IPP health with collision-resistant state, quiet baseline and debounce.
+concurrency:
+  limit: 1
+  behavior: QUEUE
+inputs:
+  - id: printer_uri
+    type: STRING
+    required: true
+    description: Trusted CUPS printer URI reachable from this worker.
+  - id: max_age_seconds
+    type: INT
+    defaults: 600
+    min: 1
+  - id: unverified_threshold
+    type: INT
+    defaults: 2
+    min: 1
+    max: 5
+  - id: probe_timeout_seconds
+    type: INT
+    defaults: 5
+    min: 1
+    max: 10
+tasks:
+  - id: previous
+    type: io.kestra.plugin.core.kv.Get
+    key: "pqw_state_v4_{{ [inputs.printer_uri, inputs.max_age_seconds, inputs.unverified_threshold] | toJson | sha256 }}"
+    errorOnMissing: false
+  - id: probe
+    type: io.kestra.plugin.scripts.python.Commands
+    description: A bounded observation; the wrapper requests a retry only for transient first observations (Kestra retries any non-zero exit); the final report is retained.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    timeout: PT45S
+    retry:
+      type: constant
+      maxAttempts: 2
+      interval: PT1S
+      maxDuration: PT2M
+      warningOnRetry: false
+    env:
+      PQ_URI: "{{ inputs.printer_uri }}"
+      PQ_MAX_AGE: "{{ inputs.max_age_seconds }}"
+      PQ_TIMEOUT: "{{ inputs.probe_timeout_seconds }}"
+      PQ_ATTEMPT_INDEX: "{{ taskrun.attemptsCount }}"
+    commands:
+      - python3 flow_probe.py
+    outputFiles:
+      - report.json
+      - report.md
+    inputFiles:
+      printqueue_watch.py: |
+        """Read-only IPP queue health; Python standard library, no document/user names."""
+        import argparse
+        import hashlib
+        import json
+        import os
+        import plistlib
+        import re
+        import subprocess
+        import tempfile
+        from xml.parsers.expat import ExpatError
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from urllib.parse import urlsplit
+
+        ATTRS = {
+            "printer": ("Get-Printer-Attributes", "printer-state,printer-is-accepting-jobs,printer-state-reasons,printer-up-time"),
+            "jobs": ("Get-Jobs", "job-id,job-state,time-at-creation,job-state-reasons"),
+        }
+
+        JOB_LIMIT = 500  # Request budget; reaching it means possibly partial evidence, not full coverage.
+        QUEUE_PATH = re.compile(r"/printers/[A-Za-z0-9._~-]{1,127}")
+        REASON_KEYWORD = re.compile(r"[a-z0-9-]{1,64}")
+        DEVICE_PROBLEMS = {"connecting-to-device", "offline-report"}  # CUPS backend cannot reach the device
+        FAILURE_REASONS = {
+            "client-error-not-found": "queue_not_found",
+            "client-error-forbidden": "access_denied",
+            "client-error-not-authorized": "access_denied",
+            "client-error-not-authenticated": "auth_required",
+        }
+
+        INTENTIONAL_HOLD_REASON = "job-hold-until-specified"
+
+        def parse_job_reasons(value):
+            """Preserve every keyword; never drop an unknown/problem reason into a safe hold."""
+            items = [value] if isinstance(value, str) else value
+            if (not isinstance(items, list) or not 1 <= len(items) <= 64
+                    or any(not isinstance(v, str) or not REASON_KEYWORD.fullmatch(v) for v in items)):
+                raise ProbeError("malformed_response")
+            return sorted(set(items))
+
+        def intentional_hold(job):
+            # Only the positive, unambiguous IPP reason grants exemption. Missing/mixed/unknown
+            # evidence and other job states keep the normal age rule.
+            return job["job-state"] == 4 and job.get("job-state-reasons") == [INTENTIONAL_HOLD_REASON]
+
+        class ProbeError(ValueError):
+            """Verification failed; .reason is a stable, non-sensitive machine code."""
+            def __init__(self, reason):
+                super().__init__(reason)
+                self.reason = reason
+
+        class JobList(list):
+            truncated = False
+
+        def validate_uri(uri):
+            parsed = urlsplit(uri)
+            if (parsed.scheme not in ("ipp", "ipps") or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or not QUEUE_PATH.fullmatch(parsed.path) or parsed.path.rsplit("/", 1)[1] in (".", "..")
+                    or any(ord(c) < 33 for c in uri) or '"' in uri or "\\" in uri):
+                raise ValueError("Expected an ipp(s) URI for one printer, without credentials/query")
+            if parsed.port is not None and not 1 <= parsed.port <= 65535:
+                raise ValueError("Invalid port")
+            return uri
+
+        def request_text(kind):
+            operation, fields = ATTRS[kind]
+            extra = (' ATTR name requesting-user-name printqueue-watch\n'
+                     ' ATTR keyword which-jobs not-completed\n ATTR boolean my-jobs false\n'
+                     ' ATTR integer limit ' + str(JOB_LIMIT) + '\n') if kind == "jobs" else ""
+            return ('{\n NAME "PrintQueue Watch read-only probe"\n OPERATION ' + operation +
+                    '\n GROUP operation-attributes-tag\n ATTR charset attributes-charset utf-8\n'
+                    ' ATTR language attributes-natural-language en\n ATTR uri printer-uri $uri\n'
+                    + extra + ' ATTR keyword requested-attributes ' + fields +
+                    '\n STATUS successful-ok\n}\n')
+
+        def clean_reasons(value):
+            """printer-state-reasons is a keyword or a list of keywords; keep only well-formed ones."""
+            items = value if isinstance(value, list) else [value]
+            keep = {v for v in items if isinstance(v, str) and REASON_KEYWORD.fullmatch(v) and v != "none"}
+            return sorted(keep)[:16]
+
+        def parse_response(data, kind):
+            try:
+                doc = plistlib.loads(data)
+            except (plistlib.InvalidFileException, ExpatError, ValueError, TypeError) as exc:
+                raise ProbeError("malformed_response") from exc
+            if not isinstance(doc, dict):
+                raise ProbeError("malformed_response")
+            tests = doc.get("Tests", [])
+            if not isinstance(tests, list) or not all(isinstance(t, dict) for t in tests):
+                raise ProbeError("malformed_response")
+            if doc.get("Successful") is not True or len(tests) != 1:
+                raise ProbeError("malformed_response")
+            test = tests[0]
+            if test.get("Successful") is not True or test.get("StatusCode") != "successful-ok":
+                raise ProbeError("malformed_response")
+            groups = test.get("ResponseAttributes")
+            if not isinstance(groups, list) or not all(isinstance(x, dict) for x in groups):
+                raise ProbeError("malformed_response")
+            if kind == "printer":
+                result = {}
+                for group in groups:
+                    for key in ATTRS[kind][1].split(","):
+                        if key in group:
+                            result[key] = group[key]
+                for key in ("printer-state", "printer-up-time"):
+                    if type(result.get(key)) is not int:
+                        raise ProbeError("malformed_response")
+                if result["printer-state"] not in (3, 4, 5):
+                    raise ProbeError("malformed_response")
+                if type(result.get("printer-is-accepting-jobs")) is not bool:
+                    raise ProbeError("malformed_response")
+                result["printer-state-reasons"] = clean_reasons(result.get("printer-state-reasons"))
+                return result
+            jobs = JobList()
+            seen = 0
+            for group in groups:
+                if "job-id" not in group:
+                    if any(k in group for k in ("job-state", "time-at-creation", "job-state-reasons")):
+                        raise ProbeError("malformed_response")
+                    continue
+                seen += 1
+                job = {k: group.get(k) for k in ("job-id", "job-state", "time-at-creation")}
+                if any(type(v) is not int for v in job.values()) or job["job-state"] not in range(3, 10):
+                    raise ProbeError("malformed_response")
+                if "job-state-reasons" in group:
+                    job["job-state-reasons"] = parse_job_reasons(group["job-state-reasons"])
+                if job["job-state"] < 7:
+                    jobs.append(job)
+            jobs.truncated = seen >= JOB_LIMIT
+            return jobs
+
+        def verdict(printer, jobs, max_age):
+            if max_age < 1:
+                raise ValueError("Age budget must be positive")
+            clock = printer["printer-up-time"]
+            reasons = []
+            if printer["printer-state"] == 5:
+                reasons.append("queue_stopped")
+            if not printer["printer-is-accepting-jobs"]:
+                reasons.append("not_accepting")
+            keywords = printer.get("printer-state-reasons") or []
+            errors = [k for k in keywords if k.endswith("-error")]
+            if errors:
+                reasons.append("printer_error")
+            if DEVICE_PROBLEMS.intersection(keywords):
+                reasons.append("device_unreachable")
+            ages = [clock - j["time-at-creation"] for j in jobs]
+            if any(age < -5 for age in ages):
+                raise ProbeError("clock_inconsistent")
+            # A long-running job in state 5 (processing) is a different signal from one that never started.
+            waiting = sum(max(0, a) >= max_age for a, j in zip(ages, jobs) if j["job-state"] != 5 and not intentional_hold(j))
+            running = sum(max(0, a) >= max_age for a, j in zip(ages, jobs) if j["job-state"] == 5)
+            if waiting:
+                reasons.append("old_jobs")
+            if running:
+                reasons.append("old_processing")
+            status = "STOPPED" if "queue_stopped" in reasons else ("WARNING" if reasons else "HEALTHY")
+            report = {"status": status, "reasons": reasons, "active_jobs": len(jobs),
+                      "held_jobs": sum(j["job-state"] == 4 for j in jobs),
+                      "intentional_held_jobs": sum(intentional_hold(j) for j in jobs),
+                      "old_intentional_held_jobs": sum(max(0,a) >= max_age and intentional_hold(j) for a,j in zip(ages,jobs)),
+                      "job_reasons": sorted({v for j in jobs for v in j.get("job-state-reasons", [])}),
+                      "old_jobs": waiting + running,
+                      "oldest_age_seconds": max([max(0, a) for a in ages], default=0),
+                      "accepting": printer["printer-is-accepting-jobs"],
+                      "max_age_seconds": max_age, "printer_reasons": keywords}
+            if errors:
+                report["printer_errors"] = errors
+            if getattr(jobs, "truncated", False):
+                report["jobs_truncated"] = True  # active_jobs is a lower bound
+            return report
+
+        def failure_reason(stdout):
+            """Map the IPP status of a failed ipptool run to a stable reason code."""
+            try:
+                status = plistlib.loads(stdout)["Tests"][0]["StatusCode"]
+                return FAILURE_REASONS.get(status, "ipp_request_failed")
+            except Exception:
+                return "ipp_request_failed"
+
+        def read_ipp(uri, kind, timeout, executable="ipptool"):
+            with tempfile.TemporaryDirectory(prefix="pqw-") as tmp:
+                test = Path(tmp) / "read.test"
+                test.write_text(request_text(kind), encoding="utf-8")
+                completed = subprocess.run([executable, "-X", "-T", str(timeout), uri, str(test)],
+                                           capture_output=True, timeout=timeout + 3, check=False)
+                if completed.returncode:
+                    raise ProbeError(failure_reason(completed.stdout))
+                return parse_response(completed.stdout, kind)
+
+        def finalize(report):
+            # Exclude age/counters so an unchanged incident does not notify every poll.
+            stable = {key: report.get(key) for key in ("status", "reasons", "accepting")}
+            if report.get("printer_errors"):  # absent when empty, so v1 fingerprints stay valid
+                stable["printer_errors"] = report["printer_errors"]
+            report["fingerprint"] = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:24]
+            report["observed_at"] = datetime.now(timezone.utc).isoformat()
+            return report
+
+        def probe(uri, max_age=600, timeout=5, reader=read_ipp):
+            validate_uri(uri)
+            if not 1 <= timeout <= 30 or max_age < 1:
+                raise ValueError("Invalid timeout or age budget")
+            try:
+                # Jobs first: the printer clock is then read after every job timestamp, so a job created
+                # during a slow request can never look like it is from the future.
+                jobs = reader(uri, "jobs", timeout)
+                printer = reader(uri, "printer", timeout)
+                return finalize(verdict(printer, jobs, max_age))
+            except FileNotFoundError:
+                return finalize({"status": "UNVERIFIED", "reasons": ["ipptool_missing"]})
+            except ProbeError as exc:
+                return finalize({"status": "UNVERIFIED", "reasons": [exc.reason]})
+            except subprocess.TimeoutExpired:
+                return finalize({"status": "UNVERIFIED", "reasons": ["probe_timeout"]})
+            except (ValueError, plistlib.InvalidFileException, OSError, KeyError, TypeError):
+                return finalize({"status": "UNVERIFIED", "reasons": ["probe_failed"]})
+
+        def markdown(report):
+            lines = ["# PrintQueue Watch", "", "Status: **" + report["status"] + "**",
+                     "Observed: " + report["observed_at"], "",
+                     "Reasons: " + (", ".join(report["reasons"]) or "none"), ""]
+            for key in ("active_jobs", "held_jobs", "intentional_held_jobs", "old_intentional_held_jobs", "old_jobs", "oldest_age_seconds", "accepting", "max_age_seconds"):
+                if key in report:
+                    lines.append("- " + key + ": " + str(report[key]))
+            if report.get("job_reasons"):
+                lines.append("- job_reasons: " + ", ".join(report["job_reasons"]))
+            if report.get("printer_reasons"):
+                lines.append("- printer_reasons: " + ", ".join(report["printer_reasons"]))
+            if report.get("jobs_truncated"):
+                lines.append("- note: job list truncated at " + str(JOB_LIMIT) + "; counts are lower bounds")
+            lines += ["", "Read-only observation. Only held jobs with sole job-hold-until-specified are age-exempt.",
+                      "UNVERIFIED is never a healthy result. No printer or job was modified.", ""]
+            return "\n".join(lines)
+
+        def env_int(name, default):
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                raise SystemExit(name + " must be an integer")
+
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--uri", default=os.environ.get("PQ_URI"))
+            parser.add_argument("--max-age", type=int, default=env_int("PQ_MAX_AGE", 600))
+            parser.add_argument("--timeout", type=int, default=env_int("PQ_TIMEOUT", 5))
+            parser.add_argument("--out", type=Path, default=Path("."))
+            args = parser.parse_args()
+            if not args.uri:
+                parser.error("--uri or PQ_URI is required")
+            try:  # configuration mistakes fail the task loudly; they are not an UNVERIFIED observation
+                validate_uri(args.uri)
+                if not 1 <= args.timeout <= 30 or args.max_age < 1:
+                    raise ValueError("Invalid timeout or age budget")
+            except ValueError as exc:
+                parser.error(str(exc))
+            report = probe(args.uri, args.max_age, args.timeout)
+            args.out.mkdir(exist_ok=True, parents=True)
+            (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            (args.out / "report.md").write_text(markdown(report), encoding="utf-8")
+            # Native Kestra output protocol; no SDK or API key.
+            print("::" + json.dumps({"outputs": report}) + "::")
+
+        if __name__ == "__main__":
+            main()
+      flow_policy.py: |
+        """Pure state transitions for PrintQueue Watch flow v3."""
+        import json
+        import os
+        import re
+        from pathlib import Path
+
+        STATUSES={"HEALTHY","WARNING","STOPPED","UNVERIFIED"}
+        TRANSIENT={"probe_timeout","ipp_request_failed","probe_failed"}
+        FP=re.compile(r"[0-9a-f]{24}")
+
+        def retryable(report):
+            return report.get("status")=="UNVERIFIED" and bool(TRANSIENT.intersection(report.get("reasons",[])))
+
+        def advance(previous, report, threshold=2):
+            if type(threshold) is not int or not 1<=threshold<=5:
+                raise ValueError("unverified_threshold must be1..5")
+            if not isinstance(previous,dict):
+                raise ValueError("Stored state must be a JSON object")
+            if previous and previous.get("schema")!=1:
+                raise ValueError("Unsupported stored state schema")
+            confirmed=previous.get("confirmed_fingerprint")
+            if confirmed=="NONE":confirmed=None
+            confirmed_status=previous.get("confirmed_status")
+            if confirmed_status=="NONE":confirmed_status=None
+            streak=previous.get("unverified_streak",0)
+            if confirmed is not None and (not isinstance(confirmed,str) or not FP.fullmatch(confirmed)):
+                raise ValueError("Malformed confirmed fingerprint")
+            if (confirmed is None)!=(confirmed_status is None) or (confirmed_status is not None and confirmed_status not in STATUSES):
+                raise ValueError("Malformed confirmed status")
+            if type(streak) is not int or streak<0:
+                raise ValueError("Malformed debounce counter")
+            status=report.get("status"); fingerprint=report.get("fingerprint")
+            if status not in STATUSES or not isinstance(fingerprint,str) or not FP.fullmatch(fingerprint):
+                raise ValueError("Malformed observation")
+            emit=False; baseline=False
+            if status=="UNVERIFIED":
+                streak=min(threshold,streak+1)
+                pending=streak<threshold
+                if not pending:
+                    emit=fingerprint!=confirmed
+                    confirmed,confirmed_status=fingerprint,status
+            else:
+                streak=0; pending=False
+                baseline=confirmed is None and status=="HEALTHY"
+                emit=not baseline and fingerprint!=confirmed
+                confirmed,confirmed_status=fingerprint,status
+            return {"emit":emit,"baseline_initialized":baseline,"pending":pending,"unverified_streak":streak,
+                    "confirmed_status":confirmed_status or "NONE",
+                    "next_state":{"schema":1,"confirmed_fingerprint":confirmed or "NONE","confirmed_status":confirmed_status or "NONE",
+                                  "unverified_streak":streak}}
+
+        def main():
+            report=json.loads(Path("report.json").read_text(encoding="utf-8"))
+            previous=json.loads(Path("previous.json").read_text(encoding="utf-8"))
+            result=advance(previous or {},report,int(os.environ.get("PQ_UNVERIFIED_THRESHOLD","2")))
+            Path("decision.json").write_text(json.dumps(result,indent=2)+"\n",encoding="utf-8")
+            print("::"+json.dumps({"outputs":result})+"::")
+
+        if __name__=="__main__":
+            main()
+      flow_probe.py: |
+        """One bounded native Kestra attempt. The first attempt asks for a retry (exit 75) only for a
+        transient observation; later attempts always return their observation. Kestra itself retries any
+        non-zero exit, so a configuration error (exit 2) is retried too, up to maxAttempts."""
+        import argparse
+        import json
+        import os
+        from pathlib import Path
+        from printqueue_watch import probe, markdown, env_int, validate_uri
+        from flow_policy import retryable
+
+        def run_attempt(uri,max_age,timeout,attempt_index,observe=probe):
+            validate_uri(uri)
+            if not 1<=timeout<=10 or max_age<1 or type(attempt_index) is not int or attempt_index<0:
+                raise ValueError("Invalid flow probe configuration")
+            report=observe(uri,max_age,timeout)
+            report["probe_attempt"]=attempt_index+1
+            return report,75 if attempt_index==0 and retryable(report) else 0
+
+        def main():
+            parser=argparse.ArgumentParser(description=__doc__)
+            uri=os.environ.get("PQ_URI","")
+            try:
+                report,code=run_attempt(uri,env_int("PQ_MAX_AGE",600),env_int("PQ_TIMEOUT",5),
+                                        env_int("PQ_ATTEMPT_INDEX",0))
+            except ValueError as exc:
+                parser.error(str(exc))
+            Path("report.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
+            Path("report.md").write_text(markdown(report)+"\nProbe attempt: "+str(report["probe_attempt"])+"\n",
+                                        encoding="utf-8")
+            print("::"+json.dumps({"outputs":report})+"::",flush=True)
+            raise SystemExit(code)
+
+        if __name__=="__main__":
+            main()
+  - id: decide
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Keep confirmed state while UNVERIFIED is pending; initialize first HEALTHY quietly.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    timeout: PT10S
+    env:
+      PQ_UNVERIFIED_THRESHOLD: "{{ inputs.unverified_threshold }}"
+    commands:
+      - python3 flow_policy.py
+    outputFiles:
+      - decision.json
+    inputFiles:
+      report.json: "{{ outputs.probe.outputFiles['report.json'] }}"
+      previous.json: "{{ (outputs.previous.value ?? {}) | toJson }}"
+      flow_policy.py: |
+        """Pure state transitions for PrintQueue Watch flow v3."""
+        import json
+        import os
+        import re
+        from pathlib import Path
+
+        STATUSES={"HEALTHY","WARNING","STOPPED","UNVERIFIED"}
+        TRANSIENT={"probe_timeout","ipp_request_failed","probe_failed"}
+        FP=re.compile(r"[0-9a-f]{24}")
+
+        def retryable(report):
+            return report.get("status")=="UNVERIFIED" and bool(TRANSIENT.intersection(report.get("reasons",[])))
+
+        def advance(previous, report, threshold=2):
+            if type(threshold) is not int or not 1<=threshold<=5:
+                raise ValueError("unverified_threshold must be1..5")
+            if not isinstance(previous,dict):
+                raise ValueError("Stored state must be a JSON object")
+            if previous and previous.get("schema")!=1:
+                raise ValueError("Unsupported stored state schema")
+            confirmed=previous.get("confirmed_fingerprint")
+            if confirmed=="NONE":confirmed=None
+            confirmed_status=previous.get("confirmed_status")
+            if confirmed_status=="NONE":confirmed_status=None
+            streak=previous.get("unverified_streak",0)
+            if confirmed is not None and (not isinstance(confirmed,str) or not FP.fullmatch(confirmed)):
+                raise ValueError("Malformed confirmed fingerprint")
+            if (confirmed is None)!=(confirmed_status is None) or (confirmed_status is not None and confirmed_status not in STATUSES):
+                raise ValueError("Malformed confirmed status")
+            if type(streak) is not int or streak<0:
+                raise ValueError("Malformed debounce counter")
+            status=report.get("status"); fingerprint=report.get("fingerprint")
+            if status not in STATUSES or not isinstance(fingerprint,str) or not FP.fullmatch(fingerprint):
+                raise ValueError("Malformed observation")
+            emit=False; baseline=False
+            if status=="UNVERIFIED":
+                streak=min(threshold,streak+1)
+                pending=streak<threshold
+                if not pending:
+                    emit=fingerprint!=confirmed
+                    confirmed,confirmed_status=fingerprint,status
+            else:
+                streak=0; pending=False
+                baseline=confirmed is None and status=="HEALTHY"
+                emit=not baseline and fingerprint!=confirmed
+                confirmed,confirmed_status=fingerprint,status
+            return {"emit":emit,"baseline_initialized":baseline,"pending":pending,"unverified_streak":streak,
+                    "confirmed_status":confirmed_status or "NONE",
+                    "next_state":{"schema":1,"confirmed_fingerprint":confirmed or "NONE","confirmed_status":confirmed_status or "NONE",
+                                  "unverified_streak":streak}}
+
+        def main():
+            report=json.loads(Path("report.json").read_text(encoding="utf-8"))
+            previous=json.loads(Path("previous.json").read_text(encoding="utf-8"))
+            result=advance(previous or {},report,int(os.environ.get("PQ_UNVERIFIED_THRESHOLD","2")))
+            Path("decision.json").write_text(json.dumps(result,indent=2)+"\n",encoding="utf-8")
+            print("::"+json.dumps({"outputs":result})+"::")
+
+        if __name__=="__main__":
+            main()
+  - id: changed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decide.vars.emit }}"
+    then:
+      - id: slack_notify
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        timeout: PT15S
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "PrintQueue Watch: {{ outputs.probe.vars.status }}; reasons={{ outputs.probe.vars.reasons | toJson }}; event={{ outputs.probe.vars.fingerprint }}; execution={{ execution.id }}. Inspect probe/report.md."
+      - id: change_event
+        type: io.kestra.plugin.core.log.Log
+        message: "Confirmed queue state changed: {{ outputs.probe.vars.status }}. Inspect probe/report.md."
+    else:
+      - id: unchanged
+        type: io.kestra.plugin.core.log.Log
+        level: DEBUG
+        message: Quiet baseline, pending debounce, or unchanged confirmed state; evidence retained.
+  - id: remember
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist baseline/debounce on every successful run, after any change event.
+    key: "pqw_state_v4_{{ [inputs.printer_uri, inputs.max_age_seconds, inputs.unverified_threshold] | toJson | sha256 }}"
+    kvType: JSON
+    value: "{{ outputs.decide.vars.next_state | toJson }}"
+triggers:
+  - id: poll_queue
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    disabled: true
+    inputs:
+      printer_uri: ipp://configure-before-enabling.invalid/printers/queue
+      max_age_seconds: 600
+      unverified_threshold: 2
+      probe_timeout_seconds: 5
+outputs:
+  - id: status
+    type: STRING
+    value: "{{ outputs.probe.vars.status }}"
+  - id: event_emitted
+    type: BOOL
+    value: "{{ outputs.decide.vars.emit }}"
+  - id: unverified_streak
+    type: INT
+    value: "{{ outputs.decide.vars.unverified_streak }}"
+  - id: report
+    type: STRING
+    value: "{{ outputs.probe.outputFiles['report.md'] }}"
+extend:
+  title: Monitor CUPS Print Queues with Quiet Baselines and Debounce
+  metaTitle: Read-Only CUPS Queue Health with Debounce | Kestra
+  shortDescription: Retain anonymous queue evidence, debounce verification failures and record confirmed state changes.
+  metaDescription: Read-only CUPS queue monitoring with SHA-256 state keys, quiet HEALTHY baselines, bounded retries and persistent debounce.
+  description: |
+    Observe CUPS queues; send confirmed changes to Slack.
+
+    ## How it works
+    1. A disabled Schedule reserves polling; manual runs require a trusted printer_uri.
+    2. KV reads schema1 under pqw_state_v4_ plus SHA256 of JSON [URI,max age,debounce].
+       Old keys are untouched; each policy has independent state.
+    3. Python Commands reads jobs before the printer clock. A transient first
+       observation requests one native retry after1second; final UNVERIFIED is evidence.
+    4. The first HEALTHY persists silently. By default two consecutive UNVERIFIED
+       runs confirm a change. Pending failures preserve confirmed state; recovery
+       from an unconfirmed blip stays quiet. WARNING/STOPPED are immediate.
+    5. Confirmed changes call native SlackIncomingWebhook via a secret, then log.
+       Only after success does remember persist state. Failed delivery fails the run
+       without advancing confirmed state or its counter. Quiet runs do not post.
+
+    ## What you get
+    - HEALTHY/WARNING/STOPPED/UNVERIFIED, JSON/Markdown and decision artifacts.
+    - Anonymous reports and messages; report: outputs.probe.outputFiles['report.md'].
+    - Probe budget45s/attempt,2attempts,2minutes total; Slack task timeout15s.
+    - Get-Jobs limit500: counts can be partial; no whole-queue ordering guarantee.
+
+    ## Who it's for
+    Platform teams maintaining CUPS queues.
+
+    ## Why orchestrate this with Kestra
+    KV, native retries and conditional Slack delivery separate transient observations
+    from confirmed incidents and successful notification.
+
+    ## Prerequisites
+    Kestra2.0 with Python Commands and Slack plugins, Python3/ipptool on a Process
+    worker, and a reachable CUPS queue.
+    Inputs: printer_uri STRING required; max_age_seconds INT>=1 default600;
+    unverified_threshold INT1..5 default2; probe_timeout_seconds INT1..10 default5.
+    Changing URI/max age/debounce starts a fresh baseline. Old keys are not migrated.
+
+    ### Secrets
+    Configure SLACK_WEBHOOK_URL in Kestra secrets, never as an input or literal URL.
+    It is required for confirmed changes; there is no log-only success fallback.
+    IPPS/authenticated queues need validation.
+
+    ## Quick start
+    1. Provision a disposable CUPS queue and Slack incoming webhook secret.
+    2. Import above extend, set printer_uri and run twice: quiet baseline then repeat.
+    3. Pause only a lab queue, verify delivery, then restore and verify recovery.
+    4. Keep Schedule disabled until its own inputs are configured.
+
+    ## How to extend
+    No reminder cooldown or parallel multi-queue policy is included. Slack delivery
+    is at-least-once: a lost acknowledgement or worker crash may duplicate a post.
+    Fingerprint is not a Slack idempotency key. Changed
+    reasons during a confirmed outage can emit again; debounce counts failures by status.
+
+    ## Links
+    - [Slack](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Secrets](https://kestra.io/docs/how-to-guides/secrets/index)
+    - [IPP/CUPS](https://openprinting.github.io/cups/doc/man-ipptool.html)
+  tags: [Infrastructure]
+  subTags: [Monitoring & Alerting]
+  ee: false
+  demo: false
