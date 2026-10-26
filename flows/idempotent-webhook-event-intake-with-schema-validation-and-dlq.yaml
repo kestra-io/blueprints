@@ -1,0 +1,704 @@
+id: idempotent-webhook-event-intake-with-schema-validation-and-dlq
+namespace: company.team
+description: |
+  Exactly-once intake for signed webhooks: Standard Webhooks HMAC check on the raw bytes, JSON Schema validation,
+  KV claim (`overwrite: false`, `ttl`), SQLite event store, Switch routing, dead-letter queue with replay and parking.
+  The default order-event schema is sample data; point it at your own events.
+
+variables:
+  event_store_url: "jdbc:sqlite:/app/storage/order-event-store.db"
+
+inputs:
+  - id: mode
+    type: SELECT
+    values: [replay, intake]
+    defaults: replay
+    description: The webhook trigger sets `intake`. Manual runs default to `replay`, which with `dry_run` only lists the dead-letter queue.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Replay only. true lists what would be reprocessed and changes nothing.
+  - id: include_parked
+    type: BOOL
+    defaults: false
+    description: Replay only. Also retry events parked after `max_attempts` failures (use after fixing the root cause).
+  - id: replay_limit
+    type: INT
+    defaults: 50
+    min: 1
+    max: 500
+    description: Replay only. Maximum dead-letter entries reprocessed per run, oldest first.
+  - id: max_attempts
+    type: INT
+    defaults: 3
+    min: 1
+    max: 20
+    description: An event that fails this many times (first delivery plus replays) is parked and no longer replayed automatically.
+  - id: dedupe_window
+    type: DURATION
+    defaults: P3D
+    description: KV `ttl` of each idempotency claim. Match the sender's retry horizon (Stripe retries for up to 3 days, Svix for about a day).
+  - id: signature_tolerance_seconds
+    type: INT
+    defaults: 300
+    min: 30
+    description: Reject a `webhook-timestamp` further than this from the worker clock (replay-attack window from the Standard Webhooks spec).
+  - id: max_body_bytes
+    type: INT
+    defaults: 262144
+    min: 1024
+    description: Reject larger bodies before parsing them.
+  - id: event_schema
+    type: JSON
+    description: >-
+      JSON Schema for the payload (sample order-event schema). Supported subset - type, properties, required, additionalProperties (false),
+      enum, const, pattern, minLength, maxLength, minimum, maximum, items, minItems, maxItems, format (date-time), allOf, if/then/else.
+      Any other keyword fails the run instead of being silently ignored.
+    defaults:
+      type: object
+      required: [type, timestamp, data]
+      additionalProperties: false
+      properties:
+        type: {type: string, pattern: "^order\\.[a-z_]{3,30}$"}
+        timestamp: {type: string, format: date-time}
+        data:
+          type: object
+          required: [order_id]
+          properties:
+            order_id: {type: string, pattern: "^ord_[A-Za-z0-9]{3,40}$"}
+            customer_email: {type: string, maxLength: 254, pattern: "^[^@\\s]+@[^@\\s]+$"}
+            amount_cents: {type: integer, minimum: 1, maximum: 100000000}
+            currency: {type: string, enum: [USD, EUR, GBP, INR]}
+            reason: {type: string, maxLength: 500}
+      allOf:
+        - if: {properties: {type: {const: order.created}}}
+          then: {properties: {data: {required: [order_id, customer_email, amount_cents, currency]}}}
+        - if: {properties: {type: {const: order.paid}}}
+          then: {properties: {data: {required: [order_id, amount_cents, currency]}}}
+
+checks:
+  - when: "{{ inputs.mode == 'replay' or trigger.uri is defined }}"
+    message: mode=intake only runs from the webhook trigger. Run manually with mode=replay.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.event_schema | jq('type == \"object\" and .type == \"object\"') | first }}"
+    message: event_schema must be a JSON Schema object whose top-level type is "object".
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+concurrency:
+  limit: 5
+  behavior: QUEUE
+
+sla:
+  - id: sender_timeout_budget
+    type: MAX_DURATION
+    duration: PT1M
+    behavior: FAIL
+    labels:
+      intake_sla: breached
+
+triggers:
+  - id: order_events
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Senders POST the event here and wait for the outcome. STORE keeps the exact request bytes, which the HMAC needs.
+    key: "{{ secret('ORDER_WEBHOOK_KEY') }}"
+    fetchType: STORE
+    wait: true
+    returnOutputs: true
+    inputs:
+      mode: intake
+
+tasks:
+  - id: init_store
+    type: io.kestra.plugin.jdbc.sqlite.Queries
+    description: Idempotent DDL for the event store, the order projection and the dead-letter table. The trigger is a database-level invariant that the payment must equal the order total.
+    url: "{{ vars.event_store_url }}"
+    timeout: PT30S
+    retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+    sql: |
+      CREATE TABLE IF NOT EXISTS webhook_events (
+        event_id TEXT PRIMARY KEY, event_type TEXT, order_id TEXT, payload TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('received', 'processed', 'failed', 'dead_lettered', 'parked')),
+        last_error TEXT, received_at TEXT NOT NULL, processed_at TEXT, last_execution_id TEXT);
+      CREATE TABLE IF NOT EXISTS orders (
+        order_id TEXT PRIMARY KEY, customer_email TEXT, amount_cents INTEGER NOT NULL, currency TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('created', 'paid', 'cancelled')),
+        paid_cents INTEGER NOT NULL DEFAULT 0, refund_due_cents INTEGER NOT NULL DEFAULT 0, last_event_id TEXT, updated_at TEXT);
+      CREATE TABLE IF NOT EXISTS dead_letter (
+        event_id TEXT PRIMARY KEY, event_type TEXT, reason_class TEXT NOT NULL, last_error TEXT NOT NULL,
+        attempts INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN ('retryable', 'parked', 'resolved')),
+        first_failed_at TEXT NOT NULL, last_failed_at TEXT NOT NULL, resolved_at TEXT, claimed_by TEXT, claimed_at TEXT);
+      CREATE TABLE IF NOT EXISTS intake_audit (execution_id TEXT, mode TEXT, outcome TEXT, event_id TEXT, finished_at TEXT);
+      CREATE TRIGGER IF NOT EXISTS payment_must_match_total BEFORE UPDATE OF paid_cents ON orders
+      WHEN NEW.paid_cents <> 0 AND NEW.paid_cents <> OLD.amount_cents
+      BEGIN SELECT RAISE(ABORT, 'payment does not match the order total'); END;
+
+  - id: load_replay_batch
+    type: io.kestra.plugin.jdbc.sqlite.Queries
+    description: Replay only. Claims the oldest retryable dead letters for this execution in one transaction (two replays never take the same row; a claim older than 10 minutes counts as abandoned), plus events stranded in received/failed for 10 minutes. A dry run only reads.
+    runIf: "{{ inputs.mode == 'replay' }}"
+    url: "{{ vars.event_store_url }}"
+    fetchType: FETCH
+    timeout: PT30S
+    retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+    parameters:
+      exec: "{{ execution.id }}"
+      dry: "{{ inputs.dry_run ? 1 : 0 }}"
+      parked: "{{ inputs.include_parked ? 1 : 0 }}"
+      lim: "{{ inputs.replay_limit }}"
+      now: "{{ now() }}"
+      stale: "{{ now() | dateAdd(-10, 'MINUTES') }}"
+    sql: |
+      UPDATE dead_letter SET claimed_by = :exec, claimed_at = :now
+      WHERE CAST(:dry AS INTEGER) = 0 AND event_id IN (
+        SELECT event_id FROM dead_letter
+        WHERE (status = 'retryable' OR (status = 'parked' AND CAST(:parked AS INTEGER) = 1))
+          AND (claimed_by IS NULL OR claimed_at < :stale)
+        ORDER BY first_failed_at LIMIT CAST(:lim AS INTEGER));
+      SELECT e.event_id, e.event_type, e.payload, e.payload_sha256, coalesce(d.status, 'stranded') AS dlq_status,
+             coalesce(d.attempts, 0) AS attempts, coalesce(d.last_error, e.status) AS last_error
+      FROM webhook_events e LEFT JOIN dead_letter d ON d.event_id = e.event_id
+      WHERE (CAST(:dry AS INTEGER) = 0 AND d.claimed_by = :exec)
+         OR (CAST(:dry AS INTEGER) = 1 AND (d.status = 'retryable' OR (d.status = 'parked' AND CAST(:parked AS INTEGER) = 1)))
+         OR (d.event_id IS NULL AND e.status IN ('received', 'failed') AND e.received_at < :stale)
+      ORDER BY coalesce(d.first_failed_at, e.received_at) LIMIT CAST(:lim AS INTEGER);
+
+  - id: screen
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Standard-library Python. Intake: size limit, Standard Webhooks HMAC-SHA256 check over the exact stored bytes
+      (constant-time, several v1 signatures for key rotation, timestamp tolerance), JSON parse, then JSON Schema
+      validation. Replay: re-validates every claimed payload against the current schema. A schema keyword outside
+      the supported subset fails the task (a config error, so the sender retries later) rather than being ignored.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    timeout: PT30S
+    inputFiles:
+      body.bin: "{{ trigger.uri ?? '' }}"
+      replay.json: "{{ (outputs.load_replay_batch.outputs[0].rows ?? []) | toJson }}"
+      schema.json: "{{ inputs.event_schema | toJson }}"
+    env:
+      MODE: "{{ inputs.mode }}"
+      SIGNING_SECRET: "{{ inputs.mode == 'intake' ? secret('ORDER_WEBHOOK_SIGNING_SECRET') : '' }}"
+      HEADERS_JSON: "{{ (trigger.headers ?? {}) | toJson }}"
+      TOLERANCE: "{{ inputs.signature_tolerance_seconds }}"
+      MAX_BYTES: "{{ inputs.max_body_bytes }}"
+      MAX_ATTEMPTS: "{{ inputs.max_attempts }}"
+    script: |
+      import base64, datetime, hashlib, hmac, json, os, re, time
+      SUPPORTED = {"type", "properties", "required", "additionalProperties", "enum", "const", "pattern", "minLength", "maxLength",
+                   "minimum", "maximum", "items", "minItems", "maxItems", "format", "allOf", "if", "then", "else",
+                   "$schema", "$id", "title", "description", "default", "examples"}
+      TYPES = {"object": dict, "array": list, "string": str, "null": type(None)}
+      def check_schema(s, path="#"):
+          if not isinstance(s, dict):
+              raise SystemExit("event_schema error at %s: a schema must be an object" % path)
+          if set(s) - SUPPORTED:
+              raise SystemExit("event_schema uses unsupported keyword(s) %s at %s; this validator would ignore them" % (sorted(set(s) - SUPPORTED), path))
+          subs = [("/properties/" + k, v) for k, v in (s.get("properties") or {}).items()]
+          subs += [("/" + k, s[k]) for k in ("items", "if", "then", "else") if isinstance(s.get(k), dict)]
+          subs += [("/allOf/%d" % i, v) for i, v in enumerate(s.get("allOf") or [])]
+          for sub_path, sub in subs:
+              check_schema(sub, path + sub_path)
+      def is_type(v, t):
+          if t in ("integer", "number", "boolean"):
+              return isinstance(v, bool) if t == "boolean" else (not isinstance(v, bool) and isinstance(v, int if t == "integer" else (int, float)))
+          return isinstance(v, TYPES[t])
+      def validate(v, s, path, errs):
+          ts = s["type"] if isinstance(s.get("type"), list) else [s["type"]] if "type" in s else []
+          if ts and not any(is_type(v, t) for t in ts):
+              return errs.append("%s: expected %s" % (path, "/".join(ts)))
+          if "const" in s and v != s["const"]:
+              errs.append("%s: must equal %r" % (path, s["const"]))
+          if "enum" in s and v not in s["enum"]:
+              errs.append("%s: %r is not one of %s" % (path, v, s["enum"]))
+          if isinstance(v, str):
+              if not s.get("minLength", 0) <= len(v) <= s.get("maxLength", 10**9):
+                  errs.append("%s: length %d out of range" % (path, len(v)))
+              if "pattern" in s and not re.search(s["pattern"], v):
+                  errs.append("%s: does not match %s" % (path, s["pattern"]))
+              if s.get("format") == "date-time":
+                  try:
+                      if not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$", v):
+                          raise ValueError(v)
+                      datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+                  except ValueError:
+                      errs.append("%s: not an RFC 3339 date-time" % path)
+          if is_type(v, "number") and not s.get("minimum", v) <= v <= s.get("maximum", v):
+              errs.append("%s: %s outside [%s, %s]" % (path, v, s.get("minimum", "-inf"), s.get("maximum", "inf")))
+          if isinstance(v, dict):
+              errs += ["%s: missing required property '%s'" % (path, k) for k in s.get("required", []) if k not in v]
+              for k, sub in v.items():
+                  if k in s.get("properties", {}):
+                      validate(sub, s["properties"][k], path + "/" + k, errs)
+                  elif s.get("additionalProperties") is False:
+                      errs.append("%s: unexpected property '%s'" % (path, k))
+          if isinstance(v, list):
+              if not s.get("minItems", 0) <= len(v) <= s.get("maxItems", 10**9):
+                  errs.append("%s: item count %d out of range" % (path, len(v)))
+              for i, sub in enumerate(v if isinstance(s.get("items"), dict) else []):
+                  validate(sub, s["items"], "%s/%d" % (path, i), errs)
+          for sub in s.get("allOf", []):
+              validate(v, sub, path, errs)
+          if "if" in s:
+              probe = []
+              validate(v, s["if"], path, probe)
+              if s.get("else" if probe else "then"):
+                  validate(v, s["else" if probe else "then"], path, errs)
+      def item(event_id, payload_text, sha):
+          errs, doc = [], {}
+          try:
+              doc = json.loads(payload_text)
+              validate(doc, schema, "#", errs)
+          except ValueError as exc:
+              errs.append("#: invalid JSON (%s)" % exc)
+          data = doc.get("data") if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else {}
+          safe = event_id if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,150}", event_id) else "sha_" + hashlib.sha256(event_id.encode()).hexdigest()[:40]
+          return {"event_id": event_id, "kv_key": "webhook_" + safe, "event_type": str(doc.get("type", "")) if isinstance(doc, dict) else "",
+                  "order_id": str(data.get("order_id", "")), "payload_sha256": sha, "schema_ok": not errs,
+                  "schema_errors": "; ".join(errs[:10])[:1500], "max_attempts": int(os.environ["MAX_ATTEMPTS"])}
+      def emit(out):
+          print("::" + json.dumps({"outputs": out}) + "::")
+      schema = json.load(open("schema.json"))
+      check_schema(schema)
+      if os.environ["MODE"] == "replay":
+          batch = [json.dumps(item(r["event_id"], r["payload"], r["payload_sha256"])) for r in json.load(open("replay.json"))]
+          print("replay: %d dead-letter event(s) loaded, %d still schema-invalid" % (len(batch), sum(not json.loads(b)["schema_ok"] for b in batch)))
+          emit({"accepted": True, "reason": "replay", "batch": batch})
+          raise SystemExit(0)
+      body, reason, text = open("body.bin", "rb").read(), "", ""
+      headers = {k.lower(): (v[0] if isinstance(v, list) and v else v) for k, v in json.loads(os.environ["HEADERS_JSON"]).items()}
+      msg_id, ts, sigs = (headers.get(h) or "" for h in ("webhook-id", "webhook-timestamp", "webhook-signature"))
+      if len(body) > int(os.environ["MAX_BYTES"]):
+          reason = "body_too_large: %d bytes" % len(body)
+      elif not (msg_id and ts and sigs) or len(msg_id) > 256:
+          reason = "missing_headers: webhook-id, webhook-timestamp and webhook-signature are required"
+      elif not ts.isdigit() or abs(time.time() - int(ts)) > int(os.environ["TOLERANCE"]):
+          reason = "stale_timestamp: webhook-timestamp is not within %ss of now (possible replay)" % os.environ["TOLERANCE"]
+      else:
+          secret = os.environ["SIGNING_SECRET"]
+          key = base64.b64decode(secret[6:]) if secret.startswith("whsec_") else secret.encode()
+          expected = base64.b64encode(hmac.new(key, msg_id.encode() + b"." + ts.encode() + b"." + body, hashlib.sha256).digest()).decode()
+          if not any(hmac.compare_digest(expected.encode(), p[3:].encode()) for p in sigs.split() if p.startswith("v1,")):
+              reason = "bad_signature: no v1 signature matches the shared secret"
+      if not reason:
+          try:
+              text = body.decode("utf-8")
+              reason = "" if isinstance(json.loads(text), dict) else "not_json_object: the body must be a JSON object"
+          except ValueError:
+              reason = "not_utf8_json: the body is not UTF-8 JSON"
+      if reason:
+          print("REJECTED " + reason)
+          emit({"accepted": False, "reason": reason, "event_id": msg_id[:256]})
+          raise SystemExit(0)
+      it = item(msg_id, text, hashlib.sha256(body).hexdigest())
+      print("verified %s type=%s schema_ok=%s %s" % (msg_id, it["event_type"], it["schema_ok"], it["schema_errors"]))
+      emit(dict(it, accepted=True, reason="verified", payload=text, item=json.dumps(it)))
+
+  - id: reject_unverified
+    type: io.kestra.plugin.core.flow.If
+    description: Hard fail on purpose. Nothing unverified reaches the store; the sender gets HTTP 500 with the reason in the body and the errors handler alerts (forged or misconfigured senders are security events).
+    condition: "{{ not outputs.screen.vars.accepted }}"
+    then:
+      - id: reject
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Webhook rejected before any state change: {{ outputs.screen.vars.reason }}"
+
+  - id: dedupe
+    type: io.kestra.plugin.core.flow.If
+    description: Three idempotency layers. A live KV claim answers retries without touching SQLite; `overwrite false` makes the first writer win; the event-store primary key settles the remaining race because KV checks and writes in two steps.
+    condition: "{{ inputs.mode == 'intake' }}"
+    then:
+      - id: window_check
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ kv(outputs.screen.vars.kv_key, errorOnMissing=false) is not null }}"
+        then:
+          - id: seen_in_window
+            type: io.kestra.plugin.core.output.OutputValues
+            values:
+              original: "{{ kv(outputs.screen.vars.kv_key, errorOnMissing=false) }}"
+          - id: payload_conflict
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (fromJson(outputs.seen_in_window.values.original).payload_sha256 ?? outputs.screen.vars.payload_sha256) != outputs.screen.vars.payload_sha256 }}"
+            then:
+              - id: note_conflict
+                type: io.kestra.plugin.core.output.OutputValues
+                values:
+                  reason: "id_conflict: event {{ outputs.screen.vars.event_id }} was already received with a different payload; the new body was not stored"
+              - id: reject_conflict
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "{{ outputs.note_conflict.values.reason }}"
+        else:
+          - id: claim
+            type: io.kestra.plugin.core.flow.Sequential
+            description: allowFailure because losing the race is a normal outcome. The execution ends in WARNING and the sender still gets 200 (duplicate).
+            allowFailure: true
+            tasks:
+              - id: take_claim
+                type: io.kestra.plugin.core.kv.Set
+                key: "{{ outputs.screen.vars.kv_key }}"
+                kvType: JSON
+                value: "{{ {'status': 'processing', 'execution_id': execution.id, 'payload_sha256': outputs.screen.vars.payload_sha256} | toJson }}"
+                ttl: "{{ inputs.dedupe_window }}"
+                overwrite: false
+            errors:
+              - id: lost_claim_race
+                type: io.kestra.plugin.core.output.OutputValues
+                values:
+                  lost: "true"
+          - id: record_event
+            type: io.kestra.plugin.jdbc.sqlite.Queries
+            description: INSERT OR IGNORE on the primary key is the atomic arbiter. A row stuck in `received` for 5 minutes (its execution died) can be taken over by the sender's retry.
+            runIf: "{{ (outputs.lost_claim_race.values.lost ?? 'false') != 'true' }}"
+            url: "{{ vars.event_store_url }}"
+            fetchType: FETCH_ONE
+            timeout: PT30S
+            retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+            parameters:
+              id: "{{ outputs.screen.vars.event_id }}"
+              type: "{{ outputs.screen.vars.event_type }}"
+              order_id: "{{ outputs.screen.vars.order_id }}"
+              payload: "{{ outputs.screen.vars.payload }}"
+              sha: "{{ outputs.screen.vars.payload_sha256 }}"
+              exec: "{{ execution.id }}"
+              now: "{{ now() }}"
+              stale: "{{ now() | dateAdd(-5, 'MINUTES') }}"
+            sql: |
+              INSERT INTO webhook_events (event_id, event_type, order_id, payload, payload_sha256, status, received_at, last_execution_id)
+              VALUES (:id, :type, :order_id, :payload, :sha, 'received', :now, :exec)
+              ON CONFLICT(event_id) DO UPDATE SET last_execution_id = excluded.last_execution_id, received_at = excluded.received_at
+              WHERE webhook_events.status = 'received' AND webhook_events.payload_sha256 = excluded.payload_sha256
+                AND webhook_events.received_at < :stale;
+              SELECT changes() AS claimed, status, payload_sha256, last_execution_id FROM webhook_events WHERE event_id = :id;
+
+  - id: plan
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The single list the processing Loop works on. Intake gives one item (or none for a duplicate); a real replay gives the claimed dead letters.
+    values:
+      duplicate: "{{ inputs.mode == 'intake' and ((outputs.seen_in_window is defined) or (outputs.lost_claim_race.values.lost ?? 'false') == 'true' or (outputs.record_event.outputs[0].row.claimed ?? 0) == 0) }}"
+      conflict: "{{ inputs.mode == 'intake' and (outputs.record_event.outputs[0].row.payload_sha256 ?? outputs.screen.vars.payload_sha256) != outputs.screen.vars.payload_sha256 }}"
+      batch: "{{ (inputs.mode == 'replay' ? (inputs.dry_run ? [] : outputs.screen.vars.batch) : (((outputs.record_event.outputs[0].row.claimed ?? 0) == 1) ? [outputs.screen.vars.item] : [])) | toJson }}"
+
+  - id: refuse_reused_id
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan.values.conflict == 'true' }}"
+    then:
+      - id: note_db_conflict
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          reason: "id_conflict: event {{ outputs.screen.vars.event_id }} is already in the store with a different payload; the new body was not stored"
+      - id: reject_db_conflict
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "{{ outputs.note_db_conflict.values.reason }}"
+
+  - id: process
+    type: io.kestra.plugin.core.flow.Loop
+    description: One iteration per event. transmitFailed false so a broken event never fails the rest of a replay; every outcome is written to SQLite, so nothing depends on iteration outputs.
+    values: "{{ outputs.plan.values.batch }}"
+    concurrencyLimit: 1
+    transmitFailed: false
+    tasks:
+      - id: apply
+        type: io.kestra.plugin.core.flow.Sequential
+        description: allowFailure so `settle` below always runs. Business rule misses are written as data (status failed); exceptions (the DB trigger, a locked file after retries) are caught by `mark_exception`.
+        allowFailure: true
+        tasks:
+          - id: route
+            type: io.kestra.plugin.core.flow.Switch
+            value: "{{ fromJson(item.value).schema_ok ? fromJson(item.value).event_type : 'schema_invalid' }}"
+            cases:
+              schema_invalid:
+                - id: mark_schema_invalid
+                  type: io.kestra.plugin.jdbc.sqlite.Query
+                  url: "{{ vars.event_store_url }}"
+                  parameters: {id: "{{ fromJson(item.value).event_id }}", err: "{{ fromJson(item.value).schema_errors }}"}
+                  sql: UPDATE webhook_events SET status = 'failed', last_error = 'schema_invalid - ' || :err WHERE event_id = :id
+              order.created:
+                - id: apply_created
+                  type: io.kestra.plugin.jdbc.sqlite.Queries
+                  url: "{{ vars.event_store_url }}"
+                  retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+                  parameters: {id: "{{ fromJson(item.value).event_id }}", now: "{{ now() }}", exec: "{{ execution.id }}"}
+                  sql: |
+                    INSERT INTO orders (order_id, customer_email, amount_cents, currency, status, last_event_id, updated_at)
+                    SELECT order_id, json_extract(payload, '$.data.customer_email'), json_extract(payload, '$.data.amount_cents'),
+                           json_extract(payload, '$.data.currency'), 'created', event_id, :now
+                    FROM webhook_events WHERE event_id = :id
+                    ON CONFLICT(order_id) DO NOTHING;
+                    UPDATE webhook_events SET status = 'processed', last_error = NULL, processed_at = :now, last_execution_id = :exec WHERE event_id = :id;
+              order.paid:
+                - id: apply_paid
+                  type: io.kestra.plugin.jdbc.sqlite.Queries
+                  description: An unknown order is a retryable miss (paid arrived before created). A wrong amount makes the DB trigger raise, which repeats on every replay until the event is parked.
+                  url: "{{ vars.event_store_url }}"
+                  retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 2}
+                  parameters: {id: "{{ fromJson(item.value).event_id }}", now: "{{ now() }}", exec: "{{ execution.id }}"}
+                  sql: |
+                    UPDATE orders SET status = 'paid', paid_cents = (SELECT json_extract(payload, '$.data.amount_cents') FROM webhook_events WHERE event_id = :id),
+                           last_event_id = :id, updated_at = :now
+                    WHERE order_id = (SELECT order_id FROM webhook_events WHERE event_id = :id) AND status = 'created';
+                    UPDATE webhook_events SET
+                      status = CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.order_id = webhook_events.order_id) THEN 'processed' ELSE 'failed' END,
+                      last_error = CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.order_id = webhook_events.order_id) THEN NULL
+                                        ELSE 'processing_failed - order ' || order_id || ' not found (paid arrived before created)' END,
+                      processed_at = :now, last_execution_id = :exec
+                    WHERE event_id = :id;
+              order.cancelled:
+                - id: apply_cancelled
+                  type: io.kestra.plugin.jdbc.sqlite.Queries
+                  url: "{{ vars.event_store_url }}"
+                  retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+                  parameters: {id: "{{ fromJson(item.value).event_id }}", now: "{{ now() }}", exec: "{{ execution.id }}"}
+                  sql: |
+                    UPDATE orders SET status = 'cancelled', refund_due_cents = paid_cents, last_event_id = :id, updated_at = :now
+                    WHERE order_id = (SELECT order_id FROM webhook_events WHERE event_id = :id) AND status <> 'cancelled';
+                    UPDATE webhook_events SET
+                      status = CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.order_id = webhook_events.order_id) THEN 'processed' ELSE 'failed' END,
+                      last_error = CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.order_id = webhook_events.order_id) THEN NULL
+                                        ELSE 'processing_failed - order ' || order_id || ' not found' END,
+                      processed_at = :now, last_execution_id = :exec
+                    WHERE event_id = :id;
+            defaults:
+              - id: mark_unknown_type
+                type: io.kestra.plugin.jdbc.sqlite.Query
+                url: "{{ vars.event_store_url }}"
+                parameters: {id: "{{ fromJson(item.value).event_id }}"}
+                sql: UPDATE webhook_events SET status = 'failed', last_error = 'unknown_type - no handler for ' || event_type WHERE event_id = :id
+        errors:
+          - id: mark_exception
+            type: io.kestra.plugin.jdbc.sqlite.Query
+            url: "{{ vars.event_store_url }}"
+            retry: {type: exponential, interval: PT2S, maxInterval: PT20S, maxAttempts: 4}
+            parameters: {id: "{{ fromJson(item.value).event_id }}", exec: "{{ execution.id }}"}
+            sql: >-
+              UPDATE webhook_events SET status = 'failed', last_execution_id = :exec,
+              last_error = 'processing_failed - the ' || coalesce(event_type, '?') || ' handler raised (database rule or outage), see the Loop iteration logs of execution ' || :exec
+              WHERE event_id = :id
+      - id: settle
+        type: io.kestra.plugin.jdbc.sqlite.Queries
+        description: The only place the DLQ is written. Failed events are upserted with attempts + 1 and parked at max_attempts; processed ones resolve their DLQ row.
+        url: "{{ vars.event_store_url }}"
+        fetchType: FETCH_ONE
+        retry: {type: exponential, interval: PT2S, maxInterval: PT20S, maxAttempts: 4}
+        parameters: {id: "{{ fromJson(item.value).event_id }}", max: "{{ fromJson(item.value).max_attempts }}", now: "{{ now() }}"}
+        sql: |
+          INSERT INTO dead_letter (event_id, event_type, reason_class, last_error, attempts, status, first_failed_at, last_failed_at)
+          SELECT event_id, event_type, substr(last_error, 1, instr(last_error || ' ', ' ') - 1), last_error, 1,
+                 CASE WHEN 1 >= CAST(:max AS INTEGER) THEN 'parked' ELSE 'retryable' END, :now, :now
+          FROM webhook_events WHERE event_id = :id AND status = 'failed'
+          ON CONFLICT(event_id) DO UPDATE SET attempts = dead_letter.attempts + 1, last_error = excluded.last_error,
+            reason_class = excluded.reason_class, last_failed_at = excluded.last_failed_at, claimed_by = NULL, resolved_at = NULL,
+            status = CASE WHEN dead_letter.attempts + 1 >= CAST(:max AS INTEGER) THEN 'parked' ELSE 'retryable' END;
+          UPDATE dead_letter SET status = 'resolved', resolved_at = :now, claimed_by = NULL
+          WHERE event_id = :id AND EXISTS (SELECT 1 FROM webhook_events WHERE event_id = :id AND status = 'processed');
+          UPDATE webhook_events SET status = CASE (SELECT status FROM dead_letter WHERE event_id = :id) WHEN 'parked' THEN 'parked' ELSE 'dead_lettered' END
+          WHERE event_id = :id AND status = 'failed';
+          SELECT e.event_id, e.status, d.attempts, d.reason_class FROM webhook_events e LEFT JOIN dead_letter d USING (event_id) WHERE e.event_id = :id;
+
+  - id: report
+    type: io.kestra.plugin.jdbc.sqlite.Query
+    description: Reads the final state back from the store, so the answer to the sender reflects what was committed, not what a task intended.
+    url: "{{ vars.event_store_url }}"
+    fetchType: FETCH
+    timeout: PT30S
+    retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 4}
+    parameters:
+      ids: "{{ (inputs.mode == 'intake' ? [outputs.screen.vars.event_id] : ((outputs.load_replay_batch.outputs[0].rows ?? []) | jq('[.[].event_id]') | first)) | toJson }}"
+    sql: |
+      SELECT e.event_id, e.event_type, e.status, e.last_error, e.received_at, e.processed_at, coalesce(d.attempts, 0) AS attempts, d.status AS dlq_status
+      FROM webhook_events e LEFT JOIN dead_letter d USING (event_id)
+      WHERE e.event_id IN (SELECT value FROM json_each(:ids)) ORDER BY e.received_at
+
+  - id: respond
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Becomes the webhook response body (returnOutputs). HTTP 200 for processed, duplicate, dead_lettered and parked (do not retry, the event is ours now); 500 only when rejected or when the intake itself broke (retry is right).
+    values:
+      result: >-
+        {{ (inputs.mode == 'intake'
+           ? {'outcome': outputs.plan.values.duplicate == 'true' ? 'duplicate' : (outputs.report.rows[0].status == 'processed' ? 'processed' : outputs.report.rows[0].status),
+              'event_id': outputs.screen.vars.event_id, 'event_type': outputs.screen.vars.event_type,
+              'stored_status': outputs.report.rows[0].status ?? (fromJson(outputs.seen_in_window.values.original ?? '{}').status ?? 'unknown'),
+              'attempts': outputs.report.rows[0].attempts ?? 0, 'detail': outputs.report.rows[0].last_error ?? '',
+              'first_execution_id': fromJson(outputs.seen_in_window.values.original ?? '{}').execution_id ?? (outputs.record_event.outputs[0].row.last_execution_id ?? execution.id),
+              'execution_id': execution.id}
+           : {'outcome': inputs.dry_run ? 'replay_dry_run' : 'replayed', 'candidates': (outputs.load_replay_batch.outputs[0].rows ?? []) | length,
+              'events': outputs.report.rows ?? [], 'execution_id': execution.id}) | toJson }}
+
+  - id: remember_outcome
+    type: io.kestra.plugin.core.kv.Set
+    description: Replaces the `processing` claim with the committed status for the rest of the dedupe window, so retries get the original outcome from KV.
+    runIf: "{{ inputs.mode == 'intake' and outputs.seen_in_window is not defined and (outputs.lost_claim_race.values.lost ?? 'false') != 'true' }}"
+    key: "{{ outputs.screen.vars.kv_key }}"
+    kvType: JSON
+    value: "{{ {'status': outputs.report.rows[0].status, 'execution_id': outputs.record_event.outputs[0].row.last_execution_id ?? execution.id, 'payload_sha256': outputs.screen.vars.payload_sha256} | toJson }}"
+    ttl: "{{ inputs.dedupe_window }}"
+
+  - id: log_outcome
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ inputs.mode }} result: {{ outputs.respond.values.result }}"
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Webhook intake ({{ inputs.mode }}) failed in task {{ ((errorLogs() | length) > 0 and (errorLogs()[0].taskId ?? '') != '') ? errorLogs()[0].taskId : 'none (execution-level: SLA breach or kill)' }}: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'no task error logged' }} - {{ kestra.url ?? 'http://localhost:8080/' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: allowFailure so a missing SLACK_WEBHOOK_URL never hides the original error, which is also in the ERROR log above.
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":rotating_light: Order webhook intake failed in `{{ ((errorLogs() | length) > 0 and (errorLogs()[0].taskId ?? '') != '') ? errorLogs()[0].taskId : 'none (SLA breach or kill)' }}`: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'no task error logged' }} {{ kestra.url ?? 'http://localhost:8080/' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+finally:
+  - id: audit_and_gauge
+    type: io.kestra.plugin.jdbc.sqlite.Queries
+    description: Always runs, also after a rejection. One audit row per execution, then the DLQ counts for the KV gauge below. allowFailure so a locked file cannot turn a processed event into a failed response.
+    allowFailure: true
+    url: "{{ vars.event_store_url }}"
+    fetchType: FETCH_ONE
+    timeout: PT30S
+    parameters:
+      exec: "{{ execution.id }}"
+      mode: "{{ inputs.mode }}"
+      outcome: "{{ fromJson(outputs.respond.values.result ?? '{}').outcome ?? (outputs.note_conflict.values.reason ?? outputs.note_db_conflict.values.reason ?? ((outputs.screen.vars.accepted ?? true) ? 'error' : 'rejected - ' ~ outputs.screen.vars.reason)) }}"
+      event: "{{ outputs.screen.vars.event_id ?? '' }}"
+      now: "{{ now() }}"
+    sql: |
+      INSERT INTO intake_audit VALUES (:exec, :mode, :outcome, :event, :now);
+      SELECT sum(status = 'retryable') AS retryable, sum(status = 'parked') AS parked, sum(status = 'resolved') AS resolved FROM dead_letter;
+  - id: publish_dlq_gauge
+    type: io.kestra.plugin.core.kv.Set
+    description: DLQ size in KV, readable by dashboards or another flow without opening the database.
+    allowFailure: true
+    key: dlq_summary
+    kvType: JSON
+    value: "{{ {'retryable': outputs.audit_and_gauge.outputs[0].row.retryable ?? 0, 'parked': outputs.audit_and_gauge.outputs[0].row.parked ?? 0, 'resolved': outputs.audit_and_gauge.outputs[0].row.resolved ?? 0, 'updated_by': execution.id} | toJson }}"
+
+afterExecution:
+  - id: release_stranded_claim
+    type: io.kestra.plugin.core.flow.If
+    description: Runs even after an SLA breach (when finally does not). If this execution claimed the id and died before committing, release the claim and the uncommitted row so the sender's retry is processed instead of being answered as a duplicate.
+    condition: "{{ inputs.mode == 'intake' and (execution.state == 'FAILED' or execution.state == 'KILLED') and outputs.screen.vars.kv_key is defined and ((kv(outputs.screen.vars.kv_key, errorOnMissing=false) ?? {}).execution_id ?? '') == execution.id and ((kv(outputs.screen.vars.kv_key, errorOnMissing=false) ?? {}).status ?? '') == 'processing' }}"
+    then:
+      - id: forget_uncommitted_row
+        type: io.kestra.plugin.jdbc.sqlite.Query
+        description: A row still in `received` means no handler committed (each handler updates the order and the status in one transaction), so removing it is safe and lets the retry start clean.
+        allowFailure: true
+        url: "{{ vars.event_store_url }}"
+        parameters: {id: "{{ outputs.screen.vars.event_id }}", exec: "{{ execution.id }}"}
+        sql: DELETE FROM webhook_events WHERE event_id = :id AND status = 'received' AND last_execution_id = :exec
+      - id: delete_claim
+        type: io.kestra.plugin.core.kv.Delete
+        key: "{{ outputs.screen.vars.kv_key }}"
+        description: Last on purpose. The If condition is evaluated again after each child, and deleting the key makes it false, so anything after this task would never run.
+        errorOnMissing: false
+  - id: alert_sla_or_parked
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (labels.intake_sla ?? '') == 'breached' or (fromJson(outputs.respond.values.result ?? '{}').outcome ?? '') == 'parked' or ((fromJson(outputs.respond.values.result ?? '{}').events ?? []) | jq('[.[] | select(.dlq_status == \"parked\")] | length') | first) > 0 }}"
+    then:
+      - id: notify_operator
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "{{ (labels.intake_sla ?? '') == 'breached' ? ':hourglass: Order webhook intake exceeded its 1 minute SLA and was stopped; the claim was released so the sender retry will be processed.' : ':no_entry: A poison order event was parked after ' ~ inputs.max_attempts ~ ' failed attempts and will not be replayed automatically.' }} {{ kestra.url ?? 'http://localhost:8080/' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+outputs:
+  - id: result
+    type: JSON
+    description: Webhook response body. On a rejection the outcome and reason are still returned with HTTP 500.
+    value: >-
+      {{ outputs.respond.values.result is defined ? fromJson(outputs.respond.values.result)
+         : {'outcome': (outputs.note_conflict is defined or outputs.note_db_conflict is defined) ? 'id_conflict' : ((outputs.screen.vars.accepted ?? true) ? 'error' : 'rejected'),
+            'reason': outputs.note_conflict.values.reason ?? (outputs.note_db_conflict.values.reason ?? ((outputs.screen.vars.accepted ?? true) ? 'the intake failed after verification; the sender should retry' : outputs.screen.vars.reason)),
+            'event_id': outputs.screen.vars.event_id ?? '', 'execution_id': execution.id} }}
+
+extend:
+  title: Idempotent Webhook Event Intake with Schema Validation and a Replayable DLQ
+  metaTitle: Exactly-Once Webhook Intake with HMAC, JSON Schema and DLQ | Kestra
+  shortDescription: Verify Standard Webhooks signatures, validate the payload, process each event id once with a KV claim and a SQLite event store, and dead-letter, replay or park the rest.
+  metaDescription: Signed webhook intake in Kestra with HMAC checks, JSON Schema validation, KV idempotency claims, a SQLite event store and a replayable dead-letter queue.
+  description: |
+    Payment, CRM and IoT providers deliver webhooks at least once: the same event comes again after a timeout, sometimes in parallel, sometimes before the event it depends on. This flow is a reusable intake that applies each event exactly once. It answers the sender synchronously, rejects forged or replayed requests, and keeps every event it could not apply in a replayable dead-letter queue. The default JSON Schema describes sample order events (`order.created`, `order.paid`, `order.cancelled`); the `orders` table is the real action and stands in for your own handler.
+
+    ## How it works
+
+    1. `order_events` (Webhook) uses `fetchType: STORE`, so the body is kept byte for byte (the default fetch re-serialises JSON, `1.50` becomes `1.5`, and the HMAC breaks). `wait` and `returnOutputs` return the flow output `result` to the sender.
+    2. `init_store` creates the event store, `orders`, `dead_letter` and a trigger refusing a payment that differs from the order total.
+    3. `screen` (stdlib Python) checks the size, the [Standard Webhooks](https://www.standardwebhooks.com/) `webhook-id`, `webhook-timestamp` and `webhook-signature` headers, the timestamp tolerance and the HMAC-SHA256 in constant time (several `v1,` signatures allowed for key rotation), then validates the payload against `event_schema` (subset on that input). `reject_unverified` fails the run before any state change.
+    4. `dedupe` applies three idempotency layers: a live KV key answers retries without touching the database; `take_claim` writes the key with `overwrite: false` and `ttl: dedupe_window`; `record_event` inserts into the primary-keyed event store, the atomic arbiter. A reused id with another body is refused (`id_conflict`).
+    5. `process` (Loop) handles one event per iteration. `route` (Switch) sends invalid payloads to `mark_schema_invalid`, the three known types to their SQL handlers and anything else to `mark_unknown_type` (the Switch `defaults`). Business misses (paid before created) are written as data; exceptions (the payment trigger) are caught by `mark_exception`. `settle` is the only writer of the DLQ: attempts + 1, parked at `max_attempts`, resolved when a replay succeeds.
+    6. `report` reads the committed state back; `respond` answers `processed`, `duplicate`, `dead_lettered` or `parked` with HTTP 200, `rejected` or `id_conflict` with HTTP 500.
+    7. `mode: replay` claims the oldest retryable dead letters in one transaction, re-validates them and runs them through the same Loop. `dry_run` (the default) only lists them; `include_parked` retries parked events once you fixed the cause.
+
+    ## What this blueprint teaches
+
+    - **KV `overwrite: false` as a claim and KV `ttl` as the dedupe window** (`take_claim`). Tested on 2.0.5: of three rounds of twelve parallel claims on one key, one round had two winners, because the store checks, then writes. That is why `record_event` (INSERT OR IGNORE on the primary key) stays as the final guard.
+    - **Webhook `fetchType: STORE` with `wait` and `returnOutputs`** (`order_events`): exact bytes for signatures and a synchronous answer; outputs are returned even when the run fails.
+    - **Flow-level `checks`**: a manual `mode=intake` run, or a schema that is not an object, is refused with HTTP 422 before an execution exists.
+    - **`sla` and `afterExecution`** (`sender_timeout_budget`, `release_stranded_claim`): when the SLA stops a run, `finally` does not run but `afterExecution` does. It deletes this run's `processing` claim and uncommitted row, so the sender's retry is processed, not answered as a duplicate. `delete_claim` comes last because the If condition is evaluated again after each child.
+    - **`finally`** (`audit_and_gauge`, `publish_dlq_gauge`): an audit row and a `dlq_summary` KV gauge, also after rejections.
+    - **Per-item isolation** (`process`, `apply`, `settle`): Loop `transmitFailed: false`, a Sequential with `allowFailure` and local `errors`, and a `settle` step that always runs (`errorLogs()` is empty inside Loop iterations on 2.0.5, so each failure is recorded by the task that saw it).
+    - `concurrency` (limit 5, QUEUE) bounds parallel SQLite writers.
+
+    ## What you get
+
+    - One row per event id, and an `orders` table changed once per event.
+    - A `dead_letter` table with reason class (`schema_invalid`, `unknown_type`, `processing_failed`), attempts and status, plus a `dlq_summary` key in KV.
+    - Clear rejections: `bad_signature`, `stale_timestamp`, `missing_headers`, `body_too_large`, `not_utf8_json`, `id_conflict`.
+    - Alerts with the failed task id and execution link; a note when an event is parked or the SLA breached.
+
+    ## Who it's for
+
+    - Integration and platform engineers receiving signed provider webhooks.
+    - Data engineers who need an auditable event store.
+
+    ## Why orchestrate this with Kestra
+
+    Every delivery is an inspectable execution with declared retries, timeouts and masked secrets, and the DLQ is a mode of the same flow. SLA, checks and afterExecution give guarantees a bare HTTP handler must build by hand.
+
+    ## Prerequisites
+
+    - `python3` on the worker for the Process runner (included in the official Kestra image), or a Docker task runner with `python:3.13-slim`.
+    - A writable path for the SQLite file in `variables.event_store_url` (`/app/storage` is the Docker Compose data volume).
+
+    ### Secrets
+
+    - `ORDER_WEBHOOK_KEY`: the key in the webhook URL.
+    - `ORDER_WEBHOOK_SIGNING_SECRET`: the shared HMAC secret, `whsec_` + base64 as in the Standard Webhooks spec, or any raw string.
+    - `SLACK_WEBHOOK_URL`: optional alerts; the tasks that use it have `allowFailure`.
+
+    ## Quick start
+
+    1. Add the secrets and save the flow. The URL is `/api/v1/main/executions/webhook/company.team/<flow id>/<key>`.
+    2. Send a signed sample event (`SECRET` and `URL` set in your shell):
+       ```bash
+       ID=evt_demo_1; TS=$(date +%s)
+       BODY='{"type":"order.created","timestamp":"2026-10-20T12:00:00Z","data":{"order_id":"ord_demo1","customer_email":"a@example.com","amount_cents":1200,"currency":"EUR"}}'
+       SIG=$(printf '%s.%s.%s' "$ID" "$TS" "$BODY" | openssl dgst -sha256 -mac HMAC -macopt hexkey:$(printf '%s' "${SECRET#whsec_}" | base64 -d | xxd -p -c 256) -binary | base64)
+       curl -X POST "$URL" -H "webhook-id: $ID" -H "webhook-timestamp: $TS" -H "webhook-signature: v1,$SIG" -H 'Content-Type: application/json' -d "$BODY"
+       ```
+    3. Send it again (`duplicate`), then an `order.paid` for an unknown order (`dead_lettered`). Run `mode=replay` to list the queue, and with `dry_run=false` once the missing order arrived.
+
+    ## How to extend
+
+    - Replace the SQL handlers with your own (a Subflow per type, an HTTP call) and add cases to `route`.
+    - Schedule `mode=replay` every 15 minutes and alert on `dlq_summary.parked`.
+    - Move the store to PostgreSQL when several workers share the intake.
+
+    ## Links
+
+    - [Webhook trigger](https://kestra.io/docs/workflow-components/triggers/webhook-trigger)
+    - [KV store](https://kestra.io/docs/concepts/kv-store) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [SLA](https://kestra.io/docs/workflow-components/sla), [finally](https://kestra.io/docs/workflow-components/finally), [errors](https://kestra.io/docs/workflow-components/errors), [concurrency](https://kestra.io/docs/workflow-components/concurrency)
+    - [SQLite plugin](https://kestra.io/plugins/plugin-jdbc-sqlite) and [Python scripts](https://kestra.io/plugins/plugin-script-python)
+    - [Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)
+  tags:
+    - Data
+    - Core
+  subTags:
+    - Realtime & Streaming
+    - Testing & Quality
+    - Flow Control & Conditions
+  ee: false
+  demo: false

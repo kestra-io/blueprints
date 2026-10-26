@@ -1,0 +1,824 @@
+id: ldap-duplicate-uidnumber-collision-repair-guard
+namespace: company.team
+
+description: |
+  Find duplicate numeric uidNumber values among POSIX people, then reassign only the newer account to a verified free uidNumber after approval.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true the flow reports collisions and never writes to LDAP.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true and dry_run is false, the flow may repair safe collisions after approval.
+  - id: ldap_host
+    type: STRING
+    defaults: ldap.example.com
+    description: LDAP hostname.
+  - id: ldap_port
+    type: INT
+    defaults: 389
+    description: LDAP port.
+  - id: bind_dn
+    type: STRING
+    defaults: cn=admin,dc=example,dc=org
+    description: Bind DN allowed to search and modify the directory.
+  - id: ldap_password
+    type: SECRET
+    defaults: "{{ secret('LDAP_PASSWORD') }}"
+    description: Bind password.
+  - id: people_base_dn
+    type: STRING
+    defaults: ou=people,dc=example,dc=org
+    description: Search base for POSIX people. Only entries below this DN can be targets.
+  - id: inventory_base_dn
+    type: STRING
+    defaults: dc=example,dc=org
+    description: Search base for all uidNumber and gidNumber reservations.
+  - id: protected_dns
+    type: STRING
+    defaults: cn=admin,dc=example,dc=org;ou=system,dc=example,dc=org
+    description: Semicolon-separated DNs that must never be modified.
+  - id: allocation_floor
+    type: INT
+    defaults: 10000
+    description: New uidNumbers must be strictly greater than this floor.
+  - id: allocation_ceiling
+    type: INT
+    defaults: 60000
+    description: Highest uidNumber the allocator may use.
+  - id: max_repairs
+    type: INT
+    defaults: 20
+    description: Maximum number of accounts one approved run may repair.
+  - id: page_size
+    type: INT
+    defaults: 500
+    description: LDAP page size used to avoid silently truncated searches.
+  - id: slack_webhook_url
+    type: STRING
+    defaults: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    description: Findings webhook. Defaults to the SLACK_WEBHOOK_URL secret.
+
+tasks:
+  - id: detect_people
+    type: io.kestra.plugin.ldap.Search
+    description: Search every POSIX account below the people base with its numeric identity and creation timestamp.
+    hostname: "{{ inputs.ldap_host }}"
+    port: "{{ inputs.ldap_port }}"
+    userDn: "{{ inputs.bind_dn }}"
+    password: "{{ inputs.ldap_password }}"
+    baseDn: "{{ inputs.people_base_dn }}"
+    filter: "(&(objectClass=posixAccount)(uidNumber=*))"
+    attributes:
+      - uid
+      - uidNumber
+      - gidNumber
+      - objectClass
+      - createTimestamp
+      - "+"
+    pageSize: "{{ inputs.page_size }}"
+
+  - id: detect_inventory
+    type: io.kestra.plugin.ldap.Search
+    description: Search the whole inventory base for both uidNumber and gidNumber reservations so a new uidNumber cannot take a group ID.
+    hostname: "{{ inputs.ldap_host }}"
+    port: "{{ inputs.ldap_port }}"
+    userDn: "{{ inputs.bind_dn }}"
+    password: "{{ inputs.ldap_password }}"
+    baseDn: "{{ inputs.inventory_base_dn }}"
+    filter: "(|(uidNumber=*)(gidNumber=*))"
+    attributes:
+      - uidNumber
+      - gidNumber
+      - objectClass
+    pageSize: "{{ inputs.page_size }}"
+
+  - id: analyze
+    type: io.kestra.plugin.scripts.python.Script
+    description: Group duplicate uidNumbers, keep the oldest entry, allocate the first free number above the floor and write a plan for the post-approval recheck.
+    containerImage: python:3.12-slim
+    inputFiles:
+      people.ldif: "{{ outputs.detect_people.uri }}"
+      inventory.ldif: "{{ outputs.detect_inventory.uri }}"
+    outputFiles:
+      - plan.json
+      - remediate.ldif
+    env:
+      PROTECTED_DNS: "{{ inputs.protected_dns }}"
+      ALLOCATION_FLOOR: "{{ inputs.allocation_floor }}"
+      ALLOCATION_CEILING: "{{ inputs.allocation_ceiling }}"
+      MAX_REPAIRS: "{{ inputs.max_repairs }}"
+      PEOPLE_BASE_DN: "{{ inputs.people_base_dn }}"
+    script: |
+      import base64
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+
+      FLOOR = int(os.environ["ALLOCATION_FLOOR"])
+      CEILING = int(os.environ["ALLOCATION_CEILING"])
+      MAX_REPAIRS = int(os.environ["MAX_REPAIRS"])
+      PROTECTED_RAW = os.environ.get("PROTECTED_DNS", "")
+
+      def split_dn(value):
+          parts, current, escaped = [], [], False
+          for char in value or "":
+              if escaped:
+                  current.append(char)
+                  escaped = False
+              elif char == "\\":
+                  current.append(char)
+                  escaped = True
+              elif char == ",":
+                  parts.append("".join(current))
+                  current = []
+              else:
+                  current.append(char)
+          parts.append("".join(current))
+          return parts
+
+      def norm_dn(value):
+          return ",".join(part.strip().lower() for part in split_dn(value))
+
+      def decode_value(value):
+          value = value.lstrip()
+          if value.startswith(":"):
+              try:
+                  return base64.b64decode(value[1:].strip()).decode("utf-8", "replace")
+              except Exception:
+                  return ""
+          if value.startswith("<"):
+              return ""
+          return value
+
+      def parse_ldif(path):
+          raw = open(path, encoding="utf-8", errors="replace").read()
+          unfolded = re.sub(r"\r?\n[ ]", "", raw)
+          entries, current = [], None
+          def flush():
+              nonlocal current
+              if current and current.get("dn"):
+                  entries.append(current)
+              current = None
+          for line in unfolded.splitlines():
+              if not line.strip():
+                  flush()
+                  continue
+              if line.startswith("#") or ":" not in line:
+                  continue
+              key, _, value = line.partition(":")
+              key = key.strip().lower()
+              value = decode_value(value)
+              if key == "version":
+                  continue
+              if key == "dn":
+                  flush()
+                  current = {"dn": value, "attrs": {}}
+                  continue
+              if current is not None:
+                  current["attrs"].setdefault(key, []).append(value)
+          flush()
+          return entries
+
+      def numbers(entry, key):
+          values = []
+          for value in entry.get("attrs", {}).get(key, []):
+              if value.isdigit():
+                  values.append(int(value))
+          return values
+
+      def timestamp(entry):
+          value = (entry.get("attrs", {}).get("createtimestamp") or [""])[0].strip()
+          if not re.fullmatch(r"\d{14}Z", value):
+              return None
+          try:
+              return datetime.strptime(value[:-1], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+          except ValueError:
+              return None
+
+      def stamp(entry):
+          value = (entry.get("attrs", {}).get("createtimestamp") or [""])[0].strip()
+          return value if timestamp(entry) else "unknown"
+
+      def ldif_dn_line(value):
+          if value.isascii() and value == value.strip() and not value.startswith((":", "<")) and "\n" not in value:
+              return "dn: " + value
+          return "dn:: " + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+      people = parse_ldif("people.ldif")
+      inventory = parse_ldif("inventory.ldif")
+      protected = {norm_dn(value) for value in PROTECTED_RAW.split(";") if value.strip()}
+      groups = {}
+      for entry in people:
+          values = numbers(entry, "uidnumber")
+          if not values:
+              continue
+          groups.setdefault(values[0], []).append(entry)
+
+      duplicate_groups = {}
+      unsafe = []
+      targets = []
+      for uid_number, entries in sorted(groups.items()):
+          if len(entries) < 2:
+              continue
+          members = sorted((norm_dn(entry["dn"]) for entry in entries))
+          duplicate_groups[str(uid_number)] = members
+          if any(norm_dn(entry["dn"]) in protected for entry in entries):
+              unsafe.append("uidNumber {} includes a protected DN".format(uid_number))
+              continue
+          times = [timestamp(entry) for entry in entries]
+          if any(value is None for value in times):
+              unsafe.append("uidNumber {} has an unreadable createTimestamp".format(uid_number))
+              continue
+          if len({value for value in times}) != len(times):
+              unsafe.append("uidNumber {} has tied createTimestamp values".format(uid_number))
+              continue
+          ordered = sorted(entries, key=lambda entry: timestamp(entry))
+          keeper = ordered[0]
+          for target in ordered[1:]:
+              targets.append({
+                  "old_uid": uid_number,
+                  "target_dn": target["dn"],
+                  "target_dn_norm": norm_dn(target["dn"]),
+                  "target_timestamp": stamp(target),
+                  "keeper_dn": keeper["dn"],
+                  "keeper_dn_norm": norm_dn(keeper["dn"]),
+                  "keeper_timestamp": stamp(keeper),
+                  "members": members,
+              })
+
+      if len(targets) > MAX_REPAIRS:
+          unsafe.append("{} repairs exceed max_repairs {}".format(len(targets), MAX_REPAIRS))
+      used = set()
+      for entry in inventory:
+          used.update(numbers(entry, "uidnumber"))
+          used.update(numbers(entry, "gidnumber"))
+      if not inventory:
+          unsafe.append("inventory search returned no entries")
+
+      candidate = FLOOR + 1
+      for target in targets:
+          while candidate <= CEILING and candidate in used:
+              candidate += 1
+          if candidate > CEILING:
+              unsafe.append("no free uidNumber remains below allocation_ceiling {}".format(CEILING))
+              break
+          target["new_uid"] = candidate
+          used.add(candidate)
+          candidate += 1
+
+      plan = {
+          "duplicate_groups": duplicate_groups,
+          "targets": targets if not unsafe else [],
+          "protected_dns": sorted(protected),
+          "people_base_dn": os.environ.get("PEOPLE_BASE_DN", ""),
+          "allocation_floor": FLOOR,
+          "allocation_ceiling": CEILING,
+      }
+      with open("plan.json", "w", encoding="utf-8") as handle:
+          json.dump(plan, handle, sort_keys=True)
+
+      lines = []
+      if not unsafe:
+          for target in targets:
+              lines.extend([
+                  ldif_dn_line(target["target_dn"]),
+                  "changetype: modify",
+                  "replace: uidNumber",
+                  "uidNumber: " + str(target["new_uid"]),
+                  "-",
+                  "",
+              ])
+      open("remediate.ldif", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
+      for uid_number, members in duplicate_groups.items():
+          print("DUPLICATE uidNumber={} entries={}".format(uid_number, ",".join(members)))
+      for target in targets:
+          print("PLAN target={} old_uid={} new_uid={} target_created={} keeper={} keeper_created={}".format(
+              target["target_dn"], target["old_uid"], target.get("new_uid", "none"), target["target_timestamp"], target["keeper_dn"], target["keeper_timestamp"]))
+      for reason in unsafe:
+          print("UNSAFE " + reason)
+      display_targets = targets if not unsafe else []
+      summary = " | ".join(
+          "{} old={} new={} created={} keeper_created={}".format(t["target_dn"], t["old_uid"], t.get("new_uid", "none"), t["target_timestamp"], t["keeper_timestamp"])
+          for t in display_targets
+      ) or "none"
+      out = {
+          "has_findings": "yes" if (duplicate_groups or unsafe) else "no",
+          "has_targets": "yes" if (targets and not unsafe) else "no",
+          "safe_to_write": "yes" if (targets and not unsafe) else "no",
+          "target_count": str(len(targets) if not unsafe else 0),
+          "duplicate_count": str(len(duplicate_groups)),
+          "unsafe_count": str(len(unsafe)),
+          "target_summary": summary,
+          "unsafe_reasons": " | ".join(unsafe) if unsafe else "none",
+      }
+      print("SCAN people={} inventory={} duplicate_groups={} targets={} unsafe={}".format(len(people), len(inventory), len(duplicate_groups), out["target_count"], len(unsafe)))
+      print("::" + json.dumps({"outputs": out}) + "::")
+
+  - id: findings_alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.analyze.vars.has_findings == 'yes' }}"
+    then:
+      - id: log_findings
+        type: io.kestra.plugin.core.log.Log
+        message: "uidNumber collision scan: duplicate_groups={{ outputs.analyze.vars.duplicate_count }}, targets={{ outputs.analyze.vars.target_count }}, unsafe={{ outputs.analyze.vars.unsafe_reasons }}. Plan: {{ outputs.analyze.vars.target_summary }}"
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Report collision details, including the planned newer entries and timestamps, on every finding run.
+        url: "{{ inputs.slack_webhook_url }}"
+        payload: |
+          {
+            "text": "LDAP uidNumber collision scan found {{ outputs.analyze.vars.duplicate_count }} duplicate group(s) under {{ inputs.people_base_dn }}. Targets={{ outputs.analyze.vars.target_count }}. Unsafe={{ outputs.analyze.vars.unsafe_reasons }}. Plan={{ outputs.analyze.vars.target_summary }}. dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}."
+          }
+
+  - id: unsafe_remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.analyze.vars.has_findings == 'yes' and outputs.analyze.vars.safe_to_write != 'yes' }}"
+    then:
+      - id: refuse_unsafe_plan
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "No write was attempted because the collision plan is unsafe: {{ outputs.analyze.vars.unsafe_reasons }}"
+
+  - id: remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.analyze.vars.has_targets == 'yes' and outputs.analyze.vars.safe_to_write == 'yes' }}"
+    then:
+      - id: approval_hold
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          Review the collision plan before writing. The newer entries and their creation timestamps are: {{ outputs.analyze.vars.target_summary }}. Resume with approved=true to re-read the directory and apply the verified plan or leave it false to make no change.
+        onResume:
+          - id: approved
+            type: BOOL
+            defaults: false
+            description: Set true only after reviewing every target and timestamp in the plan.
+      - id: approved_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approval_hold.onResume.approved ?? false }}"
+        then:
+          - id: recheck_people
+            type: io.kestra.plugin.ldap.Search
+            description: Re-read the people subtree immediately after approval; stale plans are refused before Modify.
+            hostname: "{{ inputs.ldap_host }}"
+            port: "{{ inputs.ldap_port }}"
+            userDn: "{{ inputs.bind_dn }}"
+            password: "{{ inputs.ldap_password }}"
+            baseDn: "{{ inputs.people_base_dn }}"
+            filter: "(&(objectClass=posixAccount)(uidNumber=*))"
+            attributes:
+              - uid
+              - uidNumber
+              - gidNumber
+              - objectClass
+              - createTimestamp
+              - "+"
+            pageSize: "{{ inputs.page_size }}"
+          - id: recheck_inventory
+            type: io.kestra.plugin.ldap.Search
+            description: Re-read uidNumber and gidNumber reservations immediately after approval.
+            hostname: "{{ inputs.ldap_host }}"
+            port: "{{ inputs.ldap_port }}"
+            userDn: "{{ inputs.bind_dn }}"
+            password: "{{ inputs.ldap_password }}"
+            baseDn: "{{ inputs.inventory_base_dn }}"
+            filter: "(|(uidNumber=*)(gidNumber=*))"
+            attributes:
+              - uidNumber
+              - gidNumber
+              - objectClass
+            pageSize: "{{ inputs.page_size }}"
+          - id: recheck_plan
+            type: io.kestra.plugin.scripts.python.Script
+            description: Compare the approved plan with both fresh searches, reject any directory drift and render the LDIF only after all checks pass.
+            containerImage: python:3.12-slim
+            inputFiles:
+              plan.json: "{{ outputs.analyze.outputFiles['plan.json'] }}"
+              people.ldif: "{{ outputs.recheck_people.uri }}"
+              inventory.ldif: "{{ outputs.recheck_inventory.uri }}"
+            outputFiles:
+              - recheck.ldif
+            env:
+              PROTECTED_DNS: "{{ inputs.protected_dns }}"
+            script: |
+              import base64
+              import json
+              import os
+              import re
+
+              def split_dn(value):
+                  parts, current, escaped = [], [], False
+                  for char in value or "":
+                      if escaped:
+                          current.append(char)
+                          escaped = False
+                      elif char == "\\":
+                          current.append(char)
+                          escaped = True
+                      elif char == ",":
+                          parts.append("".join(current))
+                          current = []
+                      else:
+                          current.append(char)
+                  parts.append("".join(current))
+                  return parts
+
+              def norm_dn(value):
+                  return ",".join(part.strip().lower() for part in split_dn(value))
+
+              def ldif_dn_line(value):
+                  if value.isascii() and value == value.strip() and not value.startswith((":", "<")) and "\n" not in value:
+                      return "dn: " + value
+                  return "dn:: " + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+              def decode_value(value):
+                  value = value.lstrip()
+                  if value.startswith(":"):
+                      try:
+                          return base64.b64decode(value[1:].strip()).decode("utf-8", "replace")
+                      except Exception:
+                          return ""
+                  if value.startswith("<"):
+                      return ""
+                  return value
+
+              def parse_ldif(path):
+                  raw = open(path, encoding="utf-8", errors="replace").read()
+                  unfolded = re.sub(r"\r?\n[ ]", "", raw)
+                  entries, current = [], None
+                  def flush():
+                      nonlocal current
+                      if current and current.get("dn"):
+                          entries.append(current)
+                      current = None
+                  for line in unfolded.splitlines():
+                      if not line.strip():
+                          flush()
+                          continue
+                      if line.startswith("#") or ":" not in line:
+                          continue
+                      key, _, value = line.partition(":")
+                      key = key.strip().lower()
+                      value = decode_value(value)
+                      if key == "version":
+                          continue
+                      if key == "dn":
+                          flush()
+                          current = {"dn": value, "attrs": {}}
+                          continue
+                      if current is not None:
+                          current["attrs"].setdefault(key, []).append(value)
+                  flush()
+                  return entries
+
+              def nums(entry, key):
+                  return [int(value) for value in entry.get("attrs", {}).get(key, []) if value.isdigit()]
+
+              plan = json.load(open("plan.json", encoding="utf-8"))
+              people = parse_ldif("people.ldif")
+              inventory = parse_ldif("inventory.ldif")
+              by_dn = {norm_dn(entry["dn"]): entry for entry in people}
+              groups = {}
+              for entry in people:
+                  values = nums(entry, "uidnumber")
+                  if values:
+                      groups.setdefault(str(values[0]), []).append(norm_dn(entry["dn"]))
+              current_duplicates = {key: sorted(value) for key, value in groups.items() if len(value) >= 2}
+              reasons = []
+              if current_duplicates != plan.get("duplicate_groups", {}):
+                  reasons.append("duplicate membership changed during approval")
+
+              protected = {norm_dn(value) for value in os.environ.get("PROTECTED_DNS", "").split(";") if value.strip()}
+              used = set()
+              gid_used = set()
+              for entry in inventory:
+                  used.update(nums(entry, "uidnumber"))
+                  gid_used.update(nums(entry, "gidnumber"))
+              rendered = []
+              seen_new = set()
+              for target in plan.get("targets", []):
+                  target_key = target["target_dn_norm"]
+                  keeper_key = target["keeper_dn_norm"]
+                  current_target = by_dn.get(target_key)
+                  current_keeper = by_dn.get(keeper_key)
+                  if current_target is None or current_keeper is None:
+                      reasons.append("planned target or keeper disappeared")
+                      continue
+                  target_attrs = current_target.get("attrs", {})
+                  keeper_attrs = current_keeper.get("attrs", {})
+                  target_uid = (target_attrs.get("uidnumber") or [""])[0]
+                  keeper_uid = (keeper_attrs.get("uidnumber") or [""])[0]
+                  target_created = (target_attrs.get("createtimestamp") or [""])[0]
+                  keeper_created = (keeper_attrs.get("createtimestamp") or [""])[0]
+                  if target_uid != str(target["old_uid"]) or target_created != target["target_timestamp"]:
+                      reasons.append("target changed: " + target["target_dn"])
+                  if keeper_uid != str(target["old_uid"]) or keeper_created != target["keeper_timestamp"]:
+                      reasons.append("keeper changed: " + target["keeper_dn"])
+                  if target_key in protected or keeper_key in protected:
+                      reasons.append("protected DN appeared in plan")
+                  new_uid = int(target["new_uid"])
+                  if new_uid in used or new_uid in gid_used or new_uid in seen_new:
+                      reasons.append("planned new uidNumber is no longer free: " + str(new_uid))
+                  seen_new.add(new_uid)
+                  rendered.extend([
+                      ldif_dn_line(target["target_dn"]),
+                      "changetype: modify",
+                      "replace: uidNumber",
+                      "uidNumber: " + str(new_uid),
+                      "-",
+                      "",
+                  ])
+              if reasons:
+                  rendered = []
+              open("recheck.ldif", "w", encoding="utf-8").write("\n".join(rendered) + "\n")
+              for reason in reasons:
+                  print("DRIFT " + reason)
+              print("RECHECK targets={} duplicate_groups={} drift={}".format(len(plan.get("targets", [])), len(current_duplicates), len(reasons)))
+              out = {
+                  "safe_to_write": "yes" if (plan.get("targets") and not reasons) else "no",
+                  "target_count": str(len(plan.get("targets", []))),
+                  "drift_count": str(len(reasons)),
+                  "reason": " | ".join(reasons) if reasons else "none",
+              }
+              print("::" + json.dumps({"outputs": out}) + "::")
+          - id: apply_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.recheck_plan.vars.safe_to_write == 'yes' }}"
+            then:
+              - id: remediate
+                type: io.kestra.plugin.ldap.Modify
+                description: Apply the freshly rendered native LDIF. LDAP Modify can log rejected records while remaining green, so verification below is authoritative.
+                hostname: "{{ inputs.ldap_host }}"
+                port: "{{ inputs.ldap_port }}"
+                userDn: "{{ inputs.bind_dn }}"
+                password: "{{ inputs.ldap_password }}"
+                inputs:
+                  - "{{ outputs.recheck_plan.outputFiles['recheck.ldif'] }}"
+              - id: verify_people
+                type: io.kestra.plugin.ldap.Search
+                description: Re-run the collision search after Modify.
+                hostname: "{{ inputs.ldap_host }}"
+                port: "{{ inputs.ldap_port }}"
+                userDn: "{{ inputs.bind_dn }}"
+                password: "{{ inputs.ldap_password }}"
+                baseDn: "{{ inputs.people_base_dn }}"
+                filter: "(&(objectClass=posixAccount)(uidNumber=*))"
+                attributes:
+                  - uid
+                  - uidNumber
+                  - gidNumber
+                  - objectClass
+                  - createTimestamp
+                  - "+"
+                pageSize: "{{ inputs.page_size }}"
+              - id: verify_inventory
+                type: io.kestra.plugin.ldap.Search
+                description: Re-read all uidNumber and gidNumber reservations after Modify.
+                hostname: "{{ inputs.ldap_host }}"
+                port: "{{ inputs.ldap_port }}"
+                userDn: "{{ inputs.bind_dn }}"
+                password: "{{ inputs.ldap_password }}"
+                baseDn: "{{ inputs.inventory_base_dn }}"
+                filter: "(|(uidNumber=*)(gidNumber=*))"
+                attributes:
+                  - uidNumber
+                  - gidNumber
+                  - objectClass
+                pageSize: "{{ inputs.page_size }}"
+              - id: verify_result
+                type: io.kestra.plugin.scripts.python.Script
+                description: Assert that no duplicate uidNumber remains, every planned target has its new number and no target number equals a gidNumber.
+                containerImage: python:3.12-slim
+                inputFiles:
+                  plan.json: "{{ outputs.analyze.outputFiles['plan.json'] }}"
+                  people.ldif: "{{ outputs.verify_people.uri }}"
+                  inventory.ldif: "{{ outputs.verify_inventory.uri }}"
+                outputFiles:
+                  - verification.json
+                script: |
+                  import base64, json, re
+                  def parse(path):
+                      raw = open(path, encoding="utf-8", errors="replace").read()
+                      unfolded = re.sub(r"\r?\n[ ]", "", raw)
+                      entries, current = [], None
+                      def flush():
+                          nonlocal current
+                          if current and current.get("dn"):
+                              entries.append(current)
+                          current = None
+                      for line in unfolded.splitlines():
+                          if not line.strip():
+                              flush(); continue
+                          if line.startswith("#") or ":" not in line:
+                              continue
+                          key, _, value = line.partition(":")
+                          value = value.lstrip()
+                          if value.startswith(":"):
+                              try: value = base64.b64decode(value[1:].strip()).decode("utf-8", "replace")
+                              except Exception: value = ""
+                          if key.strip().lower() == "dn":
+                              flush(); current = {"dn": value, "attrs": {}}; continue
+                          if current is not None:
+                              current["attrs"].setdefault(key.strip().lower(), []).append(value)
+                      flush(); return entries
+                  def split_dn(value):
+                      parts, current, escaped = [], [], False
+                      for char in value or "":
+                          if escaped:
+                              current.append(char)
+                              escaped = False
+                          elif char == "\\":
+                              current.append(char)
+                              escaped = True
+                          elif char == ",":
+                              parts.append("".join(current))
+                              current = []
+                          else:
+                              current.append(char)
+                      parts.append("".join(current))
+                      return parts
+                  def norm(value):
+                      return ",".join(part.strip().lower() for part in split_dn(value))
+                  def nums(entry, key):
+                      return [int(value) for value in entry.get("attrs", {}).get(key, []) if value.isdigit()]
+                  plan = json.load(open("plan.json", encoding="utf-8"))
+                  people = parse("people.ldif")
+                  inventory = parse("inventory.ldif")
+                  groups = {}
+                  by_dn = {}
+                  for entry in people:
+                      by_dn[norm(entry["dn"])] = entry
+                      values = nums(entry, "uidnumber")
+                      if values: groups.setdefault(values[0], []).append(entry["dn"])
+                  duplicates = {str(key): value for key, value in groups.items() if len(value) >= 2}
+                  gids = set()
+                  for entry in inventory: gids.update(nums(entry, "gidnumber"))
+                  missing, wrong, gid_conflicts = [], [], []
+                  for target in plan.get("targets", []):
+                      entry = by_dn.get(norm(target["target_dn"]))
+                      if entry is None:
+                          missing.append(target["target_dn"]); continue
+                      values = nums(entry, "uidnumber")
+                      if values != [int(target["new_uid"])]:
+                          wrong.append(target["target_dn"])
+                      if int(target["new_uid"]) in gids:
+                          gid_conflicts.append(str(target["new_uid"]))
+                  ok = not duplicates and not missing and not wrong and not gid_conflicts
+                  result = {"ok": ok, "duplicate_groups": len(duplicates), "missing_targets": len(missing), "wrong_targets": len(wrong), "gid_conflicts": len(gid_conflicts)}
+                  print("VERIFY duplicate_groups={} targets={} missing={} wrong={} gid_conflicts={} ok={}".format(len(duplicates), len(plan.get("targets", [])), len(missing), len(wrong), len(gid_conflicts), ok))
+                  if duplicates:
+                      print("DUPLICATES " + json.dumps(duplicates, sort_keys=True))
+                  print("::" + json.dumps({"outputs": {"verification_ok": "yes" if ok else "no", "details": json.dumps(result, sort_keys=True)}}) + "::")
+                  json.dump(result, open("verification.json", "w", encoding="utf-8"), sort_keys=True)
+              - id: assert_verified
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.verify_result.vars.verification_ok != 'yes' }}"
+                then:
+                  - id: verification_failed
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "uidNumber repair verification failed: {{ outputs.verify_result.vars.details }}"
+              - id: log_applied
+                type: io.kestra.plugin.core.log.Log
+                message: "Repaired {{ outputs.recheck_plan.vars.target_count }} uidNumber collision target(s); verification passed with no duplicate uidNumber or uid/gid overlap."
+            else:
+              - id: stale_plan
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "The directory changed during approval; no Modify was attempted. {{ outputs.recheck_plan.vars.reason }}"
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: "Approval declined; no uidNumber was changed. Planned targets remain: {{ outputs.analyze.vars.target_summary }}"
+
+triggers:
+  - id: daily_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Daily collision audit, disabled and pinned to safe inputs.
+    cron: "0 6 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when a stale plan, refused write or failed verification stops the run.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "LDAP uidNumber collision repair guard FAILED (execution {{ execution.id }}). Inspect the directory and the verification logs before retrying."
+      }
+
+
+extend:
+  title: Repair Duplicate LDAP uidNumber Collisions Safely
+  shortDescription: Find duplicate POSIX uidNumber values, move only the newer entry to a free number and prove uid/gid uniqueness after approval.
+  metaTitle: LDAP Duplicate uidNumber Collision Repair Guard
+  metaDescription: Repair duplicate POSIX uidNumber values behind approval, avoiding gidNumber reservations and failing if uniqueness is not restored.
+  description: |
+    Two valid POSIX entries with one `uidNumber` are one kernel identity. A file owner, sudo rule or audit record can therefore be attributed to the wrong person even though both LDAP accounts still bind. This blueprint repairs that collision in place and leaves both entries valid.
+
+    ## How it works
+
+    1. `detect_people` (`io.kestra.plugin.ldap.Search`) reads POSIX entries under `people_base_dn` with `uidNumber`, `gidNumber`, `objectClass` and `createTimestamp`.
+    2. `detect_inventory` (`io.kestra.plugin.ldap.Search`) reads all `uidNumber` and `gidNumber` values under `inventory_base_dn`. The second search supplies the reservation set for allocation.
+    3. `analyze` (`io.kestra.plugin.scripts.python.Script`) groups numeric `uidNumber` values, keeps the oldest creation timestamp and plans a new number for every newer entry. It refuses protected DNs, missing or tied timestamps, an empty inventory, plans above `max_repairs` and exhausted allocation ranges.
+    4. `findings_alert` logs and posts the exact collision groups and planned target timestamps. Safe defaults never write.
+    5. With `auto_remediate` true and `dry_run` false, `approval_hold` pauses with the target DNs, old and new numbers and both creation timestamps. After approval, `recheck_people` and `recheck_inventory` run again. `recheck_plan` refuses any target, keeper, duplicate membership or candidate reservation drift.
+    6. `remediate` (`io.kestra.plugin.ldap.Modify`) applies the native LDIF only after the fresh plan passes. `verify_people` and `verify_inventory` run again and `verify_result` fails unless every duplicate is gone, every target has its planned number and no target number is a `gidNumber`.
+
+    ## What you get
+
+    - A read-only collision report with the DNs and creation timestamps that make the keeper choice reviewable.
+    - A bounded repair that changes only `uidNumber` on newer and unprotected entries.
+    - Allocation checked against both user IDs and group IDs, with a post-write uniqueness assertion.
+    - A stale-approval guard that re-reads the directory immediately before the native Modify.
+    - Slack alerts for findings and failed runs.
+
+    ## Who it's for
+
+    - Identity and Linux platform teams operating OpenLDAP or another LDAP directory with POSIX accounts.
+    - Teams where shared NFS ownership, sudo matching or audit attribution depends on stable numeric identities.
+    - Operators who need a scheduled audit but require every directory write to be reviewed and verified.
+
+    ## Why orchestrate this with Kestra
+
+    Repairing a collision by hand means two searches, sorting creation timestamps, checking group ID reservations, writing LDIF, approving a change and searching again. Kestra keeps those steps in one auditable execution with a disabled safe schedule, a human pause, native LDAP tasks and a failed run when the directory does not reach the expected state.
+
+    ## Tested end to end
+
+    Kestra 2.0.6 with the bundled LDAP, script, flow and Slack tasks and OpenLDAP 1.5.0. Every case below ran on the final revision and was confirmed with `ldapsearch` inside the directory container, separately from the flow's own reads. In the repair case the newer of two entries sharing `uidNumber 12000` moved to `10001` while the keeper stayed at `12000` and every other entry was unchanged.
+
+    A bind that may read but not write the directory made `ldap.Modify` report SUCCESS while the server answered `insufficient access rights`. The flow's own collision and reservation searches failed the run and the entry kept its number, so the task state alone is never trusted. The bind password is a `SECRET` input.
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy | `5rHqRnWMtlhtwtSHsvVyw7` | SUCCESS. No duplicate, no write |
+    | Dry run with a duplicate | `4dGGncZfFhnhnSmS4ddAdl` | SUCCESS. Collision reported, directory unchanged |
+    | Declined approval | `67lkGuDhCkk7JT7oTyP5Zn` | SUCCESS. Newer entry still `12000`, no write |
+    | Approved repair | `5FeLuq3zzuAWXubHjRFAY7` | SUCCESS. Newer entry `12000` to `10001`, keeper and other entries unchanged, zero duplicates |
+    | Repeat | `4sVy8JDKQJGHGheF1R35iO` | SUCCESS. No targets, no approval, no write |
+    | Write refused by the directory | `1xSLQSSE6U0CCTcxexpp4M` | FAILED as intended. `ldap.Modify` reported SUCCESS on `insufficient access rights`, verification failed the run, entry unchanged |
+    | Target deleted during the Pause | `40yp9YtN6SSSam0Zvbd4Q8` | FAILED as intended. Stale plan refused before Modify |
+    | Bind password stored nowhere | `4tZIplCqX5fJrks8GWQdaE` | SUCCESS. A distinct bind password was absent from the stored execution, its logs and the execution search |
+    | Fresh OpenLDAP: healthy | `6pTyDjbfDmxvWaDUoCOSJu` | SUCCESS |
+    | Fresh OpenLDAP: dry run | `4NsImBZqbDhhbPDLUI5jNy` | SUCCESS |
+    | Fresh OpenLDAP: declined | `3J7mBDSjYvQpRdVK3uPrw5` | SUCCESS |
+    | Fresh OpenLDAP: approved repair | `5gFBlgyxHqs7XyX5aL3xff` | SUCCESS. `12000` to `10001`, zero duplicates |
+    | Fresh OpenLDAP: repeat | `6IYIlxNLiVjREytxmaeYHs` | SUCCESS |
+    | Fresh OpenLDAP: target deleted during the Pause | `2o3zwPhw66e69plxqkXlhp` | FAILED as intended |
+
+    Controls for protected DNs, allocation exhaustion, an empty inventory, Unicode DNs, a 512-entry inventory, concurrent executions and an LDAP outage ran on the previous revision, which differs only in the password input type.
+
+    ## Prerequisites
+
+    An LDAP directory reachable from Kestra, with a bind account allowed to search both bases and modify only the people entries that should be repaired. Entries need readable `createTimestamp` values and POSIX `uidNumber` attributes.
+
+    ### Secrets
+
+    - `LDAP_PASSWORD`: bind password for `bind_dn`.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for findings and failure alerts.
+
+    ### Inputs
+
+    - `dry_run` (default `true`) and `auto_remediate` (default `false`) guard every write.
+    - `ldap_host`, `ldap_port`, `bind_dn`, `people_base_dn` and `inventory_base_dn` define the directory scope.
+    - `protected_dns` is a semicolon-separated DN allowlist that is never modified.
+    - `allocation_floor` and `allocation_ceiling` bound the first-free allocator; `max_repairs` bounds one write pass.
+    - `page_size` enables paged searches for inventories larger than a server result limit.
+
+    ## Quick start
+
+    1. Add `LDAP_PASSWORD` and `SLACK_WEBHOOK_URL` to the namespace.
+    2. Run with defaults to report duplicate groups without writing.
+    3. Review the DNs and timestamps, then run with `dry_run` false and `auto_remediate` true.
+    4. Approve the pause only after confirming the target and keeper entries.
+    5. Enable the schedule only after the report is trusted. Its inputs remain pinned to safe mode.
+
+    ## How to extend
+
+    - Set `people_base_dn` to a single organizational unit when only one population owns a UID range.
+    - Add known service or system DNs to `protected_dns` before enabling remediation.
+    - Set `allocation_floor` and `allocation_ceiling` to the numeric range reserved by the platform team.
+    - Keep `inventory_base_dn` broad enough to include every source of `gidNumber`, including group entries outside the people OU.
+
+    ## Links
+
+    - LDAP plugin documentation: https://kestra.io/plugins/plugin-ldap
+    - POSIX account schema reference: https://www.openldap.org/doc/admin26/schema.html
+    - This blueprint was created by [zkasuran](https://github.com/zkasuran).
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Infrastructure Automation
+  ee: false
+  demo: false

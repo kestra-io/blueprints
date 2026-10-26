@@ -1,0 +1,460 @@
+id: k8s-cronjob-silent-failure-watchdog
+namespace: company.platform
+
+description: |
+  Catch Kubernetes CronJobs that quietly stopped succeeding. Every 15 minutes
+  the flow compares each CronJob's last successful run with how often it is
+  supposed to succeed, works out why it is late (failing, stuck, or no longer
+  being scheduled), opens one incident per CronJob in the KV store, reminds
+  the owner while it stays broken, announces the recovery, and can delete a
+  hung run that blocks every future schedule.
+
+labels:
+  team: platform
+  domain: reliability
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: namespaces
+    type: ARRAY
+    itemType: STRING
+    displayName: Namespaces
+    description: Namespaces whose CronJobs are watched.
+    defaults:
+      - batch-jobs
+
+  - id: default_max_silence_hours
+    type: FLOAT
+    displayName: Default max hours between successes
+    description: How long a CronJob may go without a successful run before it counts as broken. 26 suits daily jobs; override per CronJob with the max-silence annotation.
+    defaults: 26
+
+  - id: reminder_hours
+    type: FLOAT
+    displayName: Reminder interval in hours
+    description: While an incident stays open, repeat the Slack alert at most this often. A change of diagnosis is always announced immediately.
+    defaults: 6
+
+  - id: remediate
+    type: BOOL
+    displayName: Delete stuck runs
+    description: When true, a run that has been active for longer than the CronJob's max silence is deleted, but only on CronJobs annotated with the kill-stuck annotation. With concurrencyPolicy Forbid a hung run blocks every later schedule, so deleting it lets the next one start.
+    defaults: false
+
+variables:
+  annotation_prefix: cronjob-watchdog
+  state_key: cronjob_watchdog_incidents
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Read-only by default; set remediate to true here once the alerts look right.
+    cron: "*/15 * * * *"
+    inputs:
+      remediate: false
+
+tasks:
+  - id: incidents
+    type: io.kestra.plugin.core.kv.Get
+    description: Incidents opened by earlier runs, so an outage is announced once, reminded on a cadence and closed when it recovers.
+    key: "{{ vars.state_key }}"
+    errorOnMissing: false
+
+  - id: inventory
+    type: io.kestra.plugin.core.flow.Loop
+    description: Read every CronJob and every Job in each namespace. Jobs carry the failure reason and start time that the CronJob status does not.
+    values: "{{ inputs.namespaces }}"
+    concurrencyLimit: 3
+    outputs:
+      - id: namespace
+        type: STRING
+        value: "{{ item.value }}"
+      - id: cronjob_metadata
+        type: JSON
+        value: "{{ (outputs.cronjobs.metadataItems ?? []) | toJson }}"
+      - id: cronjob_status
+        type: JSON
+        value: "{{ (outputs.cronjobs.statusItems ?? []) | toJson }}"
+      - id: job_metadata
+        type: JSON
+        value: "{{ (outputs.jobs.metadataItems ?? []) | toJson }}"
+      - id: job_status
+        type: JSON
+        value: "{{ (outputs.jobs.statusItems ?? []) | toJson }}"
+    tasks:
+      - id: cronjobs
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        connection:
+          masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+          oauthToken: "{{ secret('K8S_TOKEN') }}"
+          trustCerts: true
+        namespace: "{{ item.value }}"
+        resourceType: cronjobs
+        apiGroup: batch
+        apiVersion: v1
+        fetchType: FETCH
+
+      - id: jobs
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        connection:
+          masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+          oauthToken: "{{ secret('K8S_TOKEN') }}"
+          trustCerts: true
+        namespace: "{{ item.value }}"
+        resourceType: jobs
+        apiGroup: batch
+        apiVersion: v1
+        fetchType: FETCH
+
+  - id: diagnose
+    type: io.kestra.plugin.scripts.python.Script
+    description: Decide which CronJobs are late, explain why, and turn that into incident transitions (opened, reminded, resolved). Nothing here talks to the cluster.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      INVENTORY: "{{ outputs.inventory.outputs | toJson }}"
+      INCIDENTS: "{{ (outputs.incidents.value ?? '') | toJson }}"
+      DEFAULT_MAX_SILENCE_HOURS: "{{ inputs.default_max_silence_hours }}"
+      REMINDER_HOURS: "{{ inputs.reminder_hours }}"
+      REMEDIATE: "{{ inputs.remediate }}"
+      PREFIX: "{{ vars.annotation_prefix }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      now = datetime.now(timezone.utc)
+      prefix = os.environ["PREFIX"]
+      default_max_silence = float(os.environ["DEFAULT_MAX_SILENCE_HOURS"])
+      reminder_hours = float(os.environ["REMINDER_HOURS"])
+      remediate = os.environ["REMEDIATE"].lower() == "true"
+
+      def as_obj(value, default):
+          # Loop and KV outputs may arrive parsed or as JSON text, sometimes encoded twice.
+          while isinstance(value, str):
+              if value == "":
+                  return default
+              try:
+                  value = json.loads(value)
+              except ValueError:
+                  return default
+          return default if value is None else value
+
+      def parse_time(value):
+          if value in (None, ""):
+              return None
+          if isinstance(value, (int, float)):
+              return datetime.fromtimestamp(float(value), timezone.utc)
+          return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+      def hours_since(moment):
+          return (now - moment).total_seconds() / 3600
+
+      def fmt(moment):
+          return moment.strftime("%Y-%m-%d %H:%M UTC") if moment else "never"
+
+      def human(hours):
+          if hours < 1:
+              return "{}m".format(int(round(hours * 60)))
+          if hours < 48:
+              return "{:g}h".format(round(hours, 1))
+          return "{:g}d".format(round(hours / 24, 1))
+
+      inventory = as_obj(os.environ["INVENTORY"], [])
+      previous = as_obj(os.environ["INCIDENTS"], {})
+      watched_namespaces = set()
+      findings = {}
+      kill = []
+
+      for entry in inventory:
+          out = entry.get("outputs") or {}
+          namespace = out.get("namespace")
+          watched_namespaces.add(namespace)
+
+          jobs_by_owner = {}
+          for meta, status in zip(as_obj(out.get("job_metadata"), []), as_obj(out.get("job_status"), [])):
+              owner = next((o.get("name") for o in meta.get("ownerReferences") or [] if o.get("kind") == "CronJob"), None)
+              if owner:
+                  st = (status or {}).get("status") or {}
+                  jobs_by_owner.setdefault(owner, []).append({
+                      "name": meta.get("name"),
+                      "created": parse_time(meta.get("creationTimestamp")),
+                      "start": parse_time(st.get("startTime")),
+                      "done": st.get("completionTime") is not None,
+                      "active": int(st.get("active") or 0),
+                      "failed": next((c for c in st.get("conditions") or [] if c.get("type") == "Failed" and c.get("status") == "True"), None),
+                  })
+
+          for meta, status in zip(as_obj(out.get("cronjob_metadata"), []), as_obj(out.get("cronjob_status"), [])):
+              name = meta.get("name")
+              annotations = meta.get("annotations") or {}
+              if str(annotations.get(prefix + "/ignore", "")).lower() == "true":
+                  continue
+              st = (status or {}).get("status") or {}
+              try:
+                  max_silence = float(annotations.get(prefix + "/max-silence-hours", default_max_silence))
+              except ValueError:
+                  max_silence = default_max_silence
+
+              last_success = parse_time(st.get("lastSuccessfulTime"))
+              last_schedule = parse_time(st.get("lastScheduleTime"))
+              reference = last_success or parse_time(meta.get("creationTimestamp"))
+              if reference is None or hours_since(reference) <= max_silence:
+                  continue
+
+              jobs = sorted(jobs_by_owner.get(name, []), key=lambda j: j["start"] or j["created"] or now, reverse=True)
+              stuck = [j for j in jobs if j["active"] > 0 and not j["done"] and j["start"] and hours_since(j["start"]) > max_silence]
+              latest = jobs[0] if jobs else None
+
+              if stuck:
+                  kind = "stuck"
+                  detail = "run {} has been active for {} and blocks later schedules under concurrencyPolicy Forbid".format(stuck[0]["name"], human(hours_since(stuck[0]["start"])))
+                  if str(annotations.get(prefix + "/kill-stuck", "")).lower() == "true":
+                      for j in stuck:
+                          kill.append({"namespace": namespace, "cronjob": name, "job": j["name"]})
+              elif latest and latest["failed"]:
+                  kind = "failing"
+                  detail = "last run {} failed: {} ({})".format(latest["name"], latest["failed"].get("reason"), latest["failed"].get("message"))
+              elif last_schedule is None or hours_since(last_schedule) > max_silence:
+                  kind = "not scheduling"
+                  since = "never scheduled" if last_schedule is None else "nothing scheduled since " + fmt(last_schedule)
+                  detail = "{}: suspended, missing its startingDeadlineSeconds, or blocked by the controller".format(since)
+              else:
+                  kind = "no success"
+                  detail = "runs are scheduled (last {}) but none succeeded; their Jobs may already be garbage-collected".format(fmt(last_schedule))
+
+              findings["{}/{}".format(namespace, name)] = {
+                  "namespace": namespace,
+                  "cronjob": name,
+                  "owner": annotations.get(prefix + "/owner", ""),
+                  "diagnosis": kind,
+                  "detail": detail,
+                  "last_success": fmt(last_success),
+                  "silent_hours": round(hours_since(reference), 2),
+                  "max_silence_hours": max_silence,
+              }
+
+      stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+      state, opened, reminded, resolved = {}, [], [], []
+      for key, incident in previous.items():
+          if incident.get("namespace") not in watched_namespaces:
+              state[key] = incident
+          elif key not in findings:
+              resolved.append(dict(incident, broken_hours=round(hours_since(parse_time(incident["opened_at"])), 2)))
+      for key, finding in findings.items():
+          before = previous.get(key)
+          if before is None:
+              opened.append(finding)
+              state[key] = dict(finding, opened_at=stamp, alerted_at=stamp)
+          elif before.get("diagnosis") != finding["diagnosis"] or hours_since(parse_time(before["alerted_at"])) >= reminder_hours:
+              reminded.append(finding)
+              state[key] = dict(finding, opened_at=before["opened_at"], alerted_at=stamp)
+          else:
+              state[key] = dict(finding, opened_at=before["opened_at"], alerted_at=before["alerted_at"])
+
+      def line(f, verb):
+          who = " " + f["owner"] if f["owner"] else ""
+          silence = "never succeeded" if f["last_success"] == "never" else "no success for " + human(f["silent_hours"])
+          return "• *{}* {}/{}{}: {}, {} (limit {}), {}".format(
+              verb, f["namespace"], f["cronjob"], who, f["diagnosis"], silence, human(f["max_silence_hours"]), f["detail"])
+
+      lines = [line(f, "NEW") for f in opened] + [line(f, "STILL BROKEN") for f in reminded]
+      lines += ["• *RECOVERED* {}/{} after {} broken".format(r["namespace"], r["cronjob"], human(r["broken_hours"])) for r in resolved]
+      if kill:
+          verb = "Deleted" if remediate else "Would delete (remediate is off)"
+          lines += ["• {} stuck run {}/{}".format(verb, k["namespace"], k["job"]) for k in kill]
+      slack_text = ""
+      if opened or reminded or resolved:
+          slack_text = ":alarm_clock: *CronJob watchdog*: {} new, {} still broken, {} recovered, {} open in total\n{}\nExecution: {}".format(
+              len(opened), len(reminded), len(resolved), len(findings), "\n".join(lines), os.environ["EXECUTION_ID"])
+
+      print("open={} new={} reminded={} resolved={} stuck_runs={}".format(len(findings), len(opened), len(reminded), len(resolved), len(kill)))
+      for l in lines:
+          print(l)
+
+      print("::" + json.dumps({"outputs": {
+          "open_incidents": list(findings.values()),
+          "opened": opened,
+          "reminded": reminded,
+          "resolved": resolved,
+          "stuck_runs": kill,
+          "state": state,
+          "slack_text": slack_text,
+      }}) + "::")
+
+  - id: remediation
+    type: io.kestra.plugin.core.flow.If
+    description: Delete hung runs only when remediate is on and the CronJob opted in. The next schedule then starts normally.
+    condition: "{{ inputs.remediate and (outputs.diagnose.vars.stuck_runs | length) > 0 }}"
+    then:
+      - id: delete_stuck_runs
+        type: io.kestra.plugin.core.flow.Loop
+        values: "{{ outputs.diagnose.vars.stuck_runs }}"
+        tasks:
+          - id: delete_job
+            type: io.kestra.plugin.kubernetes.kubectl.Delete
+            connection:
+              masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+              oauthToken: "{{ secret('K8S_TOKEN') }}"
+              trustCerts: true
+            namespace: "{{ fromJson(item.value).namespace }}"
+            resourceType: jobs
+            apiGroup: batch
+            apiVersion: v1
+            resourcesNames:
+              - "{{ fromJson(item.value).job }}"
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+
+  - id: save_incidents
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist open incidents so the next run knows what was already announced.
+    key: "{{ vars.state_key }}"
+    value: "{{ outputs.diagnose.vars.state | toJson }}"
+    kvType: JSON
+    overwrite: true
+
+  - id: notify
+    type: io.kestra.plugin.core.flow.If
+    description: Post only when something changed; a quiet run stays quiet.
+    condition: "{{ outputs.diagnose.vars.slack_text != '' }}"
+    then:
+      - id: slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": {{ outputs.diagnose.vars.slack_text | toJson }}
+          }
+
+outputs:
+  - id: open_incidents
+    type: JSON
+    description: Every CronJob currently past its max silence, with diagnosis and detail.
+    value: "{{ outputs.diagnose.vars.open_incidents }}"
+
+  - id: opened
+    type: JSON
+    description: Incidents opened by this run.
+    value: "{{ outputs.diagnose.vars.opened }}"
+
+  - id: resolved
+    type: JSON
+    description: Incidents closed by this run because the CronJob succeeded again or was removed.
+    value: "{{ outputs.diagnose.vars.resolved }}"
+
+  - id: stuck_runs
+    type: JSON
+    description: Hung runs found on opted-in CronJobs; deleted when remediate is true.
+    value: "{{ outputs.diagnose.vars.stuck_runs }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: A watchdog that fails silently is worse than none.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": ":rotating_light: *CronJob watchdog FAILED*. CronJobs in {{ inputs.namespaces | join(', ') }} are not being watched until execution {{ execution.id }} of {{ flow.namespace }}.{{ flow.id }} is fixed."
+      }
+
+extend:
+  title: Kubernetes CronJob Silent Failure Watchdog with Stuck Run Recovery
+  metaTitle: Kubernetes CronJob Silent Failure Watchdog | Kestra
+  shortDescription: Detect Kubernetes CronJobs that stopped succeeding, explain whether they are failing, stuck or no longer scheduled, track each outage as an incident, and clear hung runs that block every later schedule.
+  metaDescription: Watch Kubernetes CronJobs for missed successes, diagnose failing, stuck or suspended jobs, alert owners once with reminders, and auto-clear hung runs.
+  description: |
+    Kubernetes CronJobs fail quietly. A backup that hits its backoff limit, a
+    report that was suspended during an incident and never resumed, or an ETL
+    run hung on a lock under `concurrencyPolicy: Forbid` all look the same
+    from the outside: nothing happens, and nobody notices until the data is
+    missing. This blueprint watches the one signal that matters, the time
+    since each CronJob last succeeded, tells you why it is late, and keeps a
+    proper incident lifecycle so owners are told once, reminded while it stays
+    broken, and told again when it recovers.
+
+    ## How it works
+
+    1. `every_15_minutes` (Schedule) starts a read-only run. Flow-level `concurrency: limit 1` keeps runs from overlapping.
+    2. `incidents` (`core.kv.Get`) loads the incidents opened by earlier runs.
+    3. `inventory` (`core.flow.Loop` over `namespaces`) lists CronJobs and Jobs with two `kubernetes.kubectl.Get` calls per namespace and exposes them through the loop's `outputs`. Jobs are needed because they hold the failure reason and the start time that the CronJob status does not.
+    4. `diagnose` (`scripts.python.Script`, Process runner) compares `status.lastSuccessfulTime` (or the creation time for a CronJob that never succeeded) with the CronJob's allowed silence and classifies each late CronJob:
+       - **stuck**: a run has been active longer than the allowed silence, and blocks every later schedule under `Forbid`.
+       - **failing**: the latest Job carries a `Failed` condition, quoted with its reason, for example `BackoffLimitExceeded` or `DeadlineExceeded`.
+       - **not scheduling**: no run was scheduled within the window, because the CronJob is suspended, keeps missing `startingDeadlineSeconds`, or the controller is not picking it up.
+       - **no success**: runs are scheduled but none succeeded and their Jobs were already garbage-collected.
+       It then turns the findings into incident transitions: opened, reminded (when the diagnosis changes or `reminder_hours` passed) and resolved.
+    5. `remediation` (`core.flow.If`) runs only when `remediate` is true and deletes stuck runs with `kubernetes.kubectl.Delete`, only on CronJobs annotated `cronjob-watchdog/kill-stuck: "true"`. The next schedule then starts normally.
+    6. `save_incidents` (`core.kv.Set`) stores the open incidents, and `notify` posts one Slack message only when something changed. `errors` alerts if the watchdog itself fails.
+
+    ## What you get
+
+    - Silent CronJob failures caught within 15 minutes of crossing their allowed silence, across any number of namespaces.
+    - A diagnosis in every alert, so the first message already says "BackoffLimitExceeded", "hung for 9h" or "never scheduled".
+    - No alert fatigue: one message per incident, reminders on a cadence, and a recovery message with how long it was broken.
+    - Per-CronJob control through annotations: `cronjob-watchdog/max-silence-hours`, `cronjob-watchdog/owner` (a Slack mention), `cronjob-watchdog/ignore` and `cronjob-watchdog/kill-stuck`.
+    - Opt-in self-healing for hung runs, off by default.
+    - Flow outputs (`open_incidents`, `opened`, `resolved`, `stuck_runs`) ready for dashboards or downstream flows.
+
+    ## Who it's for
+
+    - Platform and SRE teams who host batch workloads for other teams on Kubernetes.
+    - Data teams whose backups, exports and ETL run as CronJobs and must not silently skip a day.
+    - Anyone who has found out from a customer that a nightly job stopped running a week ago.
+
+    ## Why orchestrate this with Kestra
+
+    Kubernetes does not alert on a CronJob that stopped succeeding, and a check that lives in the cluster tends to fail with it. Kestra runs the watchdog from outside, keeps incident state in the KV store between runs, retries API calls, masks the cluster token, logs every decision, and lets you replay or run the same flow on demand with different namespaces or thresholds. Alerting, state and remediation are one declarative flow instead of a script, a cron entry and an alert rule maintained separately.
+
+    ## Prerequisites
+
+    - A Kubernetes cluster (1.21 or later, for `status.lastSuccessfulTime`) reachable from the Kestra worker.
+    - A ServiceAccount allowed to `get` and `list` `cronjobs.batch` and `jobs.batch` in the watched namespaces, plus `delete` on `jobs.batch` if you enable remediation.
+    - Python 3 on the worker (the default Kestra image has it), or switch `diagnose` to the Docker task runner.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    - `K8S_MASTER_URL`: Kubernetes API server URL.
+    - `K8S_TOKEN`: ServiceAccount token with the permissions above.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for incident and failure alerts.
+
+    ## Quick start
+
+    1. Create a Role with `get`, `list` on `cronjobs` and `get`, `list`, `delete` on `jobs` in the `batch` API group, bind it to a ServiceAccount in each watched namespace, and mint a token with `kubectl create token`.
+    2. Create the secrets above and set `namespaces`.
+    3. Set `default_max_silence_hours` to fit your most common schedule (26 covers daily jobs) and annotate the exceptions, for example `cronjob-watchdog/max-silence-hours: "2"` on an hourly job.
+    4. Add `cronjob-watchdog/owner: "@team-handle"` so alerts reach the right people.
+    5. Execute once, read the `open_incidents` output and the Slack message.
+    6. Annotate CronJobs whose hung runs are safe to kill with `cronjob-watchdog/kill-stuck: "true"` and set `remediate: true` on the trigger.
+
+    ## How to extend
+
+    - Fetch the failed Pod's last log lines with `kubernetes.kubectl.Get` on `pods` plus a log task and add them to the alert.
+    - Open a PagerDuty or Opsgenie incident for CronJobs annotated as critical instead of a Slack message.
+    - Re-run a failed backup immediately by applying a Job built from the CronJob's template with `kubernetes.kubectl.Apply`.
+    - Feed `open_incidents` into a Kestra dashboard to track batch reliability per team.
+
+    ## Links
+
+    - [Kestra Kubernetes plugin: kubectl.Get](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.get)
+    - [Kestra Kubernetes plugin: kubectl.Delete](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.delete)
+    - [Kestra KV store](https://kestra.io/docs/concepts/kv-store)
+    - [Kubernetes CronJob status and limitations](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/)
+    - [Kubernetes Job failure handling](https://kubernetes.io/docs/concepts/workloads/controllers/job/#handling-pod-and-container-failures)
+
+    - This blueprint has been created by [hiyach28](https://github.com/hiyach28)
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Monitoring & Alerting
+    - Incident Response
+  ee: false
+  demo: false

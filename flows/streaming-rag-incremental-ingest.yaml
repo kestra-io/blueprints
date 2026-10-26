@@ -1,0 +1,327 @@
+id: streaming-rag-incremental-ingest
+namespace: company.team
+
+description: |
+  Incrementally ingest a Kafka document stream into a Pinecone vector index -
+  chunk, embed, and upsert each update, honor tombstone deletes by id, and
+  keep an index freshness watermark so a stalled consumer pages the channel
+  before retrieval quality silently rots.
+
+triggers:
+  - id: on_doc_change
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    description: Consume each document change as it arrives and start one execution per message. Enable once your broker and topic are set.
+    topic: doc-updates
+    properties:
+      bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP_SERVERS') }}"
+    groupId: kestra-rag-ingest
+    valueDeserializer: JSON
+    disabled: true
+
+inputs:
+  - id: index_name
+    type: STRING
+    displayName: Pinecone index
+    description: Index that receives upserts and tombstone deletes.
+    defaults: knowledge-base
+
+  - id: openai_model
+    type: STRING
+    displayName: Embedding model
+    description: OpenAI embedding model used to vectorize each chunk.
+    defaults: text-embedding-3-small
+
+  - id: max_segment_chars
+    type: INT
+    displayName: Max chunk chars
+    description: Upper bound on characters per chunk - documents are split with a sliding window of this size.
+    defaults: 1000
+
+  - id: overlap_chars
+    type: INT
+    displayName: Overlap chars
+    description: Characters carried into the next chunk so sentences straddling a boundary keep their context.
+    defaults: 200
+
+  - id: max_chunks_per_event
+    type: INT
+    displayName: Max chunks per event
+    description: Cap on chunks embedded in one execution - oversized documents are truncated and flagged instead of stalling the consumer.
+    defaults: 64
+
+  - id: min_vector_count
+    type: INT
+    displayName: Min vector count (freshness watermark)
+    description: Index is reported stale when totalVectorCount drops below this floor - catches missed upserts and accidental over-deletes.
+    defaults: 1000
+
+tasks:
+  - id: route_event
+    type: io.kestra.plugin.core.flow.If
+    description: Tombstone events (op=delete) remove vectors by id; everything else is a document upsert.
+    condition: "{{ (trigger.value | jq('.op') | first) == 'delete' }}"
+    then:
+      - id: delete_vectors
+        type: io.kestra.plugin.pinecone.DeleteVectors
+        description: Remove every id carried by the tombstone - the CSV contract keeps ids simple for producers.
+        apiKey: "{{ secret('PINECONE_API_KEY') }}"
+        indexName: "{{ inputs.index_name }}"
+        ids: "{{ trigger.value.ids | split(',') }}"
+
+      - id: log_delete
+        type: io.kestra.plugin.core.log.Log
+        description: Record the tombstone so deletions are visible in the execution history.
+        message: "rag_ingest delete ids={{ trigger.value.ids }} from {{ inputs.index_name }}"
+
+    else:
+      - id: embed_chunks
+        type: io.kestra.plugin.scripts.python.Script
+        description: Split the document with an overlapping sliding window, embed every chunk against the OpenAI embeddings API, and emit a Pinecone-ready vectors.ion file.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          DOC_JSON: "{{ trigger.value | toJson }}"
+          OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
+          OPENAI_MODEL: "{{ inputs.openai_model }}"
+          MAX_SEGMENT_CHARS: "{{ inputs.max_segment_chars }}"
+          OVERLAP_CHARS: "{{ inputs.overlap_chars }}"
+          MAX_CHUNKS_PER_EVENT: "{{ inputs.max_chunks_per_event }}"
+        script: |
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          def emit(outputs):
+              print("::" + json.dumps({"outputs": outputs}) + "::")
+
+          def die(msg):
+              sys.stderr.write("embed_chunks: " + msg + "\n")
+              raise SystemExit(1)
+
+          def parse_int(name, default):
+              try:
+                  value = int(float(os.environ.get(name, "") or default))
+                  return value if value > 0 else default
+              except Exception:
+                  return default
+
+          key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+          if not key:
+              die("OPENAI_API_KEY is not set")
+
+          model = (os.environ.get("OPENAI_MODEL", "") or "text-embedding-3-small").strip()
+          max_chars = parse_int("MAX_SEGMENT_CHARS", 1000)
+          overlap = parse_int("OVERLAP_CHARS", 200)
+          max_chunks = parse_int("MAX_CHUNKS_PER_EVENT", 64)
+          overlap = min(overlap, max_chars - 1) if max_chars > 1 else 0
+          step = max(1, max_chars - overlap)
+
+          raw = (os.environ.get("DOC_JSON", "") or "").strip()
+          try:
+              event = json.loads(raw) if raw else None
+          except Exception:
+              event = None
+          if not isinstance(event, dict):
+              die("event is not valid JSON")
+
+          doc_id = str(event.get("doc_id") or "").strip()
+          text = event.get("text")
+          if not doc_id:
+              die("event missing doc_id")
+          if not isinstance(text, str) or not text.strip():
+              die("event missing text")
+
+          source = str(event.get("source") or "unknown")
+          chunks = []
+          start = 0
+          while start < len(text):
+              chunks.append(text[start:start + max_chars])
+              if start + max_chars >= len(text):
+                  break
+              start += step
+          if not chunks:
+              die("document produced no chunks")
+
+          truncated = len(chunks) > max_chunks
+          chunks = chunks[:max_chunks]
+
+          body = json.dumps({"model": model, "input": chunks}).encode("utf-8")
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/embeddings",
+              data=body,
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": "Bearer " + key,
+              },
+              method="POST",
+          )
+          try:
+              resp = urllib.request.urlopen(req, timeout=60)
+              try:
+                  payload = json.loads(resp.read())
+              finally:
+                  resp.close()
+          except Exception as exc:
+              die("embeddings request failed: %s" % exc)
+
+          data = payload.get("data") if isinstance(payload, dict) else None
+          if not isinstance(data, list) or len(data) < len(chunks):
+              got = len(data) if isinstance(data, list) else 0
+              die("provider returned %d vectors for %d chunks" % (got, len(chunks)))
+
+          ordered = sorted(
+              (item for item in data if isinstance(item, dict) and isinstance(item.get("embedding"), list)),
+              key=lambda item: item.get("index", 0),
+          )
+          if len(ordered) < len(chunks):
+              die("provider returned %d usable vectors for %d chunks" % (len(ordered), len(chunks)))
+
+          with open("vectors.ion", "w", encoding="utf-8") as out:
+              for i, chunk in enumerate(chunks):
+                  record = {
+                      "id": "%s#%d" % (doc_id, i),
+                      "values": ordered[i]["embedding"],
+                      "metadata": {
+                          "doc_id": doc_id,
+                          "source": source,
+                          "chunk": i,
+                          "text": chunk,
+                      },
+                  }
+                  out.write(json.dumps(record) + "\n")
+
+          emit({
+              "doc_id": doc_id,
+              "source": source,
+              "chunk_count": len(chunks),
+              "vector_count": len(chunks),
+              "model": model,
+              "truncated": truncated,
+          })
+
+      - id: upsert_vectors
+        type: io.kestra.plugin.pinecone.Upsert
+        description: Push the chunk vectors - stable doc#chunk ids make re-ingesting the same document idempotent.
+        apiKey: "{{ secret('PINECONE_API_KEY') }}"
+        indexName: "{{ inputs.index_name }}"
+        from: "{{ outputs.embed_chunks.outputFiles['vectors.ion'] }}"
+
+  - id: check_stats
+    type: io.kestra.plugin.pinecone.DescribeIndexStats
+    description: Read the post-write index totals for the freshness watermark.
+    apiKey: "{{ secret('PINECONE_API_KEY') }}"
+    indexName: "{{ inputs.index_name }}"
+
+  - id: evaluate_threshold
+    type: io.kestra.plugin.core.flow.If
+    description: Below the watermark the index has lost vectors it should still serve - page the channel.
+    condition: "{{ outputs.check_stats.totalVectorCount < inputs.min_vector_count }}"
+    then:
+      - id: slack_stale
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Report the measured total against the watermark.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "RAG index freshness watermark breached on {{ inputs.index_name }}: totalVectorCount={{ outputs.check_stats.totalVectorCount }} below min {{ inputs.min_vector_count }} (execution {{ execution.id }}). Check the ingest consumer and recent deletes."
+          }
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    description: One line per change so the execution history doubles as an ingest log.
+    message: "rag_ingest op={{ (trigger.value | jq('.op') | first) | default('upsert') }} index={{ inputs.index_name }} vectors_upserted={{ outputs.upsert_vectors is defined ? outputs.upsert_vectors.upsertedCount : 0 }} vectors_deleted={{ outputs.delete_vectors is defined ? (trigger.value.ids | split(',') | length) : 0 }} total={{ outputs.check_stats.totalVectorCount }}"
+
+errors:
+  - id: slack_errors
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: A failing consumer is a quietly stale index - page the channel instead.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "streaming-rag-incremental-ingest FAILED on {{ trigger.topic | default('unknown topic') }} (execution {{ execution.id }}): {{ error is defined ? error : 'see execution logs' }}"
+      }
+
+outputs:
+  - id: doc_id
+    type: STRING
+    value: "{{ (trigger.value | jq('.doc_id') | first) | default('') }}"
+  - id: chunks
+    type: INT
+    value: "{{ outputs.embed_chunks is defined ? outputs.embed_chunks.vars.chunk_count : 0 }}"
+  - id: truncated
+    type: BOOL
+    value: "{{ outputs.embed_chunks is defined ? outputs.embed_chunks.vars.truncated : false }}"
+  - id: vectors_upserted
+    type: INT
+    value: "{{ outputs.upsert_vectors is defined ? outputs.upsert_vectors.upsertedCount : 0 }}"
+  - id: vectors_deleted
+    type: INT
+    value: "{{ outputs.delete_vectors is defined ? (trigger.value.ids | split(',') | length) : 0 }}"
+  - id: index_vectors
+    type: INT
+    value: "{{ outputs.check_stats.totalVectorCount }}"
+  - id: below_watermark
+    type: BOOL
+    value: "{{ outputs.check_stats.totalVectorCount < inputs.min_vector_count }}"
+
+extend:
+  title: Streaming RAG Incremental Ingest with Tombstone Deletes
+  metaTitle: Streaming RAG Incremental Ingest
+  shortDescription: Chunk, embed, and upsert a Kafka document stream into Pinecone with tombstone deletes and a freshness watermark.
+  description: |
+    ## How it works
+    - The `on_doc_change` trigger (`io.kestra.plugin.kafka.RealtimeTrigger`) subscribes to the `doc-updates` topic with a JSON deserializer and starts one execution per document event using the `kestra-rag-ingest` consumer group.
+    - `route_event` (`core.flow.If`) branches on the event's `op` field: `delete` events go to `delete_vectors` (`pinecone.DeleteVectors`) with ids delivered as a CSV string (`{"op": "delete", "ids": "doc_1,doc_2"}`), everything else is an upsert.
+    - `embed_chunks` (`scripts.python.Script`, Process runner) slides a `max_segment_chars` window with `overlap_chars` of context across the text, calls the OpenAI embeddings API once per event, and writes a Pinecone-ready `vectors.ion` file where each line is `{"id": "doc_id#chunk", "values": [...], "metadata": {...}}`. Malformed events, missing keys, or a provider failure fail the execution on purpose so the `errors` handler pages the channel.
+    - `upsert_vectors` (`pinecone.Upsert`) pushes the file - stable `doc#chunk` ids make re-ingesting the same document idempotent.
+    - `check_stats` (`pinecone.DescribeIndexStats`) reads `totalVectorCount` afterwards, and `evaluate_threshold` (`core.flow.If`) pages Slack when the index falls below the `min_vector_count` watermark - the tripwire for missed upserts and over-eager deletes.
+    - `log_summary` writes one ingest line per change, and the `errors` handler covers anything that fails along the way.
+
+    ## What you get
+    - A Pinecone index that tracks the document stream incrementally, with idempotent upserts and CSV-driven tombstone deletes.
+    - A `min_vector_count` freshness watermark that turns a silent consumer failure into a Slack alert with the measured total.
+    - Truncation visibility (`truncated`) when a document exceeds `max_chunks_per_event`, plus per-execution outputs for `chunks`, `vectors_upserted`, `vectors_deleted`, `index_vectors`, and `below_watermark`.
+    - An execution history that reads as a per-document ingest log.
+
+    ## Who it's for
+    - Teams running retrieval-augmented generation on a corpus that changes constantly - release notes, tickets, docs - and who need the vector index to follow the source of truth instead of waiting for a nightly batch.
+
+    ## Why orchestrate this with Kestra
+    - The consumer, the embedding call, the delete path, and the watermark are four failure modes that usually hide inside one bespoke worker. As a Kestra flow every document gets a retryable execution, a visible branch for deletes vs upserts, and an alert the moment the index stops matching the stream.
+
+    ## Prerequisites
+    - A Kafka broker and a `doc-updates` topic carrying JSON events: `{"op": "upsert", "doc_id": "...", "text": "...", "source": "..."}` or `{"op": "delete", "ids": "a,b"}`.
+    - A Pinecone index whose dimension matches the embedding model (for example 1536 for `text-embedding-3-small`).
+    - An OpenAI account for embeddings.
+
+    ### Secrets
+    - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker list for the trigger.
+    - `PINECONE_API_KEY` - Pinecone API key used by upsert, delete, and stats tasks.
+    - `OPENAI_API_KEY` - OpenAI key used by the embeddings call.
+    - `SLACK_WEBHOOK_URL` - Incoming webhook used for watermark breaches and flow errors.
+
+    ## Quick start
+    - Create the index, set the four secrets, and set `min_vector_count` to your steady-state vector total.
+    - Enable the trigger (it ships `disabled: true`) and publish one upsert event - the execution shows four chunk-level vectors in `vectors.ion` and the new `totalVectorCount` in the log line.
+    - Publish a tombstone for those ids and confirm `vectors_deleted` counts them; drop `min_vector_count` above the total and confirm the watermark alert fires.
+
+    ## How to extend
+    - Fan the same stream into a second sink (Postgres full-text or an `ai.rag.IngestDocument` KV store) by adding a task inside the upsert branch.
+    - Combine with `rag-knowledge-base-vector-reconciliation` on a schedule to clean up orphaned `doc#chunk` ids after large document shrinks.
+    - Swap the OpenAI embeddings call for a self-hosted endpoint by changing one URL in the script.
+
+    ## Links
+    - [Kafka triggers in Kestra](https://kestra.io/plugins/plugin-kafka)
+    - [Pinecone plugin](https://kestra.io/plugins/plugin-pinecone)
+    - [AI plugin](https://kestra.io/plugins/plugin-ai)
+
+    - This blueprint has been created by [RudraMalvankar](https://github.com/RudraMalvankar)
+  metaDescription: Incrementally ingest a Kafka document stream into Pinecone with chunking, tombstone deletes, and a vector-count freshness watermark in Kestra.
+  tags:
+    - AI
+    - Data
+  subTags:
+    - Vector Stores & RAG
+  ee: false
+  demo: false

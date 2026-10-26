@@ -1,0 +1,462 @@
+id: postgresql-bloat-and-wraparound-vacuum-sentinel
+namespace: company.database
+
+description: >-
+  Audit PostgreSQL table dead tuple bloat and transaction ID wraparound freeze headroom,
+  alert on autovacuum starvation, and execute targeted VACUUM ANALYZE maintenance during off-peak windows.
+
+inputs:
+  - id: postgres_url
+    type: STRING
+    defaults: "jdbc:postgresql://localhost:5432/postgres"
+    displayName: PostgreSQL JDBC URL
+    description: JDBC connection string to the target PostgreSQL cluster or read-write primary instance.
+
+  - id: postgres_username
+    type: STRING
+    defaults: "postgres"
+    displayName: PostgreSQL Username
+    description: Database user with privileges to inspect pg_stat_user_tables, pg_database, and execute VACUUM ANALYZE.
+
+  - id: bloat_ratio_threshold_pct
+    type: FLOAT
+    defaults: 30.0
+    displayName: Bloat Ratio Threshold (%)
+    description: Dead tuple ratio threshold percentage (n_dead_tup / (n_live_tup + n_dead_tup) * 100) indicating autovacuum starvation.
+
+  - id: min_table_tuples
+    type: INT
+    defaults: 1000
+    displayName: Minimum Table Tuples
+    description: Minimum tuple threshold (live + dead) required before evaluating bloat ratio to prevent alerting on small test or reference tables.
+
+  - id: min_xid_headroom
+    type: INT
+    defaults: 200000000
+    displayName: Minimum XID Wraparound Headroom
+    description: Critical transaction ID headroom floor (2^31 - age(datfrozenxid)). Alerts urgently when headroom falls below 200 million transactions.
+
+  - id: enable_targeted_vacuum
+    type: BOOL
+    defaults: true
+    displayName: Enable Targeted VACUUM
+    description: Automatically execute targeted VACUUM ANALYZE on bloated candidate tables during the sentinel run.
+
+  - id: max_vacuum_tables
+    type: INT
+    defaults: 5
+    displayName: Max Tables to Vacuum per Cycle
+    description: Maximum number of bloated tables to sequentially vacuum in a single execution to bound I/O overhead.
+
+  - id: dry_run
+    type: BOOL
+    defaults: false
+    displayName: Dry Run Mode
+    description: Audit database catalog metrics and record telemetry without executing VACUUM ANALYZE or triggering execution failure.
+
+  - id: fail_on_critical_wraparound
+    type: BOOL
+    defaults: true
+    displayName: Fail on Critical Wraparound
+    description: Trigger execution failure if database XID wraparound headroom drops below the safety floor to page on-call SRE teams.
+
+triggers:
+  - id: off_peak_maintenance_window
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 2 * * *"
+    disabled: true
+    description: Scheduled daily off-peak maintenance window at 02:00 UTC for evaluating bloat and reclaiming dead tuple storage.
+
+  - id: on_demand_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "{{ secret('POSTGRES_SENTINEL_WEBHOOK_KEY') }}"
+    description: Inbound webhook trigger for initiating ad-hoc autovacuum health audits prior to batch ETL jobs or after bulk load operations.
+
+tasks:
+  - id: query_wraparound_headroom
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Inspect pg_database to calculate remaining transaction IDs before wraparound freeze (2^31 - age(datfrozenxid)) and capacity consumption.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.postgres_username }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        datname AS database_name,
+        age(datfrozenxid) AS age_datfrozenxid,
+        (2147483648::bigint - age(datfrozenxid)::bigint) AS xid_headroom_remaining,
+        ROUND((age(datfrozenxid)::numeric / 2147483648::numeric) * 100, 2) AS xid_consumption_pct
+      FROM pg_database
+      WHERE datname = current_database();
+
+  - id: query_dead_tuple_bloat
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Inspect pg_stat_user_tables for dead tuple accumulation, live rows, autovacuum starvation ratios, and last vacuum timestamps.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.postgres_username }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        schemaname,
+        relname AS table_name,
+        n_live_tup,
+        n_dead_tup,
+        (n_live_tup + n_dead_tup) AS total_tuples,
+        CASE
+          WHEN (n_live_tup + n_dead_tup) > 0 THEN
+            ROUND((n_dead_tup::numeric / (n_live_tup + n_dead_tup)::numeric) * 100, 2)
+          ELSE 0.00
+        END AS dead_tuple_ratio_pct,
+        COALESCE(to_char(last_vacuum, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), 'never') AS last_vacuum,
+        COALESCE(to_char(last_autovacuum, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), 'never') AS last_autovacuum,
+        vacuum_count,
+        autovacuum_count
+      FROM pg_stat_user_tables
+      WHERE (n_live_tup + n_dead_tup) >= {{ inputs.min_table_tuples }}
+      ORDER BY dead_tuple_ratio_pct DESC, n_dead_tup DESC;
+
+  - id: evaluate_autovacuum_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse PostgreSQL database wraparound metrics and table bloat statistics to classify operational health posture and generate maintenance candidate targets.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.12-slim
+    inputFiles:
+      wraparound.json: "{{ outputs.query_wraparound_headroom.row | toJson }}"
+      bloat.json: "{{ outputs.query_dead_tuple_bloat.rows | toJson }}"
+    env:
+      BLOAT_THRESHOLD_PCT: "{{ inputs.bloat_ratio_threshold_pct }}"
+      MIN_XID_HEADROOM: "{{ inputs.min_xid_headroom }}"
+      MAX_VACUUM_TABLES: "{{ inputs.max_vacuum_tables }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+    outputFiles:
+      - telemetry-report.json
+    script: |
+      import json
+      import os
+      from pathlib import Path
+
+      wraparound_path = Path("wraparound.json")
+      bloat_path = Path("bloat.json")
+
+      wraparound_data = json.loads(wraparound_path.read_text(encoding="utf-8")) if wraparound_path.exists() else {}
+      bloat_data = json.loads(bloat_path.read_text(encoding="utf-8")) if bloat_path.exists() else []
+
+      bloat_threshold_pct = float(os.environ.get("BLOAT_THRESHOLD_PCT", "30.0"))
+      min_xid_headroom = int(os.environ.get("MIN_XID_HEADROOM", "200000000"))
+      max_vacuum_tables = int(os.environ.get("MAX_VACUUM_TABLES", "5"))
+      dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+      db_name = str(wraparound_data.get("database_name", "unknown"))
+      age_xid = int(wraparound_data.get("age_datfrozenxid", 0) or 0)
+      xid_headroom = int(wraparound_data.get("xid_headroom_remaining", 2147483648) or 2147483648)
+      xid_consumption_pct = float(wraparound_data.get("xid_consumption_pct", 0.0) or 0.0)
+      wraparound_critical = bool(xid_headroom < min_xid_headroom)
+
+      bloated_tables = []
+      total_evaluated_tables = len(bloat_data) if isinstance(bloat_data, list) else 0
+
+      if isinstance(bloat_data, list):
+          for row in bloat_data:
+              schema = str(row.get("schemaname", "public"))
+              table = str(row.get("table_name", ""))
+              live_tup = int(row.get("n_live_tup", 0) or 0)
+              dead_tup = int(row.get("n_dead_tup", 0) or 0)
+              total_tup = live_tup + dead_tup
+
+              ratio = float(row.get("dead_tuple_ratio_pct", 0.0) or 0.0)
+              if ratio == 0.0 and total_tup > 0:
+                  ratio = round((dead_tup / total_tup) * 100.0, 2)
+
+              last_vac = str(row.get("last_vacuum", "never"))
+              last_autovac = str(row.get("last_autovacuum", "never"))
+
+              if ratio >= bloat_threshold_pct:
+                  bloated_tables.append({
+                      "schema": schema,
+                      "table": table,
+                      "full_name": f'"{schema}"."{table}"',
+                      "live_tuples": live_tup,
+                      "dead_tuples": dead_tup,
+                      "total_tuples": total_tup,
+                      "dead_tuple_ratio_pct": ratio,
+                      "last_vacuum": last_vac,
+                      "last_autovacuum": last_autovac,
+                      "vacuum_count": int(row.get("vacuum_count", 0) or 0),
+                      "autovacuum_count": int(row.get("autovacuum_count", 0) or 0)
+                  })
+
+      bloated_tables.sort(key=lambda x: (x["dead_tuple_ratio_pct"], x["dead_tuples"]), reverse=True)
+      candidate_tables = bloated_tables[:max_vacuum_tables]
+      candidate_table_names = [t["full_name"] for t in candidate_tables]
+
+      if wraparound_critical:
+          posture = "CRITICAL_WRAPAROUND_IMMINENT"
+      elif len(bloated_tables) > 0:
+          posture = "AUTOVACUUM_STARVATION_DETECTED"
+      else:
+          posture = "HEALTHY"
+
+      report = {
+          "status": posture,
+          "database_name": db_name,
+          "wraparound": {
+              "age_datfrozenxid": age_xid,
+              "xid_headroom_remaining": xid_headroom,
+              "xid_consumption_pct": xid_consumption_pct,
+              "min_headroom_threshold": min_xid_headroom,
+              "is_critical": wraparound_critical
+          },
+          "bloat_summary": {
+              "threshold_pct": bloat_threshold_pct,
+              "total_tables_evaluated": total_evaluated_tables,
+              "bloated_tables_count": len(bloated_tables),
+              "candidates_selected_count": len(candidate_tables),
+              "bloated_tables": bloated_tables,
+              "candidate_table_names": candidate_table_names
+          },
+          "maintenance_recommendation": {
+              "action_required": bool(wraparound_critical or len(bloated_tables) > 0),
+              "dry_run": dry_run,
+              "execute_targeted_vacuum": bool(len(candidate_tables) > 0 and not dry_run)
+          }
+      }
+
+      Path("telemetry-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+      print(f"Evaluated PostgreSQL telemetry for '{db_name}': status={posture}, xid_headroom={xid_headroom}, bloated_tables={len(bloated_tables)}")
+
+      print("::" + json.dumps({
+          "outputs": {
+              "status": posture,
+              "database_name": db_name,
+              "wraparound_critical": wraparound_critical,
+              "xid_headroom_remaining": xid_headroom,
+              "xid_consumption_pct": xid_consumption_pct,
+              "bloated_tables_count": len(bloated_tables),
+              "candidate_table_names": candidate_table_names,
+              "candidate_tables": candidate_tables,
+              "maintenance_needed": bool(wraparound_critical or len(bloated_tables) > 0),
+              "telemetry_json": json.dumps(report)
+          }
+      }) + "::")
+
+  - id: persist_telemetry_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Record structured autovacuum and wraparound telemetry into Kestra KV store for historical trend tracking and operational dashboards.
+    key: postgres_vacuum_sentinel_latest
+    kvType: JSON
+    value: "{{ outputs.evaluate_autovacuum_telemetry.vars.telemetry_json }}"
+
+  - id: handle_wraparound_alert
+    type: io.kestra.plugin.core.flow.If
+    description: Dispatch an urgent alert to Slack if database transaction ID wraparound headroom drops below 200 million transactions.
+    condition: "{{ outputs.evaluate_autovacuum_telemetry.vars.wraparound_critical }}"
+    then:
+      - id: alert_critical_wraparound
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Deliver urgent Slack notification when database transaction ID headroom approaches emergency freeze ceiling.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {
+            "text": "🚨 *CRITICAL: PostgreSQL Transaction ID Wraparound Freeze Imminent*\n" ~
+                    "• *Database*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.database_name ~ "`\n" ~
+                    "• *Remaining XID Headroom*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.xid_headroom_remaining ~ "` transactions (Critical Ceiling: `" ~ inputs.min_xid_headroom ~ "`)\n" ~
+                    "• *XID Space Consumed*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.xid_consumption_pct ~ "%` of 2.14B limit\n" ~
+                    "• *Execution ID*: `" ~ execution.id ~ "`\n" ~
+                    "*Immediate Action Required*: Transaction ID starvation detected. PostgreSQL will enter emergency read-only shutdown when headroom reaches zero. Investigate long-running transactions, orphaned prepared transactions, abandoned replication slots, and run manual `VACUUM FREEZE`."
+          } | toJson }}
+
+  - id: handle_targeted_vacuum_maintenance
+    type: io.kestra.plugin.core.flow.If
+    description: Execute targeted VACUUM ANALYZE maintenance on starving tables or alert via Slack.
+    condition: "{{ inputs.enable_targeted_vacuum and not inputs.dry_run and outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count > 0 }}"
+    then:
+      - id: log_maintenance_start
+        type: io.kestra.plugin.core.log.Log
+        description: Log commencement of targeted VACUUM maintenance on candidate tables.
+        message: "Starting targeted VACUUM ANALYZE maintenance across {{ outputs.evaluate_autovacuum_telemetry.vars.candidate_table_names | length }} bloated table(s)."
+
+      - id: vacuum_candidate_tables
+        type: io.kestra.plugin.core.flow.Loop
+        description: Iterate sequentially over bloated tables to execute targeted VACUUM ANALYZE without overwhelming cluster disk I/O.
+        values: "{{ outputs.evaluate_autovacuum_telemetry.vars.candidate_table_names }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: execute_vacuum_analyze
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Run targeted VACUUM ANALYZE statement on the current table.
+            url: "{{ inputs.postgres_url }}"
+            username: "{{ inputs.postgres_username }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: NONE
+            sql: "VACUUM ANALYZE {{ item.value }};"
+
+          - id: log_table_vacuumed
+            type: io.kestra.plugin.core.log.Log
+            description: Log successful completion of targeted table vacuum.
+            message: "Completed targeted VACUUM ANALYZE on table {{ item.value }}."
+
+      - id: notify_vacuum_maintenance_completed
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send maintenance completion summary to Slack detailing vacuumed candidate tables.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {
+            "text": "🧹 *PostgreSQL Maintenance: Targeted VACUUM ANALYZE Completed*\n" ~
+                    "• *Database*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.database_name ~ "`\n" ~
+                    "• *Vacuumed Tables*: `" ~ (outputs.evaluate_autovacuum_telemetry.vars.candidate_table_names | join(', ')) ~ "`\n" ~
+                    "• *Bloated Tables Count*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count ~ "`\n" ~
+                    "• *Execution ID*: `" ~ execution.id ~ "`\n" ~
+                    "*Status*: Dead tuple storage successfully reclaimed and table statistics updated during maintenance window."
+          } | toJson }}
+
+    else:
+      - id: handle_bloat_notification
+        type: io.kestra.plugin.core.flow.If
+        description: Send Slack notification when tables suffer from autovacuum starvation and targeted vacuum is disabled or in dry-run mode.
+        condition: "{{ outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count > 0 }}"
+        then:
+          - id: notify_autovacuum_starvation_slack
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Deliver autovacuum starvation notification to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {{ {
+                "text": "⚠️ *WARNING: PostgreSQL Autovacuum Starvation Detected*\n" ~
+                        "• *Database*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.database_name ~ "`\n" ~
+                        "• *Bloated Tables Count*: `" ~ outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count ~ "` exceeding `" ~ inputs.bloat_ratio_threshold_pct ~ "%` dead tuple ratio\n" ~
+                        "• *Execution ID*: `" ~ execution.id ~ "`\n" ~
+                        "*Notice*: Targeted vacuum is disabled (`enable_targeted_vacuum: false`) or dry-run mode is active. Review table bloat telemetry report."
+              } | toJson }}
+
+          - id: log_bloat_detected
+            type: io.kestra.plugin.core.log.Log
+            description: Log detected autovacuum starvation warning.
+            level: WARN
+            message: "Autovacuum starvation detected on {{ outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count }} table(s). Targeted vacuum was skipped (dry_run: {{ inputs.dry_run }}, enable_targeted_vacuum: {{ inputs.enable_targeted_vacuum }})."
+
+        else:
+          - id: log_posture_nominal
+            type: io.kestra.plugin.core.log.Log
+            description: Log confirmation of nominal database storage and autovacuum health.
+            message: "PostgreSQL database '{{ outputs.evaluate_autovacuum_telemetry.vars.database_name }}' autovacuum posture is nominal: dead tuple ratios are under {{ inputs.bloat_ratio_threshold_pct }}% and XID headroom is {{ outputs.evaluate_autovacuum_telemetry.vars.xid_headroom_remaining }} transactions."
+
+  - id: enforce_wraparound_guardrail
+    type: io.kestra.plugin.core.flow.If
+    description: Enforce execution failure if critical wraparound headroom threshold is breached and guardrail is enabled.
+    condition: "{{ outputs.evaluate_autovacuum_telemetry.vars.wraparound_critical and inputs.fail_on_critical_wraparound and not inputs.dry_run }}"
+    then:
+      - id: fail_on_critical_wraparound
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "CRITICAL: PostgreSQL database '{{ outputs.evaluate_autovacuum_telemetry.vars.database_name }}' transaction ID wraparound headroom dropped to {{ outputs.evaluate_autovacuum_telemetry.vars.xid_headroom_remaining }} (below critical floor {{ inputs.min_xid_headroom }}). Immediate DBA intervention required."
+
+  - id: emit_sentinel_summary
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Output structured execution summary variables for downstream orchestration workflows.
+    values:
+      status: "{{ outputs.evaluate_autovacuum_telemetry.vars.status }}"
+      database_name: "{{ outputs.evaluate_autovacuum_telemetry.vars.database_name }}"
+      xid_headroom_remaining: "{{ outputs.evaluate_autovacuum_telemetry.vars.xid_headroom_remaining }}"
+      xid_consumption_pct: "{{ outputs.evaluate_autovacuum_telemetry.vars.xid_consumption_pct }}"
+      wraparound_critical: "{{ outputs.evaluate_autovacuum_telemetry.vars.wraparound_critical }}"
+      bloated_tables_count: "{{ outputs.evaluate_autovacuum_telemetry.vars.bloated_tables_count }}"
+      candidate_tables: "{{ outputs.evaluate_autovacuum_telemetry.vars.candidate_table_names }}"
+
+errors:
+  - id: alert_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Deliver Slack alert when unexpected execution failure occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {
+        "text": "🔥 *ERROR: PostgreSQL Bloat & Wraparound Sentinel Failed*\n" ~
+                "• *Execution ID*: `" ~ execution.id ~ "`\n" ~
+                "• *Flow*: `" ~ flow.id ~ "`\n" ~
+                "• *Namespace*: `" ~ flow.namespace ~ "`\n" ~
+                "*Error*: Unexpected failure during catalog inspection or targeted vacuum execution."
+      } | toJson }}
+
+extend:
+  title: Audit PostgreSQL Table Bloat and Transaction ID Wraparound Autovacuum Headroom
+  metaTitle: PostgreSQL Bloat & Wraparound Vacuum Sentinel | Kestra
+  shortDescription: Inspect PostgreSQL table dead tuple bloat and transaction ID wraparound freeze headroom, alert on autovacuum starvation, and trigger targeted VACUUM ANALYZE maintenance.
+  metaDescription: Monitor PostgreSQL table dead tuple bloat and XID wraparound headroom, alert via Slack on autovacuum starvation, and run targeted VACUUM maintenance.
+  description: |
+    ## How it works
+
+    PostgreSQL uses Multi-Version Concurrency Control (MVCC) to provide transactional isolation. When a row is updated or deleted, PostgreSQL writes a new tuple version and marks the existing tuple dead. Dead tuples consume disk space and page cache until reclaimed by `VACUUM`. Under heavy write traffic, long-running transactions, or misconfigured scale factors, the PostgreSQL autovacuum daemon can experience **autovacuum starvation**, leading to severe index degradation, sequential scan latency, and table bloat.
+
+    Simultaneously, PostgreSQL tracks transaction IDs (XIDs) as 32-bit integers. If `age(datfrozenxid)` approaches $2^{31}$ (2.14 billion transactions) without an aggressive anti-wraparound freeze, PostgreSQL enters an emergency read-only shutdown mode to prevent silent data corruption.
+
+    This blueprint provides an enterprise Day 2 operations sentinel that continuously monitors both table dead tuple bloat and cluster-wide XID wraparound headroom:
+
+    1. **Catalog Telemetry Extraction**: Connects via native JDBC (`io.kestra.plugin.jdbc.postgresql.Query`) to probe `pg_database` for `age(datfrozenxid)` and calculate remaining headroom (`2^31 - age(datfrozenxid)`), and inspects `pg_stat_user_tables` to calculate exact dead tuple ratios (`n_dead_tup / (n_live_tup + n_dead_tup)`).
+    2. **Telemetry Evaluation & Classification**: A Dockerized Python script evaluates catalog statistics against warning thresholds (`bloat_ratio_threshold_pct`, default 30%, and `min_xid_headroom`, default 200M XIDs). It sorts bloated tables by severity and selects the top candidate targets for maintenance.
+    3. **KV State Persistence**: Persists a full JSON snapshot into Kestra's built-in Key-Value store (`postgres_vacuum_sentinel_latest`) for SLA reporting and historical trending.
+    4. **Wraparound Emergency Gate**: If transaction headroom drops below 200 million transactions, the flow immediately fires high-priority Slack incident alerts and triggers workflow failure.
+    5. **Targeted VACUUM Maintenance**: When tables suffer from autovacuum starvation, the flow executes sequential, bounded `VACUUM ANALYZE` operations during scheduled off-peak windows to reclaim dead storage and update query planner optimizer statistics without saturating cluster I/O.
+
+    ## What you get
+
+    - Automated, non-invasive catalog inspection of dead tuple accumulation across user tables.
+    - Early warning detection for Transaction ID wraparound exhaustion before PostgreSQL forces an emergency read-only shutdown.
+    - Automated remediation via targeted `VACUUM ANALYZE` on bloated candidate tables during maintenance windows.
+    - Bounded concurrency with customizable table limits (`max_vacuum_tables`) to prevent storage I/O spikes.
+    - Full telemetry audit trails stored in Kestra KV store for long-term health tracking.
+    - Rich Slack notifications with database diagnostics and vacuum execution summaries.
+
+    ## Who it's for
+
+    - Database Administrators (DBAs) managing high-throughput PostgreSQL production clusters.
+    - Site Reliability Engineers (SREs) safeguarding database storage capacity, read SLAs, and uptime.
+    - Data Platform Engineers running batch ETL and CDC pipelines prone to burst dead tuple accumulation.
+
+    ## Why orchestrate this with Kestra
+
+    - **Native Catalog Inspection**: Leverages `io.kestra.plugin.jdbc.postgresql.Query` to query internal PostgreSQL system views directly without deploying external daemon agents.
+    - **Safe Remediative Execution**: Provides declarative flow control (`io.kestra.plugin.core.flow.If` and `io.kestra.plugin.core.flow.Loop`) with dry-run safety modes, preventing uncoordinated database load.
+    - **Centralized Auditability & KV Storage**: Maintains execution logs, outputs, and JSON telemetry reports in Kestra's unified control plane.
+    - **Event-Driven & Scheduled Flexibility**: Supports both cron-based scheduled off-peak sweeps and webhook triggers for ad-hoc post-ingestion validation.
+
+    ## Prerequisites
+
+    - PostgreSQL cluster (version 12 or newer) reachable from Kestra worker instances.
+    - Dedicated database user account with `pg_read_all_stats` role (or superuser) and `VACUUM` permissions on target tables.
+    - Network connectivity from Kestra workers to the database host and Slack webhook endpoint.
+
+    ### Secrets
+
+    - `POSTGRES_PASSWORD`: Password for the PostgreSQL administrative or maintenance user.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL to deliver operational alerts and maintenance notices.
+    - `POSTGRES_SENTINEL_WEBHOOK_KEY`: Secret authentication token for the inbound Kestra Webhook trigger.
+
+    ## Quick start
+
+    1. Configure the required secrets (`POSTGRES_PASSWORD`, `SLACK_WEBHOOK_URL`, `POSTGRES_SENTINEL_WEBHOOK_KEY`) in your Kestra namespace.
+    2. Deploy this blueprint flow to your Kestra instance under namespace `company.database`.
+    3. Run a manual test execution with `dry_run: true` to inspect your cluster's current bloat and wraparound headroom.
+    4. Enable the `off_peak_maintenance_window` schedule trigger to run automated daily maintenance at 02:00 UTC.
+
+    ## How to extend
+
+    - Add PagerDuty or Opsgenie notifications via `io.kestra.plugin.pagerduty` for P1 escalation when wraparound headroom drops below 50 million XIDs.
+    - Incorporate table size queries using `pg_total_relation_size()` to calculate estimated gigabytes of reclaimable bloat.
+    - Chain this flow as an upstream dependency gate in Kestra ETL pipelines to ensure databases are vacuumed before large batch loads begin.
+    - Extend candidate vacuuming to support `VACUUM (PARALLEL 4)` on PostgreSQL 13+ instances with multi-core worker availability.
+
+    ## Links
+
+    - [Kestra PostgreSQL JDBC Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [PostgreSQL Documentation: Routine Vacuuming & Wraparound Prevention](https://www.postgresql.org/docs/current/routine-vacuuming.html)
+    - [PostgreSQL System Catalogs: pg_stat_user_tables](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-USER-TABLES-VIEW)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
