@@ -1,0 +1,239 @@
+id: sqlite-verified-fts-catalog
+namespace: company.data
+
+inputs:
+  - id: documents
+    type: FILE
+    description: UTF-8 JSON Lines; each object has unique string id, title and body, plus optional string url. Maximum 10 MiB and 10,000 documents.
+  - id: smoke_checks
+    type: JSON
+    description: Array of 1-20 objects with an FTS5 query and expected_ids (the exact matching document IDs, at most 100 per query).
+    defaults:
+      - query: kestra
+        expected_ids: [getting-started]
+
+tasks:
+  - id: preflight
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: source_size
+        type: io.kestra.plugin.core.storage.Size
+        uri: "{{ inputs.documents }}"
+
+      - id: validate_checks
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.13-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: none
+        inputFiles:
+          checks-input.json: "{{ inputs.smoke_checks | toJson }}"
+        outputFiles:
+          - checks.json
+        script: |
+          import json
+          import sqlite3
+          from pathlib import Path
+
+          checks = json.loads(Path("checks-input.json").read_text())
+          if not isinstance(checks, list) or not 1 <= len(checks) <= 20:
+              raise ValueError("Supply 1-20 search checks")
+          with sqlite3.connect(":memory:") as db:
+              db.execute("CREATE VIRTUAL TABLE probe USING fts5(title, body)")
+              for check in checks:
+                  if not isinstance(check, dict) or set(check) != {"query", "expected_ids"}:
+                      raise ValueError("Each check needs query and expected_ids")
+                  query, ids = check["query"], check["expected_ids"]
+                  if not isinstance(query, str) or not 1 <= len(query.strip()) <= 512:
+                      raise ValueError("Query must contain 1-512 characters")
+                  if not isinstance(ids, list) or len(ids) > 100 or any(
+                      not isinstance(i, str) or not 1 <= len(i.strip()) <= 128 for i in ids
+                  ) or len(ids) != len(set(ids)):
+                      raise ValueError("expected_ids must contain at most 100 distinct string IDs")
+                  # Prepare and execute the real FTS expression; never interpolate it into SQL.
+                  db.execute("SELECT rowid FROM probe WHERE probe MATCH ?", (query,)).fetchall()
+          Path("checks.json").write_text(json.dumps(checks, ensure_ascii=False), encoding="utf-8")
+
+  - id: bound_source
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.source_size.size > 0 and outputs.source_size.size <= 10485760 }}"
+
+  - id: build_index
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: none
+    inputFiles:
+      documents.jsonl: "{{ inputs.documents }}"
+    outputFiles:
+      - candidate.sqlite
+      - build.json
+    script: |
+      import hashlib
+      import json
+      import sqlite3
+      from pathlib import Path
+
+      source = Path("documents.jsonl")
+      records, seen = [], set()
+      for number, line in enumerate(source.read_text(encoding="utf-8").split("\n"), 1):
+          if not line.strip():
+              continue
+          doc = json.loads(line)
+          if not isinstance(doc, dict) or not {"id", "title", "body"} <= doc.keys():
+              raise ValueError(f"Line {number}: id, title and body are required")
+          for field, limit in (("id", 128), ("title", 512), ("body", 100000), ("url", 2048)):
+              value = doc.get(field, "")
+              if not isinstance(value, str) or len(value) > limit or "\x00" in value:
+                  raise ValueError(f"Line {number}: invalid {field}")
+          if not doc["id"].strip() or doc["id"] in seen or not (doc["title"].strip() or doc["body"].strip()):
+              raise ValueError(f"Line {number}: duplicate/empty id or empty searchable text")
+          seen.add(doc["id"])
+          records.append((doc["id"], doc["title"], doc["body"], doc.get("url", "")))
+          if len(records) > 10000:
+              raise ValueError("At most 10,000 documents are supported")
+      if not records:
+          raise ValueError("At least one document is required")
+      with sqlite3.connect("candidate.sqlite") as db:
+          db.execute("PRAGMA journal_mode=DELETE")
+          db.execute("CREATE TABLE documents (rowid INTEGER PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL, body TEXT NOT NULL, url TEXT NOT NULL)")
+          db.executemany("INSERT INTO documents(doc_id,title,body,url) VALUES (?,?,?,?)", sorted(records))
+          db.execute("CREATE VIRTUAL TABLE documents_fts USING fts5(title, body, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')")
+          db.execute("INSERT INTO documents_fts(documents_fts) VALUES ('rebuild')")
+          db.execute("INSERT INTO documents_fts(documents_fts) VALUES ('optimize')")
+          # rank=1 also compares the external-content table with the index.
+          db.execute("INSERT INTO documents_fts(documents_fts, rank) VALUES ('integrity-check', 1)")
+          db.execute("PRAGMA user_version=1")
+      Path("build.json").write_text(json.dumps({
+          "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+          "document_count": len(records), "sqlite_version": sqlite3.sqlite_version,
+          "tokenizer": "unicode61 remove_diacritics 2", "schema_version": 1
+      }, indent=2), encoding="utf-8")
+
+  - id: verify_and_publish
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reopen the artifact read-only in a separate container and publish it only after every search check matches exactly.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: none
+    inputFiles:
+      candidate.sqlite: "{{ outputs.build_index.outputFiles['candidate.sqlite'] }}"
+      build.json: "{{ outputs.build_index.outputFiles['build.json'] }}"
+      checks.json: "{{ outputs.validate_checks.outputFiles['checks.json'] }}"
+    outputFiles:
+      - catalog.sqlite
+      - manifest.json
+      - search-results.json
+    script: |
+      import hashlib
+      import json
+      import shutil
+      import sqlite3
+      from pathlib import Path
+
+      build = json.loads(Path("build.json").read_text())
+      checks = json.loads(Path("checks.json").read_text())
+      results = []
+      with sqlite3.connect("file:candidate.sqlite?mode=ro", uri=True) as db:
+          if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+              raise ValueError("SQLite integrity check failed")
+          if db.execute("SELECT count(*) FROM documents").fetchone()[0] != build["document_count"]:
+              raise ValueError("Document count changed during handoff")
+          for check in checks:
+              rows = db.execute(
+                  "SELECT d.doc_id FROM documents_fts JOIN documents d ON d.rowid=documents_fts.rowid "
+                  "WHERE documents_fts MATCH ? ORDER BY d.doc_id LIMIT 101", (check["query"],)
+              ).fetchall()
+              actual = [row[0] for row in rows]
+              if len(actual) > 100 or actual != sorted(check["expected_ids"]):
+                  raise ValueError("Search check failed: " + check["query"])
+              results.append({"query": check["query"], "matched_ids": actual})
+      candidate = Path("candidate.sqlite")
+      build.update(database_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                   database_bytes=candidate.stat().st_size, search_checks_passed=len(results))
+      shutil.copyfile(candidate, "catalog.sqlite")
+      Path("manifest.json").write_text(json.dumps(build, indent=2), encoding="utf-8")
+      Path("search-results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+
+outputs:
+  - id: database
+    type: FILE
+    required: false
+    value: "{{ outputs.verify_and_publish.outputFiles['catalog.sqlite'] ?? null }}"
+  - id: manifest
+    type: FILE
+    required: false
+    value: "{{ outputs.verify_and_publish.outputFiles['manifest.json'] ?? null }}"
+  - id: search_results
+    type: FILE
+    required: false
+    value: "{{ outputs.verify_and_publish.outputFiles['search-results.json'] ?? null }}"
+
+triggers:
+  - id: documents_ready
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "{{ secret('SEARCH_WEBHOOK_KEY') }}"
+    inputs:
+      documents: "{{ trigger.body.documents }}"
+      smoke_checks: "{{ trigger.body.smoke_checks ?? [{\"query\":\"kestra\",\"expected_ids\":[\"getting-started\"]}] }}"
+
+extend:
+  title: Build and verify a portable SQLite full-text search catalog
+  metaTitle: Verified SQLite FTS5 Search Catalog | Kestra
+  shortDescription: Turn JSON Lines documents into a portable FTS5 database, then verify exact search results in a separate read-only connection before publishing.
+  metaDescription: Build a portable SQLite FTS5 search database from JSON Lines and publish it with integrity checks, exact search tests and a SHA256 manifest.
+  description: |
+    Package a small documentation or runbook collection as a searchable SQLite file. The result runs without a search server and includes the original text, a Unicode FTS5 index and evidence that your chosen searches return the expected documents.
+
+    ## How it works
+
+    1. Submit a JSON Lines file manually or send its Kestra storage URI as `documents` through the keyed webhook.
+    2. In parallel, measure the file and validate 1-20 FTS5 search checks against a real in-memory SQLite table. Bound the source to 10 MiB.
+    3. Validate up to 10,000 records, insert with SQL parameters, and build an external-content index over title and body. Check that the index agrees with its content table.
+    4. A separate container reopens the database read-only, checks integrity and document count, and executes every search. Publish only when the exact matching ID sets agree, including deliberately empty results.
+
+    ## What you get
+
+    - `catalog.sqlite`, a SHA256 manifest with source hash and SQLite version, and search-results JSON.
+    - No network calls or pip dependencies; all Python task containers disable networking.
+    - Duplicate IDs, invalid text, malformed FTS syntax and unexpected search matches fail the execution.
+
+    ## Who it's for
+
+    Platform and data teams distributing small offline knowledge catalogs or testing search exports before deployment.
+
+    ## Why orchestrate this with Kestra
+
+    Input checks, index construction and independent artifact verification have separate task histories. Stored input and output files make a failed batch inspectable without changing a live search service.
+
+    ## Prerequisites
+
+    A Docker-capable worker, the Python plugin, and a Python image with SQLite FTS5 support (`python:3.13-slim` is used here). Pin the image digest for your deployment. Records need string `id`, `title`, `body`; `url` is optional metadata. Blank lines are skipped. Title/body limits are 512/100,000 characters; IDs are limited to 128.
+
+    ### Secrets
+
+    - `SEARCH_WEBHOOK_KEY`: protects event submissions.
+
+    ## Quick start
+
+    1. Configure the secret and import the flow.
+    2. Upload one JSON line: `{"id":"getting-started","title":"Kestra guide","body":"Run your first flow."}`. Execute with the default search check.
+    3. Download the database and query `SELECT d.doc_id FROM documents_fts JOIN documents d ON d.rowid=documents_fts.rowid WHERE documents_fts MATCH 'kestra';` using SQLite with FTS5 enabled.
+
+    ## How to extend
+
+    Upload the verified artifact to object storage or bundle it with an application. Add phrase, prefix and negative search checks. Each check compares the complete result set, capped at 100 matches. This is a full rebuild; source permissions and later document edits are not synchronized.
+
+    ## Links
+
+    - [Python tasks](https://kestra.io/plugins/plugin-script-python)
+    - [SQLite FTS5](https://www.sqlite.org/fts5.html)
+  tags:
+    - Data
+  subTags:
+    - File & Data Processing Basics
+  ee: false
+  demo: false
