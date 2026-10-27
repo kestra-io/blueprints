@@ -1,0 +1,542 @@
+id: course-video-content-pipeline
+namespace: company.education
+
+description: |
+  Turn every lecture video dropped into S3 into a reviewed lesson page: Amazon
+  Transcribe writes the transcript, Amazon Bedrock drafts a title, summary,
+  chapters and a quiz, a Python check rejects drafts that break the rules or
+  quote things the speaker never said, and a reviewer approves or sends it back
+  with feedback before anything is published.
+
+variables:
+  region: ap-south-1
+  bucket: my-course-videos
+  table: course_content
+  topic_arn: arn:aws:sns:ap-south-1:123456789012:course-content-review
+  model_id: apac.amazon.nova-pro-v1:0
+  ui_url: http://localhost:8080
+
+tasks:
+  - id: fingerprint
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Hash the video so the same lecture is never processed twice, whatever its file name.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: ubuntu:24.04
+    inputFiles:
+      video: "{{ trigger.objects[0].uri }}"
+    commands:
+      - HASH=$(sha256sum video | cut -d' ' -f1)
+      - echo "SHA-256 of {{ trigger.objects[0].key }} is $HASH"
+      - echo '::{"outputs":{"sha256":"'"$HASH"'"}}::'
+
+  - id: claim
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Record the video in DynamoDB with a conditional write. A hash that already exists is skipped unless its last run FAILED.
+    region: "{{ vars.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    commands:
+      - >
+        if aws dynamodb put-item
+        --table-name {{ vars.table }}
+        --item '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"},"status":{"S":"PROCESSING"},"source_key":{"S":"{{ trigger.objects[0].key }}"},"created_at":{"S":"{{ now() }}"}}'
+        --condition-expression "attribute_not_exists(video_id) OR #s = :failed"
+        --expression-attribute-names '{"#s":"status"}'
+        --expression-attribute-values '{":failed":{"S":"FAILED"}}'
+        2> err.txt;
+        then echo '::{"outputs":{"claimed":true}}::';
+        elif grep -q ConditionalCheckFailedException err.txt;
+        then echo "Duplicate video, already processed or in progress";
+        echo '::{"outputs":{"claimed":false}}::';
+        else cat err.txt; exit 1; fi
+
+  - id: if_claimed
+    type: io.kestra.plugin.core.flow.If
+    description: Only the run that won the claim does the work; duplicates finish here.
+    condition: "{{ outputs.claim.vars.claimed }}"
+    then:
+      - id: stage_media
+        type: io.kestra.plugin.aws.cli.AwsCLI
+        description: Move the original out of processing/ to media/<sha>.<ext> so every later step uses a stable key.
+        region: "{{ vars.region }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        retry:
+          type: constant
+          interval: PT15S
+          maxAttempts: 3
+        commands:
+          - |
+            KEY="{{ trigger.objects[0].key | replace({'incoming/': ''}) }}"
+            aws s3 mv "s3://{{ vars.bucket }}/processing/$KEY" "s3://{{ vars.bucket }}/media/{{ outputs.fingerprint.vars.sha256 }}.${KEY##*.}"
+
+      - id: probe
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Read the duration and extract 16 kHz mono FLAC, which Transcribe accepts for any input container (MKV included).
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          entryPoint: [""]
+        containerImage: linuxserver/ffmpeg:latest
+        inputFiles:
+          video: "{{ trigger.objects[0].uri }}"
+        commands:
+          - SECONDS_LEN=$(ffprobe -v error -show_entries format=duration -of csv=p=0 video)
+          - echo "Duration is $SECONDS_LEN seconds"
+          - ffmpeg -v error -i video -vn -ac 1 -ar 16000 audio.flac
+          - echo '::{"outputs":{"duration":'"$SECONDS_LEN"'}}::'
+        outputFiles:
+          - audio.flac
+
+      - id: transcribe
+        type: io.kestra.plugin.aws.cli.AwsCLI
+        description: Start an Amazon Transcribe job with language identification, poll it to completion and mark the video TRANSCRIBED.
+        region: "{{ vars.region }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        timeout: PT30M
+        inputFiles:
+          audio.flac: "{{ outputs.probe.outputFiles['audio.flac'] }}"
+        commands:
+          - JOB="course-{{ outputs.fingerprint.vars.sha256 | slice(0, 16) }}-{{ execution.id }}"
+          - aws s3 cp audio.flac s3://{{ vars.bucket }}/audio/{{ outputs.fingerprint.vars.sha256 }}.flac
+          - aws transcribe start-transcription-job --transcription-job-name "$JOB" --media MediaFileUri=s3://{{ vars.bucket }}/audio/{{ outputs.fingerprint.vars.sha256 }}.flac --media-format flac --identify-language --language-options en-IN hi-IN en-US --output-bucket-name {{ vars.bucket }} --output-key transcripts/{{ outputs.fingerprint.vars.sha256 }}.json > /dev/null
+          - while true; do S=$(aws transcribe get-transcription-job --transcription-job-name "$JOB" --query TranscriptionJob.TranscriptionJobStatus --output text); echo "Transcribe status $S"; [ "$S" = COMPLETED ] && break; [ "$S" = FAILED ] && exit 1; sleep 15; done
+          - aws s3 cp s3://{{ vars.bucket }}/transcripts/{{ outputs.fingerprint.vars.sha256 }}.json transcript.json
+          - |
+            aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"}}' --update-expression "SET #s = :t, duration_s = :d" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values '{":t":{"S":"TRANSCRIBED"},":d":{"N":"{{ outputs.probe.vars.duration }}"}}'
+        outputFiles:
+          - transcript.json
+
+      - id: prepare
+        type: io.kestra.plugin.scripts.python.Script
+        description: Turn the Transcribe JSON into timestamped lines the model can cite. Stops early if the transcript is too short.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        inputFiles:
+          transcript.json: "{{ outputs.transcribe.outputFiles['transcript.json'] }}"
+        outputFiles:
+          - segments.txt
+        script: |
+          import json
+          results = json.load(open("transcript.json"))["results"]
+          lines = []
+          for seg in results.get("audio_segments", []):
+              sec = 0 if not lines else int(float(seg["start_time"]))
+              text = seg["transcript"].strip()
+              if text:
+                  lines.append(f"[{sec // 60:02d}:{sec % 60:02d}] {text}")
+          if not lines and results.get("transcripts"):
+              lines.append("[00:00] " + results["transcripts"][0]["transcript"].strip())
+          words = sum(len(line.split()) - 1 for line in lines)
+          language = results.get("language_code", "unknown")
+          open("segments.txt", "w").write("\n".join(lines))
+          print(f"{len(lines)} segments, {words} words, language {language}")
+          print("::" + json.dumps({"outputs": {"segments": len(lines), "words": words, "language": language}}) + "::")
+          if words < 20:
+              raise SystemExit("Transcript has fewer than 20 words, nothing to build a lesson from")
+
+      - id: review_rounds
+        type: io.kestra.plugin.core.flow.LoopUntil
+        description: Up to two review rounds. A rejection sends the reviewer's feedback back into generation.
+        condition: "{{ (outputs.review.onResume.decision ?? 'EXPIRED') != 'REJECT' }}"
+        failOnMaxReached: false
+        checkFrequency:
+          maxIterations: 2
+          interval: PT1S
+        tasks:
+          - id: generate_loop
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: Generate and validate, retrying up to three times with the exact validation errors.
+            condition: "{{ outputs.validate.vars.valid }}"
+            failOnMaxReached: true
+            checkFrequency:
+              maxIterations: 3
+              interval: PT1S
+            tasks:
+              - id: generate
+                type: io.kestra.plugin.aws.bedrock.Converse
+                description: Ask Bedrock for the title, summary, chapters and a quiz where every answer quotes the transcript.
+                region: "{{ vars.region }}"
+                accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+                secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+                modelId: "{{ vars.model_id }}"
+                inferenceConfig:
+                  maxTokens: 3000
+                  temperature: 0.3
+                system: >
+                  You turn lecture transcripts into course material for an online
+                  learning platform. Reply with one JSON object and nothing else:
+                  no markdown, no code fences, no commentary.
+                messages:
+                  - role: user
+                    content: |
+                      Lecture transcript, one line per segment with its start time:
+                      {{ read(outputs.prepare.outputFiles['segments.txt']) }}
+
+                      The video is {{ outputs.probe.vars.duration }} seconds long. Write in the language of the transcript ({{ outputs.prepare.vars.language }}).
+
+                      Return JSON with exactly these keys:
+                      {"title": "...", "summary": "...", "chapters": [{"start": "mm:ss", "title": "..."}], "quiz": [{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0, "evidence": "..."}]}
+
+                      Rules:
+                      - The summary is 30 to 200 words.
+                      - 2 to 12 chapters. The first starts at 00:00, the rest use start times from the transcript lines, strictly increasing, and chapters are at least 20 seconds apart. A short video needs only a few chapters.
+                      - 3 to 5 quiz questions about what the speaker actually says, not general knowledge. Each has 4 options and exactly one correct option; no two options may be the same answer written differently (for example "6 + 4" and "4 + 6"). answer is the 0-based index of the correct option; vary its position.
+                      - Every question needs evidence: 5 to 30 words copied exactly from one transcript line (without the timestamp) that prove the correct option. If you cannot quote the speaker, do not ask the question. Never ask about the video itself or about numbers that only appear on screen.
+                      {% if outputs.review is defined %}
+                      A reviewer rejected your previous draft:
+                      {{ outputs.generate.content }}
+                      Reviewer feedback: {{ outputs.review.onResume.feedback ?? 'no feedback given' }}
+                      Write a new draft that addresses the feedback.
+                      {% endif %}
+                      {% if outputs.validate is defined and not outputs.validate.vars.valid %}
+                      Your previous reply failed these checks: {{ outputs.validate.vars.errors }}
+                      Return the full corrected JSON.
+                      {% endif %}
+
+              - id: validate
+                type: io.kestra.plugin.scripts.python.Script
+                description: Check structure, chapter spacing, distinct options and that every quiz quote really appears in the transcript.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: python:3.12-slim
+                env:
+                  DURATION: "{{ outputs.probe.vars.duration }}"
+                inputFiles:
+                  draft.txt: "{{ outputs.generate.content }}"
+                  segments.txt: "{{ outputs.prepare.outputFiles['segments.txt'] }}"
+                outputFiles:
+                  - draft.json
+                script: |
+                  import json, os, re
+                  raw = open("draft.txt").read()
+                  duration = float(os.environ["DURATION"])
+                  errors = []
+                  data = None
+
+
+                  def normalize(text):
+                      return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+                  spoken = normalize(" ".join(re.sub(r"^\[\d{2}:\d{2}\] ", "", line) for line in open("segments.txt").read().splitlines()))
+                  m = re.search(r"\{.*\}", raw, re.S)
+                  if not m:
+                      errors.append("Reply is not a JSON object.")
+                  else:
+                      try:
+                          data = json.loads(m.group(0))
+                      except json.JSONDecodeError as e:
+                          errors.append(f"JSON does not parse: {e.msg} at position {e.pos}.")
+                  if isinstance(data, dict):
+                      title = data.get("title")
+                      if not isinstance(title, str) or not 5 <= len(title) <= 80:
+                          errors.append("title must be a string of 5 to 80 characters.")
+                      summary = data.get("summary")
+                      words = len(summary.split()) if isinstance(summary, str) else 0
+                      if not 30 <= words <= 200:
+                          errors.append(f"summary must be 30 to 200 words, got {words}.")
+                      chapters = data.get("chapters")
+                      if not isinstance(chapters, list) or not 2 <= len(chapters) <= 12:
+                          errors.append("chapters must be a list of 2 to 12 items.")
+                      else:
+                          prev = -1
+                          min_gap = max(20, int(duration / 8))
+                          for i, c in enumerate(chapters, 1):
+                              c = c if isinstance(c, dict) else {}
+                              ts = str(c.get("start", ""))
+                              if not re.fullmatch(r"\d{2}:\d{2}", ts):
+                                  errors.append(f"chapter {i}: start must be mm:ss, got '{ts}'.")
+                                  continue
+                              s = int(ts[:2]) * 60 + int(ts[3:])
+                              if i == 1 and s != 0:
+                                  errors.append("chapter 1 must start at 00:00.")
+                              if s <= prev:
+                                  errors.append(f"chapter {i}: start {ts} is not after the previous chapter.")
+                              elif prev >= 0 and s - prev < min_gap:
+                                  errors.append(f"chapter {i}: starts {s - prev}s after the previous one; chapters must be at least {min_gap}s apart, merge short ones.")
+                              if s >= duration:
+                                  errors.append(f"chapter {i}: start {ts} is past the end of the video ({int(duration)}s).")
+                              if not str(c.get("title", "")).strip():
+                                  errors.append(f"chapter {i}: title is empty.")
+                              prev = s
+                      quiz = data.get("quiz")
+                      if not isinstance(quiz, list) or not 3 <= len(quiz) <= 5:
+                          errors.append("quiz must be a list of 3 to 5 questions.")
+                      else:
+                          for i, q in enumerate(quiz, 1):
+                              q = q if isinstance(q, dict) else {}
+                              opts = q.get("options")
+                              if not str(q.get("question", "")).strip():
+                                  errors.append(f"question {i}: text is empty.")
+                              if not isinstance(opts, list) or len(opts) != 4 or len({str(o).strip().lower() for o in opts}) != 4:
+                                  errors.append(f"question {i}: needs exactly 4 distinct options.")
+                              elif len({" ".join(sorted(t.strip() for t in re.split(r"\+|\*|×|,| and ", str(o).lower()))) for o in opts}) != 4:
+                                  errors.append(f"question {i}: two options are the same answer written differently.")
+                              evidence = normalize(str(q.get("evidence", "")))
+                              if len(evidence.split()) < 5:
+                                  errors.append(f"question {i}: evidence must quote at least 5 words the speaker says.")
+                              elif evidence not in spoken:
+                                  errors.append(f"question {i}: the evidence is not in the transcript; quote the speaker's exact words or drop the question.")
+                              a = q.get("answer")
+                              if isinstance(a, str) and a.strip().isdigit():
+                                  a = int(a.strip())
+                              elif isinstance(a, str) and isinstance(opts, list) and a.strip() in [str(o).strip() for o in opts]:
+                                  a = [str(o).strip() for o in opts].index(a.strip())
+                              q["answer"] = a
+                              if type(a) is not int or not 0 <= a <= 3:
+                                  errors.append(f"question {i}: answer must be the index 0 to 3 of the correct option.")
+                          answers = [q.get("answer") for q in quiz if isinstance(q, dict)]
+                          if len(answers) >= 3 and len(set(answers)) == 1:
+                              errors.append("every question has the same answer index; vary the position of the correct option.")
+                  elif data is not None:
+                      errors.append("Reply must be a JSON object, not a list or value.")
+                  valid = not errors
+                  json.dump(data if valid else {}, open("draft.json", "w"), indent=2, ensure_ascii=False)
+                  for e in errors:
+                      print("Validation failed:", e)
+                  if valid:
+                      print(f"Draft is valid: {len(data['chapters'])} chapters, {len(data['quiz'])} questions")
+                  print("::" + json.dumps({"outputs": {"valid": valid, "errors": " ".join(errors)}}) + "::")
+
+          - id: save_draft
+            type: io.kestra.plugin.aws.cli.AwsCLI
+            description: Keep each draft in S3 under drafts/<sha>/round-N.json and mark the video IN_REVIEW.
+            region: "{{ vars.region }}"
+            accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+            secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+            retry:
+              type: constant
+              interval: PT15S
+              maxAttempts: 3
+            inputFiles:
+              draft.json: "{{ outputs.validate.outputFiles['draft.json'] }}"
+            commands:
+              - aws s3 cp draft.json s3://{{ vars.bucket }}/drafts/{{ outputs.fingerprint.vars.sha256 }}/round-{{ outputs.review_rounds.iterationCount }}.json --content-type application/json
+              - |
+                aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"}}' --update-expression "SET #s = :s, review_round = :r, draft_key = :k" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values '{":s":{"S":"IN_REVIEW"},":r":{"N":"{{ outputs.review_rounds.iterationCount }}"},":k":{"S":"drafts/{{ outputs.fingerprint.vars.sha256 }}/round-{{ outputs.review_rounds.iterationCount }}.json"}}'
+
+          - id: notify_reviewer
+            type: io.kestra.plugin.aws.cli.AwsCLI
+            description: Email the full draft, with quotes and correct answers, and a link to the paused execution.
+            region: "{{ vars.region }}"
+            accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+            secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+            inputFiles:
+              message.txt: |
+                {% set draft = fromJson(read(outputs.validate.outputFiles['draft.json'])) %}
+                New course content is ready for review (round {{ outputs.review_rounds.iterationCount }} of 2).
+
+                Video: {{ trigger.objects[0].key }} ({{ outputs.probe.vars.duration }} seconds)
+
+                Title: {{ draft.title }}
+
+                Summary:
+                {{ draft.summary }}
+
+                Chapters:
+                {% for c in draft.chapters %}  {{ c.start }}  {{ c.title }}
+                {% endfor %}
+                Quiz (* marks the correct option):
+                {% for q in draft.quiz %}{% set answer = q.answer %}{{ loop.index + 1 }}. {{ q.question }}
+                {% for o in q.options %}   {{ loop.index == answer ? '*' : '-' }} {{ o }}
+                {% endfor %}   Speaker said: "{{ q.evidence }}"
+                {% endfor %}
+                To approve or reject, open the execution and click Resume:
+                {{ vars.ui_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+                If you reject, say what to change in the feedback field. The draft is regenerated once with your notes.
+                The review closes automatically after 2 days.
+            commands:
+              - aws sns publish --topic-arn {{ vars.topic_arn }} --subject "Course content ready for review (round {{ outputs.review_rounds.iterationCount }})" --message file://message.txt
+
+          - id: review
+            type: io.kestra.plugin.core.flow.Pause
+            description: Wait up to two days for APPROVE or REJECT with feedback.
+            pauseDuration: P2D
+            behavior: RESUME
+            onResume:
+              - id: decision
+                type: SELECT
+                values:
+                  - APPROVE
+                  - REJECT
+                description: Approve to publish, reject to regenerate with your feedback
+              - id: feedback
+                type: STRING
+                required: false
+                description: What should change? Used for the next draft when you reject
+
+      - id: finalize
+        type: io.kestra.plugin.core.flow.Switch
+        description: Publish on approval, otherwise record why the video was not published.
+        value: "{{ outputs.review.onResume.decision ?? 'EXPIRED' }}"
+        cases:
+          APPROVE:
+            - id: publish
+              type: io.kestra.plugin.aws.cli.AwsCLI
+              region: "{{ vars.region }}"
+              accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              retry:
+                type: constant
+                interval: PT15S
+                maxAttempts: 3
+              inputFiles:
+                draft.json: "{{ outputs.validate.outputFiles['draft.json'] }}"
+                values.json: |
+                  {% set draft = fromJson(read(outputs.validate.outputFiles['draft.json'])) %}
+                  {":s": {"S": "PUBLISHED"}, ":t": {"S": {{ draft.title | toJson }}}, ":k": {"S": "approved/{{ outputs.fingerprint.vars.sha256 }}.json"}, ":p": {"S": "{{ now() }}"}}
+              commands:
+                - aws s3 cp draft.json s3://{{ vars.bucket }}/approved/{{ outputs.fingerprint.vars.sha256 }}.json --content-type application/json
+                - |
+                  aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"}}' --update-expression "SET #s = :s, title = :t, content_key = :k, published_at = :p" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values file://values.json
+          REJECT:
+            - id: mark_rejected
+              type: io.kestra.plugin.aws.cli.AwsCLI
+              region: "{{ vars.region }}"
+              accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              commands:
+                - |
+                  aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"}}' --update-expression "SET #s = :s, rejected_at = :at" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values '{":s":{"S":"REJECTED"},":at":{"S":"{{ now() }}"}}'
+        defaults:
+          - id: mark_expired
+            type: io.kestra.plugin.aws.cli.AwsCLI
+            region: "{{ vars.region }}"
+            accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+            secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+            commands:
+              - |
+                aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 }}"}}' --update-expression "SET #s = :s, expired_at = :at" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values '{":s":{"S":"REVIEW_EXPIRED"},":at":{"S":"{{ now() }}"}}'
+
+errors:
+  - id: mark_failed
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Mark the video FAILED, but only if this run claimed it, and email an alert with the execution link.
+    region: "{{ vars.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    inputFiles:
+      alert.txt: |
+        The course content pipeline failed.
+
+        Video: {{ trigger.objects[0].key ?? 'unknown' }}
+        Execution: {{ vars.ui_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+        Open the execution to see which task failed. Upload the video again to retry; a video marked FAILED can be claimed again.
+    commands:
+      - |
+        if [ "{{ outputs.claim.vars.claimed ?? false }}" = "true" ]; then
+          aws dynamodb update-item --table-name {{ vars.table }} --key '{"video_id":{"S":"{{ outputs.fingerprint.vars.sha256 ?? '' }}"}}' --update-expression "SET #s = :s, failed_at = :at" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values '{":s":{"S":"FAILED"},":at":{"S":"{{ now() }}"}}'
+        fi
+        aws sns publish --topic-arn {{ vars.topic_arn }} --subject "Course content pipeline failed" --message file://alert.txt
+
+triggers:
+  - id: new_video
+    type: io.kestra.plugin.aws.s3.Trigger
+    description: Poll incoming/ every minute for video files and move each one to processing/ before the run starts.
+    region: "{{ vars.region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    bucket: "{{ vars.bucket }}"
+    prefix: incoming/
+    regexp: ".*\\.(mp4|mkv|mov|webm)$"
+    interval: PT1M
+    action: MOVE
+    moveTo:
+      bucket: "{{ vars.bucket }}"
+      key: processing/
+
+extend:
+  title: Lecture Videos to Reviewed Course Content with Amazon Transcribe, Bedrock and Human Approval
+  metaTitle: Lecture Video to Course Content with Amazon Transcribe and Bedrock | Kestra
+  shortDescription: Drop a lecture video into S3 and get a transcript, summary, chapters and a quiz grounded in what the speaker said, published only after a reviewer approves it.
+  metaDescription: Turn lecture videos in S3 into chapters, summaries and transcript-grounded quizzes with Amazon Transcribe and Bedrock, gated by human review.
+  description: |
+    Course teams record lectures faster than anyone can write the lesson page around them. This blueprint does the first draft for you and keeps a person in charge of what gets published. Upload a video to S3 and Kestra transcribes it with Amazon Transcribe, asks Amazon Bedrock for a title, summary, chapters and a short quiz, checks the draft with plain Python, and emails a reviewer who approves it or sends it back with notes. Every quiz answer has to quote the transcript, so the model cannot invent facts the lecturer never said.
+
+    ## How it works
+
+    1. The `io.kestra.plugin.aws.s3.Trigger` polls `incoming/` every minute for `.mp4`, `.mkv`, `.mov` and `.webm` files and moves each one to `processing/` before the run starts, so a file is never picked up twice.
+    2. `fingerprint` hashes the video and `claim` writes the hash to DynamoDB with a conditional put. The same lecture uploaded under another name is skipped; a video whose last run failed can be claimed again.
+    3. `stage_media` moves the original to `media/<sha>.<ext>`. `probe` reads the duration with ffprobe and extracts mono FLAC, which Transcribe accepts whatever the source container was.
+    4. `transcribe` starts a Transcribe job with language identification (English and Hindi by default), polls it until it completes and marks the video `TRANSCRIBED`.
+    5. `prepare` turns the Transcribe JSON into timestamped lines such as `[01:15] ...` that the model can cite.
+    6. `generate_loop` calls Bedrock through `io.kestra.plugin.aws.bedrock.Converse`, then `validate` checks the JSON: summary length, chapters that start at 00:00 and are at least `max(20s, duration / 8)` apart, four distinct options per question, and an `evidence` quote for every answer that must appear in the transcript. Failed checks go back to the model word for word, up to three attempts.
+    7. `save_draft` stores the draft in `drafts/<sha>/round-N.json`, `notify_reviewer` sends it by SNS email with a link to the execution, and `review` pauses for up to two days.
+    8. On **APPROVE** the content is written to `approved/<sha>.json` and the video becomes `PUBLISHED`. On **REJECT** the feedback is sent back to the model for a second draft; a second rejection ends as `REJECTED`. No answer in two days ends as `REVIEW_EXPIRED`.
+    9. If any task fails, the `errors` branch marks the video `FAILED` (only when this run claimed it) and emails an alert with the execution link.
+
+    ## What you get
+
+    - A lesson draft per video: title, summary, chapters with timestamps and a 3 to 5 question quiz, stored as JSON in S3.
+    - Quiz answers backed by a quote from the speaker, shown to the reviewer next to each question.
+    - One DynamoDB row per video with its status (`PROCESSING`, `TRANSCRIBED`, `IN_REVIEW`, `PUBLISHED`, `REJECTED`, `REVIEW_EXPIRED`, `FAILED`), timestamps and S3 keys.
+    - Duplicate uploads detected by content, not by file name.
+    - Every draft round kept in S3, so you can see what the reviewer rejected and why.
+
+    ## Who it's for
+
+    - Course and LMS teams publishing recorded lectures.
+    - Learning engineers who want AI drafts without letting unreviewed content reach students.
+    - Platform teams on AWS looking for a worked example of Transcribe, Bedrock and a human approval step in one flow.
+
+    ## Why orchestrate this with Kestra
+
+    - Transcription and review take minutes to days. The `Pause` task waits for a person without holding a worker, and the execution page is the review screen.
+    - `LoopUntil` gives you the validate-and-retry loop and the review rounds declaratively, with every attempt visible in the Gantt view.
+    - Retries on the S3 steps absorb short AWS hiccups, and the `errors` branch keeps DynamoDB honest when something does break.
+    - Credentials stay in secrets and never show up in logs.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with a Docker task runner, and `plugin-aws` 2.10.3 or later (earlier versions reject the `messages` list of `Converse`).
+    - An S3 bucket with an `incoming/` prefix.
+    - A DynamoDB table with partition key `video_id` (String). On-demand capacity is fine.
+    - A standard SNS topic with a confirmed email subscription for reviewers.
+    - Access to an Amazon Nova model in Bedrock. Set `model_id` to the inference profile for your region, for example `us.amazon.nova-pro-v1:0`, `eu.amazon.nova-pro-v1:0` or `apac.amazon.nova-pro-v1:0`.
+    - An IAM user or role allowed to call `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`, `s3:GetObjectTagging` and `s3:PutObjectTagging` on the bucket; `dynamodb:PutItem` and `dynamodb:UpdateItem` on the table; `sns:Publish` on the topic; `transcribe:StartTranscriptionJob` and `transcribe:GetTranscriptionJob`; and `bedrock:InvokeModel` on both the inference profile and the underlying `foundation-model/amazon.nova-*` ARNs. There is no separate `bedrock:Converse` action.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: access key of the IAM user that runs the pipeline.
+    - `AWS_SECRET_ACCESS_KEY`: secret key for the same user.
+
+    ## Quick start
+
+    1. Create the bucket, table and topic, and confirm the SNS email subscription.
+    2. Add the two secrets to Kestra.
+    3. Set the `variables` at the top of the flow: region, bucket, table, topic ARN, model ID and the URL of your Kestra UI (used in the review link).
+    4. Save the flow and upload a short lecture video to `incoming/`.
+    5. When the review email arrives, open the link, click **Resume** and choose **APPROVE**, or **REJECT** with feedback to get a second draft.
+    6. Check `approved/` in S3 and the video's row in DynamoDB.
+
+    ## How to extend
+
+    - Post the review request to Slack or Teams instead of email, or add a second approver for high-stakes courses.
+    - Send the approved JSON to your LMS API, or render it into an HTML lesson page.
+    - Ask Transcribe for SRT output and publish subtitles alongside the lesson.
+    - Add languages to `--language-options`, or translate the approved content with a second Bedrock call.
+    - Switch `model_id` to another Bedrock model; the prompt and validation do not depend on Nova.
+
+    ## Links
+
+    - AWS plugin: https://kestra.io/plugins/plugin-aws
+    - Bedrock Converse task: https://kestra.io/plugins/plugin-aws/bedrock/io.kestra.plugin.aws.bedrock.converse
+    - S3 trigger: https://kestra.io/plugins/plugin-aws/s3/io.kestra.plugin.aws.s3.trigger
+    - Pause task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause
+    - LoopUntil task: https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil
+    - Amazon Transcribe language identification: https://docs.aws.amazon.com/transcribe/latest/dg/lang-id.html
+    - Amazon Bedrock Converse API: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
+  tags:
+    - AI
+    - Cloud
+  subTags:
+    - Content Generation
+    - Approval Gates
+    - AWS Services
+  ee: false
+  demo: false
