@@ -1,0 +1,840 @@
+id: kubernetes-service-decommissioning
+namespace: company.platform
+description: |
+  Retire a Kubernetes service safely. The flow lists everything that belongs to
+  the service, proves from Prometheus that nothing calls it, takes a verified
+  snapshot, scales it to zero for a quiet period and brings it back by itself if
+  anything calls it, then deletes it after a second approval. A restore mode
+  re-applies the snapshot.
+
+labels:
+  team: platform
+  use-case: service-decommission
+
+inputs:
+  - id: mode
+    type: SELECT
+    displayName: Action
+    values:
+      - decommission
+      - restore
+    defaults: decommission
+  - id: namespace
+    type: STRING
+    displayName: Kubernetes namespace
+    required: false
+  - id: service
+    type: STRING
+    displayName: Service
+    description: Value of the selector label (vars.selector_label) shared by every object of the service.
+    required: false
+  - id: reason
+    type: STRING
+    displayName: Reason
+    required: false
+  - id: lookback_days
+    type: INT
+    displayName: Days of zero traffic required
+    defaults: 14
+  - id: quiet_days
+    type: INT
+    displayName: Days scaled to zero before deletion can be approved
+    defaults: 7
+  - id: delete_pvcs
+    type: BOOL
+    displayName: Also delete persistent volume claims (their data is lost)
+    defaults: false
+  - id: snapshot_key
+    type: STRING
+    displayName: Snapshot to restore (restore only)
+    description: Leave empty to use the snapshot recorded when the service was decommissioned.
+    required: false
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: List the objects and the traffic evidence without changing anything.
+    defaults: false
+
+variables:
+  selector_label: app.kubernetes.io/name
+  # Object types handled. Secrets are left in place, so they never land in a snapshot; add them only with an encrypted bucket.
+  resource_types: deployments,statefulsets,cronjobs,services,ingresses,configmaps,horizontalpodautoscalers,persistentvolumeclaims
+  # PromQL for requests to the service over $WINDOW, for ingress-nginx scraped by the Prometheus Operator.
+  # The second half adds series that started inside the window (such as the first 503 after scaling to zero), which increase() alone misses.
+  traffic_query: >-
+    sum(increase(nginx_ingress_controller_requests{exported_namespace="$NAMESPACE",exported_service="$SERVICE"}[$WINDOW]))
+    + (sum(nginx_ingress_controller_requests{exported_namespace="$NAMESPACE",exported_service="$SERVICE"}
+    unless nginx_ingress_controller_requests{exported_namespace="$NAMESPACE",exported_service="$SERVICE"} offset $WINDOW) or vector(0))
+  idle_threshold: 0
+  snapshot_bucket: k8s-decommission-snapshots
+  s3_endpoint: https://s3.us-east-1.amazonaws.com
+  s3_region: us-east-1
+
+triggers:
+  - id: retire_request
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: A portal, Backstage or Jira automation posts a JSON body with namespace, service and reason.
+    key: "{{ secret('DECOMMISSION_WEBHOOK_KEY') }}"
+    inputs:
+      mode: decommission
+
+tasks:
+  - id: target
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the namespace and service name, from the webhook body or the form.
+    dependencies:
+      - kestra
+    inputFiles:
+      target.json: |
+        {"namespace": {{ (trigger.body.namespace ?? inputs.namespace ?? '') | toJson }},
+         "service": {{ (trigger.body.service ?? inputs.service ?? '') | toJson }},
+         "reason": {{ (trigger.body.reason ?? inputs.reason ?? '') | toJson }},
+         "requested_by": {{ (trigger.body.requested_by ?? 'Kestra UI') | toJson }}}
+    script: |
+      import json, re
+      from kestra import Kestra
+
+      t = json.load(open("target.json"))
+      label = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+      for field in ("namespace", "service"):
+          t[field] = str(t[field]).strip()
+          if not label.fullmatch(t[field]) or len(t[field]) > 63:
+              raise SystemExit(f"{field} '{t[field]}' is missing or not a valid Kubernetes name.")
+      if t["namespace"] in ("kube-system", "kube-public", "kube-node-lease"):
+          raise SystemExit(f"{t['namespace']} is a system namespace.")
+      Kestra.outputs(t)
+
+  - id: label_execution
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      service: "{{ outputs.target.vars.service }}"
+      k8s-namespace: "{{ outputs.target.vars.namespace }}"
+
+  - id: by_mode
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ inputs.mode ?? 'decommission' }}"
+    cases:
+      decommission:
+        - id: inventory
+          type: io.kestra.plugin.scripts.shell.Commands
+          description: List every object carrying the service's label. kubectl is used because the selector matches across object types.
+          taskRunner:
+            type: io.kestra.plugin.scripts.runner.docker.Docker
+            user: "0"
+          containerImage: bitnami/kubectl
+          env:
+            K8S_SERVER: "{{ secret('K8S_MASTER_URL') }}"
+            K8S_TOKEN: "{{ secret('K8S_TOKEN') }}"
+            K8S_CA_CERT: "{{ secret('K8S_CA_CERT') }}"
+          commands:
+            - echo "$K8S_CA_CERT" | base64 -d > ca.crt
+            - kubectl --server="$K8S_SERVER" --token="$K8S_TOKEN" --certificate-authority=ca.crt -n "{{ outputs.target.vars.namespace }}" get {{ vars.resource_types }} -l "{{ vars.selector_label }}={{ outputs.target.vars.service }}" -o json > inventory.json
+          outputFiles:
+            - inventory.json
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: traffic_before
+          type: io.kestra.plugin.prometheus.Query
+          description: Requests to the service over the lookback window. If Prometheus can't answer, the run fails instead of assuming zero traffic.
+          url: "{{ secret('PROMETHEUS_URL') }}"
+          query: "{{ vars.traffic_query | replace({'$NAMESPACE': outputs.target.vars.namespace, '$SERVICE': outputs.target.vars.service, '$WINDOW': (inputs.lookback_days ?? 14) ~ 'd'}) }}"
+          fetchType: FETCH_ONE
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: plan
+          type: io.kestra.plugin.scripts.python.Script
+          description: Summarize the objects, the replica counts to restore later, and whether the service is idle.
+          dependencies:
+            - kestra
+          inputFiles:
+            inventory.json: "{{ outputs.inventory.outputFiles['inventory.json'] }}"
+            traffic.json: "{{ outputs.traffic_before | toJson }}"
+            settings.json: |
+              {"threshold": {{ vars.idle_threshold }}, "delete_pvcs": {{ inputs.delete_pvcs ?? false }},
+               "lookback": {{ inputs.lookback_days ?? 14 }}, "types": {{ vars.resource_types | toJson }}}
+          script: |
+            import json
+            from kestra import Kestra
+
+            items = json.load(open("inventory.json"))["items"]
+            if not items:
+                raise SystemExit("No objects carry this label in this namespace. Check the service name and vars.selector_label.")
+            s = json.load(open("settings.json"))
+            result = json.load(open("traffic.json"))
+            if not result.get("size"):
+                raise SystemExit("Prometheus returned no series for vars.traffic_query, so traffic can't be proven to be zero. "
+                                 "Check the metric and labels for this service.")
+            requests = float(result["metric"]["value"])
+            objects, scaled, cronjobs, pvcs = [], {}, [], []
+            for i in items:
+                kind, name = i["kind"], i["metadata"]["name"]
+                objects.append(f"{kind}/{name}")
+                if kind in ("Deployment", "StatefulSet"):
+                    scaled[f"{kind.lower()}s/{name}"] = i["spec"].get("replicas", 1)
+                if kind == "CronJob":
+                    cronjobs.append(name)
+                if kind == "PersistentVolumeClaim":
+                    pvcs.append(name)
+            idle = requests <= s["threshold"]
+            print(f"{len(objects)} objects, {requests:.0f} requests in {s['lookback']} days: {'idle' if idle else 'in use'}")
+            Kestra.outputs({"objects": objects, "count": len(objects), "scaled": scaled, "cronjobs": cronjobs,
+                            "pvcs": pvcs, "requests": round(requests), "idle": idle,
+                            "kept": [] if s["delete_pvcs"] else [f"PersistentVolumeClaim/{p}" for p in pvcs],
+                            "delete_types": ",".join(t for t in s["types"].split(",")
+                                                     if s["delete_pvcs"] or t != "persistentvolumeclaims")})
+
+        - id: still_in_use
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ not outputs.plan.vars.idle }}"
+          then:
+            - id: tell_in_use
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: constant
+                interval: PT10S
+                maxAttempts: 3
+              messageText: "🚦 *{{ outputs.target.vars.service }}* in `{{ outputs.target.vars.namespace }}` received *{{ outputs.plan.vars.requests }} requests* in the last {{ inputs.lookback_days ?? 14 }} days, so it is not being decommissioned. Find its callers first."
+            - id: stop_in_use
+              type: io.kestra.plugin.core.execution.Exit
+              state: WARNING
+
+        - id: dry_run_stop
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ inputs.dry_run ?? false }}"
+          then:
+            - id: show_plan
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: constant
+                interval: PT10S
+                maxAttempts: 3
+              messageText: "🧪 Dry run for *{{ outputs.target.vars.service }}* in `{{ outputs.target.vars.namespace }}`: idle ({{ outputs.plan.vars.requests }} requests in {{ inputs.lookback_days ?? 14 }} days). Would snapshot {{ outputs.plan.vars.objects | join(', ') }}, scale it to zero for {{ inputs.quiet_days ?? 7 }} days, then delete it after approval.{% if (outputs.plan.vars.kept | length) > 0 %} Kept on deletion: {{ outputs.plan.vars.kept | join(', ') }}.{% endif %} Nothing was changed."
+            - id: stop_dry_run
+              type: io.kestra.plugin.core.execution.Exit
+              state: SUCCESS
+
+        - id: ask_soft_off
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: |
+            🪦 *Decommission request:* `{{ outputs.target.vars.service }}` in `{{ outputs.target.vars.namespace }}` ({{ outputs.target.vars.reason }}), requested by {{ outputs.target.vars.requested_by }}.
+            {{ outputs.plan.vars.requests }} requests in {{ inputs.lookback_days ?? 14 }} days. {{ outputs.plan.vars.count }} objects: {{ outputs.plan.vars.objects | join(', ') }}.
+            Approve the soft off: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+        - id: approve_soft_off
+          type: io.kestra.plugin.core.flow.Pause
+          description: The service owner approves scaling the service to zero. Nothing is deleted at this step.
+          pauseDuration: P3D
+          behavior: CANCEL
+          onResume:
+            - id: decision
+              type: SELECT
+              displayName: Scale the service to zero and start the quiet period?
+              values:
+                - Approve
+                - Reject
+            - id: note
+              type: STRING
+              displayName: Note
+              required: false
+
+        - id: rejected
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.approve_soft_off.onResume.decision == 'Reject' }}"
+          then:
+            - id: tell_rejected
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: constant
+                interval: PT10S
+                maxAttempts: 3
+              messageText: "🙅 Decommissioning `{{ outputs.target.vars.service }}` was rejected; nothing was changed. {{ outputs.approve_soft_off.onResume.note ?? '' }}"
+            - id: stop_rejected
+              type: io.kestra.plugin.core.execution.Exit
+              state: SUCCESS
+
+        - id: snapshot
+          type: io.kestra.plugin.scripts.python.Script
+          description: Turn the inventory into a snapshot that can be applied again (no status, uid, resourceVersion or cluster IPs).
+          dependencies:
+            - kestra
+          inputFiles:
+            inventory.json: "{{ outputs.inventory.outputFiles['inventory.json'] }}"
+          outputFiles:
+            - snapshot.json
+          script: |
+            import json
+            from kestra import Kestra
+
+            data = json.load(open("inventory.json"))
+            for i in data["items"]:
+                i.pop("status", None)
+                meta = i["metadata"]
+                for key in ("uid", "resourceVersion", "creationTimestamp", "managedFields", "generation", "selfLink"):
+                    meta.pop(key, None)
+                meta.get("annotations", {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
+                if i["kind"] == "Service":
+                    for key in ("clusterIP", "clusterIPs"):
+                        i["spec"].pop(key, None)
+                if i["kind"] == "PersistentVolumeClaim":
+                    i["spec"].pop("volumeName", None)
+                    meta.get("annotations", {}).clear()
+            data["metadata"] = {}
+            json.dump(data, open("snapshot.json", "w"), indent=2)
+            Kestra.outputs({"objects": len(data["items"])})
+
+        - id: upload_snapshot
+          type: io.kestra.plugin.aws.s3.Upload
+          endpointOverride: "{{ vars.s3_endpoint }}"
+          forcePathStyle: true
+          compatibilityMode: true
+          region: "{{ vars.s3_region }}"
+          accessKeyId: "{{ secret('SNAPSHOT_S3_ACCESS_KEY_ID') }}"
+          secretKeyId: "{{ secret('SNAPSHOT_S3_SECRET_KEY') }}"
+          bucket: "{{ vars.snapshot_bucket }}"
+          key: "{{ outputs.target.vars.namespace }}/{{ outputs.target.vars.service }}/{{ execution.startDate | date('yyyyMMdd-HHmmss') }}.json"
+          from: "{{ outputs.snapshot.outputFiles['snapshot.json'] }}"
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: download_snapshot
+          type: io.kestra.plugin.aws.s3.Download
+          description: Read the snapshot back from the bucket before changing anything.
+          endpointOverride: "{{ vars.s3_endpoint }}"
+          forcePathStyle: true
+          compatibilityMode: true
+          region: "{{ vars.s3_region }}"
+          accessKeyId: "{{ secret('SNAPSHOT_S3_ACCESS_KEY_ID') }}"
+          secretKeyId: "{{ secret('SNAPSHOT_S3_SECRET_KEY') }}"
+          bucket: "{{ vars.snapshot_bucket }}"
+          key: "{{ outputs.upload_snapshot.key }}"
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: verify_snapshot
+          type: io.kestra.plugin.scripts.python.Script
+          dependencies:
+            - kestra
+          inputFiles:
+            stored.json: "{{ outputs.download_snapshot.uri }}"
+            expected.json: "{{ outputs.plan.vars.objects | toJson }}"
+          script: |
+            import json
+            stored = {f"{i['kind']}/{i['metadata']['name']}" for i in json.load(open("stored.json"))["items"]}
+            missing = set(json.load(open("expected.json"))) - stored
+            if missing:
+                raise SystemExit("The stored snapshot is missing: " + ", ".join(sorted(missing)))
+            print(f"Snapshot verified: {len(stored)} objects")
+
+        - id: record_soft_off
+          type: io.kestra.plugin.core.kv.Set
+          description: Remember the snapshot and the replica counts, for restore and for the audit trail.
+          key: "{{ ('decommission-' ~ outputs.target.vars.namespace ~ '-' ~ outputs.target.vars.service) | slugify }}"
+          kvType: JSON
+          value: |
+            {"namespace": {{ outputs.target.vars.namespace | toJson }}, "service": {{ outputs.target.vars.service | toJson }},
+             "state": "scaled-down", "snapshot_key": {{ outputs.upload_snapshot.key | toJson }},
+             "replicas": {{ outputs.plan.vars.scaled | toJson }}, "cronjobs": {{ outputs.plan.vars.cronjobs | toJson }},
+             "reason": {{ outputs.target.vars.reason | toJson }}, "requested_by": {{ outputs.target.vars.requested_by | toJson }},
+             "execution": {{ execution.id | toJson }}, "updated": "{{ now() | date('yyyy-MM-dd') }}"}
+
+        - id: scale_to_zero
+          type: io.kestra.plugin.core.flow.Loop
+          description: Scale Deployments and StatefulSets to zero. Fully reversible.
+          values: "{{ outputs.plan.vars.scaled | keys }}"
+          tasks:
+            - id: scale_down
+              type: io.kestra.plugin.kubernetes.kubectl.Patch
+              connection:
+                masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                oauthToken: "{{ secret('K8S_TOKEN') }}"
+                caCertData: "{{ secret('K8S_CA_CERT') }}"
+              namespace: "{{ outputs.target.vars.namespace }}"
+              apiGroup: apps
+              apiVersion: v1
+              resourceType: "{{ item.value | split('/') | first }}"
+              resourceName: "{{ item.value | split('/') | last }}"
+              patch: '{"spec": {"replicas": 0}}'
+              retry:
+                type: exponential
+                interval: PT10S
+                maxInterval: PT1M
+                maxAttempts: 3
+
+        - id: suspend_cronjobs
+          type: io.kestra.plugin.core.flow.Loop
+          values: "{{ outputs.plan.vars.cronjobs }}"
+          tasks:
+            - id: suspend
+              type: io.kestra.plugin.kubernetes.kubectl.Patch
+              connection:
+                masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                oauthToken: "{{ secret('K8S_TOKEN') }}"
+                caCertData: "{{ secret('K8S_CA_CERT') }}"
+              namespace: "{{ outputs.target.vars.namespace }}"
+              apiGroup: batch
+              apiVersion: v1
+              resourceType: cronjobs
+              resourceName: "{{ item.value }}"
+              patch: '{"spec": {"suspend": true}}'
+              retry:
+                type: exponential
+                interval: PT10S
+                maxInterval: PT1M
+                maxAttempts: 3
+
+        - id: tell_soft_off
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: "⏸️ `{{ outputs.target.vars.service }}` is scaled to zero and its CronJobs are suspended. Snapshot: `s3://{{ vars.snapshot_bucket }}/{{ outputs.upload_snapshot.key }}`. If anything calls it in the next {{ inputs.quiet_days ?? 7 }} days it comes back by itself; otherwise deletion will be up for approval."
+
+        - id: quiet_period
+          type: io.kestra.plugin.core.flow.Pause
+          description: Wait while the service is off. Resuming early only shortens the wait; the traffic check below still runs.
+          pauseDuration: "{{ 'P' ~ (inputs.quiet_days ?? 7) ~ 'D' }}"
+          behavior: RESUME
+
+        - id: traffic_during
+          type: io.kestra.plugin.prometheus.Query
+          description: Requests during the quiet period. Anything above the threshold means a caller was missed.
+          url: "{{ secret('PROMETHEUS_URL') }}"
+          query: "{{ vars.traffic_query | replace({'$NAMESPACE': outputs.target.vars.namespace, '$SERVICE': outputs.target.vars.service, '$WINDOW': (inputs.quiet_days ?? 7) ~ 'd'}) }}"
+          fetchType: FETCH_ONE
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: check_quiet
+          type: io.kestra.plugin.scripts.python.Script
+          dependencies:
+            - kestra
+          inputFiles:
+            traffic.json: "{{ outputs.traffic_during | toJson }}"
+            threshold.txt: "{{ vars.idle_threshold }}"
+          script: |
+            import json
+            from kestra import Kestra
+            result = json.load(open("traffic.json"))
+            if not result.get("size"):
+                raise SystemExit("Prometheus returned no series for vars.traffic_query, so traffic can't be proven to be zero. "
+                                 "Check the metric and labels for this service.")
+            requests = float(result["metric"]["value"])
+            threshold = float(open("threshold.txt").read().strip())
+            Kestra.outputs({"requests": round(requests), "called": requests > threshold})
+
+        - id: called_while_off
+          type: io.kestra.plugin.core.flow.If
+          description: A caller was missed. Bring the service back the way it was and stop.
+          condition: "{{ outputs.check_quiet.vars.called }}"
+          then:
+            - id: restore_replicas
+              type: io.kestra.plugin.core.flow.Loop
+              values: "{{ outputs.plan.vars.scaled | keys }}"
+              tasks:
+                - id: scale_up
+                  type: io.kestra.plugin.kubernetes.kubectl.Patch
+                  connection:
+                    masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                    oauthToken: "{{ secret('K8S_TOKEN') }}"
+                    caCertData: "{{ secret('K8S_CA_CERT') }}"
+                  namespace: "{{ outputs.target.vars.namespace }}"
+                  apiGroup: apps
+                  apiVersion: v1
+                  resourceType: "{{ item.value | split('/') | first }}"
+                  resourceName: "{{ item.value | split('/') | last }}"
+                  patch: '{"spec": {"replicas": {{ outputs.plan.vars.scaled[item.value] }}}}'
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT1M
+                    maxAttempts: 3
+            - id: resume_cronjobs
+              type: io.kestra.plugin.core.flow.Loop
+              values: "{{ outputs.plan.vars.cronjobs }}"
+              tasks:
+                - id: unsuspend
+                  type: io.kestra.plugin.kubernetes.kubectl.Patch
+                  connection:
+                    masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                    oauthToken: "{{ secret('K8S_TOKEN') }}"
+                    caCertData: "{{ secret('K8S_CA_CERT') }}"
+                  namespace: "{{ outputs.target.vars.namespace }}"
+                  apiGroup: batch
+                  apiVersion: v1
+                  resourceType: cronjobs
+                  resourceName: "{{ item.value }}"
+                  patch: '{"spec": {"suspend": false}}'
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT1M
+                    maxAttempts: 3
+            - id: record_restored
+              type: io.kestra.plugin.core.kv.Set
+              key: "{{ ('decommission-' ~ outputs.target.vars.namespace ~ '-' ~ outputs.target.vars.service) | slugify }}"
+              kvType: JSON
+              value: |
+                {"namespace": {{ outputs.target.vars.namespace | toJson }}, "service": {{ outputs.target.vars.service | toJson }},
+                 "state": "restored-after-traffic", "snapshot_key": {{ outputs.upload_snapshot.key | toJson }},
+                 "requests_while_off": {{ outputs.check_quiet.vars.requests }}, "execution": {{ execution.id | toJson }}}
+            - id: tell_called
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              retry:
+                type: constant
+                interval: PT10S
+                maxAttempts: 3
+              messageText: "↩️ `{{ outputs.target.vars.service }}` received *{{ outputs.check_quiet.vars.requests }} requests while it was off*, so it has been scaled back up and its CronJobs resumed. Find that caller before trying again."
+            - id: stop_called
+              type: io.kestra.plugin.core.execution.Exit
+              state: WARNING
+
+        - id: ask_delete
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: "🗑️ `{{ outputs.target.vars.service }}` was off for {{ inputs.quiet_days ?? 7 }} days with no calls. Approve deletion: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+        - id: approve_delete
+          type: io.kestra.plugin.core.flow.Pause
+          description: Delete the service, bring it back, or leave it scaled to zero for now.
+          pauseDuration: P7D
+          behavior: CANCEL
+          onResume:
+            - id: decision
+              type: SELECT
+              displayName: What now?
+              values:
+                - Delete
+                - Restore
+                - Keep scaled down
+            - id: note
+              type: STRING
+              displayName: Note
+              required: false
+
+        - id: final_decision
+          type: io.kestra.plugin.core.flow.Switch
+          value: "{{ outputs.approve_delete.onResume.decision }}"
+          cases:
+            Delete:
+              - id: delete_objects
+                type: io.kestra.plugin.scripts.shell.Commands
+                description: Delete the service's objects by label. Persistent volume claims are kept unless delete_pvcs is set.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  user: "0"
+                containerImage: bitnami/kubectl
+                env:
+                  K8S_SERVER: "{{ secret('K8S_MASTER_URL') }}"
+                  K8S_TOKEN: "{{ secret('K8S_TOKEN') }}"
+                  K8S_CA_CERT: "{{ secret('K8S_CA_CERT') }}"
+                commands:
+                  - echo "$K8S_CA_CERT" | base64 -d > ca.crt
+                  - kubectl --server="$K8S_SERVER" --token="$K8S_TOKEN" --certificate-authority=ca.crt -n "{{ outputs.target.vars.namespace }}" delete {{ outputs.plan.vars.delete_types }} -l "{{ vars.selector_label }}={{ outputs.target.vars.service }}" --wait=true --timeout=120s
+                  - kubectl --server="$K8S_SERVER" --token="$K8S_TOKEN" --certificate-authority=ca.crt -n "{{ outputs.target.vars.namespace }}" get {{ vars.resource_types }} -l "{{ vars.selector_label }}={{ outputs.target.vars.service }}" -o json > remaining.json
+                outputFiles:
+                  - remaining.json
+                retry:
+                  type: exponential
+                  interval: PT10S
+                  maxInterval: PT1M
+                  maxAttempts: 3
+
+              - id: verify_gone
+                type: io.kestra.plugin.scripts.python.Script
+                description: Everything except the kept volume claims must be gone.
+                dependencies:
+                  - kestra
+                inputFiles:
+                  remaining.json: "{{ outputs.delete_objects.outputFiles['remaining.json'] }}"
+                  kept.json: "{{ outputs.plan.vars.kept | toJson }}"
+                script: |
+                  import json
+                  from kestra import Kestra
+                  left = {f"{i['kind']}/{i['metadata']['name']}" for i in json.load(open("remaining.json"))["items"]}
+                  unexpected = left - set(json.load(open("kept.json")))
+                  if unexpected:
+                      raise SystemExit("Still present after deletion: " + ", ".join(sorted(unexpected)))
+                  Kestra.outputs({"kept": sorted(left)})
+
+              - id: record_deleted
+                type: io.kestra.plugin.core.kv.Set
+                key: "{{ ('decommission-' ~ outputs.target.vars.namespace ~ '-' ~ outputs.target.vars.service) | slugify }}"
+                kvType: JSON
+                value: |
+                  {"namespace": {{ outputs.target.vars.namespace | toJson }}, "service": {{ outputs.target.vars.service | toJson }},
+                   "state": "deleted", "snapshot_key": {{ outputs.upload_snapshot.key | toJson }},
+                   "replicas": {{ outputs.plan.vars.scaled | toJson }}, "kept": {{ outputs.verify_gone.vars.kept | toJson }},
+                   "reason": {{ outputs.target.vars.reason | toJson }}, "requested_by": {{ outputs.target.vars.requested_by | toJson }},
+                   "note": {{ (outputs.approve_delete.onResume.note ?? '') | toJson }}, "execution": {{ execution.id | toJson }},
+                   "deleted": "{{ now() | date('yyyy-MM-dd') }}"}
+
+              - id: tell_deleted
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                retry:
+                  type: constant
+                  interval: PT10S
+                  maxAttempts: 3
+                messageText: "✅ `{{ outputs.target.vars.service }}` is decommissioned: {{ outputs.plan.vars.count - (outputs.verify_gone.vars.kept | length) }} objects deleted.{% if (outputs.verify_gone.vars.kept | length) > 0 %} Kept: {{ outputs.verify_gone.vars.kept | join(', ') }}.{% endif %} Snapshot: `s3://{{ vars.snapshot_bucket }}/{{ outputs.upload_snapshot.key }}`. Run this flow with mode `restore` to bring it back."
+            Restore:
+              - id: restore_now
+                type: io.kestra.plugin.core.flow.Loop
+                values: "{{ outputs.plan.vars.scaled | keys }}"
+                tasks:
+                  - id: scale_back
+                    type: io.kestra.plugin.kubernetes.kubectl.Patch
+                    connection:
+                      masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                      oauthToken: "{{ secret('K8S_TOKEN') }}"
+                      caCertData: "{{ secret('K8S_CA_CERT') }}"
+                    namespace: "{{ outputs.target.vars.namespace }}"
+                    apiGroup: apps
+                    apiVersion: v1
+                    resourceType: "{{ item.value | split('/') | first }}"
+                    resourceName: "{{ item.value | split('/') | last }}"
+                    patch: '{"spec": {"replicas": {{ outputs.plan.vars.scaled[item.value] }}}}'
+                    retry:
+                      type: exponential
+                      interval: PT10S
+                      maxInterval: PT1M
+                      maxAttempts: 3
+              - id: resume_cronjobs_now
+                type: io.kestra.plugin.core.flow.Loop
+                values: "{{ outputs.plan.vars.cronjobs }}"
+                tasks:
+                  - id: unsuspend_now
+                    type: io.kestra.plugin.kubernetes.kubectl.Patch
+                    connection:
+                      masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                      oauthToken: "{{ secret('K8S_TOKEN') }}"
+                      caCertData: "{{ secret('K8S_CA_CERT') }}"
+                    namespace: "{{ outputs.target.vars.namespace }}"
+                    apiGroup: batch
+                    apiVersion: v1
+                    resourceType: cronjobs
+                    resourceName: "{{ item.value }}"
+                    patch: '{"spec": {"suspend": false}}'
+                    retry:
+                      type: exponential
+                      interval: PT10S
+                      maxInterval: PT1M
+                      maxAttempts: 3
+              - id: tell_kept_running
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                retry:
+                  type: constant
+                  interval: PT10S
+                  maxAttempts: 3
+                messageText: "↩️ `{{ outputs.target.vars.service }}` was scaled back up on request. {{ outputs.approve_delete.onResume.note ?? '' }}"
+            Keep scaled down:
+              - id: tell_still_off
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                retry:
+                  type: constant
+                  interval: PT10S
+                  maxAttempts: 3
+                messageText: "⏸️ `{{ outputs.target.vars.service }}` stays scaled to zero. Snapshot: `s3://{{ vars.snapshot_bucket }}/{{ outputs.upload_snapshot.key }}`. Run the flow again to delete or restore it."
+
+      restore:
+        - id: find_snapshot
+          type: io.kestra.plugin.core.debug.Return
+          description: The snapshot to restore, from the input or from the decommission record.
+          format: "{{ ((inputs.snapshot_key ?? '') | trim) != '' ? inputs.snapshot_key : (kv(('decommission-' ~ outputs.target.vars.namespace ~ '-' ~ outputs.target.vars.service) | slugify).snapshot_key) }}"
+
+        - id: fetch_snapshot
+          type: io.kestra.plugin.aws.s3.Download
+          endpointOverride: "{{ vars.s3_endpoint }}"
+          forcePathStyle: true
+          compatibilityMode: true
+          region: "{{ vars.s3_region }}"
+          accessKeyId: "{{ secret('SNAPSHOT_S3_ACCESS_KEY_ID') }}"
+          secretKeyId: "{{ secret('SNAPSHOT_S3_SECRET_KEY') }}"
+          bucket: "{{ vars.snapshot_bucket }}"
+          key: "{{ outputs.find_snapshot.value }}"
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: reapply
+          type: io.kestra.plugin.scripts.shell.Commands
+          description: Re-apply every object from the snapshot, with the original replica counts and CronJob schedules, and wait for the workloads to be ready.
+          taskRunner:
+            type: io.kestra.plugin.scripts.runner.docker.Docker
+            user: "0"
+          containerImage: bitnami/kubectl
+          env:
+            K8S_SERVER: "{{ secret('K8S_MASTER_URL') }}"
+            K8S_TOKEN: "{{ secret('K8S_TOKEN') }}"
+            K8S_CA_CERT: "{{ secret('K8S_CA_CERT') }}"
+          inputFiles:
+            snapshot.json: "{{ outputs.fetch_snapshot.uri }}"
+          commands:
+            - echo "$K8S_CA_CERT" | base64 -d > ca.crt
+            - kubectl --server="$K8S_SERVER" --token="$K8S_TOKEN" --certificate-authority=ca.crt -n "{{ outputs.target.vars.namespace }}" apply --server-side --force-conflicts --field-manager=kestra -f snapshot.json
+            - kubectl --server="$K8S_SERVER" --token="$K8S_TOKEN" --certificate-authority=ca.crt -n "{{ outputs.target.vars.namespace }}" rollout status deployment,statefulset -l "{{ vars.selector_label }}={{ outputs.target.vars.service }}" --timeout=180s
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT1M
+            maxAttempts: 3
+
+        - id: record_restore
+          type: io.kestra.plugin.core.kv.Set
+          key: "{{ ('decommission-' ~ outputs.target.vars.namespace ~ '-' ~ outputs.target.vars.service) | slugify }}"
+          kvType: JSON
+          value: |
+            {"namespace": {{ outputs.target.vars.namespace | toJson }}, "service": {{ outputs.target.vars.service | toJson }},
+             "state": "restored", "snapshot_key": {{ outputs.find_snapshot.value | toJson }}, "execution": {{ execution.id | toJson }},
+             "restored": "{{ now() | date('yyyy-MM-dd') }}"}
+
+        - id: tell_restored
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: "♻️ `{{ outputs.target.vars.service }}` in `{{ outputs.target.vars.namespace }}` was restored from `{{ outputs.find_snapshot.value }}` and its workloads are ready."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert with the failed task, the error and a link, and where the service stands.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    messageText: |
+      ❌ *Service decommissioning FAILED* ({{ inputs.mode ?? 'decommission' }}; flow {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}).
+      Failed task: {{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}. Error: {{ ((errorLogs() | length) > 0 and (errorLogs()[0].message ?? 'null') != 'null') ? errorLogs()[0].message : 'see the execution logs' }}
+      If the service was already scaled to zero, it stays that way; run the flow with mode `restore` to bring it back.
+      {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: objects
+    type: INT
+    displayName: Objects belonging to the service
+    value: "{{ outputs.plan.vars.count ?? 0 }}"
+  - id: snapshot
+    type: STRING
+    displayName: Snapshot key
+    value: "{{ outputs.upload_snapshot.key ?? (outputs.find_snapshot.value ?? '') }}"
+
+extend:
+  title: Kubernetes Service Decommissioning with Traffic Proof, Soft-Off Period, Verified Snapshot, Approved Deletion and Restore
+  metaTitle: Kubernetes Service Decommissioning with Traffic Proof
+  shortDescription: Retire a Kubernetes service without breaking a caller nobody knew about. Prometheus proves it is idle, a verified snapshot goes to S3, it is scaled to zero for a quiet period and comes back by itself if anything calls it, and it is deleted only after a second approval.
+  metaDescription: Retire Kubernetes services safely with Kestra. Prometheus traffic proof, a verified S3 snapshot, a quiet period with auto-restore, and approved deletion.
+  description: |
+    Services are created with care and retired carelessly. Someone deletes the Deployment and leaves its Service, Ingress, ConfigMaps and CronJobs behind, or nobody dares delete anything because nobody can prove the service is unused, so it keeps costing money and stays unpatched. When it is finally removed, a caller nobody knew about breaks and there is no copy to bring it back. This blueprint gives platform teams one safe, audited path for retiring a service, from a portal webhook or the Execute form.
+
+    ## How it works
+    1. **Find everything.** `inventory` lists every object carrying the service's label (`app.kubernetes.io/name` by default): Deployments, StatefulSets, CronJobs, Services, Ingresses, ConfigMaps, HorizontalPodAutoscalers and PersistentVolumeClaims.
+    2. **Prove it is idle.** `traffic_before` asks Prometheus how many requests reached the service in the last `lookback_days`. If there were any, the run stops with a Slack message and changes nothing. If Prometheus returns no series at all, the run **fails** instead of assuming zero traffic.
+    3. **First approval.** The owner sees the object list and the traffic evidence in Slack and approves the soft off in a `Pause` form.
+    4. **Snapshot before touching anything.** The objects are cleaned so they can be applied again (no status, uid, resourceVersion or cluster IP), uploaded to S3, then **downloaded again and checked** against the inventory.
+    5. **Soft off.** Deployments and StatefulSets are scaled to zero and CronJobs suspended with `kubectl.Patch`. The original replica counts and the snapshot key are kept in the KV store.
+    6. **Quiet period.** The execution waits `quiet_days`, then checks Prometheus again. **If anything called the service while it was off, it is scaled back up, its CronJobs resume, and the run ends** with a warning naming the request count.
+    7. **Second approval.** Delete, restore, or keep it scaled down for now.
+    8. **Delete and verify.** Objects are deleted by label, PersistentVolumeClaims are kept unless `delete_pvcs` is set, and `verify_gone` lists the namespace again and fails if anything unexpected is left. A KV record keeps who, why, when and where the snapshot is.
+    9. **Restore mode** re-applies the snapshot (from the input or the KV record) and waits for the workloads to be ready.
+
+    One execution covers the whole decommission, so its history is the audit trail. Each run is labelled with `service` and `k8s-namespace`.
+
+    ## Prerequisites
+    - A Kubernetes cluster, plus Prometheus scraping your ingress controller. The default query is for **ingress-nginx scraped by the Prometheus Operator** (kube-prometheus-stack), whose labels arrive as `exported_namespace` and `exported_service`. Prometheus retention must cover `lookback_days`.
+    - An S3 bucket (AWS S3 or any S3-compatible store such as MinIO) for snapshots, set in `vars.snapshot_bucket`, `vars.s3_endpoint` and `vars.s3_region`.
+    - Docker on the Kestra worker for the `bitnami/kubectl` script tasks.
+    - A ServiceAccount whose ClusterRole (or per-namespace Role) allows `get`, `list`, `create`, `patch` and `delete` on deployments, statefulsets, cronjobs, services, ingresses, configmaps, horizontalpodautoscalers and persistentvolumeclaims, `watch` on deployments and statefulsets, and `get`, `list`, `watch` on replicasets (for the rollout check). It needs **no access to Secrets**.
+
+    Secrets:
+    - `K8S_MASTER_URL`: the Kubernetes API URL.
+    - `K8S_TOKEN`: the ServiceAccount token.
+    - `K8S_CA_CERT`: the cluster CA certificate (PEM), base64-encoded.
+    - `PROMETHEUS_URL`: the Prometheus base URL.
+    - `SNAPSHOT_S3_ACCESS_KEY_ID` and `SNAPSHOT_S3_SECRET_KEY`: credentials that can read and write the snapshot bucket.
+    - `DECOMMISSION_WEBHOOK_KEY`: the key in the webhook URL.
+    - `SLACK_WEBHOOK_URL`: a Slack incoming webhook for approvals, results and failures.
+
+    ## Inputs
+    - `mode` (SELECT, default `decommission`): `decommission` or `restore`.
+    - `namespace` and `service` (STRING): the namespace, and the value of the selector label. A webhook body with the same field names overrides them.
+    - `reason` (STRING, optional): shown in the approval message and stored in the record.
+    - `lookback_days` (INT, default `14`): days of zero traffic required.
+    - `quiet_days` (INT, default `7`): days scaled to zero before deletion can be approved.
+    - `delete_pvcs` (BOOL, default `false`): also delete volume claims. Their data is lost.
+    - `snapshot_key` (STRING, optional): the snapshot to restore. Empty uses the one recorded at decommission.
+    - `dry_run` (BOOL, default `false`): report the objects and traffic evidence without changing anything.
+
+    ## Quick start
+    1. Create the ServiceAccount and the secrets above, and point the `vars` at your bucket.
+    2. Run a **dry run** for a service you believe is unused. Slack lists every object and the request count, and nothing changes.
+    3. Run it for real with a short `quiet_days` on a test service, approve the soft off, and watch the replicas go to zero.
+    4. Send a request through the ingress during the quiet period to see the automatic restore.
+    5. Connect the webhook to your portal: `POST /api/v1/main/executions/webhook/company.platform/kubernetes-service-decommissioning/<key>` with `{"namespace": "...", "service": "...", "reason": "...", "requested_by": "..."}`.
+
+    ## Outputs
+    - `objects` (INT): how many objects belong to the service.
+    - `snapshot` (STRING): the S3 key of the snapshot.
+    - KV `decommission-<namespace>-<service>`: state (`scaled-down`, `restored-after-traffic`, `deleted`, `restored`), snapshot key, replica counts, reason, requester and execution.
+
+    ## Common pitfalls and how to adapt it
+    - **Another ingress or mesh.** Change `vars.traffic_query`; keep `$NAMESPACE`, `$SERVICE` and `$WINDOW`. Keep the second half of the default, which adds series that start inside the window: after a service is scaled to zero its first 503s appear as a new series, and `increase()` alone counts them as 0.
+    - **Labels.** Objects without the selector label are not found and not deleted. Change `vars.selector_label` if you use another label, such as `app`.
+    - **Secrets are not touched.** They are left out of `vars.resource_types` so they never end up in a snapshot. Remove them separately, or add `secrets` only with an encrypted, access-controlled bucket.
+    - **Volume data.** The snapshot holds object definitions, not volume contents. PVCs are kept by default; back up their data before setting `delete_pvcs`.
+    - **Restore after deletion** recreates the objects with their original replica counts. A deleted PVC comes back empty.
+    - **Approvals time out.** The first approval cancels after 3 days, the deletion approval after 7, leaving the service in its current state.
+
+    ## Links
+    - [Kubernetes plugin: kubectl.Patch](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.patch)
+    - [Prometheus plugin: Query](https://kestra.io/plugins/plugin-prometheus/io.kestra.plugin.prometheus.query)
+    - [AWS plugin: S3 Upload](https://kestra.io/plugins/plugin-aws/s3/io.kestra.plugin.aws.s3.upload)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [ingress-nginx metrics](https://kubernetes.github.io/ingress-nginx/user-guide/monitoring/)
+    - [Prometheus increase()](https://prometheus.io/docs/prometheus/latest/querying/functions/#increase)
+    - This blueprint has been created by [Biplab Bera](https://github.com/bishalbera)
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Approval Gates
+  ee: false
+  demo: false
