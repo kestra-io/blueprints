@@ -56,6 +56,7 @@ triggers:
     type: io.kestra.plugin.core.trigger.Schedule
     description: Runs every day at 09:00 UTC. Shipped disabled so it never runs before secrets and inputs are configured.
     cron: "0 9 * * *"
+    timezone: Etc/UTC
     disabled: true
 
 tasks:
@@ -63,7 +64,6 @@ tasks:
     type: io.kestra.plugin.scripts.python.Script
     description: Validate inputs, fetch current Star counts, compare them with the stored state and build the new state, the milestone alerts and the summary. Uses only the Python standard library. A repository that fails to fetch keeps its stored state untouched.
     containerImage: python:3.11-slim
-    warningOnStdErr: false
     env:
       REPOSITORIES: "{{ inputs.repositories | toJson }}"
       MILESTONES: "{{ inputs.milestones | toJson }}"
@@ -74,23 +74,28 @@ tasks:
       import json
       import os
       import re
+      import time
       import urllib.error
       import urllib.request
       from datetime import datetime, timezone
 
-      REPO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
+      REPO_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$")
 
       repos = json.loads(os.environ["REPOSITORIES"])
       raw_milestones = json.loads(os.environ["MILESTONES"])
       threshold = int(os.environ["THRESHOLD"])
-      token = os.environ.get("GITHUB_TOKEN", "")
+      token = os.environ.get("GITHUB_TOKEN", "").strip()
       state = json.loads(os.environ.get("STATE") or "{}") or {}
 
-      invalid = [r for r in repos if not isinstance(r, str) or not REPO_PATTERN.match(r)]
+      invalid = [r for r in repos if not isinstance(r, str) or not REPO_PATTERN.fullmatch(r)]
       if not repos or invalid:
           raise SystemExit(f"Invalid repositories, expected owner/name: {invalid or 'empty list'}")
       if not raw_milestones or any(isinstance(m, bool) or not str(m).isdigit() or int(m) <= 0 for m in raw_milestones):
           raise SystemExit(f"Milestones must be a non-empty list of positive integers: {raw_milestones}")
+      if threshold < 0:
+          raise SystemExit("growth_alert_threshold must be 0 or greater")
+      if not isinstance(state, dict):
+          raise SystemExit("KV state must be a JSON object keyed by repository")
       milestones = sorted({int(m) for m in raw_milestones})
       repos = list({r.lower(): r for r in repos}.values())
 
@@ -103,22 +108,52 @@ tasks:
           headers["Authorization"] = f"Bearer {token}"
 
 
+      def rate_limit_message(error, message):
+          remaining = error.headers.get("x-ratelimit-remaining")
+          if remaining == "0":
+              reset = error.headers.get("x-ratelimit-reset")
+              if reset and reset.isdigit():
+                  reset = datetime.fromtimestamp(int(reset), timezone.utc).isoformat(timespec="seconds")
+                  return f"rate limited until {reset}"
+              return "rate limited"
+          if error.code == 429 or "secondary rate limit" in message or "abuse detection" in message:
+              retry_after = error.headers.get("retry-after")
+              return f"secondary rate limited (retry after {retry_after}s)" if retry_after else "secondary rate limited"
+          return None
+
+
       def fetch(repo):
           request = urllib.request.Request(f"https://api.github.com/repos/{repo}", headers=headers)
-          try:
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  stars = json.load(response).get("stargazers_count")
-          except urllib.error.HTTPError as error:
-              if error.code == 404:
-                  return None, "not found (or private without a token)"
-              if error.code == 429 or (error.code == 403 and error.headers.get("x-ratelimit-remaining") == "0"):
-                  return None, "rate limited"
-              return None, f"HTTP {error.code}"
-          except Exception as error:
-              return None, type(error).__name__
-          if not isinstance(stars, int):
-              return None, "response has no stargazers_count"
-          return stars, None
+          for attempt in range(3):
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      stars = json.load(response).get("stargazers_count")
+                  if isinstance(stars, bool) or not isinstance(stars, int) or stars < 0:
+                      return None, "response has no valid stargazers_count"
+                  return stars, None
+              except urllib.error.HTTPError as error:
+                  try:
+                      message = json.loads(error.read().decode("utf-8")).get("message", "").lower()
+                  except Exception:
+                      message = ""
+                  limited = rate_limit_message(error, message)
+                  if limited:
+                      return None, limited
+                  if error.code == 401:
+                      return None, "unauthorized (check GITHUB_TOKEN)"
+                  if error.code == 404:
+                      return None, "not found (or private without token access)"
+                  if 500 <= error.code < 600 and attempt < 2:
+                      time.sleep(2 ** (attempt + 1))
+                      continue
+                  return None, f"HTTP {error.code}"
+              except (urllib.error.URLError, TimeoutError) as error:
+                  if attempt < 2:
+                      time.sleep(2 ** (attempt + 1))
+                      continue
+                  return None, type(error).__name__
+              except Exception as error:
+                  return None, type(error).__name__
 
 
       now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -130,7 +165,7 @@ tasks:
           key = repo.lower()
           stars, error = (None, "skipped after rate limit") if rate_limited else fetch(repo)
           if error:
-              rate_limited = rate_limited or error == "rate limited"
+              rate_limited = rate_limited or "rate limited" in error
               failed.append(f"{repo}: {error}")
               lines.append(f"• {repo}: fetch failed: {error}. Stored state kept")
               continue
@@ -141,12 +176,23 @@ tasks:
               lines.append(f"• {repo}: {stars:,} stars, baseline recorded")
               continue
 
-          old = int(previous.get("stars", 0))
+          if not isinstance(previous, dict):
+              raise SystemExit(f"Invalid KV state for {repo}: expected an object")
+          old = previous.get("stars")
+          notified_values = previous.get("notified", [])
+          pending_values = previous.get("pending", [])
+          if isinstance(old, bool) or not isinstance(old, int) or old < 0:
+              raise SystemExit(f"Invalid KV state for {repo}: stars must be a non-negative integer")
+          if not isinstance(notified_values, list) or not isinstance(pending_values, list):
+              raise SystemExit(f"Invalid KV state for {repo}: notified and pending must be arrays")
+          if any(isinstance(m, bool) or not isinstance(m, int) or m <= 0 for m in notified_values + pending_values):
+              raise SystemExit(f"Invalid KV state for {repo}: milestone values must be positive integers")
+
           delta = stars - old
           pct = f"{delta * 100 / old:+.2f}%" if old else "n/a"
-          notified = sorted(set(previous.get("notified", [])))
+          notified = sorted(set(notified_values))
           crossed = {m for m in milestones if old < m <= stars}
-          pending = sorted(m for m in crossed | set(previous.get("pending", [])) if m <= stars and m not in notified)
+          pending = sorted(m for m in crossed | set(pending_values) if m not in notified)
           state[key] = {"stars": stars, "notified": notified, "pending": pending, "updated_at": now}
 
           spike = threshold > 0 and delta >= threshold
@@ -154,7 +200,7 @@ tasks:
           lines.append(f"• {repo}: {stars:,} stars ({delta:+,} / {pct}){'  growth spike' if spike else ''}")
 
           for milestone in pending:
-              notified = notified + [milestone]
+              notified = sorted(set(notified + [milestone]))
               remaining = [m for m in pending if m not in notified]
               alerts.append(json.dumps({
                   "text": f":star2: {repo} reached {milestone:,} GitHub stars (now {stars:,}). https://github.com/{repo}",
@@ -193,7 +239,7 @@ tasks:
             type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
             description: Announce one crossed milestone.
             url: "{{ secret('SLACK_WEBHOOK_URL') }}"
-            payload: "{{ {'text': fromJson(item.value).text} | toJson }}"
+            messageText: "{{ fromJson(item.value).text }}"
             retry:
               type: exponential
               interval: PT5S
@@ -212,7 +258,7 @@ tasks:
     description: Post the consolidated growth summary when enabled, or whenever a repository hits the growth threshold.
     runIf: "{{ inputs.send_daily_summary or outputs.compute.vars.growth_spikes > 0 }}"
     url: "{{ secret('SLACK_WEBHOOK_URL') }}"
-    payload: "{{ {'text': outputs.compute.vars.summary} | toJson }}"
+    messageText: "{{ outputs.compute.vars.summary }}"
     retry:
       type: exponential
       interval: PT5S
@@ -230,7 +276,12 @@ errors:
     type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
     description: Report any failure (invalid inputs, GitHub errors, rate limits, Slack errors) so a silent gap in tracking is never mistaken for zero growth.
     url: "{{ secret('SLACK_WEBHOOK_URL') }}"
-    payload: "{{ {'text': 'GitHub Star tracker failed in ' ~ flow.namespace ~ '.' ~ flow.id ~ ', execution ' ~ execution.id ~ '. Check the execution logs.'} | toJson }}"
+    messageText: "GitHub Star tracker failed in {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}. Check the execution logs."
+    retry:
+      type: exponential
+      interval: PT5S
+      maxInterval: PT1M
+      maxAttempts: 3
 
 outputs:
   - id: summary
@@ -266,7 +317,7 @@ extend:
     2. `compute` (`io.kestra.plugin.scripts.python.Script`) validates the repository names and milestones, calls `GET /repos/{owner}/{repo}` for each repository and reads the previous state from the KV key `github_star_tracker_state`.
        - First execution for a repository: the current count becomes the baseline and every milestone already reached is recorded as notified. No alerts are sent.
        - Later executions: it computes absolute and percentage growth (`n/a` when the previous count was 0) and lists every milestone where `previous < milestone <= current`, so several milestones crossed in one day each get an alert.
-       - A repository that returns 404, 5xx, a network error or a rate limit keeps its stored state untouched. After a rate limit the remaining repositories are skipped instead of burning more requests.
+       - A repository that returns 404, a persistent 5xx, a network error or a rate limit keeps its stored state untouched. Transient network and 5xx failures are retried twice with exponential backoff. After a primary or secondary rate limit, the remaining repositories are skipped instead of burning more requests.
     3. `save_state` (`io.kestra.plugin.core.kv.Set`) stores the new counts. Crossed milestones are stored as `pending`, not as notified.
     4. `has_milestones` (`io.kestra.plugin.core.flow.If`) and `notify_each_milestone` (`io.kestra.plugin.core.flow.Loop`) send one Slack message per pending milestone with `SlackIncomingWebhook`. Only after a message succeeds does `mark_notified` move that milestone from `pending` to `notified`. A failed message stays pending and is retried on the next execution.
     5. `send_summary` posts the consolidated summary when `send_daily_summary` is true, or when a repository gained at least `growth_alert_threshold` Stars.
@@ -317,6 +368,7 @@ extend:
     - A milestone already announced is not announced again after the count drops below and re-crosses it.
     - GitHub caches Star counts briefly, so a count may lag a few minutes.
     - The state lives in one KV key per flow. Keep the `concurrency` block, because it is what prevents lost updates.
+    - Delivery is at least once: if Slack accepts a milestone message but the following KV update fails, the pending milestone can be sent again on the next execution.
 
     ## Troubleshooting
 
