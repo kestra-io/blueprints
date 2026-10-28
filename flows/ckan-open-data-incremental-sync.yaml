@@ -1,0 +1,228 @@
+id: ckan-open-data-incremental-sync
+namespace: company.team
+description: |
+  Every day, ask a CKAN open-data portal which datasets changed since the last
+  sync (cursor kept in the KV store), download only their CSV resources in
+  parallel, convert each one to Parquet with DuckDB and profile it, then move
+  the cursor forward once every download has succeeded.
+
+inputs:
+  - id: ckan_url
+    type: STRING
+    defaults: "https://ckan0.cf.opendata.inter.prod-toronto.ca"
+    displayName: "CKAN Portal URL"
+    description: "Base URL of the CKAN instance (the part before `/api/3/action`)."
+  - id: filter_query
+    type: STRING
+    defaults: "res_format:CSV"
+    displayName: "Solr Filter"
+    description: "Extra CKAN `fq` filter, for example `res_format:CSV AND organization:transportation`."
+  - id: feed
+    type: STRING
+    defaults: "toronto_csv"
+    displayName: "Feed Name"
+    description: "Lowercase name of this sync; the KV cursor is stored as `ckan_cursor_<feed>`."
+  - id: initial_days
+    type: INT
+    defaults: 3
+    displayName: "First-Run Lookback (days)"
+    description: "On the very first run (no cursor yet), sync datasets modified in the last this many days."
+  - id: max_datasets
+    type: INT
+    defaults: 10
+    displayName: "Max Datasets per Run"
+    description: "Upper bound of changed datasets handled per run; the oldest changes are taken first so the cursor never skips any."
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Sync every day at 05:30. Shipped disabled; enable it after a manual run.
+    cron: "30 5 * * *"
+    disabled: true
+
+variables:
+  cursor: "{{ kv('ckan_cursor_' ~ inputs.feed, errorOnMissing=false) ?? (now() | dateAdd(-inputs.initial_days, 'DAYS') | date(\"yyyy-MM-dd'T'HH:mm:ss.SSSSSS\", timeZone='UTC')) }}"
+
+tasks:
+  - id: search_changed
+    type: io.kestra.plugin.core.http.Request
+    description: Ask CKAN's package_search for datasets whose metadata_modified is after the cursor, oldest first, matching the filter.
+    uri: "{{ inputs.ckan_url }}/api/3/action/package_search?rows={{ inputs.max_datasets }}&sort=metadata_modified%20asc&fq={{ ('metadata_modified:{' ~ render(vars.cursor) ~ 'Z TO *] AND ' ~ inputs.filter_query) | urlencode }}"
+    method: GET
+    options:
+      timeout:
+        connectTimeout: PT15S
+        readIdleTimeout: PT60S
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT1M
+      maxAttempts: 3
+
+  - id: plan_downloads
+    type: io.kestra.plugin.core.debug.Return
+    description: Turn the search result into the list of CSV resources to download and the new cursor (the newest metadata_modified returned).
+    format: >-
+      {{ fromJson(outputs.search_changed.body) | jq('
+      {previous_cursor: "' ~ render(vars.cursor) ~ '",
+      cursor: ([.result.results[].metadata_modified] | max),
+      count: .result.count,
+      resources: [.result.results[] as $p | $p.resources[]
+      | select(((.format // "") | ascii_upcase) == "CSV" and (.url // "") != "")
+      | {dataset: $p.name, resource: ((.name // .id) | tostring | .[0:80]), id: .id, url: .url, modified: $p.metadata_modified}]}
+      ') | first | toJson }}
+
+  - id: each_resource
+    type: io.kestra.plugin.core.flow.Loop
+    description: Process every changed CSV resource, two at a time.
+    values: "{{ fromJson(outputs.plan_downloads.value).resources | toJson }}"
+    concurrencyLimit: 2
+    outputs:
+      - id: status
+        type: STRING
+        value: "{{ outputs.to_parquet.vars.status ?? 'download_failed' }}"
+      - id: rows
+        type: INT
+        value: "{{ outputs.to_parquet.vars.rows ?? 0 }}"
+    tasks:
+      - id: download_csv
+        type: io.kestra.plugin.core.http.Download
+        description: Download the resource file from the portal, retrying transient errors. A file that still fails (portals do host broken links) is allowed to fail so it is reported and skipped instead of blocking the whole feed.
+        uri: "{{ fromJson(item.value).url }}"
+        allowFailure: true
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+
+      - id: to_parquet
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.download_csv.uri ?? '' != '' }}"
+        description: Load the CSV into DuckDB (types sniffed), with a lenient retry for messy files (quoted line breaks, ragged rows) and a last all-text retry, write it as Parquet, and report rows, columns and the first column names. A file that is not CSV at all is reported as unreadable with its first bytes instead of failing the sync.
+        containerImage: python:3.12-slim
+        beforeCommands:
+          - pip install --quiet --disable-pip-version-check duckdb==1.5.6
+        inputFiles:
+          data.csv: "{{ outputs.download_csv.uri }}"
+        outputFiles:
+          - data.parquet
+        script: |
+          import json
+          import duckdb
+
+          # Strict first; then lenient (quoted line breaks need parallel=false); then everything as text.
+          attempts = [
+              ("converted", "sample_size=-1"),
+              ("converted_lenient", "sample_size=-1, strict_mode=false, null_padding=true, parallel=false"),
+              ("converted_text", "all_varchar=true, strict_mode=false, null_padding=true, parallel=false, ignore_errors=true"),
+          ]
+          result = {"status": "unreadable", "rows": 0, "columns": 0, "first_columns": [], "reason": ""}
+          for status, options in attempts:
+              con = duckdb.connect()  # a fresh connection: a failed read aborts the transaction
+              try:
+                  con.execute(f"CREATE TABLE t AS SELECT * FROM read_csv_auto('data.csv', {options})")
+                  columns = [c[0] for c in con.execute("DESCRIBE t").fetchall()]
+                  con.execute("COPY t TO 'data.parquet' (FORMAT PARQUET)")
+                  result.update(status=status, rows=con.execute("SELECT count(*) FROM t").fetchone()[0],
+                                columns=len(columns), first_columns=columns[:6], reason="")
+                  break
+              except duckdb.Error as e:
+                  result["reason"] = str(e).splitlines()[0][:200]
+              finally:
+                  con.close()
+          if result["status"] == "unreadable":
+              result["reason"] += f" | file starts with: {open('data.csv', 'rb').read(80)!r}"
+              open("data.parquet", "wb").close()
+          print("::" + json.dumps({"outputs": result}) + "::")
+
+      - id: log_resource
+        type: io.kestra.plugin.core.log.Log
+        message: "{% if (outputs.download_csv.uri ?? '') == '' %}DOWNLOAD FAILED (skipped) {% endif %}{{ fromJson(item.value).dataset }} / {{ fromJson(item.value).resource }} (modified {{ fromJson(item.value).modified }}): {{ outputs.to_parquet.vars.status ?? 'download_failed' }}, {{ outputs.to_parquet.vars.rows ?? 0 }} rows x {{ outputs.to_parquet.vars.columns ?? 0 }} columns {{ outputs.to_parquet.vars.first_columns ?? [] }} {{ outputs.to_parquet.vars.reason ?? fromJson(item.value).url }}"
+
+  - id: advance_cursor
+    type: io.kestra.plugin.core.kv.Set
+    description: Move the cursor to the newest change processed once the loop has finished. Transient errors were already retried inside the loop; files that still failed are logged as skipped.
+    runIf: "{{ fromJson(outputs.plan_downloads.value).cursor != null }}"
+    key: "ckan_cursor_{{ inputs.feed }}"
+    value: "{{ fromJson(outputs.plan_downloads.value).cursor }}"
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      CKAN sync {{ inputs.feed }} from {{ inputs.ckan_url }}: {{ fromJson(outputs.plan_downloads.value).count }} dataset(s) changed after {{ fromJson(outputs.plan_downloads.value).previous_cursor }};
+      handled the oldest {{ inputs.max_datasets }} at most, {{ fromJson(outputs.plan_downloads.value).resources | length }} CSV resource(s):
+      {{ (outputs.each_resource.outputs ?? []) | toJson | jq('[.[].outputs.status] | group_by(.) | map({(.[0]): length}) | add // {}') | first | toJson }},
+      {{ (outputs.each_resource.outputs ?? []) | toJson | jq('[.[].outputs.rows] | add // 0') | first }} rows written to Parquet;
+      cursor now {{ fromJson(outputs.plan_downloads.value).cursor ?? fromJson(outputs.plan_downloads.value).previous_cursor }}.
+
+extend:
+  title: "CKAN Open Data Incremental Sync to Parquet"
+  shortDescription: Sync only the datasets that changed on a CKAN open-data portal since the last run, download their CSV files in parallel and convert each to Parquet with DuckDB, with a KV-stored cursor.
+  metaTitle: CKAN Open Data Incremental Sync to Parquet | Kestra
+  metaDescription: "Daily incremental sync from any CKAN open-data portal: changed datasets only, parallel CSV downloads, DuckDB to Parquet, and a KV cursor that never skips."
+  description: |
+    Governments and cities publish thousands of datasets on [CKAN](https://ckan.org) portals (Toronto, Canada, the UK, the Humanitarian Data Exchange and many more). Re-downloading a whole portal every day is slow and wasteful, and a script that only grabs "today's" files misses anything changed while it was down. This blueprint keeps a cursor in the Kestra KV store, asks CKAN only for datasets modified after it, downloads their CSV resources in parallel, converts each to Parquet with DuckDB, and moves the cursor forward only when every file succeeded.
+
+    ## How it works
+
+    1. `daily` (`io.kestra.plugin.core.trigger.Schedule`) runs at 05:30. It ships `disabled: true`.
+    2. The `cursor` variable reads `ckan_cursor_<feed>` from the KV store; on the first run it starts `initial_days` ago.
+    3. `search_changed` (`io.kestra.plugin.core.http.Request`) calls `package_search` with `fq=metadata_modified:{cursor TO *] AND <filter_query>`, sorted oldest first, at most `max_datasets` results, with retries.
+    4. `plan_downloads` (`io.kestra.plugin.core.debug.Return`) uses one jq query to list the CSV resources of those datasets, the starting cursor, and the newest `metadata_modified` as the next cursor.
+    5. `each_resource` (`io.kestra.plugin.core.flow.Loop`, two at a time) runs `download_csv` (`io.kestra.plugin.core.http.Download`, three attempts, `allowFailure` so a permanently broken link is logged as `DOWNLOAD FAILED (skipped)` instead of blocking the feed), then `to_parquet` (`io.kestra.plugin.scripts.python.Script`): DuckDB sniffs the CSV, retries leniently for messy files (quoted line breaks, ragged rows) and finally as all-text columns, writes `data.parquet` and reports rows and columns, which `log_resource` logs. A resource labelled CSV that is not CSV at all is reported as `unreadable` with its first bytes, so one bad file does not block the sync.
+    6. The loop exposes each file's `status` and `rows` as loop `outputs`; `advance_cursor` (`io.kestra.plugin.core.kv.Set`) stores the new cursor once the loop finished, and `log_summary` totals the files by status (converted, converted_lenient, converted_text, unreadable, download_failed) and the rows written.
+
+    ## What you get
+
+    - Only changed datasets are fetched, oldest first, so a long outage catches up in order and nothing is skipped.
+    - One Parquet file per CSV resource, attached to the execution, plus row and column counts per file.
+    - Parallel downloads with retries; a permanently broken link is reported and skipped, so one bad file cannot stall the feed.
+    - A filter you control (organization, tag, format) and a cap per run.
+
+    ## Who it's for
+
+    - Data engineers and analysts who build on public open data.
+    - Civic tech, journalism and research teams tracking a city or government portal.
+    - Teams mirroring a CKAN catalog into their own lake or warehouse.
+
+    ## Why orchestrate this with Kestra
+
+    A sync script needs state, retries, parallelism and an audit trail. Kestra keeps the cursor in the KV store, retries each HTTP call, fans out the downloads with a concurrency limit, attaches every Parquet file to its execution, and reports each file that could not be fetched or parsed, so the feed keeps moving and every gap is visible.
+
+    ## Prerequisites
+
+    - Network access from the worker to the CKAN portal and its file hosts.
+    - A Kestra worker that can run containers (Docker or Kubernetes task runner) and reach PyPI.
+
+    ### Secrets
+
+    - None for public portals. For a private CKAN instance, add an `Authorization` header with an API token stored as a secret to `search_changed` and `download_csv`.
+
+    ## Quick start
+
+    1. Set `ckan_url`, `filter_query` and a `feed` name.
+    2. Execute the flow; the first run syncs the last `initial_days` of changes and stores the cursor.
+    3. Check `log_resource` and download a Parquet file from the `to_parquet` outputs.
+    4. Execute again: only datasets changed since the first run are processed. Then enable `daily`.
+
+    ## How to extend
+
+    - Load each Parquet file into your warehouse (Snowflake, BigQuery, Postgres) in the loop instead of keeping it on the execution.
+    - Add `organization:` or `tags:` to `filter_query` and run one feed per topic.
+    - Skip files above a size limit using the resource `size` field in the jq query.
+    - Post the summary to Slack, or trigger a downstream dbt run when new data arrived.
+
+    ## Links
+
+    - [CKAN API guide: package_search](https://docs.ckan.org/en/latest/api/index.html#ckan.logic.action.get.package_search)
+    - [DuckDB CSV import](https://duckdb.org/docs/data/csv/overview)
+    - [Kestra Loop task](https://kestra.io/plugins/core/tasks/flow/io.kestra.plugin.core.flow.loop)
+    - [Kestra HTTP Download task](https://kestra.io/plugins/core/tasks/http/io.kestra.plugin.core.http.download)
+    - [Kestra KV store](https://kestra.io/docs/concepts/kv-store)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - File & Data Processing Basics
+  ee: false
+  demo: false

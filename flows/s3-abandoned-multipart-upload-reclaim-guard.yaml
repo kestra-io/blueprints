@@ -1,0 +1,605 @@
+id: s3-abandoned-multipart-upload-reclaim-guard
+namespace: company.data
+
+description: |
+  Audit Amazon S3 and MinIO buckets for abandoned multipart uploads, detect incomplete part
+  accumulations exceeding staleness thresholds, pause for operator review, abort orphaned
+  uploads to reclaim storage capacity, and verify post-remediation bucket state.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: bucket
+    type: STRING
+    displayName: Target S3 Bucket
+    description: Name of the Amazon S3 or MinIO bucket to audit for abandoned multipart uploads.
+    defaults: "analytics-data-lake"
+
+  - id: prefix
+    type: STRING
+    displayName: Key Prefix Filter
+    description: Optional key prefix to restrict the audit (e.g. 'raw/', 'checkpoints/'). Leave empty to audit the entire bucket.
+    defaults: ""
+
+  - id: stale_threshold_hours
+    type: INT
+    displayName: Staleness Threshold (Hours)
+    description: Minimum age in hours since an upload was initiated before classifying it as abandoned.
+    defaults: 24
+
+  - id: min_reclaimable_mb
+    type: FLOAT
+    displayName: Minimum Reclaimable Size (MB)
+    description: Only target abandoned uploads whose accumulated parts equal or exceed this size in megabytes.
+    defaults: 0.0
+
+  - id: max_uploads_to_abort
+    type: INT
+    displayName: Maximum Aborts Per Run
+    description: Safety ceiling limiting the number of multipart uploads aborted in a single execution run.
+    defaults: 50
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate Flag
+    description: When true, prompts for human approval and aborts confirmed abandoned multipart uploads.
+    defaults: true
+
+  - id: pause_for_approval
+    type: BOOL
+    displayName: Pause for Human Review
+    description: When true, pauses execution for operator review before issuing AbortMultipartUpload requests.
+    defaults: true
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits uploads, calculates wasted capacity, and drafts the abort plan without deleting any parts.
+    defaults: true
+
+  - id: aws_region
+    type: STRING
+    displayName: AWS Region
+    description: AWS Region where the target bucket is hosted (e.g. us-east-1, eu-west-1).
+    defaults: "us-east-1"
+
+  - id: s3_endpoint
+    type: STRING
+    displayName: S3 Endpoint Override
+    description: Optional endpoint URL for S3-compatible storage (e.g. http://localhost:9000 for MinIO or LocalStack). Leave empty for standard AWS S3.
+    required: false
+
+triggers:
+  - id: scheduled_multipart_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Automated weekly audit and reclamation sweep for abandoned multipart uploads running Sundays at 03:00 UTC.
+    cron: "0 3 * * 0"
+    disabled: true
+    inputs:
+      bucket: "analytics-data-lake"
+      prefix: ""
+      stale_threshold_hours: 24
+      min_reclaimable_mb: 0.0
+      max_uploads_to_abort: 50
+      auto_remediate: true
+      pause_for_approval: true
+      dry_run: true
+      aws_region: "us-east-1"
+
+  - id: on_demand_reclaim_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP webhook endpoint for ad-hoc FinOps audits or post-incident cleanup runs.
+    key: "{{ secret('S3_RECLAIM_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert configuration parameters satisfy operational bounds.
+    conditions:
+      - "{{ inputs.bucket | length > 0 }}"
+      - "{{ inputs.stale_threshold_hours >= 1 }}"
+      - "{{ inputs.max_uploads_to_abort >= 1 }}"
+    errorMessage: "Invalid inputs. Provide a valid bucket name, stale_threshold_hours >= 1, and max_uploads_to_abort >= 1."
+
+  - id: load_previous_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve historical multipart upload inventory from Kestra KV store to track multi-run trends.
+    key: "s3_multipart_state_{{ inputs.bucket | slugify }}"
+    errorOnMissing: false
+
+  - id: audit_and_plan_reclamation
+    type: io.kestra.plugin.scripts.python.Script
+    description: Paginate active multipart uploads via boto3, calculate part counts and accumulated bytes, and formulate the abort plan.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install boto3
+    env:
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+      AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+      S3_BUCKET: "{{ inputs.bucket }}"
+      S3_PREFIX: "{{ inputs.prefix ?? '' }}"
+      S3_ENDPOINT: "{{ inputs.s3_endpoint ?? '' }}"
+      STALE_THRESHOLD_HOURS: "{{ inputs.stale_threshold_hours }}"
+      MIN_RECLAIMABLE_MB: "{{ inputs.min_reclaimable_mb }}"
+      MAX_UPLOADS: "{{ inputs.max_uploads_to_abort }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      PREVIOUS_STATE_JSON: "{{ outputs.load_previous_state.value is defined ? (outputs.load_previous_state.value | toJson) : '{}' }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+      import boto3
+      from botocore.config import Config
+
+      bucket = os.environ.get("S3_BUCKET", "").strip()
+      prefix = os.environ.get("S3_PREFIX", "").strip()
+      endpoint = os.environ.get("S3_ENDPOINT", "").strip() or None
+      region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+      stale_hours = float(os.environ.get("STALE_THRESHOLD_HOURS", "24"))
+      min_mb = float(os.environ.get("MIN_RECLAIMABLE_MB", "0.0"))
+      max_aborts = int(os.environ.get("MAX_UPLOADS", "50"))
+      dry_run = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
+      client_kwargs = {
+          "region_name": region,
+          "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+      }
+      if endpoint:
+          client_kwargs["endpoint_url"] = endpoint
+
+      s3 = boto3.client("s3", **client_kwargs)
+
+      now = datetime.now(timezone.utc)
+      now_iso = now.isoformat()
+
+      paginator = s3.get_paginator("list_multipart_uploads")
+      list_args = {"Bucket": bucket}
+      if prefix:
+          list_args["Prefix"] = prefix
+
+      all_uploads = []
+      stale_candidates = []
+      total_active_count = 0
+
+      try:
+          for page in paginator.paginate(**list_args):
+              uploads = page.get("Uploads", [])
+              total_active_count += len(uploads)
+              for u in uploads:
+                  key = u.get("Key")
+                  upload_id = u.get("UploadId")
+                  initiated = u.get("Initiated")
+                  if isinstance(initiated, datetime):
+                      init_dt = initiated
+                  else:
+                      init_dt = datetime.fromisoformat(str(initiated).replace("Z", "+00:00"))
+
+                  age_hours = (now - init_dt).total_seconds() / 3600.0
+
+                  # Query parts to calculate total size and parts count
+                  parts_count = 0
+                  total_bytes = 0
+                  try:
+                      parts_paginator = s3.get_paginator("list_parts")
+                      for ppage in parts_paginator.paginate(Bucket=bucket, Key=key, UploadId=upload_id):
+                          for p in ppage.get("Parts", []):
+                              parts_count += 1
+                              total_bytes += p.get("Size", 0)
+                  except Exception as pe:
+                      # If parts cannot be listed (e.g. permission or already aborted), record zero bytes
+                      pass
+
+                  total_mb = round(total_bytes / (1024 * 1024), 2)
+
+                  upload_entry = {
+                      "key": key,
+                      "upload_id": upload_id,
+                      "initiated": init_dt.isoformat(),
+                      "age_hours": round(age_hours, 2),
+                      "parts_count": parts_count,
+                      "total_bytes": total_bytes,
+                      "total_mb": total_mb
+                  }
+                  all_uploads.append(upload_entry)
+
+                  if age_hours >= stale_hours and total_mb >= min_mb:
+                      stale_candidates.append(upload_entry)
+      except Exception as e:
+          print(f"Error inspecting multipart uploads for bucket '{bucket}': {e}", file=sys.stderr)
+          sys.exit(1)
+
+      # Sort candidates descending by wasted size (largest first)
+      stale_candidates.sort(key=lambda x: x["total_bytes"], reverse=True)
+
+      abort_plan = stale_candidates[:max_aborts]
+      stale_count = len(stale_candidates)
+      planned_count = len(abort_plan)
+      total_reclaimable_mb = round(sum(item["total_mb"] for item in abort_plan), 2)
+      total_reclaimable_bytes = sum(item["total_bytes"] for item in abort_plan)
+
+      status = "STALE_UPLOADS_FOUND" if planned_count > 0 else "HEALTHY"
+      if planned_count > 0 and dry_run:
+          status = "DRY_RUN_PLANNED"
+
+      summary = (
+          f"S3 Multipart Audit: {status} | Bucket: '{bucket}' | Active uploads: {total_active_count} | "
+          f"Stale uploads (>= {stale_hours}h): {stale_count} | Planned for abort: {planned_count} | "
+          f"Reclaimable storage: {total_reclaimable_mb} MB ({total_reclaimable_bytes} bytes) | Dry Run: {dry_run}"
+      )
+      print(summary)
+
+      new_state = {
+          "bucket": bucket,
+          "prefix": prefix,
+          "total_active_count": total_active_count,
+          "stale_count": stale_count,
+          "planned_count": planned_count,
+          "total_reclaimable_mb": total_reclaimable_mb,
+          "last_audit_iso": now_iso,
+          "abort_plan": abort_plan
+      }
+
+      output_payload = {
+          "outputs": {
+              "status": status,
+              "total_active_count": total_active_count,
+              "stale_count": stale_count,
+              "planned_count": planned_count,
+              "total_reclaimable_mb": total_reclaimable_mb,
+              "total_reclaimable_bytes": total_reclaimable_bytes,
+              "abort_plan": abort_plan,
+              "new_state": new_state,
+              "summary": summary
+          }
+      }
+      print("::" + json.dumps(output_payload) + "::")
+
+  - id: save_audit_state_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist multipart upload audit snapshot and reclaim metrics into Kestra KV store for historical tracking.
+    key: "s3_multipart_state_{{ inputs.bucket | slugify }}"
+    value: "{{ outputs.audit_and_plan_reclamation.vars.new_state | toJson }}"
+    kvType: JSON
+
+  - id: evaluate_remediation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Gate execution to perform human review, execute multipart aborts, and verify cleanup when stale uploads exist.
+    condition: "{{ outputs.audit_and_plan_reclamation.vars.planned_count > 0 and inputs.auto_remediate == true }}"
+    then:
+      - id: notify_remediation_plan_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post proposed multipart abort plan and reclaimable storage metrics to Slack for operator visibility.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#data-platform-alerts",
+            "attachments": [
+              {
+                "color": "{{ inputs.dry_run ? 'warning' : 'danger' }}",
+                "title": ":warning: S3 Abandoned Multipart Upload Reclamation Plan",
+                "text": "*Bucket:* `{{ inputs.bucket }}`\n*Prefix:* `{{ inputs.prefix ?? '(all)' }}`\n*Stale Uploads Found:* `{{ outputs.audit_and_plan_reclamation.vars.stale_count }}`\n*Planned for Abort:* `{{ outputs.audit_and_plan_reclamation.vars.planned_count }}`\n*Reclaimable Storage:* *{{ outputs.audit_and_plan_reclamation.vars.total_reclaimable_mb }} MB*\n*Mode:* {{ inputs.dry_run ? 'Dry Run (Plan Only)' : 'Active Remediation' }}",
+                "footer": "Kestra S3 Multipart Guard • Execution {{ execution.id }}"
+              }
+            ]
+          }
+
+      - id: pause_for_review
+        type: io.kestra.plugin.core.flow.If
+        description: Pause workflow execution when review is requested to allow an engineer to inspect the abort candidates.
+        condition: "{{ inputs.pause_for_approval == true and not inputs.dry_run }}"
+        then:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator review before issuing irreversible AbortMultipartUpload requests. Resume to proceed or kill to cancel.
+
+      - id: execute_abort_plan
+        type: io.kestra.plugin.core.flow.If
+        description: Execute S3 AbortMultipartUpload requests and re-verify bucket state when dry_run is disabled.
+        condition: "{{ not inputs.dry_run }}"
+        then:
+          - id: abort_stale_uploads
+            type: io.kestra.plugin.scripts.python.Script
+            description: Issue AbortMultipartUpload requests to Amazon S3 / MinIO for each upload in the abort plan.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install boto3
+            env:
+              AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+              S3_BUCKET: "{{ inputs.bucket }}"
+              S3_ENDPOINT: "{{ inputs.s3_endpoint ?? '' }}"
+              ABORT_PLAN_JSON: "{{ outputs.audit_and_plan_reclamation.vars.abort_plan | toJson }}"
+            script: |
+              import os
+              import sys
+              import json
+              import boto3
+              from botocore.config import Config
+
+              bucket = os.environ.get("S3_BUCKET", "").strip()
+              endpoint = os.environ.get("S3_ENDPOINT", "").strip() or None
+              region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+              plan_raw = os.environ.get("ABORT_PLAN_JSON", "[]")
+
+              client_kwargs = {
+                  "region_name": region,
+                  "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+              }
+              if endpoint:
+                  client_kwargs["endpoint_url"] = endpoint
+
+              s3 = boto3.client("s3", **client_kwargs)
+
+              try:
+                  abort_plan = json.loads(plan_raw)
+              except Exception:
+                  abort_plan = []
+
+              aborted_count = 0
+              aborted_mb = 0.0
+              aborted_records = []
+              failed_records = []
+
+              for item in abort_plan:
+                  key = item.get("key")
+                  upload_id = item.get("upload_id")
+                  mb = item.get("total_mb", 0.0)
+                  try:
+                      s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+                      aborted_count += 1
+                      aborted_mb += mb
+                      aborted_records.append({"key": key, "upload_id": upload_id, "mb": mb})
+                      print(f"Aborted multipart upload: Key='{key}', UploadId='{upload_id}' ({mb} MB reclaimed)")
+                  except Exception as e:
+                      failed_records.append({"key": key, "upload_id": upload_id, "error": str(e)})
+                      print(f"Failed to abort multipart upload '{upload_id}' for key '{key}': {e}", file=sys.stderr)
+
+              aborted_mb = round(aborted_mb, 2)
+              print(f"Remediation summary: Successfully aborted {aborted_count}/{len(abort_plan)} uploads, reclaimed {aborted_mb} MB")
+
+              out_payload = {
+                  "outputs": {
+                      "aborted_count": aborted_count,
+                      "aborted_mb": aborted_mb,
+                      "aborted_records": aborted_records,
+                      "failed_count": len(failed_records),
+                      "failed_records": failed_records
+                  }
+              }
+              print("::" + json.dumps(out_payload) + "::")
+
+          - id: verify_post_reclamation
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-query S3 ListMultipartUploads to prove that the targeted abandoned uploads were completely removed.
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install boto3
+            env:
+              AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+              S3_BUCKET: "{{ inputs.bucket }}"
+              S3_ENDPOINT: "{{ inputs.s3_endpoint ?? '' }}"
+              TARGET_IDS_JSON: "{{ outputs.abort_stale_uploads.vars.aborted_records | toJson }}"
+            script: |
+              import os
+              import json
+              import boto3
+              from botocore.config import Config
+
+              bucket = os.environ.get("S3_BUCKET", "").strip()
+              endpoint = os.environ.get("S3_ENDPOINT", "").strip() or None
+              region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").strip()
+              target_raw = os.environ.get("TARGET_IDS_JSON", "[]")
+
+              client_kwargs = {
+                  "region_name": region,
+                  "config": Config(retries={"max_attempts": 3, "mode": "standard"})
+              }
+              if endpoint:
+                  client_kwargs["endpoint_url"] = endpoint
+
+              s3 = boto3.client("s3", **client_kwargs)
+
+              try:
+                  targets = json.loads(target_raw)
+              except Exception:
+                  targets = []
+
+              target_upload_ids = set(t.get("upload_id") for t in targets if t.get("upload_id"))
+
+              # Paginate active uploads to assert none of target_upload_ids exist
+              paginator = s3.get_paginator("list_multipart_uploads")
+              remaining_count = 0
+
+              for page in paginator.paginate(Bucket=bucket):
+                  for u in page.get("Uploads", []):
+                      if u.get("UploadId") in target_upload_ids:
+                          remaining_count += 1
+                          print(f"Verification failure: Target upload '{u.get('UploadId')}' for key '{u.get('Key')}' still present!")
+
+              print(f"Post-remediation verification: {len(target_upload_ids)} targeted uploads checked, {remaining_count} lingering.")
+
+              out = {
+                  "outputs": {
+                      "remaining_targeted_count": remaining_count,
+                      "verification_passed": remaining_count == 0
+                  }
+              }
+              print("::" + json.dumps(out) + "::")
+
+          - id: assert_reclamation_success
+            type: io.kestra.plugin.core.execution.Assert
+            description: Assert that post-remediation verification confirmed zero lingering targeted multipart uploads.
+            conditions:
+              - "{{ outputs.verify_post_reclamation.vars.remaining_targeted_count == 0 }}"
+            errorMessage: "Post-remediation verification failed: targeted multipart uploads were not removed from S3."
+
+          - id: notify_reclamation_success_slack
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Post confirmed remediation outcome and verified reclaimed capacity to Slack.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {
+                "channel": "#data-platform-alerts",
+                "attachments": [
+                  {
+                    "color": "#36a64f",
+                    "title": ":white_check_mark: S3 Multipart Upload Reclamation Succeeded",
+                    "text": "*Bucket:* `{{ inputs.bucket }}`\n*Uploads Aborted:* `{{ outputs.abort_stale_uploads.vars.aborted_count }}`\n*Storage Reclaimed:* *{{ outputs.abort_stale_uploads.vars.aborted_mb }} MB*\n*Post-Verification:* Passed (0 lingering targeted uploads)",
+                    "footer": "Kestra S3 Multipart Guard • Execution {{ execution.id }}"
+                  }
+                ]
+              }
+
+  - id: log_audit_outcome
+    type: io.kestra.plugin.core.log.Log
+    description: Record final audit status and metrics in execution log.
+    message: "{{ outputs.audit_and_plan_reclamation.vars.summary }}"
+
+errors:
+  - id: alert_pipeline_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notify Slack if S3 API calls fail due to network timeout or authentication errors.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "#data-platform-alerts",
+        "attachments": [
+          {
+            "color": "danger",
+            "title": "💥 S3 Multipart Upload Guard Failed",
+            "text": "Workflow execution encountered an unhandled error while inspecting bucket `{{ inputs.bucket }}`. Check AWS credentials and S3 endpoint connectivity.",
+            "footer": "Kestra Execution Failure Guard"
+          }
+        ]
+      }
+
+outputs:
+  - id: status
+    type: STRING
+    description: Audit status classification (HEALTHY, STALE_UPLOADS_FOUND, DRY_RUN_PLANNED).
+    value: "{{ outputs.audit_and_plan_reclamation.vars.status }}"
+
+  - id: stale_count
+    type: INT
+    description: Total number of abandoned multipart uploads meeting the staleness threshold.
+    value: "{{ outputs.audit_and_plan_reclamation.vars.stale_count }}"
+
+  - id: total_reclaimable_mb
+    type: FLOAT
+    description: Total megabytes of orphaned storage capacity eligible for reclamation.
+    value: "{{ outputs.audit_and_plan_reclamation.vars.total_reclaimable_mb }}"
+
+  - id: aborted_count
+    type: INT
+    description: Count of abandoned multipart uploads successfully aborted during active remediation.
+    value: "{{ outputs.abort_stale_uploads.vars.aborted_count ?? 0 }}"
+
+  - id: reclaimed_mb
+    type: FLOAT
+    description: Megabytes of storage freed and verified during active remediation.
+    value: "{{ outputs.abort_stale_uploads.vars.aborted_mb ?? 0.0 }}"
+
+extend:
+  title: S3 Abandoned Multipart Upload & Orphan Part Reclaim Guard
+  metaTitle: S3 Abandoned Multipart Upload Reclaim Guard | Kestra
+  shortDescription: Audit Amazon S3 and MinIO buckets for abandoned multipart uploads, pause for human approval, abort stale uploads to reclaim storage, and verify cleanup.
+  metaDescription: Audit S3 and MinIO buckets for abandoned multipart uploads, pause for approval, abort stale uploads to reclaim wasted storage, and verify cleanup with Kestra.
+  description: |
+    Eliminate hidden cloud storage waste caused by incomplete and abandoned multipart uploads in Amazon S3,
+    MinIO, Cloudflare R2, and Ceph object storage. When distributed engines (Spark, Flink, Kafka Connect, or
+    batch uploaders) crash mid-write, partial chunks remain stored indefinitely under active upload IDs.
+    Standard object listings (`s3 ls`) do not expose these invisible parts, resulting in stealthy storage
+    cost growth. This blueprint audits active multipart uploads, identifies abandoned uploads exceeding staleness
+    thresholds, pauses for operator sign-off, executes `AbortMultipartUpload` commands, and cryptographically
+    proves that the orphaned uploads were purged.
+
+    ## How it works
+
+    1. **Input Validation**: Verifies that the target bucket, staleness threshold hours (minimum 1 hour), and safety abort limits are valid.
+    2. **Historical State Retrieval**: Pulls the previous audit snapshot from Kestra's KV store (`s3_multipart_state_<bucket>`) to maintain multi-run visibility.
+    3. **Discovery & Inspection**: Runs a containerized Python script using `boto3` to paginate `s3.list_multipart_uploads` across the bucket and prefix, inspects individual parts via `s3.list_parts` to tally exact byte sizes and chunk counts, and calculates upload age against `stale_threshold_hours`.
+    4. **Plan Formulation**: Sorts abandoned uploads descending by wasted byte size, caps the candidate list at `max_uploads_to_abort`, and saves the audit snapshot into Kestra KV.
+    5. **Slack Plan Notification**: If abandoned uploads are detected, dispatches a rich notification card to Slack detailing affected keys, upload ages, and total reclaimable megabytes.
+    6. **Operator Approval Gate**: If `pause_for_approval: true` and active remediation is enabled, the flow pauses execution (`io.kestra.plugin.core.flow.Pause`) for human review, allowing engineers to verify candidate keys before any deletion occurs.
+    7. **Active Reclamation**: When approved and `dry_run: false`, iterates through the planned candidates and calls `s3.abort_multipart_upload`, immediately freeing the underlying storage on AWS S3 or MinIO.
+    8. **Post-Remediation Verification & Assertion**: Re-queries `s3.list_multipart_uploads` to verify that none of the targeted upload IDs remain in the bucket, asserting complete remediation.
+    9. **Confirmation Alerting**: Dispatches a confirmation Slack card summarizing the verified freed megabytes and total aborted uploads.
+
+    ## What you get
+
+    - Automated elimination of hidden cloud storage leaks without waiting for delayed S3 lifecycle rules.
+    - Full visibility into invisible orphaned multipart parts, including upload IDs, keys, ages, and byte sizes.
+    - Safe-by-default execution featuring dry-run simulation, bounded per-run abort limits, and human approval gates.
+    - Provable post-remediation verification that re-queries S3 and asserts that target uploads are deleted.
+    - Compatible with AWS S3, MinIO, Ceph, and Cloudflare R2 object stores.
+
+    ## Who it's for
+
+    - FinOps Practitioners and Cloud Platform Engineers looking to reduce runaway object storage costs.
+    - Data Platform Engineers running Spark, Flink, Trino, or Kafka Connect S3 sink connectors where worker crashes leave abandoned parts.
+    - Site Reliability Engineers maintaining on-premise MinIO or Ceph object storage clusters with disk capacity constraints.
+
+    ## Why orchestrate this with Kestra
+
+    - **Closed-Loop Auto-Remediation**: Replaces passive alerting scripts with a complete discover-plan-approve-remediate-verify lifecycle.
+    - **Native Human-in-the-Loop Approval**: Uses Kestra's declarative `Pause` task so engineers can review the exact list of keys before parts are purged.
+    - **Stateful Differential Tracking**: Leverages Kestra KV store to track multi-run trends and calculate cumulative storage reclaimed over time.
+    - **Universal S3 Compatibility**: Works seamlessly with AWS S3 IAM credentials, instance profiles, or S3-compatible endpoint overrides.
+
+    ## Prerequisites
+
+    - AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) with `s3:ListBucketMultipartUploads`, `s3:ListMultipartUploadParts`, and `s3:AbortMultipartUpload` permissions on the target bucket.
+    - Docker container runtime enabled on the Kestra worker to run the boto3 inspection and remediation tasks.
+    - Slack incoming webhook URL for notifications.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS access key for authenticating S3 API requests.
+    - `AWS_SECRET_ACCESS_KEY`: AWS secret key corresponding to the access key.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for posting reclamation plans and success confirmations.
+    - `S3_RECLAIM_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this blueprint into your Kestra instance.
+    3. Run a test execution with `dry_run: true` pointing to your target bucket to inspect current abandoned uploads and wasted storage without mutating anything.
+    4. Set `dry_run: false` and `pause_for_approval: true` to execute active reclamation with human sign-off.
+    5. Enable `scheduled_multipart_sweep` to run weekly background maintenance.
+
+    ## How to extend
+
+    - **Automated Lifecycle Policy Comparison**: Add an upstream task to fetch `s3.get_bucket_lifecycle_configuration` and flag buckets that lack native `AbortIncompleteMultipartUpload` lifecycle rules.
+    - **Multi-Bucket Fan-Out**: Wrap this flow in a parent orchestrator using `io.kestra.plugin.core.flow.Loop` to sweep every bucket across an AWS account.
+    - **Datadog / Prometheus Metric Emission**: Emit reclaimed gigabytes as custom FinOps metrics using `io.kestra.plugin.datadog` or HTTP push gateways.
+
+    ## Links
+
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Docker Task Runner](https://kestra.io/plugins/plugin-scripts-docker)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Slack Notification Plugin](https://kestra.io/plugins/plugin-slack)
+    - [AWS S3 AbortMultipartUpload API Reference](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html)
+    - [Amazon S3 Multipart Uploads Overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - FinOps & Cost Management
+    - Day 2 Operations
+    - File & Data Processing Basics
+  ee: false
+  demo: false

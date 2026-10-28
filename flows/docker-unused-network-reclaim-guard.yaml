@@ -1,0 +1,525 @@
+id: docker-unused-network-reclaim-guard
+namespace: company.team
+
+description: |
+  Reclaim the user-defined Docker networks a build host accumulates. Every compose stack, every CI
+  job and every ephemeral test leaves a bridge network behind. They never show in docker ps, they
+  each hold a subnet out of the default address pool. When the pool runs out, new networks fail
+  to create with "all predefined address pools have been fully subnetted". Unrelated builds then
+  break for a reason nobody connects to leftover networks.
+
+  This flow inspects every custom network one at a time, selects only the ones with zero attached
+  containers past a grace window, never the built-ins, never a protected name. Removal is one
+  docker network rm per target behind an approval. The daemon is then listed again. The run fails
+  if a target survived or if a network the plan kept went missing.
+
+inputs:
+  - id: docker_host
+    type: STRING
+    displayName: Docker host
+    description: TCP endpoint of the daemon to clean, for example tcp://build-01:2375. TCP is required because the network list is read from the Engine API, which a unix socket does not expose to the worker. Point this at a build host or a CI runner, never at a daemon whose networks other workloads share.
+    defaults: "tcp://docker-host:2375"
+
+  - id: docker_cli_network
+    type: STRING
+    displayName: Docker CLI network
+    description: Network the one-off docker CLI container joins so it can reach docker_host. Leave it as bridge when the daemon resolves by DNS. Set it to the user-defined network when the daemon is itself a container, such as a Docker-in-Docker endpoint.
+    defaults: "bridge"
+
+  - id: target_drivers
+    type: MULTISELECT
+    displayName: Network drivers to consider
+    description: Only networks on these drivers are read. The daemon's own bridge, host and none are excluded by the type=custom filter and again by name, so they can never be seen or removed.
+    values:
+      - bridge
+      - macvlan
+      - ipvlan
+      - overlay
+    defaults:
+      - bridge
+
+  - id: protected_name_pattern
+    type: STRING
+    displayName: Protected name pattern
+    description: A network whose name matches this regular expression is never removed, even when it is empty and old. The protect-list wins over every other rule. Add the name of any network a service attaches to on a schedule, because an empty window makes it look abandoned.
+    defaults: "^(prod|shared|ingress|kestra|monitoring)([-_.].*)?$"
+
+  - id: min_age_minutes
+    type: INT
+    displayName: Minimum age in minutes
+    description: A network is a target only when it was created longer ago than this. Protects the network a compose stack created a minute ago, before its first container attaches.
+    defaults: 60
+
+  - id: max_removals
+    type: INT
+    displayName: Removal ceiling
+    description: At most this many networks are removed in one run. The rest are reported and left for the next run, so a wrong pattern cannot empty a daemon in one go.
+    defaults: 10
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: When false the flow only reports. Must be true, together with dry_run false and the approval, for anything to be removed.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the plan is only logged. Must be false, together with auto_remediate, for anything to be removed.
+    defaults: true
+
+variables:
+  api: "{{ inputs.docker_host | replace({'tcp://': 'http://'}) }}"
+  builtins: '["bridge","host","none"]'
+
+tasks:
+  - id: list_networks
+    type: io.kestra.plugin.core.http.Request
+    description: >-
+      Read-only. Asks the Engine API for custom networks on the selected drivers. type=custom drops
+      the daemon's own bridge, host and none before they reach the flow.
+    uri: "{{ render(vars.api) }}/networks"
+    method: GET
+    params:
+      filters: "{{ {'type': ['custom'], 'driver': inputs.target_drivers} | toJson }}"
+
+  - id: candidates
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      The candidate ids and names. The list endpoint reports an empty Containers map for every
+      network, including ones with a running container attached, which is why each one is inspected
+      next. Selecting off the list alone would target live networks.
+    values:
+      ids: >-
+        {{ ({'n': fromJson(outputs.list_networks.body)} | toJson) | jq('
+           [.n[] | {id: .Id, name: .Name}] | sort_by(.name)') | first | toJson }}
+
+  - id: inspect_each
+    type: io.kestra.plugin.core.flow.Loop
+    description: One read-only inspect per candidate. The attached containers and the subnets exist only here.
+    values: "{{ outputs.candidates.values.ids }}"
+    concurrencyLimit: 4
+    outputs:
+      - id: state
+        type: STRING
+        value: >-
+          {{ outputs.inspect.body | jq('{id: .Id, name: .Name, driver: .Driver, scope: .Scope,
+             created: (.Created // ""), internal: (.Internal // false),
+             attached: ((.Containers // {}) | length),
+             attached_names: [((.Containers // {}) | to_entries[] | .value.Name)],
+             subnets: [((.IPAM.Config // [])[] | .Subnet // empty)],
+             labels: ((.Labels // {}) | keys)}') | first | toJson }}
+    tasks:
+      - id: inspect
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ render(vars.api) }}/networks/{{ fromJson(item.value).id }}"
+        method: GET
+
+  - id: window
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The instant a network must have been created before to count as old. Frozen once, so detection and verification share one cutoff.
+    values:
+      cutoff: >-
+        {{ now(timeZone='UTC') | dateAdd(-1 * inputs.min_age_minutes, 'MINUTES') | date("yyyy-MM-dd'T'HH:mm:ss", 'UTC') }}
+
+  - id: assess
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      One row per candidate with its verdict and the address space it holds. A network is only a
+      target when nothing is attached, the name is not protected, the name is not a built-in and it
+      is older than the cutoff. The addresses figure is the size of every subnet the network holds,
+      which is the share of the default address pool that comes back.
+    values:
+      rows: >-
+        {{ ({'rows': ((outputs.inspect_each.outputs ?? []) | jq('map(.outputs.state | fromjson)') | first),
+            'cut': outputs.window.values.cutoff, 're': inputs.protected_name_pattern,
+            'cap': inputs.max_removals, 'bi': fromJson(vars.builtins)} | toJson) | jq('
+           .cut as $cut | .re as $re | .cap as $cap | .bi as $bi
+           | [.rows[] | . + {addresses: ([.subnets[] | (split("/")[1] | tonumber) as $p
+               | reduce range(0; 32 - $p) as $i (1; . * 2)] | add // 0)}]
+           | map(.name as $n | . + {old: ((.created[0:19]) < $cut),
+                      decision: (if (($bi | index($n)) != null) then "KEEP_BUILTIN"
+                        elif .attached > 0 then "KEEP_ATTACHED"
+                        elif ($n | test($re)) then "KEEP_PROTECTED"
+                        elif ((.created[0:19]) < $cut | not) then "KEEP_FRESH"
+                        else "RECLAIM" end)})
+           | sort_by(.created)
+           | ([.[] | select(.decision == "RECLAIM")] | to_entries
+              | map(.value + {decision: (if .key < $cap then "RECLAIM" else "KEEP_OVER_CAP" end)})) as $r
+           | ([.[] | select(.decision != "RECLAIM")] + $r) | sort_by(.decision, .name)') | first | toJson }}
+      targets: >-
+        {{ ({'rows': ((outputs.inspect_each.outputs ?? []) | jq('map(.outputs.state | fromjson)') | first),
+            'cut': outputs.window.values.cutoff, 're': inputs.protected_name_pattern,
+            'cap': inputs.max_removals, 'bi': fromJson(vars.builtins)} | toJson) | jq('
+           .cut as $cut | .re as $re | .cap as $cap | .bi as $bi
+           | [.rows[] | . + {addresses: ([.subnets[] | (split("/")[1] | tonumber) as $p
+               | reduce range(0; 32 - $p) as $i (1; . * 2)] | add // 0)}]
+           | [.[] | .name as $n | select((($bi | index($n)) == null) and (.attached == 0)
+               and (($n | test($re)) | not) and ((.created[0:19]) < $cut))]
+           | sort_by(.created) | .[0:$cap]
+           | map({id: .id, name: .name, driver: .driver, created: .created,
+                  subnets: .subnets, addresses: .addresses})') | first | toJson }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Unused network reclaim on {{ inputs.docker_host }}, drivers {{ inputs.target_drivers | join(',') }}:
+      {{ fromJson(outputs.assess.values.rows) | length }} custom networks read,
+      {{ fromJson(outputs.assess.values.targets) | length }} idle past {{ inputs.min_age_minutes }} minutes,
+      cutoff {{ outputs.window.values.cutoff }}Z.
+      {{ fromJson(outputs.assess.values.rows) | jq('group_by(.decision) | map("\(.[0].decision) \(length)") | join(", ")') | first }}.
+      Targets: {{ fromJson(outputs.assess.values.targets) | jq('if length == 0 then "none" else map("\(.name) \(.subnets | join("+")) \(.addresses) addresses created \(.created[0:19])") | join("; ") end') | first }}.
+      Address space to reclaim: {{ fromJson(outputs.assess.values.targets) | jq('[.[] | .addresses] | add // 0') | first }} IPv4 addresses
+      across {{ fromJson(outputs.assess.values.targets) | jq('[.[] | .subnets | length] | add // 0') | first }} subnets.
+      Still in use: {{ fromJson(outputs.assess.values.rows) | jq('[.[] | select(.decision == "KEEP_ATTACHED") | "\(.name) <- \(.attached_names | join(","))"] | if length == 0 then "none" else join("; ") end') | first }}.
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.assess.values.targets) | length > 0 }}"
+    then:
+      - id: findings_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Docker unused network reclaim on ' ~ inputs.docker_host ~ ': ' ~ (fromJson(outputs.assess.values.targets) | length) ~ ' of ' ~ (fromJson(outputs.assess.values.rows) | length) ~ ' custom networks have no attached container and are older than ' ~ inputs.min_age_minutes ~ ' minutes, holding ' ~ (fromJson(outputs.assess.values.targets) | jq('[.[] | .addresses] | add // 0') | first) ~ ' addresses out of the default pool (' ~ (fromJson(outputs.assess.values.targets) | jq('map("\(.name) \(.subnets | join("+"))") | join(", ")') | first) ~ '). ' ~ (inputs.auto_remediate and not inputs.dry_run ? 'Removal waits for approval on this execution.' : 'Nothing removed (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: remediate_gate
+        type: io.kestra.plugin.core.flow.If
+        description: A network is removed only when auto_remediate is true, dry_run is false and the pause below is approved.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: hold
+            type: io.kestra.plugin.core.flow.Pause
+            description: >-
+              Removing a network drops its subnet and its DNS aliases. A container that is stopped
+              now but was created with this network cannot be started again until the network is
+              recreated. Read the plan in the summary above, then resume with approved true.
+            onResume:
+              - id: approved
+                type: BOOL
+                required: false
+                description: Set true to remove the listed networks. Anything else leaves the daemon untouched.
+
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.hold.onResume.approved ?? false }}"
+            then:
+              - id: remediate_remove
+                type: io.kestra.plugin.core.flow.Loop
+                description: >-
+                  One docker network rm per target, by id, sequential so a failure is attributable
+                  to one network. The daemon refuses a network that gained an endpoint between
+                  detection and here. There is no force flag to override that, so a race ends in
+                  a refusal rather than a disconnected container.
+                values: "{{ outputs.assess.values.targets }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: remove_one
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    description: >-
+                      docker network rm takes one id. It is used instead of docker network prune
+                      because prune takes no name allowlist and reports no per-network result, so a
+                      protected network on the same daemon would be swept up with the rest.
+                    allowFailure: true
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: "{{ inputs.docker_cli_network }}"
+                    containerImage: docker:27-cli
+                    env:
+                      DOCKER_HOST: "{{ inputs.docker_host }}"
+                    commands:
+                      - docker network rm {{ fromJson(item.value).id }}
+
+              - id: relist
+                type: io.kestra.plugin.core.http.Request
+                description: >-
+                  Every custom network on the daemon, with no driver filter, so a network the plan
+                  targeted still shows up as present instead of reading as removed.
+                uri: "{{ render(vars.api) }}/networks"
+                method: GET
+                params:
+                  filters: "{{ {'type': ['custom']} | toJson }}"
+
+              - id: result
+                type: io.kestra.plugin.core.output.OutputValues
+                description: >-
+                  Join the plan with the daemon as it is now. A target counts as reclaimed only when
+                  its id is gone. Every network the plan kept is checked for collateral damage, so a
+                  protected or attached network that disappeared fails the run.
+                values:
+                  r: >-
+                    {{ ({'before': fromJson(outputs.assess.values.rows),
+                        'targets': fromJson(outputs.assess.values.targets),
+                        'after': fromJson(outputs.relist.body)} | toJson) | jq('
+                       ([.after[] | .Id] | map({key: ., value: true}) | from_entries) as $ids
+                       | ([.after[] | .Name] | map({key: ., value: true}) | from_entries) as $names
+                       | {reclaimed: [.targets[] | select(($ids[.id] // false) | not)
+                            | {name: .name, subnets: .subnets, addresses: .addresses}],
+                          survivors: [.targets[] | select($ids[.id] // false)
+                            | {name: .name, id: .id}],
+                          collateral: [.before[] | select(.decision != "RECLAIM")
+                            | select(($names[.name] // false) | not)
+                            | {name: .name, decision: .decision, attached: .attached}],
+                          kept: [.before[] | select(.decision != "RECLAIM") | .name],
+                          read: (.after | length)}
+                       | . + {freed: ([.reclaimed[] | .addresses] | add // 0),
+                              freed_subnets: ([.reclaimed[] | (.subnets | length)] | add // 0)}') | first | toJson }}
+
+              - id: verify
+                type: io.kestra.plugin.core.flow.If
+                description: >-
+                  The run fails when a target is still on the daemon or when a network the plan kept
+                  went missing. docker network rm reports success for a request the daemon refused
+                  on a race, so reading the daemon again is the only thing that decides.
+                condition: "{{ fromJson(outputs.result.values.r).survivors | length > 0 or fromJson(outputs.result.values.r).collateral | length > 0 }}"
+                then:
+                  - id: reclaim_incomplete
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: >-
+                      Network reclaim did not land on {{ inputs.docker_host }}. Still present:
+                      {{ fromJson(outputs.result.values.r).survivors | jq('if length == 0 then "none" else map("\(.name) \(.id[0:12])") | join(", ") end') | first }}.
+                      Removed outside the plan:
+                      {{ fromJson(outputs.result.values.r).collateral | jq('if length == 0 then "none" else map("\(.name) [\(.decision)] attached=\(.attached)") | join(", ") end') | first }}.
+                else:
+                  - id: reclaimed
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      Reclaimed {{ fromJson(outputs.result.values.r).reclaimed | length }} networks on {{ inputs.docker_host }}
+                      ({{ fromJson(outputs.result.values.r).reclaimed | jq('if length == 0 then "none" else map("\(.name) \(.subnets | join("+"))") | join(", ") end') | first }}).
+                      {{ fromJson(outputs.result.values.r).freed }} IPv4 addresses across
+                      {{ fromJson(outputs.result.values.r).freed_subnets }} subnets are back in the default address pool.
+                      {{ fromJson(outputs.result.values.r).read }} custom networks re-read. All
+                      {{ fromJson(outputs.result.values.r).kept | length }} the plan kept are still there:
+                      {{ fromJson(outputs.result.values.r).kept | jq('if length == 0 then "none" else join(", ") end') | first }}.
+            else:
+              - id: approval_declined
+                type: io.kestra.plugin.core.log.Log
+                message: "Approval not granted on execution {{ execution.id }}. No network was removed on {{ inputs.docker_host }}."
+        else:
+          - id: report_only
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Report only, nothing changed (auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}).
+              Run with auto_remediate true and dry_run false, then approve the pause, to remove
+              {{ fromJson(outputs.assess.values.targets) | jq('map("\(.name) \(.subnets | join("+"))") | join(", ")') | first }}.
+    else:
+      - id: nothing_to_reclaim
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No custom network on {{ inputs.docker_host }} is idle past {{ inputs.min_age_minutes }} minutes.
+          {{ fromJson(outputs.assess.values.rows) | length }} read, none reclaimable.
+          {{ fromJson(outputs.assess.values.rows) | jq('group_by(.decision) | map("\(.[0].decision) \(length)") | join(", ")') | first }}.
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Docker unused network reclaim failed on ' ~ inputs.docker_host ~ ' (execution ' ~ execution.id ~ '). Either the daemon is unreachable or a targeted network is still present after the removal. Check the execution logs.'} | toJson }}
+
+triggers:
+  - id: nightly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and in safe mode. Enabling it only reports until you change these inputs.
+    cron: "25 3 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Reclaim Abandoned Docker Networks Before the Address Pool Runs Out
+  shortDescription: Find user-defined Docker networks with no attached container past a grace window, report the subnet each one holds, remove them one at a time behind an approval, then list the daemon again and fail the run if a target survived.
+  ee: false
+  demo: false
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Infrastructure Automation
+    - Approval Gates
+  metaTitle: Reclaim Abandoned Docker Networks with Kestra
+  metaDescription: Detect user-defined Docker networks with no containers attached, remove them behind an approval, then re-list the daemon and fail if any survived.
+  description: |-
+    ## Safety
+
+    Point this at a build host or a CI runner. Never point it at a daemon whose networks other
+    workloads share. Never point it at a shared developer machine either, unless every network that
+    matters is in `protected_name_pattern` first. A removal is not reversible. The subnet goes back to
+    the pool. The DNS aliases go with it. A stopped container that was created with that network
+    will not start again until the network is recreated under the same name.
+
+    The dangerous case is a shared network that is idle at the moment you run this. An empty window
+    makes it look abandoned, so a network every workload on the host attaches to on a schedule is
+    exactly what the grace window cannot see. Put its name in `protected_name_pattern` before the
+    first run, not after. The default pattern covers common prefixes only, so a shared network named
+    outside that set needs adding by hand.
+
+    Four separate guards decide what is removable. Each one on its own is enough to keep a
+    network:
+
+    - The Engine API `type=custom` filter, so `bridge`, `host` and `none` never enter the flow, plus
+      a second check on those three names in the selection step.
+    - A live inspect per network. Anything with one or more attached containers is kept.
+    - `protected_name_pattern`, which wins over every other rule.
+    - `min_age_minutes`, so a network a compose stack created seconds ago is left alone.
+
+    On top of those, nothing is removed unless `auto_remediate` is true, `dry_run` is false and a
+    human resumes the `Pause` with `approved: true`. The ceiling in `max_removals` bounds a single
+    run even then.
+
+    ## How it works
+
+    1. `list_networks` (`io.kestra.plugin.core.http.Request`) reads `GET /networks` with the Engine
+       API filters `type=custom` and the drivers in `target_drivers`. The daemon's own three
+       networks are gone before the flow sees anything.
+    2. `candidates` (`io.kestra.plugin.core.output.OutputValues`) reduces that to id and name. The
+       list endpoint reports an empty `Containers` map for every network, including ones with a
+       running container attached, so the list alone cannot tell idle from busy.
+    3. `inspect_each` (`io.kestra.plugin.core.flow.Loop`) does one read-only `GET /networks/{id}`
+       per candidate. The attached containers and the IPAM subnets exist only on the inspect
+       response.
+    4. `window` freezes the age cutoff once, so detection and verification share one instant.
+    5. `assess` gives every network a verdict: `KEEP_BUILTIN`, `KEEP_ATTACHED`, `KEEP_PROTECTED`,
+       `KEEP_FRESH`, `KEEP_OVER_CAP` or `RECLAIM`. It also computes the IPv4 address count behind
+       each subnet, which is the share of the default address pool that comes back.
+    6. `summary` logs the verdict counts, every target with its subnet, the total addresses at stake
+       and which networks are held by which containers.
+    7. `route` branches on whether anything is reclaimable. When it is, Slack gets the finding. The
+       write path needs `auto_remediate` true plus `dry_run` false plus an approved `Pause`.
+    8. `remediate_remove` runs one `docker network rm <id>` per target through
+       `io.kestra.plugin.scripts.shell.Commands` on `docker:27-cli`, sequential, so a failure belongs
+       to one network.
+    9. `relist` reads `GET /networks` again with no driver filter, `result` joins the plan with the
+       daemon as it is now. `verify` fails the run through
+       `io.kestra.plugin.core.execution.Fail` if a target is still present or if a network the plan
+       kept went missing.
+
+    `docker network prune` is deliberately not used. Neither is
+    `io.kestra.plugin.docker.cli.Prune` with `pruneType: NETWORKS`. Prune takes no name allowlist, so
+    a protected network on the same daemon is swept up with the rest. It reports no per-network
+    result either, so there is nothing to verify a removal against. Per-target `docker network rm` gives one
+    gated removal and one verifiable outcome each.
+
+    ## What you get
+
+    - The reason unrelated builds start failing, named and measured: how many subnets leftover
+      networks hold, how many addresses come back.
+    - A detector that cannot confuse a busy network for an idle one, because it reads the inspect
+      response rather than the list.
+    - Read-only by default. Three gates plus a ceiling before anything is removed.
+    - A re-read of the daemon that fails the run, so a refused removal cannot report success.
+    - A collateral check: every network the plan kept has to still be there at the end.
+
+    ## Who it's for
+
+    - Platform engineers running self-hosted CI runners, where compose-based jobs leak a network per
+      build.
+    - Teams that have already hit `all predefined address pools have been fully subnetted` and
+      cleared it by hand.
+    - Anyone who wants the Docker network cleanup a cron job cannot do safely, with a name
+      allowlist, an approval and proof the removal landed.
+
+    ## Why orchestrate this with Kestra
+
+    A cron job running `docker network prune` cannot tell a protected network from an abandoned one,
+    cannot wait for a human, cannot report which subnets it freed, cannot tell you it failed. It
+    either removes everything unused or nothing. Kestra reads the daemon, inspects each network
+    individually, computes the plan in one expression, holds the change behind an approval, removes
+    one network at a time so a failure is attributable, reads the daemon again to prove what landed,
+    and keeps the history of every run against every host.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against an isolated Docker 27.5.1 daemon (Docker-in-Docker, its own Engine
+    API on `tcp://2375`), with a local HTTP sink standing in for Slack. The daemon held three
+    built-in networks plus seven custom bridges: `leaked-ci-1`, `-2` and `-3` (empty, aged),
+    `app-stack-a` and `app-stack-b` (one running container each), `prod-data` (empty, aged, matching
+    the default pattern) plus `kw7` (empty, aged, a shared network whose name does not match the
+    default pattern, so it was added to `protected_name_pattern` by hand). Every number below was
+    cross-checked with `docker network ls` plus `docker network inspect` against that daemon, never
+    with the Kestra log alone. The runs used `min_age_minutes: 1` so the grace window could be
+    exercised inside one session.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults, a container on every leaked network | No target. `KEEP_ATTACHED 5`, `KEEP_PROTECTED 2`, nothing reclaimable |
+    | 2 | identical, the three holder containers removed | 3 targets named with their subnets, 196608 addresses, `RECLAIM 3`. Nothing removed |
+    | 3 | `auto_remediate: true`, `dry_run: true` | Same 3 named. `docker network ls` 10 before, 10 after |
+    | 4 | `auto_remediate: true`, `dry_run: false`, pause resumed `approved: false` | `approval_declined`. 10 before, 10 after. No removal task ran at all |
+    | 5 | `auto_remediate: true`, `dry_run: false`, pause resumed `approved: true` | 3 removed, 196608 addresses across 3 subnets freed, `docker network ls` 10 before, 7 after. The 2 attached plus the 2 protected verified still present |
+    | 6 | a network created seconds earlier, `max_removals: 2` | The new one spared as `KEEP_FRESH`, the third eligible held as `KEEP_OVER_CAP`, 2 still selected |
+    | 7 | `protected_name_pattern` narrowed to one name | `prod-data` flipped from `KEEP_PROTECTED` to `RECLAIM`, the one protected name stayed kept |
+    | 8 | a container attached to one target during the pause, plus a kept network removed out of band | `docker network rm` reported success on the refused one, `verify` failed the run through `Fail` naming the survivor plus the collateral, the Slack `errors` block posted |
+
+    Run 5 is the headline. Creating one network straight after it handed that network `172.21.0.0/16`,
+    the exact subnet `leaked-ci-1` had been holding, so the address space really did come back to the
+    pool rather than only disappearing from a list.
+
+    Run 8 is the case the re-verify exists for. The daemon answered
+    `network leaked-ci-2 ... has active endpoints` and refused, the removal task still went green,
+    then the re-read caught it. A flow that trusted the removal task would have reported a clean
+    reclaim.
+
+    The detector was proved able to fail on the same inputs. With a container on each leaked network
+    it reported 0 targets. With those containers removed, no input changed, it reported 3.
+
+    ## Prerequisites
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: the incoming webhook the findings notice and the `errors` block post to.
+
+    ### Inputs
+
+    | Input | Default | What it does |
+    |---|---|---|
+    | `docker_host` | `tcp://docker-host:2375` | TCP endpoint of the daemon to clean |
+    | `docker_cli_network` | `bridge` | Network the docker CLI container joins |
+    | `target_drivers` | `[bridge]` | Drivers to consider |
+    | `protected_name_pattern` | `^(prod\|shared\|ingress\|kestra\|monitoring)([-_.].*)?$` | Never removed, whatever else is true |
+    | `min_age_minutes` | `60` | Grace window before an empty network is a target |
+    | `max_removals` | `10` | Ceiling per run |
+    | `auto_remediate` | `false` | Must be true for any removal |
+    | `dry_run` | `true` | Must be false for any removal |
+
+    The Engine API has no bulk network inspect call, so the reads go over HTTP, which means a TCP
+    endpoint or a read-only socket proxy rather than a bare Unix socket. Keep it off any untrusted
+    network: an open Docker API is root on that host. The one-off `docker:27-cli` container must be
+    able to reach `docker_host`, so leave `docker_cli_network` as `bridge` for a daemon that resolves
+    by DNS. Point it at the user-defined network when the daemon is itself a container.
+
+    ## Quick start
+
+    1. Add the `SLACK_WEBHOOK_URL` secret.
+    2. Import the flow, set `docker_host` and `docker_cli_network` for one build host, then run it
+       with the defaults. It only reports.
+    3. Read the summary. Put anything in `KEEP_ATTACHED` you did not expect, plus any network a
+       service attaches to on a schedule, into `protected_name_pattern`.
+    4. Re-run with `auto_remediate: true` and `dry_run: false`, read the plan on the paused
+       execution, then resume with `approved: true`.
+    5. Enable the Schedule trigger once the pattern is right. It stays in safe mode until you change
+       its inputs.
+
+    ## How to extend
+
+    - Filter on labels as well as names. Compose stamps `com.docker.compose.project` on the networks
+      it creates, so a label check separates a leaked CI network from one somebody made by hand.
+    - Write the plan to a KV pair per host and alert when the same network shows up idle on two
+      consecutive runs, so a network with a weekly workload is never a target.
+    - Add `io.kestra.plugin.docker.cli.Prune` with `pruneType: VOLUMES` behind the same gate, for the
+      anonymous volumes the same jobs leave behind.
+    - Loop the whole flow over a list of hosts with a subflow, so one execution covers a fleet.
+    - Read `docker info` for the configured `default-address-pools` and alert on the share consumed
+      rather than on idle networks alone.
+
+    ## Links
+
+    - [Docker Engine API, list networks](https://docs.docker.com/reference/api/engine/version/v1.47/#tag/Network/operation/NetworkList)
+    - [docker network rm](https://docs.docker.com/reference/cli/docker/network/rm/)
+    - [Default address pools](https://docs.docker.com/reference/cli/dockerd/#default-address-pools)
+    - [Kestra HTTP Request task](https://kestra.io/plugins/core/tasks/http/io.kestra.plugin.core.http.request)
+    - [Kestra Shell Commands task](https://kestra.io/plugins/plugin-script-shell/io.kestra.plugin.scripts.shell.commands)
+    - [Kestra Pause task](https://kestra.io/plugins/core/tasks/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
