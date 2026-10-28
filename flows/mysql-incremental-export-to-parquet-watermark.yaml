@@ -1,0 +1,332 @@
+id: mysql-incremental-export-to-parquet-watermark
+namespace: company.data
+
+description: |
+  Export the MySQL rows changed since the last watermark to Parquet in MinIO.
+  The flow advances the watermark in KV only after it reads the object back and the row counts agree.
+  A failed run keeps the old watermark, so the next run exports the same window again.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: table
+    type: STRING
+    displayName: Source table
+    description: Unquoted MySQL table name. The flow puts it into SQL, so the validator allows only identifier characters.
+    defaults: orders
+    validator: ^[A-Za-z_][A-Za-z0-9_]{0,63}$
+
+  - id: cursor_column
+    type: STRING
+    displayName: Change timestamp column
+    description: DATETIME(6) or TIMESTAMP(6) column that the application sets on each insert and update.
+    defaults: updated_at
+    validator: ^[A-Za-z_][A-Za-z0-9_]{0,63}$
+
+  - id: key_column
+    type: STRING
+    displayName: Unique key column
+    description: Unique, ordered column (usually the primary key). It breaks ties between rows with the same timestamp.
+    defaults: id
+    validator: ^[A-Za-z_][A-Za-z0-9_]{0,63}$
+
+  - id: max_rows
+    type: INT
+    displayName: Maximum rows per run
+    description: Upper limit of rows in one Parquet object. A larger backlog continues in the next run.
+    defaults: 200000
+    min: 1
+    max: 5000000
+
+  - id: lag_seconds
+    type: INT
+    displayName: Safety lag in seconds
+    description: Rows changed in the last N seconds wait for the next run. This keeps rows from transactions that commit late.
+    defaults: 60
+    min: 0
+    max: 3600
+
+  - id: start_from
+    type: STRING
+    displayName: First-run start timestamp
+    description: Lower bound for the first run only, when the KV watermark does not exist yet.
+    defaults: "1970-01-01 00:00:00"
+    validator: ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?$
+
+  - id: bucket
+    type: STRING
+    displayName: Destination bucket
+    defaults: datalake-raw
+
+  - id: prefix
+    type: STRING
+    displayName: Object key prefix
+    description: Folder in the bucket. The flow adds the table name and a dt=YYYY-MM-DD partition.
+    defaults: raw/mysql
+    validator: ^[A-Za-z0-9._/-]*[A-Za-z0-9._-]$
+
+variables:
+  kv_key: "mysql_parquet_watermark_{{ inputs.table }}"
+  object_key: "{{ inputs.prefix }}/{{ inputs.table }}/dt={{ outputs.plan_window.row.first_day }}/{{ inputs.table }}_{{ outputs.plan_window.row.first_ts_compact }}_{{ outputs.plan_window.row.first_key }}.parquet"
+
+tasks:
+  - id: read_watermark
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Read the last committed watermark from KV. Use start_from when no watermark exists.
+    values:
+      lo_ts: "{{ (kv(render(vars.kv_key), errorOnMissing=false) ?? {}).updated_at ?? inputs.start_from }}"
+      lo_key: "{{ (kv(render(vars.kv_key), errorOnMissing=false) ?? {}).key ?? '0' }}"
+
+  - id: plan_window
+    type: io.kestra.plugin.jdbc.mysql.Query
+    description: Find the next window in MySQL with a (timestamp, key) cursor. The window ends at the last row of the batch.
+    url: "{{ secret('MYSQL_JDBC_URL') }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    timeZoneId: UTC
+    fetchType: FETCH_ONE
+    retry:
+      type: constant
+      interval: PT20S
+      maxAttempts: 3
+    sql: |
+      SELECT
+        COUNT(*) OVER () AS batch_rows,
+        DATE_FORMAT(FIRST_VALUE(`{{ inputs.cursor_column }}`) OVER w, '%Y-%m-%d') AS first_day,
+        DATE_FORMAT(FIRST_VALUE(`{{ inputs.cursor_column }}`) OVER w, '%Y%m%dT%H%i%s%f') AS first_ts_compact,
+        CAST(FIRST_VALUE(`{{ inputs.key_column }}`) OVER w AS CHAR) AS first_key,
+        DATE_FORMAT(`{{ inputs.cursor_column }}`, '%Y-%m-%d %H:%i:%s.%f') AS hi_ts,
+        CAST(`{{ inputs.key_column }}` AS CHAR) AS hi_key
+      FROM (
+        SELECT `{{ inputs.key_column }}`, `{{ inputs.cursor_column }}`
+        FROM `{{ inputs.table }}`
+        WHERE (`{{ inputs.cursor_column }}` > CAST(:lo_ts AS DATETIME(6))
+               OR (`{{ inputs.cursor_column }}` = CAST(:lo_ts AS DATETIME(6)) AND `{{ inputs.key_column }}` > :lo_key))
+          AND `{{ inputs.cursor_column }}` <= NOW(6) - INTERVAL {{ inputs.lag_seconds }} SECOND
+        ORDER BY `{{ inputs.cursor_column }}`, `{{ inputs.key_column }}`
+        LIMIT {{ inputs.max_rows }}
+      ) AS batch
+      WINDOW w AS (ORDER BY `{{ inputs.cursor_column }}`, `{{ inputs.key_column }}`
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+      ORDER BY `{{ inputs.cursor_column }}` DESC, `{{ inputs.key_column }}` DESC
+      LIMIT 1
+    parameters:
+      lo_ts: "{{ outputs.read_watermark.values.lo_ts }}"
+      lo_key: "{{ outputs.read_watermark.values.lo_key }}"
+
+  - id: has_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs.plan_window.row.batch_rows ?? 0) > 0 }}"
+    then:
+      - id: export_window
+        type: io.kestra.plugin.jdbc.mysql.Query
+        description: Stream every row inside the planned window to internal storage. The _cursor_ts column keeps the exact cursor in microseconds.
+        url: "{{ secret('MYSQL_JDBC_URL') }}"
+        username: "{{ secret('MYSQL_USERNAME') }}"
+        password: "{{ secret('MYSQL_PASSWORD') }}"
+        timeZoneId: UTC
+        fetchType: STORE
+        timeout: PT30M
+        retry:
+          type: constant
+          interval: PT30S
+          maxAttempts: 3
+        sql: |
+          SELECT t.*,
+                 DATE_FORMAT(t.`{{ inputs.cursor_column }}`, '%Y-%m-%d %H:%i:%s.%f') AS _cursor_ts
+          FROM `{{ inputs.table }}` AS t
+          WHERE (`{{ inputs.cursor_column }}` > CAST(:lo_ts AS DATETIME(6))
+                 OR (`{{ inputs.cursor_column }}` = CAST(:lo_ts AS DATETIME(6)) AND `{{ inputs.key_column }}` > :lo_key))
+            AND (`{{ inputs.cursor_column }}` < CAST(:hi_ts AS DATETIME(6))
+                 OR (`{{ inputs.cursor_column }}` = CAST(:hi_ts AS DATETIME(6)) AND `{{ inputs.key_column }}` <= :hi_key))
+          ORDER BY `{{ inputs.cursor_column }}`, `{{ inputs.key_column }}`
+        parameters:
+          lo_ts: "{{ outputs.read_watermark.values.lo_ts }}"
+          lo_key: "{{ outputs.read_watermark.values.lo_key }}"
+          hi_ts: "{{ outputs.plan_window.row.hi_ts }}"
+          hi_key: "{{ outputs.plan_window.row.hi_key }}"
+
+      - id: to_parquet
+        type: io.kestra.plugin.serdes.parquet.IonToParquet
+        from: "{{ outputs.export_window.uri }}"
+        compressionCodec: SNAPPY
+        timeout: PT30M
+
+      - id: upload_object
+        type: io.kestra.plugin.minio.Upload
+        description: Write the batch to a deterministic key. A re-run of the same window replaces the object and does not add a copy.
+        endpoint: "{{ secret('MINIO_ENDPOINT') }}"
+        accessKeyId: "{{ secret('MINIO_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('MINIO_SECRET_KEY_ID') }}"
+        bucket: "{{ inputs.bucket }}"
+        key: "{{ render(vars.object_key) }}"
+        from: "{{ outputs.to_parquet.uri }}"
+        contentType: application/vnd.apache.parquet
+        metadata:
+          watermark-from: "{{ outputs.read_watermark.values.lo_ts }}|{{ outputs.read_watermark.values.lo_key }}"
+          watermark-to: "{{ outputs.plan_window.row.hi_ts }}|{{ outputs.plan_window.row.hi_key }}"
+          kestra-execution: "{{ execution.id }}"
+        retry:
+          type: constant
+          interval: PT30S
+          maxAttempts: 3
+
+      - id: read_back
+        type: io.kestra.plugin.minio.Download
+        description: Download the object from the bucket. This proves that the stored object exists, not only that the upload call returned.
+        endpoint: "{{ secret('MINIO_ENDPOINT') }}"
+        accessKeyId: "{{ secret('MINIO_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('MINIO_SECRET_KEY_ID') }}"
+        bucket: "{{ inputs.bucket }}"
+        key: "{{ render(vars.object_key) }}"
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+
+      - id: inspect_object
+        type: io.kestra.plugin.jdbc.duckdb.Query
+        description: Count the rows, the distinct keys and the rows outside the window in the downloaded Parquet file.
+        inputFiles:
+          batch.parquet: "{{ outputs.read_back.uri }}"
+        fetchType: FETCH_ONE
+        sql: |
+          SELECT count(*) AS file_rows,
+                 count(DISTINCT "{{ inputs.key_column }}") AS distinct_keys,
+                 count(*) FILTER (WHERE _cursor_ts < :lo_ts OR _cursor_ts > :hi_ts) AS rows_outside_window
+          FROM read_parquet('batch.parquet')
+        parameters:
+          lo_ts: "{{ outputs.read_watermark.values.lo_ts }}"
+          hi_ts: "{{ outputs.plan_window.row.hi_ts }}"
+
+      - id: verify_object
+        type: io.kestra.plugin.core.execution.Assert
+        description: Stop before the watermark moves if the stored object does not match the export.
+        conditions:
+          - "{{ outputs.inspect_object.row.file_rows == outputs.export_window.size }}"
+          - "{{ outputs.to_parquet.size == outputs.export_window.size }}"
+          - "{{ outputs.inspect_object.row.distinct_keys == outputs.inspect_object.row.file_rows }}"
+          - "{{ outputs.inspect_object.row.rows_outside_window == 0 }}"
+          - "{{ outputs.export_window.size <= outputs.plan_window.row.batch_rows }}"
+        errorMessage: The Parquet object in the bucket does not match the exported rows. The watermark did not move.
+
+      - id: advance_watermark
+        type: io.kestra.plugin.core.kv.Set
+        description: Move the watermark to the end of the verified window. This is the commit point of the run.
+        key: "{{ render(vars.kv_key) }}"
+        kvType: JSON
+        kvDescription: Last MySQL row exported to Parquet and verified in the bucket.
+        value: |
+          {
+            "updated_at": "{{ outputs.plan_window.row.hi_ts }}",
+            "key": "{{ outputs.plan_window.row.hi_key }}",
+            "rows": {{ outputs.export_window.size }},
+            "object": "s3://{{ inputs.bucket }}/{{ render(vars.object_key) }}",
+            "execution_id": "{{ execution.id }}"
+          }
+
+      - id: log_result
+        type: io.kestra.plugin.core.log.Log
+        level: "{{ outputs.plan_window.row.batch_rows == inputs.max_rows ? 'WARN' : 'INFO' }}"
+        message: >-
+          Exported {{ outputs.export_window.size }} rows of {{ inputs.table }} to
+          s3://{{ inputs.bucket }}/{{ render(vars.object_key) }}.
+          Watermark moved from {{ outputs.read_watermark.values.lo_ts }} / {{ outputs.read_watermark.values.lo_key }}
+          to {{ outputs.plan_window.row.hi_ts }} / {{ outputs.plan_window.row.hi_key }}.
+          {{ outputs.plan_window.row.batch_rows == inputs.max_rows ? 'The batch is full, so more rows wait. The next run continues the backlog.' : 'No backlog remains.' }}
+    else:
+      - id: log_no_changes
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No rows of {{ inputs.table }} changed after {{ outputs.read_watermark.values.lo_ts }} / {{ outputs.read_watermark.values.lo_key }}
+          (rows newer than {{ inputs.lag_seconds }} seconds wait). The watermark did not move.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      MySQL to Parquet export of {{ inputs.table }} failed in execution {{ execution.id }}.
+      Failed task: {{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}.
+      Error: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'see the execution logs' }}.
+      The watermark did not move. The next run exports the same window again.
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: Incremental MySQL to Parquet Export in MinIO with a Verified KV Watermark
+  metaTitle: Incremental MySQL to Parquet Export with a KV Watermark | Kestra
+  shortDescription: Export changed MySQL rows to date-partitioned Parquet in MinIO. Move the KV watermark only after the object is read back and verified.
+  metaDescription: Export changed MySQL rows to Parquet in MinIO with a (timestamp, key) watermark in KV that moves only after the object is read back.
+  description: |
+    A cron script that moves a timestamp before the upload is confirmed loses rows when the upload fails. A plain timestamp cursor with a LIMIT also skips rows that share a timestamp. In this flow, the KV watermark moves last, after the Parquet object is read back from MinIO and checked.
+
+    ## How it works
+
+    1. The Schedule trigger starts the flow every 15 minutes.
+    2. `read_watermark` reads the (`updated_at`, `id`) cursor from KV. The first run uses `start_from`.
+    3. `plan_window` finds the next window: at most `max_rows` rows, older than `lag_seconds`. `has_changes` (`If`) stops when it is empty.
+    4. `export_window` streams the rows. `to_parquet` writes Snappy Parquet with an exact `_cursor_ts` column.
+    5. `upload_object` writes `<prefix>/<table>/dt=<day>/<table>_<first cursor>.parquet`. A re-run of a window replaces the object.
+    6. `read_back` and `inspect_object` (DuckDB) count rows, keys and rows outside the window. `verify_object` (`Assert`) compares them with the export.
+    7. `advance_watermark` stores the new cursor in KV. On failure, `alert_failure` posts to Slack and the watermark stays.
+
+    ## What you get
+
+    - At-least-once delivery: a failed run exports the same window again.
+    - No skipped rows on timestamp ties.
+    - Bounded runs. A WARN log shows that a backlog remains.
+    - Object metadata and a KV record with the cursor range and execution id.
+
+    ## Who it's for
+
+    - Data engineers who land MySQL changes in a lake without CDC.
+
+    ## Why orchestrate this with Kestra
+
+    The watermark lives in KV, not in a file on one server. Each task has its own retry, and `concurrency` stops two runs from using the same watermark.
+
+    ## Prerequisites
+
+    - MySQL 8.0 or later, with a `DATETIME(6)` column set by `ON UPDATE CURRENT_TIMESTAMP(6)` and an index on (`updated_at`, `id`).
+    - A bucket that exists. Hard deletes are not exported.
+    - Parquet types come from `IonToParquet`: `DECIMAL` becomes a string and timestamps keep milliseconds.
+
+    ### Secrets
+
+    - `MYSQL_JDBC_URL`, `MYSQL_USERNAME`, `MYSQL_PASSWORD`: connection and user with `SELECT`.
+    - `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_KEY_ID`: bucket access.
+    - `SLACK_WEBHOOK_URL`: failure alerts.
+
+    ## Quick start
+
+    1. Add the secrets and create the bucket.
+    2. Execute the flow and read the `log_result` message.
+    3. Check the `mysql_parquet_watermark_<table>` KV key. Delete it to export again from `start_from`.
+
+    ## How to extend
+
+    - Give `to_parquet` an Avro `schema` to fix column types.
+    - Start a downstream merge after `advance_watermark`.
+
+    ## Links
+
+    - [MySQL JDBC plugin](https://kestra.io/plugins/plugin-jdbc-mysql)
+    - [MinIO plugin](https://kestra.io/plugins/plugin-minio)
+    - [Serdes plugin](https://kestra.io/plugins/plugin-serdes)
+    - [DuckDB plugin](https://kestra.io/plugins/plugin-jdbc-duckdb)
+    - [KV Set task](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [MySQL window functions](https://dev.mysql.com/doc/refman/8.4/en/window-functions.html)
+    - [MinIO docs](https://min.io/docs/minio/linux/index.html)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Day 2 Operations
+  ee: false
+  demo: false
