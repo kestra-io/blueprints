@@ -1,0 +1,892 @@
+# SPDX-License-Identifier: Apache-2.0
+id: kafka-cluster-migration-mirrormaker2-verified-cutover
+namespace: company.team
+description: Move consumer groups from one Kafka cluster to another that MirrorMaker 2 keeps in sync. The flow proves that the source and the target hold the same records, finds the exact target offset of every committed offset, asks for an approval and checks the result record by record.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: mode
+    type: SELECT
+    values:
+      - CHECK
+      - CUTOVER
+      - ROLLBACK
+    defaults: CHECK
+    description: CHECK compares the clusters and changes nothing. CUTOVER sets the consumer group offsets on the target. ROLLBACK puts the offsets back to the values recorded before the cutover.
+  - id: source_bootstrap
+    type: STRING
+    defaults: kafka-source:9092
+    description: Bootstrap servers of the old cluster, as host:port.
+  - id: target_bootstrap
+    type: STRING
+    defaults: kafka-target:9092
+    description: Bootstrap servers of the new cluster. MirrorMaker 2 must already replicate the topics from the old cluster to this one.
+  - id: source_client_properties
+    type: SECRET
+    defaults: ""
+    description: Client properties of the old cluster, for example SASL or SSL settings. Leave empty for a plaintext listener. For scheduled runs set the default to a secret() expression.
+  - id: target_client_properties
+    type: SECRET
+    defaults: ""
+    description: Client properties of the new cluster.
+  - id: topics_regex
+    type: STRING
+    defaults: ".*"
+    validator: ^[A-Za-z0-9._|*+?()\[\]\\-]{1,200}$
+    description: Extended regular expression for the topics to compare. Internal topics and MirrorMaker 2 topics are always left out.
+  - id: groups_regex
+    type: STRING
+    defaults: ".*"
+    validator: ^[A-Za-z0-9._|*+?()\[\]\\-]{1,200}$
+    description: Extended regular expression for the consumer groups to move.
+  - id: migration_name
+    type: STRING
+    defaults: kafka-migration
+    validator: ^[a-z0-9-]{1,40}$
+    description: Name of the migration. Its state is kept in the namespace KV store under this name.
+  - id: tools_image
+    type: STRING
+    defaults: apache/kafka:4.1.0
+    description: Image with the Kafka command line tools. Use the version of the target cluster.
+  - id: docker_network
+    type: STRING
+    defaults: bridge
+    description: Docker network of the task containers. They must reach both clusters.
+  - id: quiet_seconds
+    type: STRING
+    defaults: "20"
+    validator: ^[0-9]{1,3}$
+    description: How long the end offsets of the source topics must stay unchanged before a cutover.
+  - id: catchup_rounds
+    type: STRING
+    defaults: "30"
+    validator: ^[0-9]{1,3}$
+    description: How many times to check, 10 seconds apart, that MirrorMaker 2 has copied everything.
+  - id: parallelism
+    type: STRING
+    defaults: "4"
+    validator: ^[0-9]{1,2}$
+    description: How many record reads run at the same time. Each one starts a small JVM.
+  - id: scan_max
+    type: STRING
+    defaults: "5000"
+    validator: ^[0-9]{1,6}$
+    description: How many target records to scan when the exact offset is not the same as on the source.
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Plan only. No offset is changed.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: Allows the flow to change consumer group offsets. A change runs only when this is true and dry_run is false. Each change waits for an approval.
+
+variables:
+  live: "{{ inputs.dry_run == false and inputs.auto_remediate == true }}"
+  approval_window: PT24H
+  common_sh: |
+    # Shared helpers. SRC and TGT are bootstrap servers. SRC_CFG and TGT_CFG are optional client property files.
+    KB=/opt/kafka/bin
+    if [ -n "${SRC_PROPS:-}" ]; then printf '%s\n' "$SRC_PROPS" > src.properties; SRC_CFG=src.properties; fi
+    if [ -n "${TGT_PROPS:-}" ]; then printf '%s\n' "$TGT_PROPS" > tgt.properties; TGT_CFG=tgt.properties; fi
+    export KAFKA_HEAP_OPTS="-Xmx256m -Xms64m"
+    cfg() { if [ -s "$1" ]; then printf -- '--command-config %s' "$1"; fi; }
+    ccfg() { if [ -s "$1" ]; then printf -- '--consumer.config %s' "$1"; fi; }
+    boot() { if [ "$1" = src ]; then echo "$SRC"; else echo "$TGT"; fi; }
+    cfgfile() { if [ "$1" = src ]; then echo "${SRC_CFG:-/dev/null}"; else echo "${TGT_CFG:-/dev/null}"; fi; }
+    safe() { printf '%s' "$1" | tr -d '"\\' | tr '\n\t' '  '; }
+    out() { printf '::%s%s%s::\n' '{"outputs":{' "$1" '}}'; }
+    topics() { # side regex
+      $KB/kafka-topics.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --list 2>/dev/null | grep -E "^($2)\$" | grep -vE '^(__|mm2-|heartbeats$|connect-)|\.(heartbeats|checkpoints\.internal|internal)$' | sort
+    }
+    parts() { # side topic
+      $KB/kafka-topics.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --describe --topic "$2" 2>/dev/null | awk '/PartitionCount/ { for (i = 1; i <= NF; i++) if ($i == "PartitionCount:") print $(i + 1) }'
+    }
+    leo() { # side topic -> lines partition:offset
+      $KB/kafka-get-offsets.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --topic "$2" --time -1 2>/dev/null | awk -F: '{ print $2 ":" $3 }'
+    }
+    rec() { # side topic partition offset -> ts|key|valuehash or MISSING
+      local line ts rest key val
+      line=$($KB/kafka-console-consumer.sh --bootstrap-server "$(boot $1)" $(ccfg "$(cfgfile $1)") --topic "$2" --partition "$3" --offset "$4" --max-messages 1 --timeout-ms 20000 \
+        --property print.timestamp=true --property print.key=true --property key.separator='|' 2>/dev/null | head -1)
+      if [ -z "$line" ]; then echo MISSING; return; fi
+      ts=${line%%|*}; ts=${ts#*:}; rest=${line#*|}; key=${rest%%|*}; val=${rest#*|}
+      printf '%s|%s|%s\n' "$ts" "$key" "$(printf '%s' "$val" | sha256sum | cut -c1-16)"
+    }
+    groups() { # side regex
+      $KB/kafka-consumer-groups.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --list 2>/dev/null | grep -E "^($2)\$" | sort
+    }
+    group_state() { # side group
+      $KB/kafka-consumer-groups.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --describe --state --group "$2" 2>/dev/null | awk -v g="$2" '$1 == g && NF >= 3 { print $(NF - 1) }'
+    }
+    group_offsets() { # side group -> lines topic:partition:current (only partitions with a committed offset)
+      $KB/kafka-consumer-groups.sh --bootstrap-server "$(boot $1)" $(cfg "$(cfgfile $1)") --describe --group "$2" 2>/dev/null | awk -v g="$2" '$1 == g && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { print $2 ":" $3 ":" $4 }'
+    }
+    run_jobs() { # file of id|side|topic|partition|offset lines, results in res/<id>, at most PAR at a time
+      mkdir -p res; rm -f res/*
+      while IFS='|' read -r id side topic part off; do
+        ( rec "$side" "$topic" "$part" "$off" > "res/$id" ) &
+        while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "${PAR:-4}" ]; do sleep 0.3; done
+      done < "$1"
+      wait
+    }
+  inspect_sh: |
+    . ./common.sh
+    # Compares topics, tails and consumer groups of the source and the target. Writes topics.tsv and groups.tsv.
+    : > topics.tsv; : > groups.tsv; : > jobs.txt; : > pairs.txt
+    missing=""; partition_diff=""; tail_diff=""; lag=0; ntopics=0
+    for t in $(topics src "$TOPICS_REGEX"); do
+      ntopics=$((ntopics + 1))
+      sp=$(parts src "$t"); tp=$(parts tgt "$t")
+      if [ -z "$tp" ]; then missing="$missing $t"; printf '%s\t%s\t-\tMISSING\n' "$t" "$sp" >> topics.tsv; continue; fi
+      if [ "$sp" != "$tp" ]; then partition_diff="$partition_diff $t"; fi
+      printf '%s\t%s\t%s\tCHECKED\n' "$t" "$sp" "$tp" >> topics.tsv
+      leo src "$t" > src.leo; leo tgt "$t" > tgt.leo
+      for p in $(cut -d: -f1 src.leo); do
+        se=$(grep "^$p:" src.leo | cut -d: -f2); te=$(grep "^$p:" tgt.leo | cut -d: -f2); te=${te:-0}
+        [ "$se" -gt "$te" ] && lag=$((lag + se - te))
+        if [ "$se" -gt 0 ]; then
+          echo "s-$t-$p|src|$t|$p|$((se - 1))" >> jobs.txt
+          if [ "$te" -gt 0 ]; then echo "t-$t-$p|tgt|$t|$p|$((te - 1))" >> jobs.txt; fi
+          echo "$t:$p" >> pairs.txt
+        fi
+      done
+    done
+    run_jobs jobs.txt
+    while read -r tp; do
+      t=${tp%%:*}; p=${tp##*:}
+      a=$(cat "res/s-$t-$p" 2>/dev/null); b=$(cat "res/t-$t-$p" 2>/dev/null); b=${b:-MISSING}
+      if [ "$a" != "$b" ]; then tail_diff="$tail_diff $t:$p"; fi
+    done < pairs.txt
+    ngroups=0; active=""; glist=""
+    for g in $(groups src "$GROUPS_REGEX"); do
+      ngroups=$((ngroups + 1)); glist="$glist,$g"; st=$(group_state src "$g"); st=${st:-Unknown}
+      [ "$st" != "Empty" ] && [ "$st" != "Dead" ] && active="$active $g"
+      printf '%s\t%s\t%s\n' "$g" "$st" "$(group_offsets src "$g" | wc -l | tr -d ' ')" >> groups.tsv
+    done
+    out "\"topics\":$ntopics,\"groups\":$ngroups,\"missing_topics\":\"$(safe "$missing")\",\"partition_diff\":\"$(safe "$partition_diff")\",\"tail_diff\":\"$(safe "$tail_diff")\",\"lag_records\":$lag,\"active_groups\":\"$(safe "$active")\",\"group_list\":\"$(safe "${glist#,}")\""
+  quiet_sh: |
+    . ./common.sh
+    # Proves that nothing is written to the source topics: the end offsets must not move during QUIET_SECONDS.
+    snap() { for t in $(topics src "$TOPICS_REGEX"); do leo src "$t" | sed "s/^/$t:/"; done; }
+    snap > quiet.a; sleep "$QUIET_SECONDS"; snap > quiet.b
+    diffcount() { awk 'NR == FNR { a[$0] = 1; next } !($0 in a) { n++ } END { print n + 0 }' "$1" "$2"; }
+    changed=$(diffcount quiet.a quiet.b)
+    # a baseline from an earlier run also catches records written since then
+    if [ -s baseline.txt ]; then changed=$((changed + $(diffcount baseline.txt quiet.b))); fi
+    out "\"changed_partitions\":$changed,\"partitions\":$(wc -l < quiet.a | tr -d ' ')"
+  align_sh: |
+    . ./common.sh
+    # Finds, for every committed offset of the chosen source groups, the offset that points at the same record on the target.
+    # Writes align.tsv: group, topic, partition, source committed, target current, exact target offset, status, record
+    : > align.tsv; : > rows.txt; : > jobs.txt
+    active=""
+    for g in $(echo "$GROUPS_LIST" | tr ',' ' '); do
+      st=$(group_state src "$g")
+      [ "$st" != "Empty" ] && [ "$st" != "Dead" ] && active="$active $g"
+      group_offsets src "$g" > "src.$g.off"; group_offsets tgt "$g" > "tgt.$g.off"
+      while IFS=: read -r t p c; do
+        cur=$(grep "^$t:$p:" "tgt.$g.off" | cut -d: -f3); cur=${cur:--}
+        echo "$g|$t|$p|$c|$cur" >> rows.txt
+        if [ "$c" -gt 0 ]; then
+          echo "r-$g-$t-$p|src|$t|$p|$((c - 1))" >> jobs.txt
+          echo "x-$g-$t-$p|tgt|$t|$p|$((c - 1))" >> jobs.txt
+        fi
+      done < "src.$g.off"
+    done
+    run_jobs jobs.txt
+    while IFS='|' read -r g t p c cur; do
+      R=MISSING; n=-
+      if [ "$c" -eq 0 ]; then n=0; R=NONE
+      else
+        R=$(cat "res/r-$g-$t-$p" 2>/dev/null); X=$(cat "res/x-$g-$t-$p" 2>/dev/null)
+        if [ "$R" = MISSING ]; then n=-
+        elif [ "$R" = "$X" ]; then n=$c
+        else
+          ts=${R%%|*}; rest=${R#*|}; key=${rest%%|*}
+          start=0; [ "$cur" != "-" ] && start=$((cur > 0 ? cur - 1 : 0))
+          for o in $($KB/kafka-console-consumer.sh --bootstrap-server "$TGT" $(ccfg "${TGT_CFG:-/dev/null}") --topic "$t" --partition "$p" --offset "$start" --max-messages "${SCAN_MAX:-5000}" --timeout-ms 20000 \
+              --property print.offset=true --property print.timestamp=true --property print.key=true --property key.separator='|' 2>/dev/null \
+              | awk -F'|' -v ts="CreateTime:$ts" -v k="$key" '$1 == ts && $3 == k { sub(/^Offset:/, "", $2); print $2 }' | head -3); do
+            if [ "$(rec tgt "$t" "$p" "$o")" = "$R" ]; then n=$((o + 1)); break; fi
+          done
+        fi
+      fi
+      if [ "$n" = "-" ]; then status=NOT_FOUND
+      elif [ "$cur" = "$n" ]; then status=ALIGNED
+      elif [ "$cur" = "-" ]; then status=MISSING
+      elif [ "$cur" -lt "$n" ]; then status=BEHIND
+      else status=AHEAD; fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$g" "$t" "$p" "$c" "$cur" "$n" "$status" "$R" >> align.tsv
+    done < rows.txt
+    cnt() { awk -F'\t' -v s="$1" '$7 == s { n++ } END { print n + 0 }' align.tsv; }
+    reprocess=$(awk -F'\t' '$7 == "BEHIND" { n += $6 - $5 } END { print n + 0 }' align.tsv)
+    out "\"partitions\":$(wc -l < align.tsv | tr -d ' '),\"aligned\":$(cnt ALIGNED),\"behind\":$(cnt BEHIND),\"missing\":$(cnt MISSING),\"ahead\":$(cnt AHEAD),\"not_found\":$(cnt NOT_FOUND),\"reprocess_records\":$reprocess,\"active_groups\":\"$(safe "$active")\",\"fix_groups\":\"$(awk -F'\t' '$7 == "BEHIND" || $7 == "MISSING" { print $1 }' align.tsv | sort -u | tr '\n' ' ' | sed 's/ $//')\""
+  apply_sh: |
+    . ./common.sh
+    # Sets the target offsets of the groups to the exact offsets in align.tsv, then reads them back and compares the records.
+    # Rows that are ALIGNED stay as they are, so the script can run again after a failure. Rows that cannot be aligned are refused.
+    moved=0; refused=""; wrong=0; : > jobs.txt
+    fixgroups=$(awk -F'\t' '$7 == "BEHIND" || $7 == "MISSING" { print $1 }' align.tsv | sort -u)
+    for g in $fixgroups; do
+      st=$(group_state tgt "$g")
+      if [ -n "$st" ] && [ "$st" != "Empty" ] && [ "$st" != "Dead" ]; then refused="$refused $g"; fi
+    done
+    # one group with members on the target stops the whole change, so there is never a half moved cutover
+    if [ -n "$refused" ]; then out "\"moved_partitions\":0,\"verified_partitions\":0,\"wrong_partitions\":0,\"refused_groups\":\"$(safe "$refused")\""; exit 0; fi
+    for g in $fixgroups; do
+      awk -F'\t' -v g="$g" '($7 == "BEHIND" || $7 == "MISSING") && $1 == g { print $2 "," $3 "," $6 }' align.tsv > "plan.$g.csv"
+      $KB/kafka-consumer-groups.sh --bootstrap-server "$TGT" $(cfg "${TGT_CFG:-/dev/null}") --group "$g" --reset-offsets --from-file "plan.$g.csv" --execute > "reset.$g.log" 2>&1 || { cat "reset.$g.log" >&2; exit 1; }
+      moved=$((moved + $(wc -l < "plan.$g.csv")))
+    done
+    # read back every row: the committed offset on the target must be the exact one and the record before it must be the source record
+    for g in $(cut -f1 align.tsv | sort -u); do group_offsets tgt "$g" > "after.$g.off"; done
+    while IFS="$(printf '\t')" read -r g t p c cur n status R; do
+      case "$status" in ALIGNED|BEHIND|MISSING) ;; *) continue ;; esac
+      now=$(grep "^$t:$p:" "after.$g.off" | cut -d: -f3); now=${now:-0}
+      if [ "$now" != "$n" ]; then wrong=$((wrong + 1)); echo "offset of $g $t:$p is $now, expected $n" >&2; continue; fi
+      if [ "$n" -gt 0 ]; then echo "v-$g-$t-$p|tgt|$t|$p|$((n - 1))" >> jobs.txt; fi
+    done < align.tsv
+    run_jobs jobs.txt
+    verified=0
+    while IFS="$(printf '\t')" read -r g t p c cur n status R; do
+      case "$status" in ALIGNED|BEHIND|MISSING) ;; *) continue ;; esac
+      if [ "$n" -eq 0 ]; then verified=$((verified + 1)); continue; fi
+      if [ "$(cat "res/v-$g-$t-$p" 2>/dev/null)" = "$R" ]; then verified=$((verified + 1)); else wrong=$((wrong + 1)); echo "record before $g $t:$p/$n is not the source record" >&2; fi
+    done < align.tsv
+    out "\"moved_partitions\":$moved,\"verified_partitions\":$verified,\"wrong_partitions\":$wrong,\"refused_groups\":\"$(safe "$refused")\""
+  rollback_sh: |
+    . ./common.sh
+    # Puts the target offsets back to the values recorded before the cutover, but only where nobody moved them since.
+    : > jobs.txt; reverted=0; progressed=""; : > rollback.log
+    for g in $(awk -F'\t' '$7 == "BEHIND" || $7 == "MISSING" { print $1 }' snapshot.tsv | sort -u); do
+      st=$(group_state tgt "$g")
+      if [ -n "$st" ] && [ "$st" != "Empty" ] && [ "$st" != "Dead" ]; then progressed="$progressed $g(active)"; continue; fi
+      group_offsets tgt "$g" > "now.$g.off"; : > "revert.$g.csv"; : > "delete.$g.txt"
+      while IFS="$(printf '\t')" read -r gg t p c cur n status R; do
+        [ "$gg" = "$g" ] || continue
+        case "$status" in BEHIND|MISSING) ;; *) continue ;; esac
+        now=$(grep "^$t:$p:" "now.$g.off" | cut -d: -f3); now=${now:--}
+        if [ "$now" != "$n" ]; then progressed="$progressed $g:$t:$p"; continue; fi
+        if [ "$cur" = "-" ]; then echo "$t:$p" >> "delete.$g.txt"; else echo "$t,$p,$cur" >> "revert.$g.csv"; fi
+      done < snapshot.tsv
+      [ "$DRY" = true ] && { reverted=$((reverted + $(wc -l < "revert.$g.csv") + $(wc -l < "delete.$g.txt"))); continue; }
+      if [ -s "revert.$g.csv" ]; then
+        $KB/kafka-consumer-groups.sh --bootstrap-server "$TGT" $(cfg "${TGT_CFG:-/dev/null}") --group "$g" --reset-offsets --from-file "revert.$g.csv" --execute >> rollback.log 2>&1 || { cat rollback.log >&2; exit 1; }
+        reverted=$((reverted + $(wc -l < "revert.$g.csv")))
+      fi
+      for tp in $(cat "delete.$g.txt"); do
+        $KB/kafka-consumer-groups.sh --bootstrap-server "$TGT" $(cfg "${TGT_CFG:-/dev/null}") --group "$g" --delete-offsets --topic "$tp" >> rollback.log 2>&1 || { cat rollback.log >&2; exit 1; }
+        reverted=$((reverted + 1))
+      done
+    done
+    # read back what was reverted
+    wrong=0
+    [ "$DRY" = true ] && { out "\"reverted_partitions\":$reverted,\"wrong_partitions\":0,\"progressed\":\"$(safe "$progressed")\""; exit 0; }
+    for g in $(awk -F'\t' '$7 == "BEHIND" || $7 == "MISSING" { print $1 }' snapshot.tsv | sort -u); do
+      group_offsets tgt "$g" > "back.$g.off"
+      while IFS="$(printf '\t')" read -r gg t p c cur n status R; do
+        [ "$gg" = "$g" ] || continue
+        case "$status" in BEHIND|MISSING) ;; *) continue ;; esac
+        now=$(grep "^$t:$p:" "back.$g.off" | cut -d: -f3); now=${now:--}
+        case " $progressed " in *" $g:$t:$p "*|*" $g(active) "*) continue ;; esac
+        [ "$now" = "$cur" ] || { wrong=$((wrong + 1)); echo "offset of $g $t:$p is $now, expected $cur" >&2; }
+      done < snapshot.tsv
+    done
+    out "\"reverted_partitions\":$reverted,\"wrong_partitions\":$wrong,\"progressed\":\"$(safe "$progressed")\""
+
+tasks:
+  - id: label_run
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      migration: "{{ inputs.migration_name }}"
+      mode: "{{ inputs.mode | lower }}"
+
+  - id: read_state
+    type: io.kestra.plugin.core.kv.Get
+    key: "kafka-migration-{{ inputs.migration_name }}"
+    errorOnMissing: false
+
+  - id: current
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      state: "{{ (outputs.read_state.value ?? {}).state ?? 'NONE' }}"
+
+  - id: require_allowed_state
+    type: io.kestra.plugin.core.execution.Fail
+    condition: >-
+      {{ inputs.mode == 'ROLLBACK' and not (['CUTTING_OVER', 'COMPLETED'] contains outputs.current.values.state) }}
+    errorMessage: There is no cutover to roll back. ROLLBACK needs the state CUTTING_OVER or COMPLETED.
+
+  - id: inspect_flow
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode != 'ROLLBACK' }}"
+    then:
+      - id: inspect
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Lists the topics and groups, compares partitions and the last record of every partition on both clusters.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          inspect.sh: "{{ vars.inspect_sh }}"
+        outputFiles:
+          - topics.tsv
+          - groups.tsv
+        commands:
+          - bash inspect.sh
+
+      - id: show_inspect
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          {{ outputs.inspect.vars.topics }} topics and {{ outputs.inspect.vars.groups }} consumer groups match the filters. Records still to copy: {{ outputs.inspect.vars.lag_records }}.
+          Missing topics:{{ outputs.inspect.vars.missing_topics == '' ? ' none' : outputs.inspect.vars.missing_topics }}. Different partition counts:{{ outputs.inspect.vars.partition_diff == '' ? ' none' : outputs.inspect.vars.partition_diff }}. Partitions whose last record differs:{{ outputs.inspect.vars.tail_diff == '' ? ' none' : outputs.inspect.vars.tail_diff }}. Groups with active members:{{ outputs.inspect.vars.active_groups == '' ? ' none' : outputs.inspect.vars.active_groups }}.
+          Topics (name, source partitions, target partitions):
+          {{ read(outputs.inspect.outputFiles['topics.tsv']) }}
+          Groups (name, state, partitions with a committed offset):
+          {{ read(outputs.inspect.outputFiles['groups.tsv']) }}
+
+      - id: check_only
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.mode == 'CHECK' }}"
+        then:
+          - id: label_checked
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              topics: "{{ outputs.inspect.vars.topics }}"
+              groups: "{{ outputs.inspect.vars.groups }}"
+              outcome: "{{ outputs.inspect.vars.missing_topics == '' and outputs.inspect.vars.partition_diff == '' and outputs.inspect.vars.tail_diff == '' ? 'in-sync' : 'not-in-sync' }}"
+
+  - id: cutover
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode == 'CUTOVER' }}"
+    then:
+      - id: require_topics_ready
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.inspect.vars.topics == 0 or outputs.inspect.vars.missing_topics != '' or outputs.inspect.vars.partition_diff != '' }}"
+        errorMessage: "The target is not ready. Topics missing on the target:{{ outputs.inspect.vars.missing_topics }}. Topics with another partition count:{{ outputs.inspect.vars.partition_diff }}. With no topic matching topics_regex there is nothing to move."
+
+      - id: require_groups_idle
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.inspect.vars.active_groups != '' }}"
+        errorMessage: "These consumer groups still have members on the source:{{ outputs.inspect.vars.active_groups }}. Stop their consumers first, because the offsets of an active group cannot be moved."
+
+      - id: quiet
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Reads the end offsets of the source topics twice. A producer that still writes would make the target fall behind again.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          quiet.sh: "{{ vars.quiet_sh }}"
+        outputFiles:
+          - quiet.b
+        commands:
+          - QUIET_SECONDS="{{ inputs.quiet_seconds }}" bash quiet.sh
+
+      - id: require_quiet
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.quiet.vars.changed_partitions > 0 }}"
+        errorMessage: "{{ outputs.quiet.vars.changed_partitions }} source partitions received records during {{ inputs.quiet_seconds }} seconds. Stop the producers and run the cutover again."
+
+      - id: wait_for_mirror
+        type: io.kestra.plugin.core.flow.LoopUntil
+        description: Waits until the last record of every source partition is also the last record on the target.
+        condition: "{{ outputs.mirror_check.vars.lag_records == 0 and outputs.mirror_check.vars.tail_diff == '' }}"
+        checkFrequency:
+          interval: PT10S
+          maxIterations: 30
+        failOnMaxReached: true
+        tasks:
+          - id: mirror_check
+            type: io.kestra.plugin.scripts.shell.Commands
+            containerImage: "{{ inputs.tools_image }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: "{{ inputs.docker_network }}"
+              entryPoint: []
+              user: root
+            env:
+              SRC: "{{ inputs.source_bootstrap }}"
+              TGT: "{{ inputs.target_bootstrap }}"
+              SRC_PROPS: "{{ inputs.source_client_properties }}"
+              TGT_PROPS: "{{ inputs.target_client_properties }}"
+              TOPICS_REGEX: "{{ inputs.topics_regex }}"
+              GROUPS_REGEX: "{{ inputs.groups_regex }}"
+              PAR: "{{ inputs.parallelism }}"
+              SCAN_MAX: "{{ inputs.scan_max }}"
+            inputFiles:
+              common.sh: "{{ vars.common_sh }}"
+              inspect.sh: "{{ vars.inspect_sh }}"
+            commands:
+              - bash inspect.sh
+
+      - id: align
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: For every committed offset of every group, finds the offset on the target that follows the same record.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          align.sh: "{{ vars.align_sh }}"
+        outputFiles:
+          - align.tsv
+        commands:
+          - GROUPS_LIST="{{ outputs.inspect.vars.group_list }}" bash align.sh
+
+      - id: show_plan
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          {{ outputs.align.vars.partitions }} committed partitions: {{ outputs.align.vars.aligned }} already exact, {{ outputs.align.vars.behind }} behind on the target, {{ outputs.align.vars.missing }} without an offset on the target, {{ outputs.align.vars.ahead }} ahead of the source, {{ outputs.align.vars.not_found }} not found.
+          Moving the {{ outputs.align.vars.behind }} behind partitions avoids reading {{ outputs.align.vars.reprocess_records }} records a second time.
+          Columns: group, topic, partition, source offset, target offset now, exact target offset, result, record.
+          {{ read(outputs.align.outputFiles['align.tsv']) }}
+
+      - id: require_alignable
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.align.vars.ahead > 0 or outputs.align.vars.not_found > 0 }}"
+        errorMessage: "{{ outputs.align.vars.ahead }} partitions are already ahead on the target and {{ outputs.align.vars.not_found }} have no matching record there. Moving them would skip or repeat records, so nothing was changed. Read the table in the show_plan log."
+
+      - id: up_to_date
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.align.vars.fix_groups == '' }}"
+        then:
+          - id: label_up_to_date
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              outcome: up-to-date
+
+          - id: stop_up_to_date
+            type: io.kestra.plugin.core.execution.Exit
+            state: SUCCESS
+
+      - id: plan_only
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ render(vars.live) != 'true' }}"
+        then:
+          - id: label_planned
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              partitions: "{{ outputs.align.vars.behind + outputs.align.vars.missing }}"
+              outcome: planned
+
+          - id: stop_planned
+            type: io.kestra.plugin.core.execution.Exit
+            state: SUCCESS
+
+      - id: approve_cutover
+        type: io.kestra.plugin.core.flow.Pause
+        description: Nothing is changed before an answer. The source cluster and the source group offsets are never touched.
+        pauseDuration: "{{ vars.approval_window }}"
+        behavior: CANCEL
+        onResume:
+          - id: decision
+            type: SELECT
+            displayName: Decision
+            isRadio: true
+            expression: >-
+              {{ [
+              {'label': 'MOVE: set ' ~ (outputs.align.vars.behind + outputs.align.vars.missing) ~ ' partitions of ' ~ outputs.align.vars.fix_groups ~ ' to the exact offsets (' ~ outputs.align.vars.reprocess_records ~ ' records are not read twice)', 'value': 'MOVE'},
+              {'label': 'CANCEL: change nothing', 'value': 'CANCEL'}
+              ] }}
+          - id: producers_stopped
+            type: BOOL
+            displayName: Producers are stopped
+            defaults: false
+            description: Confirm that no application writes to the source topics and that the consumers of these groups are stopped.
+          - id: note
+            type: STRING
+            displayName: Note
+            description: Why you decided this, for example a change ticket. Kept in the execution.
+            required: false
+
+      - id: cancelled
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_cutover.onResume.decision == 'CANCEL' }}"
+        then:
+          - id: label_cancelled
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              outcome: cancelled
+
+          - id: stop_cancelled
+            type: io.kestra.plugin.core.execution.Exit
+            state: SUCCESS
+
+      - id: require_producers_confirmed
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.approve_cutover.onResume.producers_stopped != true }}"
+        errorMessage: Confirm that the producers and the consumers are stopped. Nothing was changed.
+
+      - id: recheck_quiet
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: The approval is a snapshot. Compares the source end offsets with the ones read before the plan, so a record written while the approval waited is caught.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          quiet.sh: "{{ vars.quiet_sh }}"
+          baseline.txt: "{{ outputs.quiet.outputFiles['quiet.b'] }}"
+        commands:
+          - QUIET_SECONDS="10" bash quiet.sh
+
+      - id: recheck_mirror
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          inspect.sh: "{{ vars.inspect_sh }}"
+        commands:
+          - bash inspect.sh
+
+      - id: require_unchanged
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.recheck_quiet.vars.changed_partitions > 0 or outputs.recheck_mirror.vars.tail_diff != '' or outputs.recheck_mirror.vars.lag_records > 0 or outputs.recheck_mirror.vars.active_groups != '' }}"
+        errorMessage: The clusters changed while the approval waited, so the plan is out of date and nothing was changed. Run CUTOVER again.
+
+      - id: snapshot_once
+        type: io.kestra.plugin.core.flow.If
+        description: Written before the first change. A run that continues an unfinished cutover keeps the first snapshot, because it holds the offsets from before any change.
+        condition: "{{ outputs.current.values.state != 'CUTTING_OVER' }}"
+        then:
+          - id: record_snapshot
+            type: io.kestra.plugin.core.kv.Set
+            key: "kafka-migration-{{ inputs.migration_name }}-snapshot"
+            kvType: STRING
+            value: "{{ read(outputs.align.outputFiles['align.tsv']) }}"
+
+      - id: cutting_over_state
+        type: io.kestra.plugin.core.kv.Set
+        key: "kafka-migration-{{ inputs.migration_name }}"
+        kvType: JSON
+        value: >-
+          {{ {'state': 'CUTTING_OVER', 'groups': outputs.align.vars.fix_groups | split(' '), 'partitions': outputs.align.vars.behind + outputs.align.vars.missing,
+          'approved_note': (outputs.approve_cutover.onResume.note ?? '')} | toJson }}
+
+      - id: apply
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Sets the offsets, reads every one back and compares the record before it with the source record. Partitions that are already exact are left alone, so this task can run again after a failure.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          apply.sh: "{{ vars.apply_sh }}"
+          align.tsv: "{{ outputs.align.outputFiles['align.tsv'] }}"
+        commands:
+          - bash apply.sh
+
+      - id: verify_cutover
+        type: io.kestra.plugin.core.execution.Assert
+        errorMessage: "The offsets on the target are not the exact ones. Wrong partitions: {{ outputs.apply.vars.wrong_partitions }}. Groups that were refused because they have members on the target:{{ outputs.apply.vars.refused_groups }}. The state stays CUTTING_OVER, so you can run CUTOVER again or ROLLBACK."
+        conditions:
+          - "{{ outputs.apply.vars.wrong_partitions == 0 }}"
+          - "{{ outputs.apply.vars.refused_groups == '' }}"
+          - "{{ outputs.apply.vars.verified_partitions == outputs.align.vars.partitions }}"
+
+      - id: completed_state
+        type: io.kestra.plugin.core.kv.Set
+        key: "kafka-migration-{{ inputs.migration_name }}"
+        kvType: JSON
+        value: >-
+          {{ {'state': 'COMPLETED', 'groups': outputs.align.vars.fix_groups | split(' '), 'partitions': outputs.align.vars.behind + outputs.align.vars.missing,
+          'approved_note': (outputs.approve_cutover.onResume.note ?? '')} | toJson }}
+
+      - id: label_completed
+        type: io.kestra.plugin.core.execution.Labels
+        labels:
+          partitions: "{{ outputs.apply.vars.verified_partitions }}"
+          outcome: completed
+
+      - id: next_steps
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          The offsets of {{ outputs.align.vars.fix_groups }} are exact on the target and every one was read back. Start the consumers against {{ inputs.target_bootstrap }}, then the producers.
+          Keep MirrorMaker 2 running until the producers moved. It never lowers an offset that is ahead of the one it translated.
+
+  - id: rollback
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode == 'ROLLBACK' }}"
+    then:
+      - id: read_snapshot
+        type: io.kestra.plugin.core.kv.Get
+        key: "kafka-migration-{{ inputs.migration_name }}-snapshot"
+
+      - id: preview_rollback
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Compares the target offsets with the ones the cutover set. Changes nothing.
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          rollback.sh: "{{ vars.rollback_sh }}"
+          snapshot.tsv: "{{ outputs.read_snapshot.value }}"
+        commands:
+          - DRY="true" bash rollback.sh
+
+      - id: require_not_progressed
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ outputs.preview_rollback.vars.progressed != '' }}"
+        errorMessage: "Consumers already moved these offsets on the target:{{ outputs.preview_rollback.vars.progressed }}. Rolling back would repeat or skip records, so nothing was changed."
+
+      - id: rollback_only_live
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ render(vars.live) != 'true' }}"
+        then:
+          - id: label_rollback_previewed
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              partitions: "{{ outputs.preview_rollback.vars.reverted_partitions }}"
+              outcome: rollback-previewed
+
+          - id: stop_rollback_previewed
+            type: io.kestra.plugin.core.execution.Exit
+            state: SUCCESS
+
+      - id: approve_rollback
+        type: io.kestra.plugin.core.flow.Pause
+        description: Puts {{ outputs.preview_rollback.vars.reverted_partitions }} partition offsets on the target back. The source is not touched.
+        pauseDuration: "{{ vars.approval_window }}"
+        behavior: CANCEL
+        onResume:
+          - id: decision
+            type: SELECT
+            displayName: Decision
+            isRadio: true
+            expression: >-
+              {{ [
+              {'label': 'ROLLBACK: put ' ~ outputs.preview_rollback.vars.reverted_partitions ~ ' partition offsets on the target back', 'value': 'ROLLBACK'},
+              {'label': 'CANCEL: change nothing', 'value': 'CANCEL'}
+              ] }}
+
+      - id: rollback_cancelled
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_rollback.onResume.decision == 'CANCEL' }}"
+        then:
+          - id: label_rollback_cancelled
+            type: io.kestra.plugin.core.execution.Labels
+            labels:
+              outcome: cancelled
+
+          - id: stop_rollback_cancelled
+            type: io.kestra.plugin.core.execution.Exit
+            state: SUCCESS
+
+      - id: revert_offsets
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: "{{ inputs.tools_image }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          entryPoint: []
+          user: root
+        env:
+          SRC: "{{ inputs.source_bootstrap }}"
+          TGT: "{{ inputs.target_bootstrap }}"
+          SRC_PROPS: "{{ inputs.source_client_properties }}"
+          TGT_PROPS: "{{ inputs.target_client_properties }}"
+          TOPICS_REGEX: "{{ inputs.topics_regex }}"
+          GROUPS_REGEX: "{{ inputs.groups_regex }}"
+          PAR: "{{ inputs.parallelism }}"
+          SCAN_MAX: "{{ inputs.scan_max }}"
+        inputFiles:
+          common.sh: "{{ vars.common_sh }}"
+          rollback.sh: "{{ vars.rollback_sh }}"
+          snapshot.tsv: "{{ outputs.read_snapshot.value }}"
+        commands:
+          - DRY="false" bash rollback.sh
+
+      - id: verify_rollback
+        type: io.kestra.plugin.core.execution.Assert
+        errorMessage: The offsets on the target are not the recorded ones. The state stays as it was.
+        conditions:
+          - "{{ outputs.revert_offsets.vars.wrong_partitions == 0 }}"
+          - "{{ outputs.revert_offsets.vars.progressed == '' }}"
+
+      - id: rolled_back_state
+        type: io.kestra.plugin.core.kv.Set
+        key: "kafka-migration-{{ inputs.migration_name }}"
+        kvType: JSON
+        value: '{"state":"ROLLED_BACK"}'
+
+      - id: label_rolled_back
+        type: io.kestra.plugin.core.execution.Labels
+        labels:
+          partitions: "{{ outputs.revert_offsets.vars.reverted_partitions }}"
+          outcome: rolled-back
+
+errors:
+  - id: label_failed
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      failed: "true"
+
+  - id: alert_migration_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {'text': 'Kafka migration ' ~ inputs.migration_name ~ ' (' ~ inputs.mode ~ ') failed. Execution ' ~ execution.id ~ '. The source cluster and the source offsets are never changed. If the state is CUTTING_OVER, run CUTOVER again or ROLLBACK.'} | toJson }}
+
+triggers:
+  - id: weekly_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "0 6 * * 1"
+    inputs:
+      mode: CHECK
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Migrate Kafka consumer groups to a new cluster with exact offsets after MirrorMaker 2
+  metaTitle: Kafka cluster migration with MirrorMaker 2 and exact consumer offsets in Kestra
+  shortDescription: Prove that a MirrorMaker 2 target holds the same records, find the exact target offset of every consumer group offset, set them after an approval and check each one record by record.
+  metaDescription: Move Kafka consumer groups to a MirrorMaker 2 target cluster with exact offsets. Prove the records match, approve, set the offsets, verify and roll back.
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Realtime & Streaming
+  ee: false
+  demo: false
+  description: |
+    MirrorMaker 2 copies topics and writes translated consumer group offsets to the new cluster, but the translation is conservative. On the test clusters it left one group 90 records behind the exact position and another 97 records behind when the target topic already held records. Consumers that start from those offsets read records twice. This flow checks that both clusters hold the same records, finds the exact offset for every committed offset and sets it after an approval.
+
+    ## How it works
+    1. `inspect` compares topics, partition counts and the last record of every partition (timestamp, key and value hash) on both clusters. `mode` CHECK ends here.
+    2. CUTOVER stops when a topic is missing on the target or a group still has members. `quiet` proves that the source end offsets do not move and `wait_for_mirror` waits until the last records match.
+    3. `align` finds the target offset that follows the same record as each committed source offset. It tries the same offset first and then scans the target.
+    4. `approve_cutover` (`Pause`) shows how many partitions move and how many records are not read twice. It asks you to confirm that the producers are stopped.
+    5. The flow checks the source again, saves the old offsets in KV and runs `apply`, which sets the offsets and reads each one back. `verify_cutover` fails unless the record before every offset is the source record.
+    6. ROLLBACK puts the saved offsets back where nobody moved them since.
+
+    ## What you get
+    Exact offsets on the new cluster with the proof for each partition. A group that is already ahead on the target is refused. The source cluster and its offsets are never changed.
+
+    ## Who it's for
+    Teams that move Kafka to a new cluster, a new version or another provider with MirrorMaker 2.
+
+    ## Why orchestrate this with Kestra
+    The `Pause` form shows the counts of the plan. The KV store keeps the old offsets and the state. A rerun reads the real offsets again and skips the exact ones.
+
+    ## Tested end to end
+    18 runs on Kestra 2.0.6 with Kafka 3.9.1 as the source and 4.1.0 as the target and MirrorMaker 2 4.1.0 with the identity policy. The flow validates clean on 2.0.5 but the runs were not repeated there. Covered: a missing topic, a producer that kept writing, a group with members, records that arrived during the approval, a target group with members, consumers that moved the offsets before a rollback and a group ahead on the target. SASL, TLS and transactions were not run.
+
+    ## Prerequisites
+    MirrorMaker 2 must already replicate the topics with the identity replication policy, so topic names match. Docker workers must reach both clusters.
+
+    ### Secrets
+    `SLACK_WEBHOOK_URL`. Client properties for SASL or TLS go into the two SECRET inputs.
+
+    ### Inputs
+    `source_bootstrap` and `target_bootstrap`. `topics_regex` and `groups_regex` choose what to compare and move. `dry_run` defaults to true and `auto_remediate` to false.
+
+    ## Quick start
+    1. Run CHECK and read the tables.
+    2. Run CUTOVER with the defaults to see the plan and the records you save.
+    3. Stop the producers and the consumers, run it with `dry_run` false and `auto_remediate` true and approve.
+    4. Start the consumers on the new cluster.
+
+    ## How to extend
+    Each record read starts a small JVM, so raise `parallelism` for big clusters. Keys that contain a pipe and binary values are compared as text. Add a notification in `onPause`.
+
+    ## Links
+    - [Geo replication with MirrorMaker 2](https://kafka.apache.org/documentation/#georeplication)
+    - [Kafka consumer groups tool](https://kafka.apache.org/documentation/#basic_ops_consumer_group)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
