@@ -1,0 +1,635 @@
+id: celery-unacknowledged-task-quarantine-and-requeue-guard
+namespace: company.tasks
+
+description: |
+  Inspects Celery task queues in Redis for unacknowledged tasks stranded after worker OOM crashes or node reboots.
+  Differentiates recoverable stalled tasks from retry-exhausted poison pills, atomically requeues recoverable tasks
+  to prevent processing stalls, quarantines unprocessable poison pills to an isolated dead-letter queue behind an
+  operator approval gate to avert worker crash loops, verifies post-remediation queue state, and persists forensic
+  audit telemetry into Kestra KV storage.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: redis_host
+    type: STRING
+    displayName: Redis Host
+    description: Hostname or IP address of the target Redis server hosting Celery broker queues.
+    defaults: "localhost"
+
+  - id: redis_port
+    type: INT
+    displayName: Redis Port
+    description: Port number for the Redis server connection (default 6379).
+    defaults: 6379
+
+  - id: redis_password
+    type: STRING
+    displayName: Redis Password
+    description: Authentication credentials for the Redis instance. Read from secrets by default.
+    defaults: "{{ secret('REDIS_PASSWORD') }}"
+
+  - id: redis_database
+    type: INT
+    displayName: Redis Database Index
+    description: Numeric Redis logical database index used by the Celery broker (default 0).
+    defaults: 0
+
+  - id: queue_name
+    type: STRING
+    displayName: Celery Queue Name
+    description: Name of the Celery task queue list in Redis (e.g., celery, default, or high_priority).
+    defaults: "celery"
+
+  - id: stalled_visibility_seconds
+    type: INT
+    displayName: Stalled Visibility Threshold (Seconds)
+    description: Duration in seconds an unacknowledged task must exceed past visibility timestamp before being flagged as stranded.
+    defaults: 300
+
+  - id: max_scan
+    type: INT
+    displayName: Maximum Unacknowledged Tasks to Scan
+    description: Upper bound on unacknowledged task delivery tags inspected in a single audit pass.
+    defaults: 100
+
+  - id: default_max_retries
+    type: INT
+    displayName: Default Maximum Retry Limit
+    description: Fallback maximum retry threshold used to classify poison pills if the Celery task header omits a retries ceiling.
+    defaults: 3
+
+  - id: quarantine_queue_name
+    type: STRING
+    displayName: Quarantine Dead-Letter Queue Name
+    description: Redis list key where poison-pill tasks are safely isolated to prevent worker crash loops.
+    defaults: "celery.quarantine.dead_letter"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits stranded unacknowledged tasks and outputs remediation manifests without altering Redis keys.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, pauses for operator verification before applying requeue and quarantine operations.
+    defaults: false
+
+variables:
+  detect_lua: |
+    local unacked_key = "unacked"
+    local unacked_index_key = "unacked_index"
+    local target_queue = ARGV[1]
+    local stalled_threshold_seconds = tonumber(ARGV[2]) or 300
+    local max_scan = tonumber(ARGV[3]) or 100
+    local default_max_retries = tonumber(ARGV[4]) or 3
+
+    local time_res = redis.call('TIME')
+    local now_epoch = tonumber(time_res[1])
+
+    local total_unacked = redis.call('HLEN', unacked_key)
+    local total_ready = redis.call('LLEN', target_queue)
+
+    -- Retrieve delivery tags ordered by visibility expiration score
+    local tags_with_scores = redis.call('ZRANGEBYSCORE', unacked_index_key, '-inf', '+inf', 'WITHSCORES', 'LIMIT', 0, max_scan)
+
+    local stalled_tasks = {}
+    local requeue_candidates = {}
+    local quarantine_candidates = {}
+
+    for i = 1, #tags_with_scores, 2 do
+        local dtag = tags_with_scores[i]
+        local score = tonumber(tags_with_scores[i + 1]) or 0
+        local elapsed = now_epoch - score
+
+        if elapsed >= stalled_threshold_seconds then
+            local raw_entry = redis.call('HGET', unacked_key, dtag)
+            if raw_entry then
+                -- Celery stores unacked entries as a JSON array: [raw_message, delivery_tag, exchange]
+                local parsed_ok, entry_data = pcall(cjson.decode, raw_entry)
+                local task_id = "unknown"
+                local task_name = "unknown"
+                local retries_count = 0
+                local is_corrupted = false
+
+                if parsed_ok and type(entry_data) == "table" and entry_data[1] then
+                    local msg_body = entry_data[1]
+                    local msg_ok, msg_obj = pcall(cjson.decode, msg_body)
+                    if msg_ok and type(msg_obj) == "table" then
+                        local headers = msg_obj["headers"] or {}
+                        task_id = headers["id"] or "unspecified_id"
+                        task_name = headers["task"] or "unspecified_task"
+                        retries_count = tonumber(headers["retries"]) or 0
+                    else
+                        is_corrupted = true
+                    end
+                else
+                    is_corrupted = true
+                end
+
+                local classification = "RECOVERABLE"
+                if is_corrupted or retries_count >= default_max_retries then
+                    classification = "POISON_PILL"
+                    table.insert(quarantine_candidates, dtag)
+                else
+                    table.insert(requeue_candidates, dtag)
+                end
+
+                table.insert(stalled_tasks, {
+                    delivery_tag = dtag,
+                    task_id = task_id,
+                    task_name = task_name,
+                    score = score,
+                    elapsed_seconds = elapsed,
+                    retries = retries_count,
+                    max_retries = default_max_retries,
+                    classification = classification,
+                    is_corrupted = is_corrupted
+                })
+            end
+        end
+    end
+
+    return cjson.encode({
+        server_epoch = now_epoch,
+        total_unacked = total_unacked,
+        total_ready = total_ready,
+        scanned_count = (#tags_with_scores / 2),
+        stalled_count = #stalled_tasks,
+        requeue_count = #requeue_candidates,
+        quarantine_count = #quarantine_candidates,
+        stalled_tasks = stalled_tasks,
+        requeue_candidates = requeue_candidates,
+        quarantine_candidates = quarantine_candidates
+    })
+
+  remediate_lua: |
+    local unacked_key = "unacked"
+    local unacked_index_key = "unacked_index"
+    local target_queue = KEYS[1]
+    local dlq_key = KEYS[2]
+
+    local requeue_tags = cjson.decode(ARGV[1] or '[]')
+    local quarantine_tags = cjson.decode(ARGV[2] or '[]')
+
+    local time_res = redis.call('TIME')
+    local now_epoch = tonumber(time_res[1])
+
+    local requeued = {}
+    local quarantined = {}
+
+    for _, dtag in ipairs(requeue_tags) do
+        local raw_entry = redis.call('HGET', unacked_key, dtag)
+        if raw_entry then
+            local parsed_ok, entry_data = pcall(cjson.decode, raw_entry)
+            if parsed_ok and type(entry_data) == "table" and entry_data[1] then
+                local raw_msg = entry_data[1]
+                -- Re-insert raw message payload into the head of the Celery ready queue
+                redis.call('LPUSH', target_queue, raw_msg)
+                redis.call('HDEL', unacked_key, dtag)
+                redis.call('ZREM', unacked_index_key, dtag)
+                table.insert(requeued, dtag)
+            end
+        end
+    end
+
+    for _, dtag in ipairs(quarantine_tags) do
+        local raw_entry = redis.call('HGET', unacked_key, dtag)
+        if raw_entry then
+            -- Atomically divert poison pill to quarantined dead-letter storage
+            redis.call('LPUSH', dlq_key, raw_entry)
+            redis.call('HDEL', unacked_key, dtag)
+            redis.call('ZREM', unacked_index_key, dtag)
+            table.insert(quarantined, dtag)
+        end
+    end
+
+    return cjson.encode({
+        requeued_count = #requeued,
+        requeued_tags = requeued,
+        quarantined_count = #quarantined,
+        quarantined_tags = quarantined,
+        timestamp_epoch = now_epoch
+    })
+
+  verify_lua: |
+    local unacked_key = "unacked"
+    local unacked_index_key = "unacked_index"
+    local target_tags = cjson.decode(ARGV[1] or '[]')
+
+    local lingering = {}
+    for _, dtag in ipairs(target_tags) do
+        local exists_hash = redis.call('HEXISTS', unacked_key, dtag)
+        local score_val = redis.call('ZSCORE', unacked_index_key, dtag)
+        if exists_hash == 1 or score_val ~= false then
+            table.insert(lingering, dtag)
+        end
+    end
+
+    return cjson.encode({
+        verified = (#lingering == 0),
+        lingering_count = #lingering,
+        lingering_tags = lingering
+    })
+
+triggers:
+  - id: periodic_celery_queue_inspection
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic health inspection executed every 15 minutes to audit stranded unacknowledged Celery tasks.
+    cron: "*/15 * * * *"
+    disabled: true
+
+  - id: on_worker_crash_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP webhook endpoint invoked by Kubernetes pod lifecycle hooks, systemd restart handlers, or SRE runbooks.
+    key: "{{ secret('CELERY_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Validates that Celery queue parameters and operational thresholds conform to safety rules.
+    conditions:
+      - "{{ inputs.queue_name | length > 0 }}"
+      - "{{ inputs.stalled_visibility_seconds >= 30 }}"
+      - "{{ inputs.max_scan >= 1 }}"
+      - "{{ inputs.default_max_retries >= 1 }}"
+      - "{{ inputs.quarantine_queue_name | length > 0 }}"
+    errorMessage: "Invalid configuration inputs. Specify valid queue names, visibility threshold >= 30 seconds, and positive scan bounds."
+
+  - id: detect_stalled_tasks
+    type: io.kestra.plugin.redis.cli.RedisCLI
+    description: Executes atomic Lua script to inspect unacked hashes, examine visibility timestamps, and classify stranded tasks.
+    host: "{{ inputs.redis_host }}"
+    port: "{{ inputs.redis_port }}"
+    database: "{{ inputs.redis_database }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      detect.lua: "{{ vars.detect_lua }}"
+    commands:
+      - "--eval detect.lua , {{ inputs.queue_name }} {{ inputs.stalled_visibility_seconds }} {{ inputs.max_scan }} {{ inputs.default_max_retries }}"
+
+  - id: evaluate_task_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Correlates detected stranded tasks against historical KV state, tracks persistent failures, and generates an audit manifest.
+    warningOnStdErr: false
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      QUEUE_NAME: "{{ inputs.queue_name }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      AUTO_REMEDIATE: "{{ inputs.auto_remediate }}"
+      DETECT_OUTPUT_RAW: "{{ outputs.detect_stalled_tasks.vars.command_1 }}"
+      PREVIOUS_STATE_JSON: "{{ kv('celery_stalled_tracker_' ~ (inputs.queue_name | slugify), errorOnMissing=false) ?? '{}' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os
+      import sys
+      import json
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      queue_name = os.environ.get("QUEUE_NAME", "celery")
+      dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+      auto_remediate = os.environ.get("AUTO_REMEDIATE", "false").lower() == "true"
+      execution_id = os.environ.get("EXECUTION_ID", "local-exec")
+
+      raw_detect = os.environ.get("DETECT_OUTPUT_RAW", "").strip()
+      if not raw_detect:
+          print("FATAL: Redis detection returned empty output from Celery inspection.", file=sys.stderr)
+          sys.exit(1)
+
+      try:
+          detect_data = json.loads(raw_detect)
+      except Exception as err:
+          print(f"FATAL: Failed to parse Redis detection JSON payload: {err}", file=sys.stderr)
+          sys.exit(1)
+
+      raw_prev = os.environ.get("PREVIOUS_STATE_JSON", "{}").strip()
+      prev_state = {}
+      if raw_prev:
+          try:
+              prev_state = json.loads(raw_prev)
+          except Exception as err:
+              print(f"Warning: Failed to parse previous KV state: {err}")
+              prev_state = {}
+
+      stalled_tasks = detect_data.get("stalled_tasks", [])
+      requeue_candidates = detect_data.get("requeue_candidates", [])
+      quarantine_candidates = detect_data.get("quarantine_candidates", [])
+      total_unacked = detect_data.get("total_unacked", 0)
+      total_ready = detect_data.get("total_ready", 0)
+      stalled_count = len(stalled_tasks)
+
+      prev_stalled_tags = set(prev_state.get("stalled_tags", []))
+      current_stalled_tags = set(t.get("delivery_tag") for t in stalled_tasks)
+
+      persistent_tags = list(current_stalled_tags.intersection(prev_stalled_tags))
+      new_stalled_tags = list(current_stalled_tags - prev_stalled_tags)
+
+      overall_status = "CRITICAL" if len(quarantine_candidates) > 0 else ("WARNING" if stalled_count > 0 else "HEALTHY")
+
+      summary = (
+          f"Celery Queue '{queue_name}': {overall_status} | Ready tasks: {total_ready}, "
+          f"Total unacked: {total_unacked}, Stranded tasks: {stalled_count} "
+          f"(Requeue: {len(requeue_candidates)}, Quarantine DLQ: {len(quarantine_candidates)}, "
+          f"Persistent from prior cycle: {len(persistent_tags)}). Mode: dry_run={dry_run}."
+      )
+      print(summary)
+
+      new_snapshot = {
+          "queue_name": queue_name,
+          "total_ready": total_ready,
+          "total_unacked": total_unacked,
+          "stalled_count": stalled_count,
+          "stalled_tags": list(current_stalled_tags),
+          "requeue_tags": requeue_candidates,
+          "quarantine_tags": quarantine_candidates,
+          "timestamp": now_iso
+      }
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "queue_name": queue_name,
+          "total_ready": total_ready,
+          "total_unacked": total_unacked,
+          "stalled_count": stalled_count,
+          "persistent_count": len(persistent_tags),
+          "new_stalled_count": len(new_stalled_tags),
+          "requeue_candidates": requeue_candidates,
+          "quarantine_candidates": quarantine_candidates,
+          "stalled_tasks": stalled_tasks,
+          "dry_run": dry_run,
+          "auto_remediate": auto_remediate,
+          "evaluated_at": now_iso,
+          "execution_id": execution_id,
+          "summary": summary
+      }
+
+      Kestra.outputs({
+          "overall_status": overall_status,
+          "has_stalled": (stalled_count > 0),
+          "stalled_count": stalled_count,
+          "total_ready": total_ready,
+          "total_unacked": total_unacked,
+          "requeue_tags": requeue_candidates,
+          "quarantine_tags": quarantine_candidates,
+          "persistent_count": len(persistent_tags),
+          "new_snapshot": new_snapshot,
+          "audit_manifest": audit_manifest,
+          "summary": summary
+      })
+
+  - id: save_state_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persists Celery stranded task snapshot into Kestra KV store for historical cycle differential tracking.
+    key: "celery_stalled_tracker_{{ inputs.queue_name | slugify }}"
+    value: "{{ outputs.evaluate_task_telemetry.vars.new_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: handle_stalled_tasks_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether stranded unacknowledged Celery tasks were identified and branches accordingly.
+    condition: "{{ outputs.evaluate_task_telemetry.vars.has_stalled == true }}"
+    then:
+      - id: remediation_mode_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Executes active state mutations when dry_run is false and auto_remediate is authorized.
+        condition: "{{ not inputs.dry_run and inputs.auto_remediate }}"
+        then:
+          - id: pause_for_remediation_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Halts workflow execution for human operator sign-off before modifying Redis queue structures.
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Approve Queue Remediation
+                description: Confirm authorization to re-insert recoverable tasks and quarantine poison pills.
+                defaults: true
+              - id: operator_email
+                type: STRING
+                displayName: Operator Email
+                description: Corporate email address of the approving engineer for audit traceability.
+                defaults: "sre-oncall@company.com"
+              - id: ticket_id
+                type: STRING
+                displayName: Incident Ticket Identifier
+                description: Reference tracking ID for the incident response runbook.
+                defaults: "INC-8492"
+
+          - id: remediate_stalled_tasks
+            type: io.kestra.plugin.redis.cli.RedisCLI
+            description: Atomically evacuates unacked delivery tags, re-injects recoverable tasks into ready queue, and isolates poison pills to DLQ.
+            host: "{{ inputs.redis_host }}"
+            port: "{{ inputs.redis_port }}"
+            database: "{{ inputs.redis_database }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            inputFiles:
+              remediate.lua: "{{ vars.remediate_lua }}"
+            commands:
+              - "--eval remediate.lua {{ inputs.queue_name }} {{ inputs.quarantine_queue_name }} , '{{ outputs.evaluate_task_telemetry.vars.requeue_tags | toJson }}' '{{ outputs.evaluate_task_telemetry.vars.quarantine_tags | toJson }}'"
+
+          - id: verify_remediation
+            type: io.kestra.plugin.redis.cli.RedisCLI
+            description: Post-remediation verification query asserting that targeted delivery tags were purged from unacked hash and index.
+            host: "{{ inputs.redis_host }}"
+            port: "{{ inputs.redis_port }}"
+            database: "{{ inputs.redis_database }}"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            inputFiles:
+              verify.lua: "{{ vars.verify_lua }}"
+            commands:
+              - "--eval verify.lua , '{{ (outputs.evaluate_task_telemetry.vars.requeue_tags + outputs.evaluate_task_telemetry.vars.quarantine_tags) | toJson }}'"
+
+          - id: assert_remediation_success
+            type: io.kestra.plugin.core.execution.Assert
+            description: Fails the execution if post-remediation verification reveals targeted tasks lingering in unacked storage.
+            conditions:
+              - "{{ fromJson(outputs.verify_remediation.vars.command_1).verified == true }}"
+            errorMessage: "CRITICAL: Post-remediation verification failed. Targeted stranded delivery tags remain present in unacked structures."
+
+          - id: log_remediation_success
+            type: io.kestra.plugin.core.log.Log
+            description: Records verified remediation outcome into execution logs.
+            message: "Remediation verified for Celery queue '{{ inputs.queue_name }}'. Requeued: {{ fromJson(outputs.remediate_stalled_tasks.vars.command_1).requeued_count }}, Quarantined to DLQ: {{ fromJson(outputs.remediate_stalled_tasks.vars.command_1).quarantined_count }}."
+
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Logs planned remediation actions when running in read-only dry run mode.
+            message: "Dry run mode active. No Redis keys modified. Planned requeue tags: {{ outputs.evaluate_task_telemetry.vars.requeue_tags | toJson }}. Planned quarantine DLQ tags: {{ outputs.evaluate_task_telemetry.vars.quarantine_tags | toJson }}."
+
+      - id: save_recovery_audit_kv
+        type: io.kestra.plugin.core.kv.Set
+        description: Persists complete incident forensic audit manifest into Kestra KV storage.
+        key: "celery_stalled_audit_{{ inputs.queue_name | slugify }}"
+        value: "{{ outputs.evaluate_task_telemetry.vars.audit_manifest | toJson }}"
+        kvType: JSON
+
+      - id: notify_slack_incident_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches detailed incident notification to Slack with stranded task breakdown and remediation state.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "{{ outputs.evaluate_task_telemetry.vars.overall_status == 'CRITICAL' ? 'danger' : 'warning' }}",
+                "title": "Celery Stranded Task Incident Alert",
+                "text": "*Queue Name:* `{{ inputs.queue_name }}`\n*Overall Status:* `{{ outputs.evaluate_task_telemetry.vars.overall_status }}`\n*Stranded Unacked Tasks:* {{ outputs.evaluate_task_telemetry.vars.stalled_count }}\n*Requeue Candidates:* {{ (outputs.evaluate_task_telemetry.vars.requeue_tags ?? []) | length }}\n*Quarantine DLQ Candidates:* {{ (outputs.evaluate_task_telemetry.vars.quarantine_tags ?? []) | length }}\n*Operational Mode:* `auto_remediate={{ inputs.auto_remediate }}`, `dry_run={{ inputs.dry_run }}`\n*Execution ID:* `{{ execution.id }}`\n\n*Summary:* {{ outputs.evaluate_task_telemetry.vars.summary }}"
+              }
+            ]
+          }
+
+  - id: log_nominal_verdict
+    type: io.kestra.plugin.core.log.Log
+    description: Logs nominal queue health when zero stranded unacknowledged tasks are detected.
+    message: "Celery task queue audit completed for '{{ inputs.queue_name }}'. Status: {{ outputs.evaluate_task_telemetry.vars.overall_status }}. Ready tasks: {{ outputs.evaluate_task_telemetry.vars.total_ready }}, Unacked tasks: {{ outputs.evaluate_task_telemetry.vars.total_unacked }}."
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatches immediate alert if the Celery quarantine and requeue workflow itself encounters an unhandled error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "CRITICAL: Celery unacknowledged task quarantine and requeue guard failed during execution {{ execution.id }}. Inspect Kestra logs immediately."
+      }
+
+extend:
+  title: Celery Unacknowledged Task Quarantine and Requeue Guard
+  metaTitle: Celery Unacknowledged Task Quarantine and Requeue Guard Blueprint
+  shortDescription: Audits Redis-backed Celery queues for stranded unacknowledged tasks, requeues recoverable work, and quarantines poison pills.
+  metaDescription: Inspects Redis-backed Celery queues for stranded unacknowledged tasks, requeuing recoverable jobs and quarantining poison pills to prevent worker crash loops.
+  description: |
+    In distributed Python backend architectures running on Celery with Redis broker transports, worker nodes are vulnerable to abrupt terminations from Out-Of-Memory (OOM) killer events, spot instance preemptions, hardware reboots, and unhandled segfaults. When a worker process crashes mid-execution, Celery's underlying Kombu transport leaves claimed tasks stranded in Redis unacknowledged data structures (`unacked` hash and `unacked_index` sorted set). Under default visibility timeouts, these stranded messages can remain invisible for hours or days, causing business workflows to stall indefinitely. Worse, if a crash was triggered by a poison pill, such as a malformed payload or memory-exhausting payload, subsequent automated redelivery triggers a catastrophic cascade where every surviving worker in the cluster crashes upon claiming the task. This blueprint implements an automated operational guardrail: it interrogates Redis unacknowledged task indexes, evaluates payload headers and retry limits in Python, safely re-injects recoverable tasks into the active queue, quarantines retry-exhausted poison pills to an isolated dead-letter queue behind a human approval gate, verifies post-remediation queue state, and records forensic audit snapshots in Kestra KV storage.
+
+    ## How it works
+    1. A schedule trigger or crash webhook initiates the Celery queue inspection.
+    2. An Assert task validates that configuration parameters, scan ceilings, and threshold bounds satisfy operational constraints.
+    3. An atomic Lua script in `io.kestra.plugin.redis.cli.RedisCLI` queries Redis `unacked` and `unacked_index`, evaluates visibility timestamps against the threshold, decodes message JSON headers, and classifies delivery tags into recoverable items versus retry-exhausted poison pills.
+    4. A Python script evaluates trend progression against historical KV records, computes differential metrics, and prepares an itemized remediation manifest.
+    5. A KV Set task updates the current snapshot for sequential cycle comparison.
+    6. If stranded tasks are detected, an `If` conditional task branches into remediation processing.
+    7. When `auto_remediate` is enabled and `dry_run` is false, a Pause task halts execution for human operator sign-off before Redis keys are altered.
+    8. Upon operator approval, a remediation Lua script atomically pops target delivery tags from `unacked` and `unacked_index`, re-inserts recoverable tasks into the ready queue, and routes poison pills to an isolated dead-letter queue.
+    9. A verification Lua script queries Redis to assert that all targeted delivery tags were successfully cleared from unacknowledged structures.
+    10. An Assert task verifies that zero targeted tags remain, logging verified counts and persisting complete forensic audit manifests into Kestra KV.
+    11. A Slack notification alerts platform engineers with detailed incident metrics.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule / Webhook Trigger] --> ValidateInputs[Assert: Validate Queue Parameters]
+        ValidateInputs --> DetectStalled[RedisCLI: Lua Scan unacked and unacked_index]
+        DetectStalled --> EvalTelemetry[Python Script: Classify Recoverable vs Poison Pills]
+        EvalTelemetry --> SaveState[KV Set: Update Queue State Snapshot]
+        SaveState --> CheckStalled{Stranded Tasks Detected?}
+        CheckStalled -- No --> NominalLog[Log: Queue Nominal]
+        CheckStalled -- Yes --> CheckMode{Dry Run or Auto Remediate?}
+        CheckMode -- Dry Run --> LogPlan[Log: Output Planned Remediation]
+        CheckMode -- Auto Remediate --> PauseApproval[Pause: Operator Sign-off Gate]
+        PauseApproval --> ExecuteRemediation[RedisCLI: Atomic LPUSH Ready / DLQ and HDEL unacked]
+        ExecuteRemediation --> VerifyRemediation[RedisCLI: Assert Delivery Tags Cleared]
+        VerifyRemediation --> PostAssert[Assert: Verification Success]
+        PostAssert --> SaveAudit[KV Set: Persist Forensic Incident Manifest]
+        LogPlan --> SaveAudit
+        SaveAudit --> NotifySlack[Slack Webhook: Incident Report]
+    ```
+
+    ## What you get
+    - Proactive detection of stranded Celery tasks stranded in Redis unacknowledged hashes after worker crashes.
+    - Automated classification isolating recoverable tasks from retry-exhausted poison pills.
+    - Safe operational self-healing atomically requeuing recoverable jobs without restarting Celery broker instances.
+    - Worker protection isolating unprocessable poison pills into a dedicated dead-letter queue to halt crash cascades.
+    - Human-in-the-loop governance pause gates guaranteeing that automated queue mutations occur only with operator approval.
+    - End-to-end verification asserting that remediated delivery tags have been purged from unacknowledged indexes.
+    - Forensic audit persistence recording historical snapshots and incident manifests in Kestra KV storage.
+
+    ## Who it's for
+    - Python Platform Engineers managing high-throughput Celery worker clusters on Redis.
+    - Site Reliability Engineers safeguarding asynchronous task processing against worker OOM crash cascades.
+    - DevOps Teams operating distributed Django, FastAPI, and Flask production microservices.
+    - Data Operations Engineers ensuring asynchronous ETL tasks do not remain stranded in unacknowledged broker state.
+
+    ## Why orchestrate this with Kestra
+    - **Native Redis CLI Integration**: Executes atomic multi-key Lua scripts directly against Redis without deploying external Python daemons.
+    - **Human-in-the-Loop Safeguards**: Combines dry-run defaults with Kestra `Pause` tasks to provide safe operator verification before queue alteration.
+    - **Closed-Loop Verification**: Re-reads Redis post-mutation to programmatically assert that unacknowledged indexes are clean before marking workflows successful.
+    - **Stateful Trend Observability**: Leverages Kestra KV storage to correlate stranded task delivery tags across successive audit cycles.
+    - **Declarative Operations**: Encapsulates incident runbooks into Git-versioned workflow code shared across platform engineering teams.
+
+    ## Use cases
+    - **Worker OOM Incident Recovery**: Automatically clears stranded tasks when Kubernetes worker pods are terminated by Linux OOM killer.
+    - **Poison Pill Crash Loop Prevention**: Isolates corrupted task payloads to dead-letter queues before redelivery can crash surviving workers.
+    - **Visibility Timeout Drift Remediation**: Unfreezes tasks stranded by worker network partitions without waiting for multi-hour visibility timeouts.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `redis_host` | STRING | `localhost` | Hostname or IP address of the target Redis server. |
+    | `redis_port` | INT | `6379` | Port number for the Redis server connection. |
+    | `redis_password` | STRING | `{{ secret('REDIS_PASSWORD') }}` | Authentication credentials for the Redis instance. |
+    | `redis_database` | INT | `0` | Numeric Redis logical database index used by Celery. |
+    | `queue_name` | STRING | `celery` | Name of the Celery task queue list in Redis. |
+    | `stalled_visibility_seconds` | INT | `300` | Elapsed duration past visibility timestamp flagging stranded tasks. |
+    | `max_scan` | INT | `100` | Upper bound on unacknowledged delivery tags inspected per pass. |
+    | `default_max_retries` | INT | `3` | Maximum retry threshold classifying poison pills. |
+    | `quarantine_queue_name` | STRING | `celery.quarantine.dead_letter` | Redis list key where poison-pill tasks are isolated. |
+    | `dry_run` | BOOL | `true` | Audit only without altering Redis keys when true. |
+    | `auto_remediate` | BOOL | `false` | Enable automated requeue and quarantine behind approval gate. |
+
+    ## Expected outputs
+    - `{{ outputs.evaluate_task_telemetry.vars.overall_status }}`: Status classification (`HEALTHY`, `WARNING`, `CRITICAL`).
+    - `{{ outputs.evaluate_task_telemetry.vars.stalled_count }}`: Count of stranded unacknowledged tasks identified.
+    - `{{ outputs.evaluate_task_telemetry.vars.requeue_tags }}`: List of delivery tags queued for re-insertion into active processing.
+    - `{{ outputs.evaluate_task_telemetry.vars.quarantine_tags }}`: List of poison-pill delivery tags quarantined to dead-letter storage.
+    - `{{ outputs.remediate_stalled_tasks.vars.command_1 }}`: JSON response from remediation Lua execution detailing mutated counts.
+
+    ## Prerequisites
+    - Celery application cluster utilizing Redis as broker transport (`redis://` scheme).
+    - Redis server version 5.0+ with Lua scripting enabled.
+    - Network connectivity from Kestra worker nodes to the Redis broker port.
+    - Redis password configured under `REDIS_PASSWORD` secret in Kestra namespace.
+
+    ### Secrets
+    - `REDIS_PASSWORD`: Authentication secret required to connect to the target Redis instance.
+    - `CELERY_GUARD_WEBHOOK_KEY`: Secret API key protecting the on-demand worker crash webhook.
+    - `SLACK_WEBHOOK_URL`: Incoming webhook URL used to dispatch incident notifications.
+
+    ## Quick start
+    1. Configure `REDIS_PASSWORD`, `CELERY_GUARD_WEBHOOK_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Confirm your Celery queue name matches `queue_name` (default is `celery`).
+    3. Trigger a manual execution with `dry_run: true` to verify connectivity and audit active queue unacknowledged depth.
+    4. When stranded tasks are identified, execute with `dry_run: false` and `auto_remediate: true`, reviewing the approval modal before applying mutations.
+    5. Enable `periodic_celery_queue_inspection` schedule to establish continuous background surveillance.
+
+    ## Common pitfalls and troubleshooting
+    - **Redis Key Namespace**: Celery prefixes unacknowledged task hashes as `unacked` and indexes as `unacked_index` under the configured database index. Verify that `redis_database` matches your Celery `broker_url` database path.
+    - **Visibility Timeout Value**: Ensure `stalled_visibility_seconds` exceeds your Celery configuration's `broker_transport_options['visibility_timeout']` to prevent premature requeuing of legitimately running long tasks.
+    - **Corrupted Message Payloads**: If upstream producers push raw strings rather than standard Celery JSON envelopes, the Lua script safely flags them as unparseable and quarantines them to prevent worker exceptions.
+
+    ## How to extend
+    - **Custom Dead-Letter Notifications**: Add an email or PagerDuty dispatch task targeting the on-call platform engineer when poison pills are quarantined.
+    - **Prometheus Metrics Push**: Export stranded task counts and requeue rates to Prometheus Pushgateway for Grafana dashboard visualization.
+    - **Automated Worker Pod Restart**: Trigger a Kubernetes API roll or cloud VM restart task after poison pills are safely quarantined.
+
+    ## Links
+    - [Kestra Redis Plugin Documentation](https://kestra.io/plugins/plugin-redis)
+    - [Kestra Flow Control Documentation](https://kestra.io/plugins/plugin-core/io.kestra.plugin.core.flow.if)
+    - [Kestra Execution Pause Documentation](https://kestra.io/plugins/plugin-core/io.kestra.plugin.core.flow.pause)
+    - [Celery Redis Broker Documentation](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html)
+    - [Celery Task Routing and Retry Guide](https://docs.celeryq.dev/en/stable/userguide/tasks.html)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Incident Response
+  ee: false
+  demo: false
