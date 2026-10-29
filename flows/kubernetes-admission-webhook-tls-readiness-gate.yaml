@@ -1,0 +1,750 @@
+id: kubernetes-admission-webhook-tls-readiness-gate
+namespace: company.platform
+description: Audit mutating and validating admission webhooks, verify their CA bundles and ready service endpoints, and perform live hostname-validated TLS handshakes before cluster changes depend on them.
+
+inputs:
+  - id: api_server_url
+    type: STRING
+    defaults: https://kubernetes.default.svc
+    description: Kubernetes API server URL reachable from the Docker task runner.
+
+  - id: include_webhook_regex
+    type: STRING
+    defaults: ".*"
+    description: Regular expression matched against each webhook name. Only matching webhooks are audited.
+
+  - id: exclude_webhook_regex
+    type: STRING
+    defaults: "^$"
+    description: Regular expression matched after inclusion. Matching webhooks are excluded from the audit.
+
+  - id: minimum_ca_validity_days
+    type: INT
+    defaults: 30
+    min: 0
+    description: Warn when the earliest certificate in a webhook CA bundle expires within this many days.
+
+  - id: minimum_leaf_validity_days
+    type: INT
+    defaults: 30
+    min: 0
+    description: Warn when the certificate returned by a live webhook endpoint expires within this many days.
+
+  - id: require_ca_bundle
+    type: BOOL
+    defaults: true
+    description: Require every selected webhook to carry clientConfig.caBundle instead of relying on the API server's system trust roots.
+
+  - id: perform_tls_probe
+    type: BOOL
+    defaults: true
+    description: Perform a live TLS handshake. Service references are reached through a temporary read-only kubectl port-forward.
+
+  - id: port_forward_timeout_seconds
+    type: INT
+    defaults: 15
+    min: 1
+    max: 60
+    description: Maximum time to wait for each service port-forward to become ready.
+
+  - id: fail_gate
+    type: BOOL
+    defaults: true
+    description: Fail the execution after alerting when a critical readiness finding is present.
+
+  - id: kubectl_image
+    type: STRING
+    defaults: alpine/k8s:1.34.1@sha256:ec714df3813b5405292860f8a1c55c5727bf8c33c88992f1e981efad8065547f
+    description: Pinned tooling image containing kubectl, jq and Python for cluster inspection and TLS probing.
+
+  - id: docker_network_mode
+    type: STRING
+    defaults: bridge
+    description: Docker network used by inspection containers. It must be able to reach the Kubernetes API server and direct URL webhooks.
+
+triggers:
+  - id: daily_readiness_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 7 * * *"
+    disabled: true
+    description: Disabled until RBAC, network access and Slack delivery have been verified with a manual execution.
+
+tasks:
+  - id: collect_cluster_state
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Read both webhook configuration kinds plus Services and EndpointSlices without changing the cluster.
+    containerImage: "{{ inputs.kubectl_image }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.docker_network_mode }}"
+    env:
+      API_SERVER_URL: "{{ inputs.api_server_url }}"
+      K8S_CA_CERT_DATA: "{{ secret('K8S_CA_CERT_DATA') }}"
+      K8S_TOKEN: "{{ secret('K8S_TOKEN') }}"
+    outputFiles:
+      - mutating.json
+      - validating.json
+      - services.json
+      - endpointslices.json
+    commands:
+      - |
+        set -euo pipefail
+        printf '%s' "$K8S_CA_CERT_DATA" | base64 -d > cluster-ca.crt
+        chmod 600 cluster-ca.crt
+
+        kubectl config set-cluster target \
+          --kubeconfig kubeconfig.yaml \
+          --server "$API_SERVER_URL" \
+          --certificate-authority cluster-ca.crt \
+          --embed-certs=true >/dev/null
+        kubectl config set-credentials auditor \
+          --kubeconfig kubeconfig.yaml \
+          --token "$K8S_TOKEN" >/dev/null
+        kubectl config set-context audit \
+          --kubeconfig kubeconfig.yaml \
+          --cluster target \
+          --user auditor >/dev/null
+        kubectl config use-context audit --kubeconfig kubeconfig.yaml >/dev/null
+        chmod 600 kubeconfig.yaml
+
+        kubectl --kubeconfig kubeconfig.yaml get mutatingwebhookconfigurations.admissionregistration.k8s.io -o json > mutating.json
+        kubectl --kubeconfig kubeconfig.yaml get validatingwebhookconfigurations.admissionregistration.k8s.io -o json > validating.json
+        kubectl --kubeconfig kubeconfig.yaml get services --all-namespaces -o json > services.json
+        kubectl --kubeconfig kubeconfig.yaml get endpointslices.discovery.k8s.io --all-namespaces -o json > endpointslices.json
+
+        test -s mutating.json
+        test -s validating.json
+        test -s services.json
+        test -s endpointslices.json
+
+  - id: build_readiness_plan
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate CA bundles, resolve service ports and ready endpoints, and build the minimal plan for live TLS probes.
+    containerImage: python:3.12-slim
+    inputFiles:
+      mutating.json: "{{ outputs.collect_cluster_state.outputFiles['mutating.json'] }}"
+      validating.json: "{{ outputs.collect_cluster_state.outputFiles['validating.json'] }}"
+      services.json: "{{ outputs.collect_cluster_state.outputFiles['services.json'] }}"
+      endpointslices.json: "{{ outputs.collect_cluster_state.outputFiles['endpointslices.json'] }}"
+    outputFiles:
+      - static-assessment.json
+      - probe-plan.json
+    env:
+      INCLUDE_WEBHOOK_REGEX: "{{ inputs.include_webhook_regex }}"
+      EXCLUDE_WEBHOOK_REGEX: "{{ inputs.exclude_webhook_regex }}"
+      MINIMUM_CA_VALIDITY_DAYS: "{{ inputs.minimum_ca_validity_days }}"
+      REQUIRE_CA_BUNDLE: "{{ inputs.require_ca_bundle }}"
+    script: |
+      import base64
+      import json
+      import os
+      import re
+      import ssl
+      import tempfile
+      import time
+      from urllib.parse import urlparse
+
+
+      def load(path):
+          with open(path, encoding="utf-8") as handle:
+              return json.load(handle)
+
+
+      include = re.compile(os.environ["INCLUDE_WEBHOOK_REGEX"])
+      exclude = re.compile(os.environ["EXCLUDE_WEBHOOK_REGEX"])
+      minimum_ca_days = int(os.environ["MINIMUM_CA_VALIDITY_DAYS"])
+      require_ca = os.environ["REQUIRE_CA_BUNDLE"].lower() == "true"
+
+      services_doc = load("services.json")
+      slices_doc = load("endpointslices.json")
+      services = {
+          (item["metadata"]["namespace"], item["metadata"]["name"]): item
+          for item in services_doc.get("items", [])
+      }
+      slices = {}
+      for item in slices_doc.get("items", []):
+          key = (
+              item["metadata"].get("namespace", "default"),
+              item["metadata"].get("labels", {}).get("kubernetes.io/service-name", ""),
+          )
+          slices.setdefault(key, []).append(item)
+
+      findings = []
+      probes = []
+      selected = 0
+
+
+      def add_finding(code, severity, kind, configuration, webhook, message):
+          findings.append(
+              {
+                  "code": code,
+                  "severity": severity,
+                  "kind": kind,
+                  "configuration": configuration,
+                  "webhook": webhook,
+                  "message": message,
+              }
+          )
+
+
+      def decode_ca_bundle(encoded, kind, configuration, webhook):
+          if not encoded:
+              if require_ca:
+                  add_finding(
+                      "CA_BUNDLE_MISSING",
+                      "CRITICAL",
+                      kind,
+                      configuration,
+                      webhook,
+                      "clientConfig.caBundle is empty, so the API server cannot pin the webhook's private CA.",
+                  )
+              return None, None
+          try:
+              pem = base64.b64decode(encoded, validate=True)
+          except (ValueError, TypeError) as exc:
+              add_finding("CA_BUNDLE_INVALID_BASE64", "CRITICAL", kind, configuration, webhook, str(exc))
+              return None, None
+
+          blocks = re.findall(
+              rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+              pem,
+              flags=re.DOTALL,
+          )
+          if not blocks:
+              add_finding(
+                  "CA_BUNDLE_HAS_NO_PEM_CERTIFICATE",
+                  "CRITICAL",
+                  kind,
+                  configuration,
+                  webhook,
+                  "The decoded CA bundle contains no PEM certificate.",
+              )
+              return pem, None
+
+          expiries = []
+          for block in blocks:
+              try:
+                  with tempfile.NamedTemporaryFile(suffix=".pem") as handle:
+                      handle.write(block + b"\n")
+                      handle.flush()
+                      decoded = ssl._ssl._test_decode_cert(handle.name)
+                  expiries.append(ssl.cert_time_to_seconds(decoded["notAfter"]))
+              except (OSError, KeyError, ValueError, ssl.SSLError) as exc:
+                  add_finding("CA_CERTIFICATE_UNREADABLE", "CRITICAL", kind, configuration, webhook, str(exc))
+                  return pem, None
+
+          earliest = min(expiries)
+          days_left = int((earliest - time.time()) // 86400)
+          if days_left < 0:
+              add_finding(
+                  "CA_CERTIFICATE_EXPIRED",
+                  "CRITICAL",
+                  kind,
+                  configuration,
+                  webhook,
+                  f"The earliest CA certificate expired {-days_left} day(s) ago.",
+              )
+          elif days_left < minimum_ca_days:
+              add_finding(
+                  "CA_CERTIFICATE_EXPIRING",
+                  "WARNING",
+                  kind,
+                  configuration,
+                  webhook,
+                  f"The earliest CA certificate expires in {days_left} day(s), below the {minimum_ca_days}-day threshold.",
+              )
+          return pem, days_left
+
+
+      def resolve_service_port(service, requested):
+          requested = int(requested or 443)
+          for port in service.get("spec", {}).get("ports", []):
+              if int(port.get("port", -1)) == requested:
+                  return requested
+          return None
+
+
+      def ready_endpoint_count(namespace, service_name):
+          count = 0
+          for endpoint_slice in slices.get((namespace, service_name), []):
+              for endpoint in endpoint_slice.get("endpoints", []):
+                  if endpoint.get("conditions", {}).get("ready") is not False:
+                      count += len(endpoint.get("addresses", []))
+          return count
+
+
+      documents = [
+          ("MutatingWebhookConfiguration", load("mutating.json")),
+          ("ValidatingWebhookConfiguration", load("validating.json")),
+      ]
+      for kind, document in documents:
+          for configuration_item in document.get("items", []):
+              configuration = configuration_item["metadata"]["name"]
+              for webhook_item in configuration_item.get("webhooks", []):
+                  webhook = webhook_item.get("name", "")
+                  if not include.search(webhook) or exclude.search(webhook):
+                      continue
+                  selected += 1
+                  client = webhook_item.get("clientConfig", {})
+                  ca_pem, ca_days_left = decode_ca_bundle(
+                      client.get("caBundle", ""), kind, configuration, webhook
+                  )
+
+                  base_probe = {
+                      "kind": kind,
+                      "configuration": configuration,
+                      "webhook": webhook,
+                      "ca_bundle": client.get("caBundle", ""),
+                      "ca_days_left": ca_days_left,
+                  }
+                  if "service" in client:
+                      reference = client["service"]
+                      namespace = reference.get("namespace", "default")
+                      service_name = reference.get("name", "")
+                      service = services.get((namespace, service_name))
+                      if service is None:
+                          add_finding(
+                              "SERVICE_NOT_FOUND",
+                              "CRITICAL",
+                              kind,
+                              configuration,
+                              webhook,
+                              f"Service {namespace}/{service_name} does not exist.",
+                          )
+                          continue
+                      service_port = resolve_service_port(service, reference.get("port", 443))
+                      if service_port is None:
+                          add_finding(
+                              "SERVICE_PORT_NOT_FOUND",
+                              "CRITICAL",
+                              kind,
+                              configuration,
+                              webhook,
+                              f"Service {namespace}/{service_name} does not expose port {reference.get('port', 443)}.",
+                          )
+                          continue
+                      ready = ready_endpoint_count(namespace, service_name)
+                      if ready == 0:
+                          add_finding(
+                              "NO_READY_ENDPOINTS",
+                              "CRITICAL",
+                              kind,
+                              configuration,
+                              webhook,
+                              f"Service {namespace}/{service_name} has no ready EndpointSlice addresses.",
+                          )
+                          continue
+                      probes.append(
+                          {
+                              **base_probe,
+                              "type": "service",
+                              "namespace": namespace,
+                              "service": service_name,
+                              "port": service_port,
+                              "server_name": f"{service_name}.{namespace}.svc",
+                              "ready_endpoints": ready,
+                          }
+                      )
+                  elif "url" in client:
+                      parsed = urlparse(client["url"])
+                      if parsed.scheme != "https" or not parsed.hostname:
+                          add_finding(
+                              "WEBHOOK_URL_NOT_HTTPS",
+                              "CRITICAL",
+                              kind,
+                              configuration,
+                              webhook,
+                              f"Webhook URL must be HTTPS with a hostname: {client['url']}",
+                          )
+                          continue
+                      probes.append(
+                          {
+                              **base_probe,
+                              "type": "url",
+                              "host": parsed.hostname,
+                              "port": parsed.port or 443,
+                              "server_name": parsed.hostname,
+                          }
+                      )
+                  else:
+                      add_finding(
+                          "CLIENT_TARGET_MISSING",
+                          "CRITICAL",
+                          kind,
+                          configuration,
+                          webhook,
+                          "clientConfig has neither service nor url.",
+                      )
+
+      if selected == 0:
+          add_finding(
+              "NO_WEBHOOKS_SELECTED",
+              "WARNING",
+              "AdmissionWebhook",
+              "n/a",
+              "n/a",
+              "No webhook names matched the include/exclude filters.",
+          )
+
+      static = {"selected": selected, "probe_count": len(probes), "findings": findings}
+      with open("static-assessment.json", "w", encoding="utf-8") as handle:
+          json.dump(static, handle, indent=2)
+      with open("probe-plan.json", "w", encoding="utf-8") as handle:
+          json.dump(probes, handle, indent=2)
+
+  - id: probe_tls_and_finalize
+    type: io.kestra.plugin.scripts.python.Script
+    description: Port-forward each service reference, perform a hostname-verified TLS handshake, inspect the leaf certificate and combine live results with static findings.
+    containerImage: "{{ inputs.kubectl_image }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.docker_network_mode }}"
+    inputFiles:
+      static-assessment.json: "{{ outputs.build_readiness_plan.outputFiles['static-assessment.json'] }}"
+      probe-plan.json: "{{ outputs.build_readiness_plan.outputFiles['probe-plan.json'] }}"
+    outputFiles:
+      - readiness-report.json
+    env:
+      API_SERVER_URL: "{{ inputs.api_server_url }}"
+      K8S_CA_CERT_DATA: "{{ secret('K8S_CA_CERT_DATA') }}"
+      K8S_TOKEN: "{{ secret('K8S_TOKEN') }}"
+      PERFORM_TLS_PROBE: "{{ inputs.perform_tls_probe }}"
+      PORT_FORWARD_TIMEOUT_SECONDS: "{{ inputs.port_forward_timeout_seconds }}"
+      MINIMUM_LEAF_VALIDITY_DAYS: "{{ inputs.minimum_leaf_validity_days }}"
+    script: |
+      import base64
+      import json
+      import os
+      import socket
+      import ssl
+      import subprocess
+      import time
+
+
+      def load(path):
+          with open(path, encoding="utf-8") as handle:
+              return json.load(handle)
+
+
+      static = load("static-assessment.json")
+      plan = load("probe-plan.json")
+      findings = list(static.get("findings", []))
+      results = []
+      perform_probe = os.environ["PERFORM_TLS_PROBE"].lower() == "true"
+      minimum_leaf_days = int(os.environ["MINIMUM_LEAF_VALIDITY_DAYS"])
+
+
+      def add_finding(entry, code, severity, message):
+          findings.append(
+              {
+                  "code": code,
+                  "severity": severity,
+                  "kind": entry["kind"],
+                  "configuration": entry["configuration"],
+                  "webhook": entry["webhook"],
+                  "message": message,
+              }
+          )
+
+
+      def run(command):
+          subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+
+
+      kubeconfig = "kubeconfig.yaml"
+      if perform_probe and plan:
+          with open("cluster-ca.crt", "wb") as handle:
+              handle.write(base64.b64decode(os.environ["K8S_CA_CERT_DATA"], validate=True))
+          os.chmod("cluster-ca.crt", 0o600)
+          run(
+              [
+                  "kubectl",
+                  "config",
+                  "set-cluster",
+                  "target",
+                  "--kubeconfig",
+                  kubeconfig,
+                  "--server",
+                  os.environ["API_SERVER_URL"],
+                  "--certificate-authority",
+                  "cluster-ca.crt",
+                  "--embed-certs=true",
+              ]
+          )
+          run(
+              [
+                  "kubectl",
+                  "config",
+                  "set-credentials",
+                  "auditor",
+                  "--kubeconfig",
+                  kubeconfig,
+                  "--token",
+                  os.environ["K8S_TOKEN"],
+              ]
+          )
+          run(
+              [
+                  "kubectl",
+                  "config",
+                  "set-context",
+                  "audit",
+                  "--kubeconfig",
+                  kubeconfig,
+                  "--cluster",
+                  "target",
+                  "--user",
+                  "auditor",
+              ]
+          )
+          run(["kubectl", "config", "use-context", "audit", "--kubeconfig", kubeconfig])
+          os.chmod(kubeconfig, 0o600)
+
+      for entry in plan:
+          result = {
+              "kind": entry["kind"],
+              "configuration": entry["configuration"],
+              "webhook": entry["webhook"],
+              "server_name": entry["server_name"],
+              "probed": perform_probe,
+          }
+          if not perform_probe:
+              result["verified"] = None
+              results.append(result)
+              continue
+
+          port_forward = None
+          try:
+              host = entry.get("host")
+              port = int(entry["port"])
+              if entry["type"] == "service":
+                  listener = socket.socket()
+                  listener.bind(("127.0.0.1", 0))
+                  local_port = listener.getsockname()[1]
+                  listener.close()
+                  port_forward = subprocess.Popen(
+                      [
+                          "kubectl",
+                          "--kubeconfig",
+                          kubeconfig,
+                          "--namespace",
+                          entry["namespace"],
+                          "port-forward",
+                          f"service/{entry['service']}",
+                          f"{local_port}:{port}",
+                          "--address",
+                          "127.0.0.1",
+                      ],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  host = "127.0.0.1"
+                  port = local_port
+                  deadline = time.time() + int(os.environ["PORT_FORWARD_TIMEOUT_SECONDS"])
+                  while time.time() < deadline:
+                      if port_forward.poll() is not None:
+                          output = port_forward.stdout.read() if port_forward.stdout else ""
+                          raise RuntimeError("kubectl port-forward exited: " + output[-300:])
+                      try:
+                          with socket.create_connection((host, port), timeout=0.5):
+                              break
+                      except OSError:
+                          time.sleep(0.25)
+                  else:
+                      raise TimeoutError("kubectl port-forward did not become ready before the timeout")
+
+              ca_bundle = entry.get("ca_bundle", "")
+              if ca_bundle:
+                  ca_pem = base64.b64decode(ca_bundle, validate=True).decode("ascii")
+                  context = ssl.create_default_context(cadata=ca_pem)
+              else:
+                  context = ssl.create_default_context()
+              context.check_hostname = True
+              with socket.create_connection((host, port), timeout=5) as connection:
+                  with context.wrap_socket(connection, server_hostname=entry["server_name"]) as tls:
+                      certificate = tls.getpeercert()
+                      protocol = tls.version()
+              expires_at = ssl.cert_time_to_seconds(certificate["notAfter"])
+              days_left = int((expires_at - time.time()) // 86400)
+              result.update({"verified": True, "protocol": protocol, "leaf_days_left": days_left})
+              if days_left < 0:
+                  add_finding(entry, "LEAF_CERTIFICATE_EXPIRED", "CRITICAL", f"The served certificate expired {-days_left} day(s) ago.")
+              elif days_left < minimum_leaf_days:
+                  add_finding(
+                      entry,
+                      "LEAF_CERTIFICATE_EXPIRING",
+                      "WARNING",
+                      f"The served certificate expires in {days_left} day(s), below the {minimum_leaf_days}-day threshold.",
+                  )
+          except Exception as exc:
+              result.update({"verified": False, "error": str(exc)[:400]})
+              add_finding(entry, "TLS_HANDSHAKE_FAILED", "CRITICAL", str(exc)[:400])
+          finally:
+              if port_forward is not None and port_forward.poll() is None:
+                  port_forward.terminate()
+                  try:
+                      port_forward.wait(timeout=3)
+                  except subprocess.TimeoutExpired:
+                      port_forward.kill()
+                      port_forward.wait(timeout=3)
+          results.append(result)
+
+      critical_count = sum(item["severity"] == "CRITICAL" for item in findings)
+      warning_count = sum(item["severity"] == "WARNING" for item in findings)
+      status = "FAIL" if critical_count else ("WARNING" if warning_count else "PASS")
+      report = {
+          "status": status,
+          "selected": static.get("selected", 0),
+          "probed": sum(result.get("probed") is True for result in results),
+          "verified": sum(result.get("verified") is True for result in results),
+          "critical_count": critical_count,
+          "warning_count": warning_count,
+          "findings": findings,
+          "tls_results": results,
+      }
+      with open("readiness-report.json", "w", encoding="utf-8") as handle:
+          json.dump(report, handle, indent=2)
+      print("::" + json.dumps({"outputs": report}, separators=(",", ":")) + "::")
+
+  - id: route_gate_result
+    type: io.kestra.plugin.core.flow.Switch
+    description: Log a passing gate, alert on warnings, and optionally stop downstream work on critical readiness failures.
+    value: "{{ outputs.probe_tls_and_finalize.vars.status }}"
+    cases:
+      PASS:
+        - id: log_ready
+          type: io.kestra.plugin.core.log.Log
+          message: "Admission webhook TLS readiness gate passed: selected={{ outputs.probe_tls_and_finalize.vars.selected }} verified={{ outputs.probe_tls_and_finalize.vars.verified }}."
+      WARNING:
+        - id: alert_warning
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            :warning: *Kubernetes admission webhook TLS readiness warning*
+            Selected: `{{ outputs.probe_tls_and_finalize.vars.selected }}` | Probed: `{{ outputs.probe_tls_and_finalize.vars.probed }}` | Warnings: `{{ outputs.probe_tls_and_finalize.vars.warning_count }}`
+            {% for item in outputs.probe_tls_and_finalize.vars.findings %}
+            • *{{ item.code }}* `{{ item.webhook }}`: {{ item.message }}
+            {% endfor %}
+            Execution: `{{ execution.id }}`
+      FAIL:
+        - id: alert_failure
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            :rotating_light: *Kubernetes admission webhook TLS readiness failed*
+            Selected: `{{ outputs.probe_tls_and_finalize.vars.selected }}` | Verified: `{{ outputs.probe_tls_and_finalize.vars.verified }}` | Critical: `{{ outputs.probe_tls_and_finalize.vars.critical_count }}`
+            {% for item in outputs.probe_tls_and_finalize.vars.findings %}
+            • *{{ item.severity }} / {{ item.code }}* `{{ item.webhook }}`: {{ item.message }}
+            {% endfor %}
+            Execution: `{{ execution.id }}`
+        - id: enforce_gate
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ inputs.fail_gate }}"
+          then:
+            - id: stop_downstream
+              type: io.kestra.plugin.core.execution.Fail
+              errorMessage: "Admission webhook TLS readiness failed with {{ outputs.probe_tls_and_finalize.vars.critical_count }} critical finding(s)."
+    defaults:
+      - id: reject_unknown_status
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Unexpected admission webhook readiness status: {{ outputs.probe_tls_and_finalize.vars.status }}"
+
+errors:
+  - id: alert_gate_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when cluster collection or report generation fails, because unknown admission health must not be treated as ready.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":warning: Admission webhook TLS readiness inspection failed in execution `{{ execution.id }}`. Check Kubernetes connectivity, RBAC and task logs; readiness is unknown."
+
+outputs:
+  - id: status
+    type: STRING
+    value: "{{ outputs.probe_tls_and_finalize.vars.status }}"
+
+  - id: findings
+    type: JSON
+    value: "{{ outputs.probe_tls_and_finalize.vars.findings }}"
+
+  - id: report
+    type: FILE
+    value: "{{ outputs.probe_tls_and_finalize.outputFiles['readiness-report.json'] }}"
+
+extend:
+  title: Kubernetes Admission Webhook TLS Readiness Gate
+  metaTitle: Kubernetes Admission Webhook TLS Readiness Gate | Kestra
+  shortDescription: Verify admission webhook CA expiry, service endpoints and live hostname-validated TLS before broken webhooks block Kubernetes API operations.
+  metaDescription: Gate Kubernetes changes on admission webhook CA validity, ready endpoints and live hostname-verified TLS handshakes with Kestra.
+  description: |
+    Admission webhooks sit synchronously in the Kubernetes API request path. A stale CA bundle, certificate hostname mismatch or Service with no ready endpoint can reject or delay every matching deployment even while the webhook configuration itself looks valid. This blueprint audits both mutating and validating webhooks and proves that selected endpoints can complete the TLS handshake the API server expects.
+
+    ## How it works
+
+    1. The disabled daily schedule starts the gate after operators verify credentials, network access and Slack delivery manually.
+    2. `collect_cluster_state` builds a mode-600 kubeconfig from secret-backed CA and token values, then reads MutatingWebhookConfigurations, ValidatingWebhookConfigurations, Services and EndpointSlices across the cluster. It performs no Kubernetes write.
+    3. `build_readiness_plan` applies the include/exclude filters, base64-decodes every selected CA bundle, reads each PEM certificate's expiry, resolves service ports and requires at least one ready EndpointSlice address. URL targets must use HTTPS.
+    4. `probe_tls_and_finalize` opens a temporary `kubectl port-forward` for each service target, or connects directly to URL targets. Python's TLS verifier uses the webhook's own CA bundle and the exact service DNS name or URL hostname, catching untrusted issuers and SAN mismatches. The port-forward process is always terminated after the handshake.
+    5. The final report combines static and live findings into `PASS`, `WARNING` or `FAIL`. Warnings alert Slack. Critical findings alert Slack and, when `fail_gate` is true, stop downstream work with a Fail task.
+    6. The execution retains a structured JSON report with every finding and TLS result. Flow-level errors separately alert because an incomplete inspection is not a passing gate.
+
+    ## What you get
+
+    - Coverage of both mutating and validating admission webhook configurations.
+    - Early warning for expiring CA bundles and served leaf certificates.
+    - Critical findings for missing Services, missing service ports, zero ready endpoints, invalid targets, and failed hostname-verified TLS handshakes.
+    - A reusable status output and JSON report suitable for deployment or cluster-upgrade gates.
+    - Read-only cluster behavior: the flow lists resources and uses port-forward; it never invokes a webhook endpoint or changes a Kubernetes object.
+
+    ## Who it's for
+
+    - Kubernetes platform teams operating policy engines, service-mesh injectors, certificate managers and custom admission controllers.
+    - SREs preventing API-server request failures during webhook certificate rotation or controller maintenance.
+    - Release engineers who need an admission-control preflight before cluster-wide deployments.
+
+    ## Why orchestrate this with Kestra
+
+    A static manifest check cannot prove the Service has ready backends or that its live certificate matches the API server's expected hostname and CA. Kestra combines cluster inventory, certificate parsing, network verification, alerting and an enforceable release decision in one auditable execution. Inputs let the same flow target one webhook, one vendor or the entire cluster without maintaining separate scripts.
+
+    ## Prerequisites
+
+    - A Kubernetes API server reachable from the Docker task runner.
+    - RBAC to list mutating and validating webhook configurations, Services and EndpointSlices cluster-wide; live service probes also require `get` on Pods and `create` on `pods/portforward`.
+    - Docker task-runner access to pull the pinned `alpine/k8s` image.
+    - Network access to direct URL webhook targets when those are selected.
+
+    ### Secrets
+
+    - `K8S_CA_CERT_DATA`: base64-encoded PEM cluster CA, such as the kubeconfig `certificate-authority-data` value.
+    - `K8S_TOKEN`: bearer token for the read-only auditor service account plus port-forward permission.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used for warnings, failures and inspection errors.
+
+    ## Quick start
+
+    1. Create a service account and bind only the read/list and port-forward permissions listed above.
+    2. Add the cluster CA, token and Slack webhook as Kestra secrets.
+    3. Set `api_server_url` and `docker_network_mode` so the task containers can reach the cluster.
+    4. Start with `include_webhook_regex` matching one non-critical webhook and `fail_gate: false`; inspect `readiness-report.json` and confirm the TLS result is verified.
+    5. Expand the filter, restore `fail_gate: true`, and enable the schedule or call the flow before cluster changes.
+
+    ## How to extend
+
+    - Run the gate as a subflow before Kubernetes upgrades, policy-controller rollouts or certificate rotations.
+    - Store report summaries in Kestra KV and alert only on new or changed findings.
+    - Add organization-specific checks for `failurePolicy`, `timeoutSeconds`, namespace selectors or approved URL domains without changing the TLS probe.
+    - Send critical findings to an incident system while routing certificate-expiry warnings to a maintenance backlog.
+
+    ## Links
+
+    - [Kubernetes dynamic admission control](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
+    - [Kubernetes webhook configuration API](https://kubernetes.io/docs/reference/generated/kubernetes-api/)
+    - [kubectl port-forward](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_port-forward/)
+    - [Kestra Python Script task](https://kestra.io/plugins/plugin-script-python/tasks/io.kestra.plugin.scripts.python.script)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-notifications-slack)
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Approval Gates
+    - Monitoring & Alerting
+  ee: false
+  demo: false
