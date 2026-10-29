@@ -1,0 +1,388 @@
+id: nats-jetstream-mirror-cluster-migration-verified-cutover
+namespace: company.infrastructure
+
+description: |
+  Moves durable JetStream consumers from a source NATS cluster to a target
+  cluster that already mirrors the source stream natively, refusing the
+  cutover unless the mirror has fully caught up, capturing each consumer's
+  exact acknowledged sequence on the source, recreating it on the target at
+  that precise stream sequence after operator approval, then reading every
+  new consumer back to verify the starting sequence actually matches before
+  declaring success. The source stream and its consumers are never modified.
+
+inputs:
+  - id: source_nats_url
+    type: STRING
+    displayName: "Source NATS Server URL"
+    description: NATS server URL(s) for the source cluster, e.g. nats://source.internal:4222.
+  - id: target_nats_url
+    type: STRING
+    displayName: "Target NATS Server URL"
+    description: NATS server URL(s) for the target cluster, which already runs a stream mirroring source_stream.
+  - id: source_stream
+    type: STRING
+    displayName: "Source Stream Name"
+    description: The JetStream stream on the source cluster whose consumers are being migrated.
+  - id: target_stream
+    type: STRING
+    displayName: "Target Mirror Stream Name"
+    description: The JetStream stream on the target cluster that mirrors source_stream (created ahead of time with `nats stream add --mirror=<source_stream>`).
+  - id: consumer_names
+    type: ARRAY
+    itemType: STRING
+    displayName: "Durable Consumer Names"
+    description: Durable consumer names on the source stream to migrate to the target mirror, resuming each at its exact last-acknowledged sequence.
+
+
+tasks:
+  - id: inspect_source_and_mirror
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Reads real JetStream state from both clusters via the official nats CLI (natsio/nats-box image) - the stream info JSON directly reflects nats-server's own StreamInfo/StreamState/StreamSourceInfo structs, confirmed from nats-server's source.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: natsio/nats-box:latest
+    outputFiles:
+      - "source_stream.json"
+      - "target_stream.json"
+    env:
+      NATS_URL: "{{ inputs.source_nats_url }}"
+      NATS_CREDS: "{{ secret('SOURCE_NATS_CREDS') }}"
+    commands:
+      - nats stream info "{{ inputs.source_stream }}" --json > source_stream.json
+      - NATS_URL="{{ inputs.target_nats_url }}" NATS_CREDS="{{ secret('TARGET_NATS_CREDS') }}" nats stream info "{{ inputs.target_stream }}" --json > target_stream.json
+
+  - id: evaluate_mirror_readiness
+    type: io.kestra.plugin.scripts.python.Script
+    description: Refuses the cutover unless the target is a real mirror of the named source stream and has fully caught up (mirror.lag == 0), confirmed from nats-server's own StreamSourceInfo.Lag field - the same role the Kafka reference blueprint's "quiet check" plays before it allows a cutover.
+    inputFiles:
+      source_stream.json: "{{ outputs.inspect_source_and_mirror.outputFiles['source_stream.json'] }}"
+      target_stream.json: "{{ outputs.inspect_source_and_mirror.outputFiles['target_stream.json'] }}"
+    script: |
+      import json
+
+      with open("source_stream.json") as f:
+          source = json.load(f)
+      with open("target_stream.json") as f:
+          target = json.load(f)
+
+      source_state = source.get("state", {})
+      target_mirror = target.get("mirror")
+
+      refusal_reasons = []
+
+      if target_mirror is None:
+          refusal_reasons.append("Target stream has no mirror configuration at all.")
+      else:
+          mirror_name = target_mirror.get("name")
+          mirror_lag = target_mirror.get("lag", -1)
+          if mirror_name != "{{ inputs.source_stream }}":
+              refusal_reasons.append(
+                  f"Target stream mirrors '{mirror_name}', not the requested source '{{ inputs.source_stream }}'."
+              )
+          if mirror_lag != 0:
+              refusal_reasons.append(
+                  f"Target mirror is not caught up: lag={mirror_lag} messages behind the source."
+              )
+
+      is_safe = len(refusal_reasons) == 0
+
+      print("::" + json.dumps({
+          "outputs": {
+              "is_safe": is_safe,
+              "refusal_reasons": refusal_reasons,
+              "source_first_seq": source_state.get("first_seq"),
+              "source_last_seq": source_state.get("last_seq"),
+              "source_messages": source_state.get("messages"),
+          }
+      }) + "::")
+
+  - id: evaluate_safety_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Stops the whole migration before touching any consumer if the mirror is not in a provably safe state.
+    condition: "{{ outputs.evaluate_mirror_readiness.vars.is_safe == false }}"
+    then:
+      - id: alert_unsafe_to_cutover
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Refuses and explains exactly why, instead of silently skipping or half-applying.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "NATS JetStream cutover REFUSED for stream {{ inputs.source_stream }} -> {{ inputs.target_stream }}. Reasons: {{ outputs.evaluate_mirror_readiness.vars.refusal_reasons | toJson }}. Execution {{ execution.id }}."
+          }
+      - id: fail_unsafe_cutover
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stops the flow here; nothing downstream runs when the mirror is not safely caught up.
+        errorMessage: "Target mirror is not in a safe state for cutover. See the Slack alert and this execution's logs for the exact reasons."
+
+  - id: capture_consumer_positions
+    type: io.kestra.plugin.core.flow.Loop
+    description: Reads each source consumer's real AckFloor.Stream sequence - confirmed from nats-server's ConsumerInfo/SequenceInfo structs - which is the exact point the new target consumer must resume from to avoid a gap or a duplicate redelivery.
+    values: "{{ inputs.consumer_names }}"
+    concurrencyLimit: 1
+    outputs:
+      - id: consumer_name
+        type: STRING
+        value: "{{ item.value }}"
+      - id: ack_floor_seq
+        type: INT
+        value: "{{ outputs.read_source_consumer_info.vars.ack_floor_seq }}"
+    tasks:
+      - id: fetch_source_consumer_info
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: natsio/nats-box:latest
+        outputFiles:
+          - "consumer_info.json"
+        env:
+          NATS_URL: "{{ inputs.source_nats_url }}"
+          NATS_CREDS: "{{ secret('SOURCE_NATS_CREDS') }}"
+        commands:
+          - nats consumer info "{{ inputs.source_stream }}" "{{ item.value }}" --json > consumer_info.json
+
+      - id: read_source_consumer_info
+        type: io.kestra.plugin.scripts.python.Script
+        inputFiles:
+          consumer_info.json: "{{ outputs.fetch_source_consumer_info.outputFiles['consumer_info.json'] }}"
+        script: |
+          import json
+
+          with open("consumer_info.json") as f:
+              info = json.load(f)
+
+          ack_floor_seq = info.get("ack_floor", {}).get("stream_seq", 0)
+
+          print("::" + json.dumps({
+              "outputs": {
+                  "ack_floor_seq": ack_floor_seq,
+              }
+          }) + "::")
+
+  - id: save_migration_plan_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persists every consumer's captured source ack-floor sequence before anything on the target is touched, as the audit record for this cutover.
+    key: "nats_mirror_cutover_{{ inputs.source_stream | slugify }}_to_{{ inputs.target_stream | slugify }}"
+    value: "{{ outputs.capture_consumer_positions.outputs | toJson }}"
+    kvType: JSON
+
+  - id: pause_for_operator_approval
+    type: io.kestra.plugin.core.flow.Pause
+    description: Waits indefinitely for an operator to review the captured sequences before any consumer is created on the target cluster. No pauseDuration is set, so an unattended execution waits rather than silently proceeding.
+
+  - id: apply_cutover
+    type: io.kestra.plugin.core.flow.Loop
+    description: Creates each consumer on the target mirror starting at the exact next sequence after the source's ack floor, confirmed from natscli's own setStartPolicy source - a plain numeric --deliver value sets DeliverPolicy=by_start_sequence and OptStartSeq to that number. The loop iterates over capture_consumer_positions' own declared Loop outputs, confirmed from Loop.java's real Output.outputs shape (a List<LoopOutput>, each wrapping {item, outputs}), so each map-typed element arrives JSON-stringified in item.value and is parsed with fromJson(...).outputs.<field> rather than direct dot access.
+    values: "{{ outputs.capture_consumer_positions.outputs }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: create_target_consumer
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: natsio/nats-box:latest
+        env:
+          NATS_URL: "{{ inputs.target_nats_url }}"
+          NATS_CREDS: "{{ secret('TARGET_NATS_CREDS') }}"
+        commands:
+          - nats consumer add "{{ inputs.target_stream }}" "{{ fromJson(item.value).outputs.consumer_name }}" --deliver "{{ fromJson(item.value).outputs.ack_floor_seq + 1 }}" --ack explicit --pull --max-deliver -1 --replay instant --json
+
+  - id: verify_cutover
+    type: io.kestra.plugin.core.flow.Loop
+    description: Reads each newly created target consumer back and fails the verification unless its configured opt_start_seq exactly matches what was requested, instead of trusting the create command's exit code alone. Same fromJson(item.value).outputs.<field> access pattern as apply_cutover, for the same verified reason.
+    values: "{{ outputs.capture_consumer_positions.outputs }}"
+    concurrencyLimit: 1
+    outputs:
+      - id: consumer_name
+        type: STRING
+        value: "{{ fromJson(item.value).outputs.consumer_name }}"
+      - id: expected_start_seq
+        type: INT
+        value: "{{ fromJson(item.value).outputs.ack_floor_seq + 1 }}"
+      - id: verified
+        type: BOOL
+        value: "{{ outputs.check_target_consumer_start_seq.vars.verified }}"
+      - id: actual_start_seq
+        type: INT
+        value: "{{ outputs.check_target_consumer_start_seq.vars.actual_start_seq }}"
+    tasks:
+      - id: fetch_target_consumer_info
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: natsio/nats-box:latest
+        outputFiles:
+          - "target_consumer_info.json"
+        env:
+          NATS_URL: "{{ inputs.target_nats_url }}"
+          NATS_CREDS: "{{ secret('TARGET_NATS_CREDS') }}"
+        commands:
+          - nats consumer info "{{ inputs.target_stream }}" "{{ fromJson(item.value).outputs.consumer_name }}" --json > target_consumer_info.json
+
+      - id: check_target_consumer_start_seq
+        type: io.kestra.plugin.scripts.python.Script
+        env:
+          EXPECTED_START_SEQ: "{{ fromJson(item.value).outputs.ack_floor_seq + 1 }}"
+        inputFiles:
+          target_consumer_info.json: "{{ outputs.fetch_target_consumer_info.outputFiles['target_consumer_info.json'] }}"
+        script: |
+          import json
+          import os
+
+          with open("target_consumer_info.json") as f:
+              info = json.load(f)
+
+          expected = int(os.environ["EXPECTED_START_SEQ"])
+          actual = info.get("config", {}).get("opt_start_seq", -1)
+          verified = actual == expected
+
+          print("::" + json.dumps({
+              "outputs": {
+                  "verified": verified,
+                  "actual_start_seq": actual,
+              }
+          }) + "::")
+
+  - id: evaluate_verification_results
+    type: io.kestra.plugin.core.flow.If
+    description: Branches on whether every migrated consumer verified cleanly. verify_cutover's own outputs are also wrapped List<LoopOutput> ({item, outputs}), confirmed from Loop.java, so the jq expression selects on .outputs.verified, not a flat .verified.
+    condition: "{{ outputs.verify_cutover.outputs | jq('[.[] | select(.outputs.verified == false)] | length > 0') | first }}"
+    then:
+      - id: alert_verification_failed
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Names exactly which consumer(s) did not verify, so a human investigates instead of trusting a partial cutover.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "NATS JetStream cutover for {{ inputs.source_stream }} -> {{ inputs.target_stream }} completed with FAILED verification on at least one consumer. Details: {{ outputs.verify_cutover.outputs | toJson }}. Investigate before routing traffic to the target consumers. Execution {{ execution.id }}."
+          }
+    else:
+      - id: notify_cutover_verified
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Confirms the real, read-back-verified outcome.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "NATS JetStream cutover for {{ inputs.source_stream }} -> {{ inputs.target_stream }} verified: {{ outputs.verify_cutover.outputs | length }} consumer(s) recreated on the target at their exact source ack-floor sequence. Source stream and consumers were never modified. Execution {{ execution.id }}."
+          }
+
+errors:
+  - id: alert_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alerts Slack separately if the flow itself fails, so a broken migration attempt is never mistaken for a completed or refused one.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "NATS JetStream cutover FAILED in execution {{ execution.id }} for {{ inputs.source_stream }} -> {{ inputs.target_stream }}. Check whether any target consumers were partially created before fixing and retrying."
+      }
+
+outputs:
+  - id: migration_plan
+    type: JSON
+    value: "{{ outputs.capture_consumer_positions.outputs | toJson }}"
+
+extend:
+  title: "Migrate NATS JetStream Consumers to a Mirrored Stream with a Verified Cutover"
+  metaTitle: Migrate NATS JetStream Consumers with a Verified Cutover in Kestra
+  shortDescription: Move durable JetStream consumers to a cluster that mirrors the source stream, resuming each at its exact acknowledged sequence, with an approval gate and a read-back verification.
+  metaDescription: "Migrate NATS JetStream consumers to a mirrored stream, resuming at the exact ack-floor sequence, with approval and read-back verification."
+  description: |
+    NATS JetStream's native stream mirroring keeps a target stream's messages
+    in sync with a source stream, the same role MirrorMaker 2 plays for
+    Kafka. But mirroring only copies the data: durable consumers still have
+    to be recreated on the target, and if they are not pinned to the exact
+    sequence each one had actually acknowledged on the source, a naive
+    recreation either replays already-processed messages or skips ones that
+    were never acknowledged. This blueprint reads each source consumer's
+    real `ack_floor` sequence, refuses to proceed unless the target mirror
+    has genuinely caught up, and recreates every consumer on the target at
+    precisely the right starting point, then reads each one back to confirm
+    it took before calling the cutover done.
+
+    ## How it works
+
+    1. `inspect_source_and_mirror` (`io.kestra.plugin.scripts.shell.Commands`, official `natsio/nats-box` image) runs `nats stream info --json` against both clusters.
+    2. `evaluate_mirror_readiness` (`io.kestra.plugin.scripts.python.Script`) refuses the cutover unless the target's `mirror.name` actually matches the source stream and `mirror.lag` is exactly `0` - confirmed from nats-server's own `StreamSourceInfo` struct.
+    3. `evaluate_safety_gate` (`io.kestra.plugin.core.flow.If`) stops the entire flow with a Slack alert and `io.kestra.plugin.core.execution.Fail` before any consumer is touched if the mirror is not safely caught up.
+    4. `capture_consumer_positions` (`io.kestra.plugin.core.flow.Loop`) reads each listed consumer's real `ack_floor.stream_seq` on the source - confirmed from nats-server's `ConsumerInfo`/`SequenceInfo` structs.
+    5. `save_migration_plan_kv` (`io.kestra.plugin.core.kv.Set`) persists the full captured plan before anything on the target changes.
+    6. `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) waits indefinitely for a human to review the exact sequences before anything is created on the target.
+    7. `apply_cutover` creates each consumer on the target mirror with `nats consumer add ... --deliver <ack_floor + 1>` - confirmed from natscli's own `setStartPolicy` source, where a plain numeric `--deliver` value sets `DeliverPolicy=by_start_sequence` and `OptStartSeq` to that exact number.
+    8. `verify_cutover` reads every newly created target consumer back and compares its real `config.opt_start_seq` against what was requested, rather than trusting the create command's exit code.
+    9. `evaluate_verification_results` alerts Slack with the specific failing consumer(s) if any verification failed, or confirms success with the verified count if all passed.
+    10. The `errors` block alerts Slack separately if the flow itself fails outright.
+
+    ## What you get
+
+    - A migration that never touches the source stream or its consumers - only reads from the source, only writes to the target.
+    - An explicit, provable readiness gate (`mirror.lag == 0`, correct mirror source name) instead of assuming the mirror is caught up.
+    - Gap-free, duplicate-free consumer cutover computed from each consumer's real acknowledged position, not a guessed or "start from the beginning" recreation.
+    - A read-back verification step per consumer, naming exactly which one failed if the created consumer does not match the intended starting sequence.
+    - A full KV audit record of the computed migration plan, saved before the target is touched.
+
+    ## Who it's for
+
+    - Platform engineers migrating event-driven services between NATS clusters (datacenter move, cloud migration, major version upgrade) who cannot afford to replay or drop messages for downstream consumers.
+    - SREs who want a cutover runbook that refuses to proceed on a half-caught-up mirror instead of leaving that judgment call to whoever is running the migration by hand.
+    - Teams already using JetStream mirroring for disaster recovery who want the same mechanism to also carry live consumer cutovers during planned maintenance.
+
+    ## Why orchestrate this with Kestra
+
+    The `nats` CLI can read stream and consumer state and create consumers, but it has no concept of refusing an unsafe cutover, no cross-step memory of the sequences it captured, and no approval gate between "here is the plan" and "the target now has live consumers." Kestra supplies the safety gate as a first-class branch, the KV-backed audit record of exactly what was migrated and from where, the human approval pause, and a visible execution history proving the read-back verification actually happened.
+
+    ## Prerequisites
+
+    - A source NATS cluster with JetStream enabled and the stream named in `source_stream`.
+    - A target NATS cluster with a stream already configured to mirror the source (`nats stream add <target_stream> --mirror=<source_stream>`), created ahead of running this flow.
+    - Network access from the Kestra worker to both clusters.
+    - Durable (not ephemeral) consumers on the source stream, since ephemeral consumers have no stable `ack_floor` to migrate from once connections close.
+
+    ### Secrets
+
+    - `SOURCE_NATS_CREDS`: NATS credentials file contents for the source cluster, passed as the `NATS_CREDS` environment variable the `nats` CLI reads natively. Leave unset if the source cluster has no auth configured.
+    - `TARGET_NATS_CREDS`: NATS credentials file contents for the target cluster, same mechanism.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used by every alert in this flow.
+    - In Kestra OSS (no Enterprise secrets backend), secrets are supplied as environment variables prefixed `SECRET_`, base64-encoded, and read back in flows with `{{ secret('NAME') }}`.
+
+    ### Inputs
+
+    - `source_nats_url` / `target_nats_url` (STRING, no default): NATS server URLs for each cluster.
+    - `source_stream` / `target_stream` (STRING, no default): the source stream and its target mirror stream.
+    - `consumer_names` (ARRAY of STRING, no default): the durable consumer names to migrate.
+
+    ### Outputs
+
+    - `outputs.migration_plan`: the full captured per-consumer migration plan (consumer name, source ack-floor sequence) as JSON.
+
+    ## Quick start
+
+    1. On the target cluster, create the mirror ahead of time: `nats stream add {{target_stream}} --mirror={{source_stream}}` and wait until `nats stream info {{target_stream}} --json` shows `mirror.lag: 0`.
+    2. Add the `SOURCE_NATS_CREDS` / `TARGET_NATS_CREDS` (if auth is enabled) and `SLACK_WEBHOOK_URL` secrets.
+    3. Run the flow manually with a small, non-critical consumer first and confirm `evaluate_mirror_readiness` reports `is_safe: true`.
+    4. Resume `pause_for_operator_approval` and confirm `verify_cutover` reports every consumer `verified: true` with the expected starting sequence.
+    5. Point the consuming application at the target cluster for that consumer, confirm it resumes cleanly with no gap or duplicate, then repeat for the remaining consumers.
+
+    ## How to extend
+
+    - Add a cleanup task that calls `nats consumer rm` on the target for any consumer that failed verification, so a partial cutover never leaves a misconfigured consumer sitting there silently.
+    - Extend `evaluate_mirror_readiness` to also refuse the cutover if the source stream is still receiving messages faster than some configured rate, mirroring the Kafka reference blueprint's "producer still writing" refusal check.
+    - Loop this flow over multiple stream pairs for a full cluster migration instead of one stream at a time.
+
+    ## Pitfalls
+
+    - **This blueprint does not create the target mirror stream itself.** The mirror must already exist and have caught up before this flow is run; `evaluate_mirror_readiness` only checks that state, it does not configure it.
+    - **Only durable consumers can be migrated this way.** An ephemeral consumer's position lives only in the connection that created it and has no stable `ack_floor` to read once that connection is gone.
+    - **`mirror.lag == 0` is a point-in-time check, not a guarantee the mirror stays caught up for the rest of the run.** If the source stream keeps receiving new messages after `inspect_source_and_mirror` runs, the captured `ack_floor` sequences for each consumer are still correct (they describe what was already acknowledged, not the stream's end), but genuinely new messages arriving after cutover will only be visible once the mirror relays them to the target.
+    - **This flow never deletes or modifies anything on the source.** There is no explicit rollback step because nothing on the source needs restoring; if `verify_cutover` fails, the fix is to remove the bad consumer on the target (see How to extend) and re-run, not to undo anything upstream.
+
+    ## Links
+
+    - [NATS JetStream Stream Mirroring](https://docs.nats.io/nats-concepts/jetstream/streams#mirroring)
+    - [NATS CLI (natscli) Reference](https://github.com/nats-io/natscli)
+    - [Kestra KV Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+  ee: false
+  demo: false
