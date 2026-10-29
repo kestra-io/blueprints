@@ -1,0 +1,522 @@
+id: kafka-topic-config-gitops-reconciler
+namespace: company.team
+
+description: |
+  Reconcile Kafka topics with a desired-state YAML file kept in Git. The flow creates missing
+  topics, adds partitions, and sets the declared topic configs. It refuses unsafe changes, such as
+  a partition decrease or a replication factor change, and fails before it changes anything.
+  Changes that remap keys or delete data wait for an approval. Each applied change is verified
+  with a new describe of the topic.
+
+inputs:
+  - id: bootstrap_servers
+    type: STRING
+    displayName: Kafka bootstrap servers
+    defaults: "kafka-1.internal:9092,kafka-2.internal:9092,kafka-3.internal:9092"
+
+  - id: cluster
+    type: STRING
+    displayName: Cluster name
+    description: Short name of the cluster. It is part of the KV keys and of the Slack messages.
+    defaults: prod-eu1
+    validator: "^[a-zA-Z0-9_-]{1,40}$"
+
+  - id: repo_url
+    type: STRING
+    displayName: Git repository with the topic definitions
+    defaults: "https://github.com/your-org/kafka-topics.git"
+
+  - id: branch
+    type: STRING
+    displayName: Git branch
+    defaults: main
+
+  - id: state_file
+    type: STRING
+    displayName: Desired-state file in the repository
+    description: Path of the topics YAML file, relative to the repository root.
+    defaults: clusters/prod-eu1/topics.yaml
+
+  - id: gated_changes
+    type: SELECT
+    displayName: Changes that remap keys or delete data
+    description: >-
+      ask_approval pauses the run for a human decision. apply runs them without a pause, for teams
+      that treat the Git review as the approval. skip never applies them.
+    values:
+      - ask_approval
+      - apply
+      - skip
+    defaults: ask_approval
+
+  - id: approval_timeout
+    type: DURATION
+    displayName: Approval timeout
+    description: The gated changes are skipped when nobody answers before this duration.
+    defaults: PT8H
+
+  - id: max_partitions
+    type: INT
+    displayName: Maximum partitions per topic
+    description: A topic in the file with more partitions than this value makes the plan invalid. This catches typos such as 600 instead of 60.
+    defaults: 120
+
+variables:
+  rejected_key: "kafka_topics_{{ inputs.cluster }}_rejected_plan"
+  state_key: "kafka_topics_{{ inputs.cluster }}_last_reconcile"
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+tasks:
+  - id: checkout
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: Clone the branch. Keep the desired-state file and the branch ref, so the plan can name the Git commit it applies.
+    outputFiles:
+      - "{{ inputs.state_file }}"
+      - .git/refs/heads/**
+      - .git/packed-refs
+    tasks:
+      - id: clone
+        type: io.kestra.plugin.git.Clone
+        url: "{{ inputs.repo_url }}"
+        branch: "{{ inputs.branch }}"
+        username: "{{ secret('GIT_USERNAME') }}"
+        password: "{{ secret('GIT_TOKEN') }}"
+        retry:
+          type: constant
+          interval: PT15S
+          maxAttempts: 3
+
+  - id: desired
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Parse the YAML file. Invalid YAML fails the run here, before any call to Kafka.
+    values:
+      spec: "{{ yaml(read(outputs.checkout.outputFiles[inputs.state_file])) | toJson }}"
+
+  - id: list_topics
+    type: io.kestra.plugin.kafka.TopicList
+    properties:
+      bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+
+  - id: describe_live
+    type: io.kestra.plugin.core.flow.Loop
+    description: Describe each topic of the file that already exists on the cluster.
+    values: "{{ {'want': (fromJson(outputs.desired.values.spec).topics ?? {}) | keys, 'have': outputs.list_topics.topics} | jq('[.have as $h | .want[] | select(. as $t | [$h[] == $t] | any)]') | first | toJson }}"
+    concurrencyLimit: 4
+    outputs:
+      - id: live
+        type: STRING
+        value: "{{ {'topic': item.value, 'partitions': outputs.describe.partitionCount, 'replicationFactor': outputs.describe.replicationFactor, 'configs': outputs.describe.configs} | toJson }}"
+    tasks:
+      - id: describe
+        type: io.kestra.plugin.kafka.TopicDescribe
+        properties:
+          bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+        topic: "{{ item.value }}"
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+
+  - id: plan
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Validate the file and compare it with the live topics. Each change is classified as safe,
+      gated (needs approval) or refused. This task only reads the inputs, it never calls Kafka.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: IF_NOT_PRESENT
+    containerImage: python:3.12-slim
+    timeout: PT5M
+    inputFiles:
+      spec.json: "{{ outputs.desired.values.spec }}"
+      live.json: "{{ (outputs.describe_live.outputs ?? []) | toJson }}"
+      cluster_topics.json: "{{ outputs.list_topics.topics | toJson }}"
+      branch_ref.txt: "{{ outputs.checkout.outputFiles['.git/refs/heads/' ~ inputs.branch] ?? '' }}"
+      packed_refs.txt: "{{ outputs.checkout.outputFiles['.git/packed-refs'] ?? '' }}"
+    env:
+      MAX_PARTITIONS: "{{ inputs.max_partitions }}"
+      GIT_BRANCH: "{{ inputs.branch }}"
+    script: |
+      import hashlib, json, os, re
+
+      spec = json.load(open("spec.json"))
+      cluster_topics = set(json.load(open("cluster_topics.json")))
+      live = {}
+      for it in json.load(open("live.json")):
+          d = json.loads(it["outputs"]["live"])
+          live[d["topic"]] = d
+      max_partitions = int(os.environ["MAX_PARTITIONS"])
+
+      # Commit of the cloned branch: a loose ref first, then packed-refs.
+      commit = open("branch_ref.txt").read().strip()
+      if not re.fullmatch(r"[0-9a-f]{40}", commit):
+          ref = "refs/heads/" + os.environ["GIT_BRANCH"]
+          commit = next((l.split()[0] for l in open("packed_refs.txt").read().splitlines()
+                         if l.endswith(" " + ref)), "unknown")
+      invalid, refused, actions, lines = [], [], [], []
+      NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
+      TOPIC_FIELDS = {"partitions", "replicationFactor", "keyed", "configs"}
+
+      def norm(v):
+          if isinstance(v, bool):
+              return "true" if v else "false"
+          if isinstance(v, float) and v.is_integer():
+              return str(int(v))
+          if isinstance(v, (int, float, str)):
+              return str(v)
+          raise ValueError(f"config value {v!r} must be a string, a number or a boolean")
+
+      def canon_policy(v):
+          # Brokers may return "compact,delete" for "delete,compact".
+          return ",".join(sorted(p.strip() for p in str(v).split(",") if p.strip()))
+
+      def same(a, b):
+          try:
+              return float(a) == float(b)
+          except (TypeError, ValueError):
+              return a == b
+
+      def limit(v):
+          n = int(float(v))
+          return float("inf") if n < 0 else n  # -1 means no limit
+
+      def is_int(v):
+          return isinstance(v, int) and not isinstance(v, bool)
+
+      if not isinstance(spec, dict) or not isinstance(spec.get("topics"), dict) or not spec["topics"]:
+          invalid.append("the file needs a non-empty 'topics' map")
+          spec = {"topics": {}}
+      for extra in sorted(set(spec) - {"defaults", "topics"}):
+          invalid.append(f"unknown top-level field '{extra}' (allowed: defaults, topics)")
+      defaults = spec.get("defaults") or {}
+
+      for name, t in sorted(spec["topics"].items()):
+          t = t or {}
+          if not NAME.match(name) or name in (".", ".."):
+              invalid.append(f"{name}: invalid topic name"); continue
+          if not isinstance(t, dict):
+              invalid.append(f"{name}: the topic entry must be a map"); continue
+          extra = sorted(set(t) - TOPIC_FIELDS)
+          if extra:
+              invalid.append(f"{name}: unknown field(s) {extra} (allowed: {sorted(TOPIC_FIELDS)})"); continue
+          parts = t.get("partitions", defaults.get("partitions"))
+          rf = t.get("replicationFactor", defaults.get("replicationFactor"))
+          keyed = t.get("keyed", defaults.get("keyed", False))
+          try:
+              configs = {k: norm(v) for k, v in {**(defaults.get("configs") or {}), **(t.get("configs") or {})}.items()}
+              if "cleanup.policy" in configs:
+                  configs["cleanup.policy"] = canon_policy(configs["cleanup.policy"])
+          except ValueError as e:
+              invalid.append(f"{name}: {e}"); continue
+          problems = []
+          if not is_int(parts) or not 1 <= parts <= max_partitions:
+              problems.append(f"partitions must be an integer from 1 to {max_partitions}, got {parts!r}")
+          if not is_int(rf) or rf < 1:
+              problems.append(f"replicationFactor must be a positive integer, got {rf!r}")
+          if not isinstance(keyed, bool):
+              problems.append(f"keyed must be true or false, got {keyed!r}")
+          for k in ("retention.ms", "retention.bytes", "min.insync.replicas"):
+              if k in configs and not re.fullmatch(r"-?\d+", configs[k]):
+                  problems.append(f"{k} must be an integer, got {configs[k]!r}")
+          if not problems and "min.insync.replicas" in configs and int(configs["min.insync.replicas"]) > rf:
+              problems.append(f"min.insync.replicas {configs['min.insync.replicas']} is higher than replicationFactor {rf}, so producers with acks=all fail")
+          if problems:
+              invalid.extend(f"{name}: {p}" for p in problems); continue
+
+          cur = live.get(name)
+          if cur is None:
+              actions.append({"action": "create", "topic": name, "partitions": parts, "replicationFactor": rf,
+                              "configs": configs, "gated": False,
+                              "expect": {"partitions": parts, "replicationFactor": rf, "configs": configs}})
+              lines.append(f"create {name}: {parts} partitions, replication factor {rf}, {len(configs)} configs")
+              continue
+          if cur["replicationFactor"] != rf:
+              refused.append(f"{name}: replication factor {cur['replicationFactor']} -> {rf} needs a partition reassignment, which this flow does not do")
+          if parts < cur["partitions"]:
+              refused.append(f"{name}: partitions {cur['partitions']} -> {parts}. Kafka cannot remove partitions. Set {cur['partitions']} again in Git, or recreate the topic by hand")
+          elif parts > cur["partitions"]:
+              actions.append({"action": "add_partitions", "topic": name, "from": cur["partitions"], "partitions": parts,
+                              "gated": keyed, "expect": {"partitions": parts}})
+              lines.append(f"{name}: partitions {cur['partitions']} -> {parts}" + (" [approval: keyed topic, keys move to other partitions]" if keyed else ""))
+          safe, gated = {}, {}
+          for k, v in sorted(configs.items()):
+              if k not in cur["configs"]:
+                  refused.append(f"{name}: the broker does not report config '{k}'. Check the spelling"); continue
+              old = cur["configs"][k]
+              if old is not None and (canon_policy(old) == v if k == "cleanup.policy" else same(old, v)):
+                  continue
+              why = ""
+              if k in ("retention.ms", "retention.bytes") and old is not None and limit(v) < limit(old):
+                  why = "lower retention deletes older data"
+              elif k == "cleanup.policy":
+                  why = "cleanup policy change"
+              (gated if why else safe)[k] = v
+              lines.append(f"{name}: {k} {old} -> {v}" + (f" [approval: {why}]" if why else ""))
+          for group, is_gated in ((safe, False), (gated, True)):
+              if group:
+                  actions.append({"action": "update_configs", "topic": name, "configs": group,
+                                  "from": {k: cur["configs"][k] for k in group}, "gated": is_gated,
+                                  "expect": {"configs": group}})
+
+      gated_actions = [a for a in actions if a["gated"]]
+      fingerprint = hashlib.sha256(json.dumps([{k: v for k, v in a.items() if k != "expect"} for a in gated_actions], sort_keys=True).encode()).hexdigest()[:16] if gated_actions else ""
+      unmanaged = sorted(t for t in cluster_topics - set(spec["topics"]) if not t.startswith("_"))
+
+      print("::" + json.dumps({"outputs": {
+          "actions": actions, "lines": lines, "invalid": invalid, "refused": refused,
+          "safe_count": len(actions) - len(gated_actions), "gated_count": len(gated_actions),
+          "gated_fingerprint": fingerprint, "unmanaged": unmanaged[:25], "unmanaged_count": len(unmanaged),
+          "commit": commit,
+          "blocking": "; ".join([f"invalid: {m}" for m in invalid] + [f"refused: {m}" for m in refused]),
+      }}) + "::")
+
+  - id: plan_summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Plan for {{ inputs.cluster }} from {{ inputs.repo_url }}@{{ inputs.branch }}:{{ inputs.state_file }} (commit {{ outputs.plan.vars.commit }})
+      {{ outputs.plan.vars.safe_count }} safe and {{ outputs.plan.vars.gated_count }} gated changes, {{ outputs.plan.vars.refused | length }} refused, {{ outputs.plan.vars.invalid | length }} invalid entries.
+      {% for line in outputs.plan.vars.lines %}- {{ line }}
+      {% endfor %}{% for item in outputs.plan.vars.invalid %}- INVALID {{ item }}
+      {% endfor %}{% for item in outputs.plan.vars.refused %}- REFUSED {{ item }}
+      {% endfor %}Topics on the cluster that are not in Git ({{ outputs.plan.vars.unmanaged_count }}, never deleted): {{ outputs.plan.vars.unmanaged | join(', ') }}
+
+  - id: refuse_unsafe
+    type: io.kestra.plugin.core.flow.If
+    description: Any invalid entry or unsafe change stops the run before the first change.
+    condition: "{{ (outputs.plan.vars.invalid | length) + (outputs.plan.vars.refused | length) > 0 }}"
+    then:
+      - id: fail_plan
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Nothing was changed on {{ inputs.cluster }}. {{ outputs.plan.vars.blocking }}. Fix the file in Git, then run the flow again."
+
+  - id: reconcile
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan.vars.actions | length > 0 }}"
+    then:
+      - id: approval_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Ask once per gated plan. A rejected plan is stored in KV. The same gated changes are not asked again until Git or the cluster changes them.
+        condition: "{{ outputs.plan.vars.gated_count > 0 and inputs.gated_changes == 'ask_approval' and outputs.plan.vars.gated_fingerprint != (kv(render(vars.rejected_key), errorOnMissing=false) ?? '') }}"
+        then:
+          - id: request_approval
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'text': 'Kafka topic reconcile on ' ~ inputs.cluster ~ ' needs approval for ' ~ outputs.plan.vars.gated_count ~ ' change(s): ' ~ (outputs.plan.vars.actions | jq('[.[] | select(.gated) | .topic + " " + .action] | join(", ")') | first) ~ '. Safe changes wait for this decision too. Resume execution ' ~ execution.id ~ ' of ' ~ flow.namespace ~ '.' ~ flow.id ~ ' with approved=true to apply them.'} | toJson }}
+
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            behavior: WARN
+            onResume:
+              - id: approved
+                type: BOOL
+                description: Apply the gated changes.
+                defaults: false
+              - id: reason
+                type: STRING
+                description: Reason for the decision. It is kept in the execution history.
+                defaults: no reason given
+
+          - id: record_rejection
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ not (outputs.approval.onResume.approved ?? false) }}"
+            then:
+              - id: save_rejection
+                type: io.kestra.plugin.core.kv.Set
+                key: "{{ render(vars.rejected_key) }}"
+                value: "{{ outputs.plan.vars.gated_fingerprint }}"
+                kvDescription: Fingerprint of the last gated plan that was rejected or not answered.
+
+      - id: decide
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          to_apply: "{{ {'a': outputs.plan.vars.actions, 'ok': inputs.gated_changes == 'apply' or (outputs.approval.onResume.approved ?? false) == true} | jq('[.ok as $ok | .a[] | select((.gated | not) or $ok)]') | first | toJson }}"
+          skipped: "{{ {'a': outputs.plan.vars.actions, 'ok': inputs.gated_changes == 'apply' or (outputs.approval.onResume.approved ?? false) == true} | jq('[.ok as $ok | .a[] | select(.gated and ($ok | not)) | .topic + \" \" + .action]') | first | toJson }}"
+
+      - id: apply
+        type: io.kestra.plugin.core.flow.Loop
+        description: One AdminClient call per change, one at a time.
+        values: "{{ outputs.decide.values.to_apply }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: by_action
+            type: io.kestra.plugin.core.flow.Switch
+            value: "{{ fromJson(item.value).action }}"
+            cases:
+              create:
+                - id: create_topic
+                  type: io.kestra.plugin.kafka.TopicCreate
+                  properties:
+                    bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+                  topic: "{{ fromJson(item.value).topic }}"
+                  partitions: "{{ fromJson(item.value).partitions }}"
+                  replicationFactor: "{{ fromJson(item.value).replicationFactor }}"
+                  configs: "{{ fromJson(item.value).configs | toJson }}"
+                  ifNotExists: true
+              update_configs:
+                - id: update_configs
+                  type: io.kestra.plugin.kafka.TopicUpdate
+                  properties:
+                    bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+                  topic: "{{ fromJson(item.value).topic }}"
+                  configs: "{{ fromJson(item.value).configs | toJson }}"
+              add_partitions:
+                - id: add_partitions
+                  type: io.kestra.plugin.kafka.TopicCreatePartitions
+                  properties:
+                    bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+                  topic: "{{ fromJson(item.value).topic }}"
+                  totalPartitionCount: "{{ fromJson(item.value).partitions }}"
+            defaults:
+              - id: unknown_action
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Unknown plan action {{ fromJson(item.value).action }}."
+
+      - id: verify
+        type: io.kestra.plugin.core.flow.Loop
+        description: Describe each changed topic again. The run fails if the broker does not hold the expected value.
+        values: "{{ outputs.decide.values.to_apply }}"
+        concurrencyLimit: 4
+        tasks:
+          - id: recheck
+            type: io.kestra.plugin.kafka.TopicDescribe
+            properties:
+              bootstrap.servers: "{{ inputs.bootstrap_servers }}"
+            topic: "{{ fromJson(item.value).topic }}"
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+
+          - id: assert_applied
+            type: io.kestra.plugin.core.execution.Assert
+            errorMessage: "{{ fromJson(item.value).topic }} does not match the plan after {{ fromJson(item.value).action }}. Broker reports {{ outputs.recheck.partitionCount }} partitions, replication factor {{ outputs.recheck.replicationFactor }}, configs {{ {'e': fromJson(item.value).expect, 'c': outputs.recheck.configs} | jq('.c as $c | [(.e.configs // {}) | keys[] | . + \"=\" + ($c[.] // \"missing\")] | join(\", \")') | first }}."
+            conditions:
+              - "{{ {'e': fromJson(item.value).expect, 'p': outputs.recheck.partitionCount, 'r': outputs.recheck.replicationFactor, 'c': outputs.recheck.configs} | jq('def canon: split(\",\") | map(ltrimstr(\" \") | rtrimstr(\" \")) | sort | join(\",\"); . as $x | (($x.e.partitions // $x.p) == $x.p) and (($x.e.replicationFactor // $x.r) == $x.r) and ([($x.e.configs // {}) | to_entries[] | select((if .key == \"cleanup.policy\" then (($x.c[.key] // \"\") | canon) else ($x.c[.key] // \"\") end) != .value)] | length == 0)') | first }}"
+
+      - id: notify
+        type: io.kestra.plugin.core.flow.If
+        description: Post to Slack only when the run changed the cluster. Gated changes that stay rejected are only logged, so an hourly run does not repeat the same message.
+        condition: "{{ fromJson(outputs.decide.values.to_apply) | length > 0 }}"
+        then:
+          - id: report
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'text': 'Kafka topic reconcile on ' ~ inputs.cluster ~ ': ' ~ (fromJson(outputs.decide.values.to_apply) | length) ~ ' change(s) applied and verified (' ~ (fromJson(outputs.decide.values.to_apply) | jq('map(.topic + " " + .action) | join(", ")') | first) ~ '). ' ~ ((fromJson(outputs.decide.values.skipped) | length) > 0 ? 'Skipped without approval: ' ~ (fromJson(outputs.decide.values.skipped) | join(', ')) ~ '. ' : '') ~ 'Source: ' ~ inputs.repo_url ~ '@' ~ inputs.branch ~ ', commit ' ~ outputs.plan.vars.commit ~ '. Execution ' ~ execution.id ~ '.'} | toJson }}
+        else:
+          - id: nothing_applied
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: "No change applied on {{ inputs.cluster }}. Gated changes still skipped: {{ fromJson(outputs.decide.values.skipped) | join(', ') }}. Approve them in a new run with gated_changes=apply, or change them in Git."
+    else:
+      - id: in_sync
+        type: io.kestra.plugin.core.log.Log
+        message: "All {{ fromJson(outputs.desired.values.spec).topics | length }} topics in {{ inputs.state_file }} match the cluster {{ inputs.cluster }}. Nothing to change."
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ render(vars.state_key) }}"
+    kvType: JSON
+    value: "{{ {'branch': inputs.branch, 'commit': outputs.plan.vars.commit, 'file': inputs.state_file, 'executionId': execution.id, 'at': now(), 'planned': outputs.plan.vars.actions | length, 'applied': fromJson(outputs.decide.values.to_apply ?? '[]') | length, 'skipped': fromJson(outputs.decide.values.skipped ?? '[]')} | toJson }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Kafka topic reconcile FAILED on ' ~ inputs.cluster ~ ' (execution ' ~ execution.id ~ '). ' ~ ((outputs.plan.vars.blocking ?? '') != '' ? 'Plan refused, nothing changed: ' ~ outputs.plan.vars.blocking : 'Git, Kafka or a verification step failed. Read the execution logs before the next run.')} | toJson }}
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Catch manual changes and missed pushes. Disabled until the inputs point at your cluster and repository.
+    cron: "0 * * * *"
+    disabled: true
+
+  - id: git_push
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this webhook from the Git push event of the topics repository, so a merged change applies in minutes.
+    key: "{{ secret('KAFKA_TOPICS_WEBHOOK_KEY') }}"
+
+extend:
+  title: Kafka Topic GitOps Reconciler with Unsafe Change Refusal
+  metaTitle: Reconcile Kafka Topics from Git with Approval Gates | Kestra
+  shortDescription: Apply a reviewed topics YAML file from Git to a Kafka or Redpanda cluster. Create topics, add partitions and set configs, refuse a partition decrease, and verify every change.
+  metaDescription: Reconcile Kafka topics with a YAML file in Git. Create topics, add partitions, set configs, refuse unsafe changes and verify each change.
+  description: |
+    Teams keep Kafka topic definitions in Git and review them by pull request. A manual apply can skip a topic or cut retention on the wrong topic. This flow applies the merged file and checks the result on the broker.
+
+    ## How it works
+
+    1. The `git_push` webhook starts the flow after a merge. The `hourly` schedule finds manual changes.
+    2. `clone` gets the branch and `desired` parses the YAML file.
+    3. `list_topics` and `describe_live` read the live partitions, replication factor and configs.
+    4. `plan` sorts each difference. A partition decrease, a replication factor change or an unknown key on an existing topic is refused. A retention decrease, a `cleanup.policy` change or new partitions on a `keyed: true` topic need approval.
+    5. `refuse_unsafe` fails the run before any change if an entry is refused or invalid.
+    6. `approval_gate` posts gated changes to Slack and pauses. A rejected plan is kept in KV and is not asked again.
+    7. `apply` runs `TopicCreate`, `TopicCreatePartitions` or `TopicUpdate`. `verify` describes each topic again and fails on a different value.
+    8. `report` posts the changes and the Git commit. `save_state` writes the result to KV.
+
+    ## What you get
+
+    - Topics that match the reviewed file, with the commit in each report.
+    - No partition decrease and no replication factor change.
+    - An approval before a change that deletes data or moves keys.
+    - Topics not in Git are listed, never deleted.
+
+    ## Who it's for
+
+    - Platform teams that run Kafka or Redpanda for many services.
+
+    ## Why orchestrate this with Kestra
+
+    - Approval, KV state, retries and verification are in one YAML file, with history for each run.
+
+    ## Prerequisites
+
+    - A Kafka or Redpanda cluster, with permission to create and alter topics.
+    - A Git file like `topics: {orders.v1: {partitions: 6, configs: {retention.ms: 604800000}}}`, with an optional `defaults` map.
+    - A Docker task runner for the `plan` script.
+
+    ### Secrets
+
+    - `GIT_USERNAME`, `GIT_TOKEN`: read access to the repository.
+    - `SLACK_WEBHOOK_URL`: approvals, reports and failures.
+    - `KAFKA_TOPICS_WEBHOOK_KEY`: key of the `git_push` webhook.
+
+    ## Quick start
+
+    1. Create the secrets.
+    2. Set `bootstrap_servers`, `cluster`, `repo_url` and `state_file`.
+    3. Execute the flow and read the `plan_summary` log.
+    4. Add the webhook to the Git push event and enable `hourly`.
+
+    ## How to extend
+
+    - Add SASL or TLS keys to the AdminClient `properties`.
+
+    ## Links
+
+    - [TopicCreate](https://kestra.io/plugins/plugin-kafka/io.kestra.plugin.kafka.topiccreate)
+    - [TopicCreatePartitions](https://kestra.io/plugins/plugin-kafka/io.kestra.plugin.kafka.topiccreatepartitions)
+    - [TopicUpdate](https://kestra.io/plugins/plugin-kafka/io.kestra.plugin.kafka.topicupdate)
+    - [Git Clone](https://kestra.io/plugins/plugin-git/io.kestra.plugin.git.clone)
+    - [Kafka topic configs](https://kafka.apache.org/documentation/#topicconfigs)
+    - [Redpanda topic properties](https://docs.redpanda.com/current/reference/properties/topic-properties/)
+  tags:
+    - Infrastructure
+  subTags:
+    - GitOps & Flow Sync
+    - Approval Gates
+    - Day 2 Operations
+  ee: false
+  demo: false

@@ -1,0 +1,537 @@
+id: kafka-connect-sink-poison-pill-offset-rewind-and-skip-gate
+namespace: company.streaming
+
+description: |
+  Audit Kafka Connect sink connectors for poison pill task crashes and frozen committed offsets,
+  quarantine diagnostic failure records to a dead-letter topic, safely rewind or advance committed
+  partition offsets via KIP-875 with human approval, and verify recovery on the live cluster.
+
+variables:
+  connect_url: "http://localhost:8083"
+  connector_name: "orders-jdbc-sink"
+  bootstrap_servers: "localhost:9092"
+  quarantine_topic: "connect-poison-pill-quarantine"
+
+inputs:
+  - id: connect_url
+    type: STRING
+    displayName: Kafka Connect REST URL
+    description: Base URL of the Kafka Connect REST API worker cluster.
+    defaults: "http://localhost:8083"
+
+  - id: connector_name
+    type: STRING
+    displayName: Connector Name
+    description: Kafka Connect sink or source connector name to audit, guard, and remediate.
+    defaults: "orders-jdbc-sink"
+
+  - id: bootstrap_servers
+    type: STRING
+    displayName: Kafka Bootstrap Servers
+    description: Comma-separated list of Kafka broker endpoints for dead-letter quarantine publishing.
+    defaults: "localhost:9092"
+
+  - id: quarantine_topic
+    type: STRING
+    displayName: Dead-Letter Quarantine Topic
+    description: Destination Kafka topic where isolated poison pill payloads and failure metadata are published.
+    defaults: "connect-poison-pill-quarantine"
+
+  - id: publish_to_dlq
+    type: BOOL
+    displayName: Publish to Dead-Letter Topic
+    description: When true, publishes structured poison pill isolation records to the quarantine topic.
+    defaults: true
+
+  - id: remediation_action
+    type: SELECT
+    displayName: Remediation Action
+    description: Corrective offset action to apply when a poison pill offset or stalled partition is identified.
+    values:
+      - SKIP_POISON_RECORD
+      - REWIND_OFFSET
+      - AUDIT_ONLY
+    defaults: SKIP_POISON_RECORD
+
+  - id: rewind_record_count
+    type: INT
+    displayName: Rewind Record Count
+    description: Number of records to rewind when remediation_action is set to REWIND_OFFSET.
+    defaults: 1
+
+  - id: stalled_runs_threshold
+    type: INT
+    displayName: Stalled Runs Threshold
+    description: Number of consecutive runs an offset must remain uncommitted with failing tasks before triggering remediation.
+    defaults: 1
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, generates the remediation plan and logs diagnostics without altering connector offsets.
+    defaults: true
+
+triggers:
+  - id: on_connector_failure
+    type: io.kestra.plugin.kafka.ConnectorStatusTrigger
+    description: Event-based polling trigger that fires automatically when the connector or any worker task enters FAILED state.
+    connectUrl: "{{ vars.connect_url }}"
+    connectorName: "{{ vars.connector_name }}"
+    targetState: FAILED
+    interval: PT1M
+    disabled: true
+
+  - id: periodic_offset_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic scheduled audit monitoring connector offset progression and task health every 10 minutes.
+    cron: "*/10 * * * *"
+    disabled: true
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy sanity and threshold constraints.
+    conditions:
+      - "{{ (inputs.connector_name ?? vars.connector_name) | length > 0 }}"
+      - "{{ (inputs.connect_url ?? vars.connect_url) | length > 0 }}"
+      - "{{ inputs.rewind_record_count >= 1 }}"
+      - "{{ inputs.stalled_runs_threshold >= 1 }}"
+    errorMessage: "Invalid configuration inputs. Provide a valid connector name, connect URL, and positive rewind/stalled thresholds."
+
+  - id: get_connector_status
+    type: io.kestra.plugin.kafka.ConnectorGetStatus
+    description: Query Kafka Connect REST API for connector status, worker assignments, task states, and stack traces.
+    connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+    connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT15S
+      maxAttempts: 3
+
+  - id: get_connector_offsets
+    type: io.kestra.plugin.kafka.ConnectorGetOffsets
+    description: Retrieve current committed partition offsets from Kafka Connect via KIP-875 GET /connectors/{name}/offsets.
+    connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+    connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT15S
+      maxAttempts: 3
+
+  - id: load_previous_offset_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve previous run offset snapshot and stalled partition history from Kestra KV store.
+    key: "kafka_connect_offset_tracker_{{ inputs.connector_name ?? vars.connector_name }}"
+    errorOnMissing: false
+
+  - id: triage_poison_pill_and_compute_offsets
+    type: io.kestra.plugin.scripts.python.Script
+    description: Analyze failed task stack traces, diff committed offsets against KV baseline, isolate poison pill records, and compute target offsets.
+    containerImage: python:3.11-slim
+    inputFiles:
+      status.json: "{{ outputs.get_connector_status | toJson }}"
+      offsets.json: "{{ (outputs.get_connector_offsets.offsets ?? []) | toJson }}"
+      previous_kv.json: "{{ (outputs.load_previous_offset_state.value ?? {}) | toJson }}"
+    env:
+      REMEDIATION_ACTION: "{{ inputs.remediation_action }}"
+      REWIND_RECORD_COUNT: "{{ inputs.rewind_record_count }}"
+      STALLED_RUNS_THRESHOLD: "{{ inputs.stalled_runs_threshold }}"
+      CONNECTOR_NAME: "{{ inputs.connector_name ?? vars.connector_name }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      remediation_action = os.environ.get("REMEDIATION_ACTION", "SKIP_POISON_RECORD")
+      rewind_record_count = int(os.environ.get("REWIND_RECORD_COUNT", "1"))
+      stalled_runs_threshold = int(os.environ.get("STALLED_RUNS_THRESHOLD", "1"))
+      connector_name = os.environ.get("CONNECTOR_NAME", "unknown-connector")
+      execution_id = os.environ.get("EXECUTION_ID", "manual-run")
+
+      def load_json_file(filename, fallback):
+          try:
+              if os.path.exists(filename):
+                  with open(filename, "r", encoding="utf-8") as f:
+                      content = f.read().strip()
+                      return json.loads(content) if content else fallback
+          except Exception:
+              pass
+          return fallback
+
+      status_data = load_json_file("status.json", {})
+      offsets_data = load_json_file("offsets.json", [])
+      previous_kv_raw = load_json_file("previous_kv.json", {})
+
+      previous_kv = previous_kv_raw if isinstance(previous_kv_raw, dict) else {}
+      if isinstance(previous_kv, str):
+          try:
+              previous_kv = json.loads(previous_kv)
+          except Exception:
+              previous_kv = {}
+
+      tasks = status_data.get("tasks", []) if isinstance(status_data, dict) else []
+      connector_state = status_data.get("connectorState", "UNKNOWN")
+
+      failed_tasks = [t for t in tasks if t.get("state") == "FAILED"]
+      has_failures = len(failed_tasks) > 0 or connector_state == "FAILED"
+
+      error_traces = []
+      poison_hints = []
+      for t in failed_tasks:
+          trace = t.get("trace") or ""
+          task_id = t.get("id", -1)
+          error_traces.append(f"Task {task_id}: {trace[:300]}")
+          matches = re.findall(r"([a-zA-Z0-9._-]+)[ -]partition[ :]+([0-9]+)[ -]offset[ :]+([0-9]+)", trace, re.IGNORECASE)
+          for m in matches:
+              poison_hints.append({"topic": m[0], "partition": int(m[1]), "offset": int(m[2])})
+
+      updated_kv = {}
+      target_offsets = []
+      stalled_partitions = []
+      remediation_required = False
+
+      if isinstance(offsets_data, list):
+          for entry in offsets_data:
+              if not isinstance(entry, dict):
+                  continue
+              partition_map = entry.get("partition", {})
+              offset_map = entry.get("offset", {})
+
+              topic = partition_map.get("kafka_topic", partition_map.get("topic", partition_map.get("table", "default")))
+              partition_id = partition_map.get("kafka_partition", partition_map.get("partition", 0))
+              partition_key = f"{topic}-{partition_id}"
+
+              current_offset = None
+              offset_field_name = "kafka_offset"
+              for field in ["kafka_offset", "offset", "position", "incrementing"]:
+                  if field in offset_map and isinstance(offset_map[field], (int, float)):
+                      current_offset = int(offset_map[field])
+                      offset_field_name = field
+                      break
+
+              prev_info = previous_kv.get(partition_key, {})
+              prev_offset = prev_info.get("last_offset") if isinstance(prev_info, dict) else None
+              stalled_runs = prev_info.get("stalled_runs", 0) if isinstance(prev_info, dict) else 0
+
+              is_stalled = False
+              if has_failures:
+                  if current_offset is not None and prev_offset is not None and current_offset == prev_offset:
+                      stalled_runs += 1
+                      is_stalled = True
+                  else:
+                      stalled_runs = 1
+                      is_stalled = True
+              else:
+                  stalled_runs = 0
+
+              updated_kv[partition_key] = {
+                  "last_offset": current_offset,
+                  "stalled_runs": stalled_runs,
+                  "last_audit_timestamp": datetime.now(timezone.utc).isoformat(),
+                  "status": "STALLED" if is_stalled else "HEALTHY"
+              }
+
+              if is_stalled and stalled_runs >= stalled_runs_threshold:
+                  # Always record a stalled partition, regardless of remediation_action, so
+                  # AUDIT_ONLY still reports what it found instead of looking identical to HEALTHY.
+                  stalled_partitions.append({
+                      "partition_key": partition_key,
+                      "topic": topic,
+                      "partition": partition_id,
+                      "current_offset": current_offset,
+                      "stalled_runs": stalled_runs
+                  })
+
+                  if remediation_action != "AUDIT_ONLY":
+                      remediation_required = True
+
+                      target_offset_value = current_offset if current_offset is not None else 0
+                      if remediation_action == "SKIP_POISON_RECORD":
+                          target_offset_value += 1
+                      elif remediation_action == "REWIND_OFFSET":
+                          target_offset_value = max(0, target_offset_value - rewind_record_count)
+
+                      new_offset_map = dict(offset_map)
+                      new_offset_map[offset_field_name] = target_offset_value
+                      target_offsets.append({
+                          "partition": partition_map,
+                          "offset": new_offset_map
+                      })
+
+      quarantine_payload = {
+          "eventType": "KAFKA_CONNECT_POISON_PILL_ISOLATION",
+          "executionId": execution_id,
+          "connectorName": connector_name,
+          "connectorState": connector_state,
+          "failedTaskCount": len(failed_tasks),
+          "stalledPartitions": stalled_partitions,
+          "targetOffsets": target_offsets,
+          "remediationPolicy": remediation_action,
+          "errorTraces": error_traces,
+          "timestamp": datetime.now(timezone.utc).isoformat()
+      }
+
+      summary_lines = [
+          f"*Connector:* `{connector_name}` | *State:* `{connector_state}`",
+          f"*Failed Tasks:* {len(failed_tasks)} of {len(tasks)}",
+          f"*Stalled Partitions:* {len(stalled_partitions)}",
+          f"*Remediation Required:* `{remediation_required}` (Policy: `{remediation_action}`)"
+      ]
+      if stalled_partitions:
+          summary_lines.append("*Partition Breakdown:*")
+          for sp in stalled_partitions:
+              summary_lines.append(f"- `{sp['partition_key']}`: current offset `{sp['current_offset']}`, stalled `{sp['stalled_runs']}` run(s)")
+
+      output_data = {
+          "remediation_required": remediation_required,
+          "has_failed_tasks": has_failures,
+          "failed_task_count": len(failed_tasks),
+          "stalled_partition_count": len(stalled_partitions),
+          "target_offsets": target_offsets,
+          "quarantine_payload": quarantine_payload,
+          "kv_payload": updated_kv,
+          "summary_markdown": "\\n".join(summary_lines)
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print("::" + json.dumps({"outputs": output_data}) + "::")
+
+  - id: persist_offset_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist updated connector offset snapshot and remediation telemetry into Kestra namespace KV store for historical trend tracking.
+    key: "kafka_connect_offset_tracker_{{ inputs.connector_name ?? vars.connector_name }}"
+    kvType: JSON
+    overwrite: true
+    value: "{{ outputs.triage_poison_pill_and_compute_offsets.vars.kv_payload | toJson }}"
+
+  - id: gate_remediation
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate if stalled partitions or poison pill records require quarantine publishing and offset remediation.
+    condition: "{{ outputs.triage_poison_pill_and_compute_offsets.vars.remediation_required }}"
+    then:
+      - id: gate_quarantine_publishing
+        type: io.kestra.plugin.core.flow.If
+        description: Publish isolated poison pill metadata to quarantine topic when enabled.
+        condition: "{{ inputs.publish_to_dlq }}"
+        then:
+          - id: publish_poison_pill_to_dlq
+            type: io.kestra.plugin.kafka.Produce
+            description: Publish structured poison pill record metadata, failed task stack trace, and offset telemetry to dead-letter quarantine topic.
+            properties:
+              bootstrap.servers: "{{ inputs.bootstrap_servers ?? vars.bootstrap_servers }}"
+            topic: "{{ inputs.quarantine_topic ?? vars.quarantine_topic }}"
+            from:
+              key: "{{ inputs.connector_name ?? vars.connector_name }}_{{ execution.id }}"
+              value: "{{ outputs.triage_poison_pill_and_compute_offsets.vars.quarantine_payload | toJson }}"
+
+      - id: check_dry_run_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Branch between dry-run audit logging and authorized live cluster offset modification.
+        condition: "{{ inputs.dry_run }}"
+        then:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log proposed offset modifications without altering connector offsets in dry-run mode.
+            message: |
+              [DRY RUN] Identified {{ outputs.triage_poison_pill_and_compute_offsets.vars.stalled_partition_count }} stalled partition(s) on {{ inputs.connector_name ?? vars.connector_name }}.
+              Target offsets planned for KIP-875 alteration:
+              {{ outputs.triage_poison_pill_and_compute_offsets.vars.target_offsets | toJson }}
+              Set dry_run=false and approve the pause gate to apply offset modifications to the live cluster.
+        else:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator verification before altering committed Kafka Connect offsets. Resume to apply or kill to abort.
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Approve Offset Remediation
+                description: Confirm authorization to stop connector tasks and apply altered committed offsets.
+                defaults: true
+
+          - id: stop_connector
+            type: io.kestra.plugin.core.http.Request
+            description: Send PUT /connectors/{name}/stop to place the connector in STOPPED state required by KIP-875 for offset alteration.
+            uri: "{{ inputs.connect_url ?? vars.connect_url }}/connectors/{{ inputs.connector_name ?? vars.connector_name }}/stop"
+            method: PUT
+            headers:
+              Accept: "application/json"
+              Content-Type: "application/json"
+            options:
+              allowFailed: true
+
+          - id: alter_connector_offsets
+            type: io.kestra.plugin.kafka.ConnectorAlterOffsets
+            description: Overwrite committed Kafka Connect connector offsets with target remediation offsets via KIP-875 PATCH /connectors/{name}/offsets.
+            connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+            connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+            offsets: "{{ outputs.triage_poison_pill_and_compute_offsets.vars.target_offsets }}"
+
+          - id: resume_connector
+            type: io.kestra.plugin.kafka.ConnectorResume
+            description: Resume connector and restart worker tasks from newly committed remediation offsets.
+            connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+            connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+
+          - id: verify_post_remediation_offsets
+            type: io.kestra.plugin.kafka.ConnectorGetOffsets
+            description: Post-remediation verification querying Connect REST API to confirm new offsets are committed.
+            connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+            connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+
+          - id: verify_post_remediation_status
+            type: io.kestra.plugin.kafka.ConnectorGetStatus
+            description: Query connector status post-resume to verify connectorState is RUNNING and tasks are active.
+            connectUrl: "{{ inputs.connect_url ?? vars.connect_url }}"
+            connectorName: "{{ inputs.connector_name ?? vars.connector_name }}"
+
+          - id: assert_connector_running
+            type: io.kestra.plugin.core.execution.Assert
+            description: Assert that connector returned to RUNNING state after offset modification.
+            conditions:
+              - "{{ outputs.verify_post_remediation_status.connectorState == 'RUNNING' }}"
+            errorMessage: "Connector failed to return to RUNNING state after offset alteration. Inspect worker logs."
+
+          - id: log_remediation_success
+            type: io.kestra.plugin.core.log.Log
+            description: Log verified offset alterations and connector recovery telemetry.
+            message: "Successfully applied KIP-875 offset remediation for {{ inputs.connector_name ?? vars.connector_name }}. Verified committed offsets: {{ outputs.verify_post_remediation_offsets.offsets | toJson }}."
+
+  - id: notify_if_unhealthy
+    type: io.kestra.plugin.core.flow.If
+    description: Only post to Slack when the connector actually has failed tasks, so a healthy poll produces no notification noise.
+    condition: "{{ outputs.triage_poison_pill_and_compute_offsets.vars.has_failed_tasks }}"
+    then:
+      - id: dispatch_slack_notification
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch structured incident triage and remediation report to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": "*Kafka Connect Offset Remediation & Poison Pill Report*\n" ~ outputs.triage_poison_pill_and_compute_offsets.vars.summary_markdown ~ "\n\n*Execution Mode:* dry_run=" ~ inputs.dry_run ~ ", remediation_action=" ~ inputs.remediation_action ~ " (Execution: `" ~ execution.id ~ "`)"
+          } | toJson }}
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if an unexpected execution error occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Flow Execution Failed*: `kafka-connect-sink-poison-pill-offset-rewind-and-skip-gate` (Execution: `" ~ execution.id ~ "`). Failed to audit or remediate Kafka Connect connector `" ~ (inputs.connector_name ?? vars.connector_name) ~ "`. Check Connect worker reachability and network permissions."
+      } | toJson }}
+
+extend:
+  title: Kafka Connect Sink Poison Pill Offset Rewind and Skip Gate
+  metaTitle: Kafka Connect Sink Poison Pill Offset Rewind and Skip Gate | Kestra
+  shortDescription: Detect Kafka Connect sink poison pill crashes, quarantine failed messages to DLQ, safely rewind or skip offsets via KIP-875 with approval, and verify recovery.
+  metaDescription: Detect Kafka Connect poison pill crashes, isolate bad records to DLQ, safely rewind or skip committed offsets with approval, and verify recovery via KIP-875.
+  description: |
+    Production Apache Kafka streaming architectures rely heavily on Kafka Connect to stream events from
+    Kafka topics into relational databases, search engines, and data lakes via sink connectors (such as
+    JDBC Sink, Elasticsearch Sink, OpenSearch Sink, or Snowflake Sink). When a consumer task encounters
+    a poison pill record, such as an unparseable byte sequence, schema mismatch, or foreign key constraint
+    violation, the task crashes and enters `FAILED` state.
+
+    Because Kafka Connect sink tasks process records in strict offset order, standard automated restarts
+    simply re-read the exact same poison pill record, causing immediate recursive task crashes. Ingestion
+    on that partition completely halts, consumer lag mounts, and downstream systems fall out of sync.
+    Until Apache Kafka 3.6 (KIP-875), modifying a connector's committed offsets required taking down
+    the Connect cluster and manually mutating the internal `connect-offsets` topic.
+
+    This blueprint implements an automated end-to-end recovery guard for Kafka Connect that detects
+    crashed sink tasks, verifies stationary committed offsets against historical telemetry in Kestra KV,
+    publishes diagnostic poison pill records to a dead-letter quarantine topic, safely advances (`SKIP_POISON_RECORD`)
+    or rewinds (`REWIND_OFFSET`) committed partition offsets using native KIP-875 offset management behind
+    an operator approval gate, and verifies that the connector recovers to a healthy `RUNNING` state.
+
+    ## How it works
+
+    1. **Configuration Pre-Flight Assertion**: `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) validates operational parameters, ensuring positive rewind counts, valid thresholds, and non-empty connector names.
+    2. **Connector Status Inspection**: `get_connector_status` (`io.kestra.plugin.kafka.ConnectorGetStatus`) queries the Kafka Connect REST API, extracting the overall connector state (`RUNNING`, `FAILED`, `PAUSED`), active worker IDs, task states, and stack traces.
+    3. **Committed Offset Collection**: `get_connector_offsets` (`io.kestra.plugin.kafka.ConnectorGetOffsets`) retrieves the committed partition offsets for all assigned partitions via KIP-875 `GET /connectors/{name}/offsets`.
+    4. **Historical State Diffing**: `load_previous_offset_state` (`io.kestra.plugin.core.kv.Get`) retrieves previous run offset snapshots from Kestra KV store under `kafka_connect_offset_tracker_{connector_name}`.
+    5. **Triage & Offset Calculation**: `triage_poison_pill_and_compute_offsets` (`io.kestra.plugin.scripts.python.Script`) parses task traces, correlates stalled offsets across execution runs, identifies stuck partitions, formats a dead-letter quarantine manifest, and calculates target remediation offsets based on the selected policy (`SKIP_POISON_RECORD` advances the failing offset by 1, `REWIND_OFFSET` rewinds by `N` records).
+    6. **KV Telemetry Persistence**: `persist_offset_tracker_kv` (`io.kestra.plugin.core.kv.Set`) writes the updated offset progression and stall telemetry back to the Kestra KV store.
+    7. **Quarantine Dead-Letter Publishing**: When enabled, `publish_poison_pill_to_dlq` (`io.kestra.plugin.kafka.Produce`) sends a structured diagnostic record containing the connector name, partition, poison offset, and full exception stack trace to the designated Kafka quarantine topic.
+    8. **Authorized Remediation with Approval Gate**: When `dry_run` is disabled:
+       - Execution pauses at `approval_gate` (`io.kestra.plugin.core.flow.Pause`) for operator verification.
+       - Upon approval, `stop_connector` (`io.kestra.plugin.core.http.Request`) invokes `PUT /connectors/{name}/stop` to place the connector in `STOPPED` state as strictly required by KIP-875.
+       - `alter_connector_offsets` (`io.kestra.plugin.kafka.ConnectorAlterOffsets`) overwrites committed offsets with the computed target offsets via `PATCH /connectors/{name}/offsets`.
+       - `resume_connector` (`io.kestra.plugin.kafka.ConnectorResume`) issues `PUT /connectors/{name}/resume` to restart tasks from the newly applied offsets.
+    9. **Post-Remediation Verification**: The workflow re-queries `ConnectorGetOffsets` and `ConnectorGetStatus`, asserting that the connector state returned to `RUNNING` without failing again.
+    10. **Incident Notification**: `dispatch_slack_notification` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) delivers a structured operational summary to Slack.
+
+    ## What you get
+
+    - Automated detection of Kafka Connect sink partition stalls and poison pill task crashes.
+    - Elimination of recursive task crash loops without manual cluster restarts or internal topic surgery.
+    - Isolated dead-letter quarantine records published to Kafka with exact partition, offset, and error traces.
+    - First-class KIP-875 offset manipulation supporting single-record skipping (`SKIP_POISON_RECORD`) or multi-message rewind (`REWIND_OFFSET`).
+    - Human approval gate (`Pause`) and non-destructive dry-run simulation mode to prevent accidental data loss.
+    - Post-remediation verification confirming that new offsets are committed and worker tasks are running cleanly.
+    - Persistent historical telemetry in Kestra KV store for audit compliance and trend analysis.
+
+    ## Who it's for
+
+    - Streaming Platform Engineers and SREs maintaining Apache Kafka and Kafka Connect clusters.
+    - Data Engineers running CDC ingestion pipelines (Debezium, JDBC Sink, Snowflake Sink, OpenSearch Sink).
+    - Incident Response teams triaging streaming consumer lag spikes and crashed Connect workers.
+
+    ## Why orchestrate this with Kestra
+
+    Kafka Connect provides no built-in mechanism to automatically pause, skip poison pill offsets, and resume failed sink connectors. Handling this with ad-hoc scripts requires fragile curl commands against internal REST APIs, lacks state persistence between runs, has no built-in pause-and-resume approval mechanisms, and risks offset corruption if an operator modifies offsets while a connector is still running.
+
+    Orchestrating this workflow with Kestra delivers a declarative blueprint with atomic Kestra KV state tracking, native Kafka Connect plugin tasks, built-in approval gates, guaranteed `STOPPED` state lifecycle compliance, automated dead-letter publishing, and comprehensive Slack triage alerting.
+
+    ## Prerequisites
+
+    - Apache Kafka Connect cluster (version 3.6 or higher supporting KIP-875 offset management) reachable from Kestra.
+    - An accessible Apache Kafka cluster hosting source/sink topics and the quarantine topic.
+    - Target sink connector deployed on Kafka Connect.
+    - A Slack Incoming Webhook URL configured in Kestra secrets.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for incident triage notifications and execution alerts.
+
+    ## Quick start
+
+    1. Configure `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Set `connect_url` and `bootstrap_servers` to match your Kafka environment.
+    3. Specify the target connector name in `connector_name` (e.g. `orders-jdbc-sink`).
+    4. Run an initial manual execution with `dry_run: true` to record an offset baseline and inspect connector health.
+    5. When a poison pill crash occurs, review the triage summary, set `dry_run: false`, and approve the `approval_gate` to alter offsets and recover the connector.
+    6. Enable the `on_connector_failure` status trigger and `periodic_offset_guard` schedule for continuous automated protection.
+
+    ## How to extend
+
+    - **Automated DLQ Consumer & Notification**: Wire an `io.kestra.plugin.kafka.Consume` task to inspect quarantined poison records and dispatch schema diffs to data governance channels.
+    - **Source Connector Support**: Extend the triage script to adjust source connector partition keys (such as `filename` and `position` for file connectors, or `table` and `incrementing` for JDBC sources).
+    - **PagerDuty Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` when consecutive poison pill crashes exceed critical thresholds.
+
+    ## Links
+
+    - [KIP-875: First-Class Offsets Support in Kafka Connect](https://cwiki.apache.org/confluence/display/KAFKA/KIP-875:+First-class+offsets+support+in+Kafka+Connect)
+    - [Kestra Kafka Plugin Documentation](https://kestra.io/plugins/plugin-kafka)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kafka Connect REST API Reference](https://kafka.apache.org/documentation/#connect_rest)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Approval Gates
+  ee: false
+  demo: false

@@ -1,0 +1,458 @@
+id: vault-pki-certificate-rotation
+namespace: company.team
+description: |
+  Rotate a workload certificate before expiry using a CSR whose private key stays with the workload.
+  Verify Vault's signed leaf against a pinned CA and the requested DNS name, then publish it to
+  a versioned KV v2 location only after human approval and a final compare-and-set check.
+
+concurrency: {limit: 1, behavior: QUEUE}
+
+triggers:
+  - id: csr_ready_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: vault-pki-rotation-change-me
+    description: "After replacing the key, POST to /api/v1/main/executions/webhook/company.team/vault-pki-certificate-rotation/vault-pki-rotation-change-me when a workload publishes a new CSR."
+  - id: daily_expiry_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 4 * * *"
+    disabled: true
+    description: Enable only after configuring the Vault paths, pinned CA fingerprint, and an approval owner.
+
+inputs:
+  - id: vault_url
+    type: STRING
+    defaults: http://vault-pki:8200
+    description: Vault API origin; the default reaches the local dev-mode container in the quick start.
+  - id: pki_mount
+    type: STRING
+    defaults: pki
+    description: PKI mount containing the restricted signing role; use a dedicated mount per trust domain.
+  - id: pki_role
+    type: STRING
+    defaults: web
+    description: Vault signing role that allows exactly the workload DNS name and caps certificate TTL.
+  - id: kv_mount
+    type: STRING
+    defaults: secret
+    description: KV v2 mount holding the public CSR and active certificate metadata.
+  - id: csr_path
+    type: STRING
+    defaults: cert-requests/service
+    description: KV v2 key whose csr field contains a workload-generated PEM CSR; the private key stays on the workload.
+  - id: active_path
+    type: STRING
+    defaults: certificates/service
+    description: KV v2 key that consumers watch for the active public certificate and CA chain.
+  - id: dns_name
+    type: STRING
+    defaults: service.example.test
+    description: Exact DNS SAN that the signed certificate must contain.
+  - id: trusted_root_sha256
+    type: STRING
+    defaults: replace-with-64-hex-sha256-of-trusted-root
+    description: Out-of-band SHA-256 of the trusted root certificate DER; pin it before any rotation.
+  - id: renew_before_hours
+    type: INT
+    defaults: 24
+    description: Ask for approval when the active certificate expires within this many hours.
+  - id: certificate_ttl
+    type: STRING
+    defaults: 72h
+    description: Requested leaf validity; the Vault role must allow this TTL and the value must be 1h to 720h.
+  - id: force_rotate
+    type: BOOL
+    defaults: false
+    description: Request approval even when the active certificate is healthy, for an incident or key change.
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reject unsafe URLs, paths, names, TTLs, and an unset CA pin before contacting Vault.
+    taskRunner: {type: io.kestra.plugin.core.runner.Process}
+    inputFiles:
+      vault_url.txt: "{{ inputs.vault_url }}"
+      pki_mount.txt: "{{ inputs.pki_mount }}"
+      pki_role.txt: "{{ inputs.pki_role }}"
+      kv_mount.txt: "{{ inputs.kv_mount }}"
+      csr_path.txt: "{{ inputs.csr_path }}"
+      active_path.txt: "{{ inputs.active_path }}"
+      dns_name.txt: "{{ inputs.dns_name }}"
+      root_pin.txt: "{{ inputs.trusted_root_sha256 }}"
+      hours.txt: "{{ inputs.renew_before_hours }}"
+      ttl.txt: "{{ inputs.certificate_ttl }}"
+    script: |
+      import re
+      from urllib.parse import urlsplit
+
+      def value(name):
+          with open(name + ".txt", encoding="utf-8") as file:
+              return file.read().strip()
+
+      origin = urlsplit(value("vault_url"))
+      if origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password or origin.path not in ("", "/") or origin.query or origin.fragment:
+          raise ValueError("vault_url must be an HTTP(S) origin without credentials, path, or query")
+      for key in ("pki_mount", "pki_role", "kv_mount"):
+          if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", value(key)):
+              raise ValueError(key + " must be a single safe Vault path component")
+      for key in ("csr_path", "active_path"):
+          if not re.fullmatch(r"[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+){0,5}", value(key)):
+              raise ValueError(key + " must be a relative KV path with safe components")
+      if value("csr_path") == value("active_path"):
+          raise ValueError("CSR and active certificate paths must differ")
+      if not re.fullmatch(r"(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+", value("dns_name")):
+          raise ValueError("dns_name must be an exact lower-case DNS name")
+      if not re.fullmatch(r"[0-9a-fA-F]{64}", value("root_pin")):
+          raise ValueError("trusted_root_sha256 must be a pinned 64-character hex digest")
+      if not 1 <= int(value("hours")) <= 720:
+          raise ValueError("renew_before_hours must be between 1 and 720")
+      match = re.fullmatch(r"([0-9]{1,3})h", value("ttl"))
+      if not match or not 1 <= int(match.group(1)) <= 720:
+          raise ValueError("certificate_ttl must be between 1h and 720h")
+
+  - id: inspect_certificate
+    type: io.kestra.plugin.scripts.python.Script
+    description: Read the active certificate and, only when rotation is due, validate and pin the CSR version.
+    taskRunner: {type: io.kestra.plugin.core.runner.Process}
+    inputFiles:
+      vault_url.txt: "{{ inputs.vault_url }}"
+      kv_mount.txt: "{{ inputs.kv_mount }}"
+      csr_path.txt: "{{ inputs.csr_path }}"
+      active_path.txt: "{{ inputs.active_path }}"
+      dns_name.txt: "{{ inputs.dns_name }}"
+      hours.txt: "{{ inputs.renew_before_hours }}"
+      force.txt: "{{ inputs.force_rotate }}"
+    env:
+      VAULT_TOKEN: "{{ secret('VAULT_TOKEN') }}"
+    script: |
+      import hashlib
+      import json
+      import os
+      import subprocess
+      import time
+      import urllib.error
+      import urllib.request
+
+      def value(name):
+          with open(name + ".txt", encoding="utf-8") as file:
+              return file.read().strip()
+
+      origin = value("vault_url").rstrip("/")
+      prefix = "/v1/" + value("kv_mount") + "/data/"
+      headers = {"X-Vault-Token": os.environ["VAULT_TOKEN"], "Accept": "application/json"}
+
+      def read(path, missing_ok=False):
+          for attempt in range(3):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(origin + prefix + path, headers=headers), timeout=8) as response:
+                      result = json.load(response)
+                  if not isinstance(result, dict) or result.get("errors") or not isinstance(result.get("data"), dict):
+                      raise RuntimeError("Vault KV read returned an API error or missing data")
+                  return result["data"]
+              except urllib.error.HTTPError as error:
+                  if error.code == 404 and missing_ok:
+                      return None
+                  if error.code in (429, 502, 503, 504) and attempt < 2:
+                      time.sleep(2 ** attempt)
+                      continue
+                  raise RuntimeError(f"Vault KV read failed with HTTP {error.code} at {path}") from error
+              except (urllib.error.URLError, TimeoutError) as error:
+                  if attempt < 2:
+                      time.sleep(2 ** attempt)
+                      continue
+                  raise RuntimeError(f"Vault KV read could not connect at {path}: {error.reason if hasattr(error, 'reason') else error}") from error
+
+      active = read(value("active_path"), True)
+      version = 0 if active is None else active.get("metadata", {}).get("version")
+      if type(version) is not int or version < 0:
+          raise RuntimeError("Active KV response has no valid version")
+      reason = "missing"
+      hours_left = None
+      serial = ""
+      if active is not None:
+          certificate = active.get("data", {}).get("certificate")
+          if not isinstance(certificate, str) or "BEGIN CERTIFICATE" not in certificate:
+              raise RuntimeError("Active KV version has no PEM certificate; repair the record before rotation")
+          probe = subprocess.run(["openssl", "x509", "-noout", "-enddate", "-serial", "-checkhost", value("dns_name")], input=certificate, text=True, capture_output=True)
+          if probe.returncode:
+              raise RuntimeError("Active certificate is malformed: " + probe.stderr[:160])
+          fields = dict(line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line)
+          serial = fields.get("serial", "")
+          expiry = subprocess.run(["openssl", "x509", "-noout", "-checkend", str(int(value("hours")) * 3600)], input=certificate, text=True, capture_output=True)
+          if expiry.returncode:
+              reason = "expiring"
+          elif "does NOT match" in probe.stdout:
+              reason = "wrong_name"
+          elif value("force").lower() == "true":
+              reason = "forced"
+          else:
+              reason = "healthy"
+          end_date = fields.get("notAfter", "")
+          if end_date:
+              from datetime import datetime, timezone
+              hours_left = round((datetime.strptime(end_date, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc).timestamp() - time.time()) / 3600, 2)
+      if reason == "healthy":
+          report = {"due": False, "reason": reason, "current_version": version, "current_serial": serial, "hours_left": hours_left, "csr_version": 0, "csr_sha256": ""}
+      else:
+          csr_record = read(value("csr_path"))
+          csr = csr_record.get("data", {}).get("csr")
+          csr_version = csr_record.get("metadata", {}).get("version")
+          if not isinstance(csr, str) or "BEGIN CERTIFICATE REQUEST" not in csr or type(csr_version) is not int:
+              raise RuntimeError("CSR KV record must contain a PEM csr and a version")
+          verify = subprocess.run(["openssl", "req", "-noout", "-verify"], input=csr, text=True, capture_output=True)
+          if verify.returncode:
+              raise RuntimeError("CSR signature is invalid")
+          report = {"due": True, "reason": reason, "current_version": version, "current_serial": serial, "hours_left": hours_left, "csr_version": csr_version, "csr_sha256": hashlib.sha256(csr.encode()).hexdigest()}
+      print("::" + json.dumps({"outputs": {"report": report}}) + "::")
+
+  - id: when_rotation_due
+    type: io.kestra.plugin.core.flow.If
+    description: Healthy certificates end quietly; a due certificate requires an explicit human decision.
+    condition: "{{ outputs.inspect_certificate.vars.report.due == true }}"
+    then:
+      - id: approve_rotation
+        type: io.kestra.plugin.core.flow.Pause
+        description: Review the current serial, reason, CSR version, and pinned CA before publishing a new certificate.
+        onResume:
+          - id: approved
+            type: BOOL
+            defaults: false
+            description: Approve signing and publishing the new certificate; false leaves the active KV version unchanged.
+          - id: change_ticket
+            type: STRING
+            required: false
+            description: Record the change ticket or incident number for the audit trail.
+      - id: when_approved
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approve_rotation.onResume.approved == true }}"
+        then:
+          - id: sign_verify_publish
+            type: io.kestra.plugin.scripts.python.Script
+            description: Recheck both KV versions, sign once, verify the pinned chain and public key, then publish with KV compare-and-set.
+            taskRunner: {type: io.kestra.plugin.core.runner.Process}
+            inputFiles:
+              vault_url.txt: "{{ inputs.vault_url }}"
+              pki_mount.txt: "{{ inputs.pki_mount }}"
+              pki_role.txt: "{{ inputs.pki_role }}"
+              kv_mount.txt: "{{ inputs.kv_mount }}"
+              csr_path.txt: "{{ inputs.csr_path }}"
+              active_path.txt: "{{ inputs.active_path }}"
+              dns_name.txt: "{{ inputs.dns_name }}"
+              root_pin.txt: "{{ inputs.trusted_root_sha256 }}"
+              ttl.txt: "{{ inputs.certificate_ttl }}"
+              expected_version.txt: "{{ outputs.inspect_certificate.vars.report.current_version }}"
+              expected_csr_version.txt: "{{ outputs.inspect_certificate.vars.report.csr_version }}"
+              expected_csr_sha256.txt: "{{ outputs.inspect_certificate.vars.report.csr_sha256 }}"
+            env:
+              VAULT_TOKEN: "{{ secret('VAULT_TOKEN') }}"
+            script: |
+              import hashlib
+              import json
+              import os
+              import subprocess
+              import tempfile
+              import time
+              import urllib.error
+              import urllib.request
+              from pathlib import Path
+
+              def value(name):
+                  with open(name + ".txt", encoding="utf-8") as file:
+                      return file.read().strip()
+
+              origin = value("vault_url").rstrip("/")
+              kv_prefix = "/v1/" + value("kv_mount") + "/data/"
+              headers = {"X-Vault-Token": os.environ["VAULT_TOKEN"], "Accept": "application/json", "Content-Type": "application/json"}
+
+              def call(method, path, body=None, retry_read=False, missing_ok=False):
+                  encoded = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+                  for attempt in range(3 if retry_read else 1):
+                      try:
+                          request = urllib.request.Request(origin + path, data=encoded, headers=headers, method=method)
+                          with urllib.request.urlopen(request, timeout=10) as response:
+                              result = json.load(response)
+                          if not isinstance(result, dict) or result.get("errors"):
+                              raise RuntimeError(f"Vault {method} {path} returned an API error")
+                          return result
+                      except urllib.error.HTTPError as error:
+                          if missing_ok and error.code == 404:
+                              return None
+                          if retry_read and error.code in (429, 502, 503, 504) and attempt < 2:
+                              time.sleep(2 ** attempt)
+                              continue
+                          raise RuntimeError(f"Vault {method} {path} failed with HTTP {error.code}; inspect the active KV version before retrying a write") from error
+                      except (urllib.error.URLError, TimeoutError) as error:
+                          if retry_read and attempt < 2:
+                              time.sleep(2 ** attempt)
+                              continue
+                          raise RuntimeError(f"Vault {method} {path} could not connect; inspect Vault state before retrying") from error
+
+              active_path = kv_prefix + value("active_path")
+              csr_path = kv_prefix + value("csr_path")
+              active = call("GET", active_path, retry_read=True, missing_ok=True)
+              current_version = 0 if active is None else active.get("data", {}).get("metadata", {}).get("version")
+              if current_version != int(value("expected_version")):
+                  raise RuntimeError("Active certificate changed after approval; no certificate was signed")
+              csr_result = call("GET", csr_path, retry_read=True)
+              csr_record = csr_result.get("data", {})
+              csr = csr_record.get("data", {}).get("csr")
+              if csr_record.get("metadata", {}).get("version") != int(value("expected_csr_version")) or not isinstance(csr, str) or hashlib.sha256(csr.encode()).hexdigest() != value("expected_csr_sha256"):
+                  raise RuntimeError("CSR changed after approval; no certificate was signed")
+
+              def openssl(args, data):
+                  result = subprocess.run(["openssl", *args], input=data, text=True, capture_output=True)
+                  if result.returncode:
+                      raise RuntimeError("OpenSSL verification failed: " + result.stderr[:180])
+                  return result.stdout
+
+              openssl(["req", "-noout", "-verify"], csr)
+              root_result = call("GET", "/v1/" + value("pki_mount") + "/cert/ca", retry_read=True)
+              root = root_result.get("data", {}).get("certificate")
+              if not isinstance(root, str) or "BEGIN CERTIFICATE" not in root:
+                  raise RuntimeError("Vault PKI root response omitted the CA certificate")
+              root_der = subprocess.run(["openssl", "x509", "-outform", "DER"], input=root.encode(), capture_output=True)
+              if root_der.returncode or hashlib.sha256(root_der.stdout).hexdigest() != value("root_pin").lower():
+                  raise RuntimeError("Vault PKI root does not match the out-of-band SHA-256 pin; no certificate was signed")
+
+              payload = {"csr": csr, "common_name": value("dns_name"), "ttl": value("ttl"), "format": "pem"}
+              signed = call("POST", "/v1/" + value("pki_mount") + "/sign/" + value("pki_role"), payload)
+              data = signed.get("data")
+              if not isinstance(data, dict) or not isinstance(data.get("certificate"), str) or not isinstance(data.get("ca_chain"), list) or not data.get("ca_chain"):
+                  raise RuntimeError("Vault sign response omitted certificate or CA chain; inspect the issued serial before retrying")
+              leaf = data["certificate"]
+              chain = data["ca_chain"]
+              if any(not isinstance(part, str) or "BEGIN CERTIFICATE" not in part for part in chain):
+                  raise RuntimeError("Vault returned a malformed CA chain")
+              with tempfile.TemporaryDirectory() as directory:
+                  root_file = Path(directory) / "root.pem"
+                  chain_file = Path(directory) / "chain.pem"
+                  leaf_file = Path(directory) / "leaf.pem"
+                  root_file.write_text(root)
+                  leaf_file.write_text(leaf)
+                  chain_file.write_text("\n".join(chain))
+                  verify = subprocess.run(["openssl", "verify", "-CAfile", str(root_file), "-untrusted", str(chain_file), str(leaf_file)], capture_output=True, text=True)
+                  if verify.returncode:
+                      raise RuntimeError("Signed certificate chain did not verify against the pinned root")
+              host = openssl(["x509", "-noout", "-checkhost", value("dns_name")], leaf)
+              if "does NOT match" in host or "does match" not in host:
+                  raise RuntimeError("Signed certificate does not cover the requested DNS name")
+              if openssl(["x509", "-pubkey", "-noout"], leaf).strip() != openssl(["req", "-pubkey", "-noout"], csr).strip():
+                  raise RuntimeError("Signed certificate public key differs from the workload CSR")
+              validity = subprocess.run(["openssl", "x509", "-noout", "-checkend", "3600"], input=leaf, text=True, capture_output=True)
+              if validity.returncode:
+                  raise RuntimeError("Signed certificate expires within one hour")
+              serial = openssl(["x509", "-noout", "-serial"], leaf).strip().split("=", 1)[-1]
+              if not serial:
+                  raise RuntimeError("Signed certificate has no serial number")
+              record = {"certificate": leaf, "ca_chain": chain, "serial_number": serial, "dns_name": value("dns_name"), "csr_sha256": value("expected_csr_sha256")}
+              written = call("POST", active_path, {"options": {"cas": current_version}, "data": record})
+              new_version = written.get("data", {}).get("version")
+              if type(new_version) is not int or new_version != current_version + 1:
+                  raise RuntimeError("Vault KV write response omitted expected version; inspect active KV before retrying")
+              readback = call("GET", active_path, retry_read=True)
+              current = readback.get("data", {})
+              if current.get("metadata", {}).get("version") != new_version or current.get("data", {}).get("serial_number") != serial:
+                  raise RuntimeError("Published certificate readback did not match; inspect active KV before retrying")
+              print("::" + json.dumps({"outputs": {"rotation": {"serial_number": serial, "kv_version": new_version, "dns_name": value("dns_name")}}}) + "::")
+
+          - id: notify_rotation
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Notify only after a verified certificate was published and read back.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: >-
+              Vault PKI certificate rotated for {{ inputs.dns_name }}. New serial {{ outputs.sign_verify_publish.vars.rotation.serial_number }},
+              KV version {{ outputs.sign_verify_publish.vars.rotation.kv_version }}. Have the workload reload the public certificate
+              and confirm its live TLS handshake. Execution {{ execution.id }}.
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: "Certificate rotation declined; active KV version {{ outputs.inspect_certificate.vars.report.current_version }} remains unchanged."
+    else:
+      - id: log_healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "Certificate is healthy with {{ outputs.inspect_certificate.vars.report.hours_left }} hours left; no Vault write or notification."
+
+errors:
+  - id: alert_rotation_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Vault PKI rotation execution {{ execution.id }} failed in {{ tasksWithState('FAILED')[0]['taskId'] }}.
+      Cause: {{ (errorLogs() | toJson | jq('[.[] | .message | select(contains("Error:"))] | first') | first) ?? errorLogs()[0]['message'] }}.
+      Inspect the active KV version and issued serial before retrying; do not blindly re-sign or overwrite a changed CSR.
+
+outputs:
+  - id: inspection
+    type: JSON
+    description: Expiry decision, active KV version, and pinned CSR version from the initial read.
+    value: "{{ (outputs.inspect_certificate.vars.report ?? {}) | toJson }}"
+  - id: rotation
+    type: JSON
+    description: Published serial and KV version after approval; empty when healthy or declined.
+    value: "{{ (outputs.sign_verify_publish.vars.rotation ?? {}) | toJson }}"
+
+extend:
+  title: Rotate Vault PKI Certificates Without Moving Private Keys
+  shortDescription: Sign workload CSRs before certificate expiry, verify the pinned CA chain, and publish only after approval and a KV version check.
+  metaTitle: Vault PKI Certificate Rotation with Kestra
+  metaDescription: Sign workload CSRs in Vault PKI, verify the CA chain and DNS identity, and publish approved certificates with KV v2 compare-and-set.
+  description: |
+    Workload certificate renewal should not put a private key in an orchestration log or silently overwrite a certificate changed by another operator. This blueprint reads an externally generated CSR, signs it through a restricted Vault PKI role, verifies the resulting certificate against an out-of-band CA fingerprint, and uses KV v2 compare-and-set for publication. The workload keeps its private key and watches the active KV record for the public certificate.
+
+    ## How it works
+    1. `csr_ready_webhook` accepts an event after a workload publishes a CSR; the disabled `daily_expiry_sweep` is an optional backstop.
+    2. `validate_request` checks all paths, DNS name, TTL, and CA fingerprint before an external request.
+    3. `inspect_certificate` reads the active KV v2 version, checks its expiry and DNS name, and verifies the CSR signature when rotation is due. A healthy certificate produces no write and no Slack message.
+    4. `approve_rotation` (`Pause`) defaults to rejection. Approval pins the active and CSR KV versions observed before the pause.
+    5. `sign_verify_publish` rechecks both versions after approval, pins Vault's CA against the supplied SHA-256 digest, signs the CSR once, verifies chain, DNS name, public-key match, and remaining validity, then publishes through KV v2 CAS and reads the result back.
+    6. `notify_rotation` reports the new serial only after a successful readback. The consumer must reload the public certificate and verify its live TLS endpoint; this flow does not deploy it.
+
+    ## Error handling
+    - Bad inputs, missing or malformed CSR, wrong CA pin, bad chain, wrong DNS name, public-key mismatch, and short-lived signed leaves fail closed.
+    - Read-only Vault calls retry transient network and 429/5xx errors with exponential backoff. Signing and KV writes are never blindly retried because a lost response can hide a completed side effect.
+    - Both the active version and CSR digest are checked after approval. KV v2 CAS also rejects a concurrent writer between the final read and publish.
+    - `errors` sends an actionable Slack alert with the failed task and cause. The active record remains inspectable; a failed readback requires checking Vault before any retry.
+
+    ## What this blueprint teaches about Kestra
+    - A webhook and disabled Schedule can share an expiry decision. `If` keeps the no-change path quiet, `Pause` records human approval, and script output carries the pinned KV versions between steps.
+    - A single final script can verify and publish with an external compare-and-set primitive, without putting certificate private keys in Kestra's inputs or outputs.
+
+    ## Prerequisites
+    - Vault with a PKI mount, a restricted sign role for the DNS name, and a KV v2 mount reachable by the Kestra worker. The token needs read on the CSR and active KV keys, create/update on the active key, read on the PKI CA, and update on the sign role.
+    - A workload-generated PEM CSR in `secret/data/cert-requests/service` under the `csr` field. Its private key stays outside Kestra. Consumers read `secret/data/certificates/service` and reload the public certificate after a version change.
+    - Python 3 and OpenSSL on the Kestra worker, a Slack incoming webhook, and a trusted root fingerprint obtained out of band.
+
+    ## Secrets
+    - `VAULT_TOKEN`: a narrowly scoped Vault token, supplied as a Kestra secret.
+    - `SLACK_WEBHOOK_URL`: Slack webhook for successful rotations and operational failures.
+
+    ## Inputs
+    - `vault_url`, `pki_mount`, `pki_role`, `kv_mount`, `csr_path`, and `active_path` locate the Vault records.
+    - `dns_name`, `trusted_root_sha256`, `renew_before_hours`, and `certificate_ttl` define the security gate and timing. The CA pin is deliberately unset by default.
+    - `force_rotate` allows a planned or incident-driven renewal of an otherwise healthy certificate, still behind approval.
+
+    ## Outputs
+    - `inspection` contains the due reason, current KV version, serial, and CSR version. `rotation` contains the new serial and KV version only after a verified publication. The KV record contains only public certificate material and metadata, never a private key.
+
+    ## Quick start
+    1. Start Vault dev mode on a private Docker network, enable a `pki` mount, generate a test root, configure a `web` role restricted to `service.example.test`, and use the dev `secret` KV v2 mount.
+    2. Generate the workload key and CSR outside Kestra; write only the CSR to `secret/data/cert-requests/service`. Compute SHA-256 from the trusted root certificate DER out of band.
+    3. Set the two Kestra secrets, supply the CA digest in `trusted_root_sha256`, run the flow, inspect the `inspection` output, and resume the Pause with `approved=true` only after review.
+    4. Read `secret/data/certificates/service` and have the workload reload that public certificate. Check the live TLS endpoint separately before retiring its previous certificate.
+
+    ## Plugins used
+    - `io.kestra.plugin.scripts.python.Script` for input checks and Vault PKI/KV calls, using the `Process` runner and Python standard library.
+    - `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` for one success message and operational error alerts.
+    - Kestra core Webhook, Schedule, If, Pause, and Log tasks for event and human-controlled orchestration.
+
+    ## Links
+    - [Vault PKI sign certificate API](https://developer.hashicorp.com/vault/api-docs/secret/pki)
+    - [Vault KV v2 check-and-set API](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Policy & Compliance
+    - Infrastructure Automation
+  ee: false
+  demo: false

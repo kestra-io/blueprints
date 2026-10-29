@@ -1,0 +1,378 @@
+id: flux-kustomization-apply-drift-gate
+namespace: company.team
+description: |
+  Flux Kustomizations keep releasing on top of a broken base because a stale
+  lastAppliedRevision, climbing failure counters and inventory differences never
+  gate the next CD run. A keyed webhook accepts the Kustomization status report, a
+  WorkingDirectory materializes the report for a Python pass that grades every
+  kustomization against its applied and attempted revision, its reconcile failures
+  and its inventory drift. Stale, failing or drifted kustomizations open a labeled
+  GitHub issue, alert Slack and fail the execution, a clean fleet logs the in sync
+  position, and the verdict, the stale and failing names, the failure high water
+  mark and the drifted objects are published as outputs while unexpected failures
+  escalate to Slack.
+
+triggers:
+  - id: post_kustomization_status
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: POST the Flux kustomization status report here after each reconcile, for example from a cluster cron job running flux get kustomizations as JSON.
+    key: "{{ secret('FLUX_STATUS_WEBHOOK_KEY') }}"
+  - id: hourly_drift_safety_net
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Hourly 08:00 UTC safety net, shipped disabled so no release is blocked until an operator reviews the thresholds and switches it on.
+    cron: "0 8 * * *"
+    disabled: true
+
+inputs:
+  - id: max_fail_count_allowed
+    type: INT
+    defaults: 2
+    description: Highest reconcile failure count a kustomization may reach before it counts as failing and blocks the release.
+  - id: stale_revision_hours_allowed
+    type: INT
+    defaults: 6
+    description: Hours an attempted revision may sit unapplied before the kustomization counts as stale.
+  - id: github_repository
+    type: STRING
+    defaults: your-org/platform-gitops
+    description: Repository that receives the drift issue, in owner slash name form.
+
+tasks:
+  - id: status_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the posted Flux status and the grading script read the same file for the whole run.
+    tasks:
+      - id: materialize_status_report
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Write the posted status body into the shared workspace with a heredoc and size it for the log, so the analyst child reads exactly what the cluster sent.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          entryPoint: []
+        containerImage: python:3.12-slim
+        commands:
+          - |
+            set -u
+            cat > kustomizations.json <<'KESTRA_FLUX_REPORT'
+            {{ (trigger.body ?? {}) | toJson }}
+            KESTRA_FLUX_REPORT
+            echo "wrote $(wc -c < kustomizations.json) bytes of Flux status to the shared workspace"
+
+      - id: evaluate_kustomizations
+        type: io.kestra.plugin.scripts.python.Script
+        description: Grade each kustomization on applied versus attempted revision age, reconcile failures and inventory drift, then emit the release verdict through the outputs protocol.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        env:
+          MAX_FAIL_COUNT_ALLOWED: "{{ inputs.max_fail_count_allowed }}"
+          STALE_REVISION_HOURS_ALLOWED: "{{ inputs.stale_revision_hours_allowed }}"
+        script: |
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          STATUS_FILE = "kustomizations.json"
+
+          def env_float(name, default):
+              try:
+                  return float(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return float(default)
+
+          MAX_FAIL_COUNT_ALLOWED = env_float("MAX_FAIL_COUNT_ALLOWED", 2)
+          STALE_REVISION_HOURS_ALLOWED = env_float("STALE_REVISION_HOURS_ALLOWED", 6)
+
+          def parse_timestamp(value):
+              if not value:
+                  return None
+              text = str(value).strip()
+              if text.endswith("Z"):
+                  text = text[:-1] + "+00:00"
+              try:
+                  stamp = datetime.fromisoformat(text)
+              except ValueError:
+                  return None
+              if stamp.tzinfo is None:
+                  stamp = stamp.replace(tzinfo=timezone.utc)
+              return stamp.astimezone(timezone.utc)
+
+          def load_report(path):
+              try:
+                  if not os.path.exists(path) or os.path.getsize(path) == 0:
+                      return None, "status report file is missing or empty"
+                  with open(path, "r", encoding="utf-8") as handle:
+                      document = json.load(handle)
+                  document = json.loads(document) if isinstance(document, str) else document
+                  if not isinstance(document, dict):
+                      return None, "status report is not a JSON object"
+                  return document, ""
+              except ValueError:
+                  return None, "status report is not valid JSON"
+
+          report, problem = load_report(STATUS_FILE)
+          now = parse_timestamp(report.get("observedAt")) if report else None
+          now = now or datetime.now(timezone.utc)
+
+          verdict, detail = "IN_SYNC", ""
+          stale_names, failing_names, drift_entries = [], [], []
+          checked, max_fail_count = 0, 0
+
+          if report is None:
+              verdict, detail = "UNREADABLE_REPORT", problem
+          else:
+              items = [row for row in (report.get("kustomizations") or []) if isinstance(row, dict)]
+              checked = len(items)
+              stale_bits, fail_bits, drift_bits = [], [], []
+              for item in items:
+                  name = str((item.get("metadata") or {}).get("name") or "unnamed-kustomization")
+                  status = item.get("status") or {}
+                  applied = str(status.get("lastAppliedRevision") or "")
+                  attempted = str(status.get("lastAttemptedRevision") or "")
+                  try:
+                      failures = int(status.get("failures") or 0)
+                  except (TypeError, ValueError):
+                      failures = 0
+                  max_fail_count = max(max_fail_count, failures)
+
+                  if applied and attempted and applied != attempted:
+                      attempt_time = parse_timestamp(status.get("lastAttemptedTime"))
+                      lag = (now - attempt_time).total_seconds() / 3600.0 if attempt_time else None
+                      if lag is None or lag > STALE_REVISION_HOURS_ALLOWED:
+                          stale_names.append(name)
+                          stale_bits.append("%s applied %s while %s is attempted%s" % (
+                              name, applied, attempted,
+                              "" if lag is None else " for %.1fh" % lag))
+
+                  ready_status, stalled = "", False
+                  for condition in [row for row in (status.get("conditions") or []) if isinstance(row, dict)]:
+                      ctype = str(condition.get("type") or "")
+                      cstatus = str(condition.get("status") or "")
+                      if ctype == "Ready":
+                          ready_status = cstatus
+                      if ctype == "Stalled" and cstatus == "True":
+                          stalled = True
+                  reasons = []
+                  if failures > MAX_FAIL_COUNT_ALLOWED:
+                      reasons.append("%g failures past the %g allowed" % (failures, MAX_FAIL_COUNT_ALLOWED))
+                  if ready_status == "False":
+                      reasons.append("Ready condition is False")
+                  if stalled:
+                      reasons.append("Stalled condition is True")
+                  if reasons:
+                      failing_names.append(name)
+                      fail_bits.append("%s %s" % (name, ", ".join(reasons)))
+
+                  inventory = status.get("inventory") or {}
+                  drift = [str(entry) for entry in (inventory.get("drift") or []) if entry]
+                  if drift:
+                      drift_entries.extend(drift)
+                      drift_bits.append("%s differs in %d object(s)" % (name, len(drift)))
+
+              if checked == 0:
+                  verdict, detail = "NO_DATA", "report contained no kustomization entries"
+              else:
+                  bits = stale_bits + fail_bits + drift_bits
+                  if bits:
+                      verdict, detail = "DRIFT_BLOCKING", "; ".join(bits)
+                  else:
+                      verdict = "IN_SYNC"
+                      detail = "%d kustomization(s) applied their attempted revision, no failing reconciles, no inventory drift" % checked
+
+          gate_blocked = verdict != "IN_SYNC"
+          print("verdict=%s checked=%d stale=%d failing=%d drift=%d max_fail=%d" % (
+              verdict, checked, len(stale_names), len(failing_names), len(drift_entries), max_fail_count))
+          print("::" + json.dumps({"outputs": {
+              "verdict": verdict,
+              "gate_blocked": gate_blocked,
+              "kustomizations_checked": checked,
+              "stale_kustomizations": stale_names,
+              "failing_kustomizations": failing_names,
+              "max_fail_count": max_fail_count,
+              "drift_entries": drift_entries,
+              "detail": detail,
+          }}) + "::")
+
+  - id: apply_drift_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Escalate and fail whenever a kustomization is stale, failing or drifted, and log the in sync position otherwise.
+    condition: "{{ outputs.evaluate_kustomizations.vars.gate_blocked }}"
+    then:
+      - id: open_drift_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: Open a labeled GitHub issue carrying the stale revisions, failing reconciles and drifted objects, so the broken base has a thread to be fixed in.
+        oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "Flux apply drift blocks {{ flow.id }}"
+        body: |
+          ## Flux apply drift detected
+
+          Verdict **{{ outputs.evaluate_kustomizations.vars.verdict }}** across {{ outputs.evaluate_kustomizations.vars.kustomizations_checked }}
+          kustomization(s), highest reconcile failure count {{ outputs.evaluate_kustomizations.vars.max_fail_count }}.
+
+          {{ outputs.evaluate_kustomizations.vars.detail }}
+
+          ```json
+          {"stale": {{ outputs.evaluate_kustomizations.vars.stale_kustomizations | toJson }},
+           "failing": {{ outputs.evaluate_kustomizations.vars.failing_kustomizations | toJson }},
+           "drift": {{ outputs.evaluate_kustomizations.vars.drift_entries | toJson }}}
+          ```
+
+          Execution `{{ execution.id }}`. Reconcile the listed kustomizations, then re-run this gate before the next release builds on the broken base.
+        labels:
+          - flux
+          - drift
+      - id: alert_drift
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the platform channel which kustomizations are stale, failing or drifted, right after the issue exists and before the execution fails.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "Flux apply drift gate BLOCKED for {{ flow.id }}. {{ outputs.evaluate_kustomizations.vars.detail }}. Stale {{ outputs.evaluate_kustomizations.vars.stale_kustomizations | toJson }}, failing {{ outputs.evaluate_kustomizations.vars.failing_kustomizations | toJson }}, max failures {{ outputs.evaluate_kustomizations.vars.max_fail_count }}. Execution {{ execution.id }}."}
+      - id: fail_drift_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Fail the execution so a release waiting on this gate stops instead of building on a broken base.
+        errorMessage: "Flux apply drift gate blocked - {{ outputs.evaluate_kustomizations.vars.detail }}"
+    else:
+      - id: log_in_sync
+        type: io.kestra.plugin.core.log.Log
+        description: Record the in sync position with the kustomization count so the execution history proves the gate ran.
+        message: "Flux apply gate clear - {{ outputs.evaluate_kustomizations.vars.kustomizations_checked }} kustomization(s) applied their attempted revision, max failures {{ outputs.evaluate_kustomizations.vars.max_fail_count }}, no inventory drift."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    value: "{{ outputs.evaluate_kustomizations.vars.verdict }}"
+  - id: gate_blocked
+    type: BOOL
+    value: "{{ outputs.evaluate_kustomizations.vars.gate_blocked }}"
+  - id: kustomizations_checked
+    type: INT
+    value: "{{ outputs.evaluate_kustomizations.vars.kustomizations_checked }}"
+  - id: stale_kustomizations
+    type: ARRAY
+    value: "{{ outputs.evaluate_kustomizations.vars.stale_kustomizations | toJson }}"
+  - id: failing_kustomizations
+    type: ARRAY
+    value: "{{ outputs.evaluate_kustomizations.vars.failing_kustomizations | toJson }}"
+  - id: max_fail_count
+    type: INT
+    value: "{{ outputs.evaluate_kustomizations.vars.max_fail_count }}"
+  - id: drift_entries
+    type: ARRAY
+    value: "{{ outputs.evaluate_kustomizations.vars.drift_entries | toJson }}"
+  - id: detail
+    type: STRING
+    value: "{{ outputs.evaluate_kustomizations.vars.detail }}"
+
+extend:
+  title: Block CD Releases on Flux Kustomization Apply Drift and Failing Reconciles
+  metaTitle: Flux Kustomization Apply Drift Gate with Kestra
+  shortDescription: "Grade every Flux Kustomization on applied versus attempted revision age, reconcile failures and inventory drift, then gate the release through GitHub and Slack."
+  metaDescription: "Gate Flux Kustomization apply drift, stale revisions and reconcile failures from one status report, escalating through GitHub issues and Slack alerts."
+  description: |
+    A Flux Kustomization that reports a stale lastAppliedRevision, a climb in reconcile failures, or objects in its inventory
+    that no longer match the manifests will not stop the next CD run by itself, and the release keeps building on the broken
+    base. This blueprint takes one status report from the cluster, materializes it in a shared WorkingDirectory, and grades
+    every kustomization in Python against two thresholds you control. Anything stale, failing or drifted opens a labeled
+    GitHub issue, alerts Slack and fails the execution; a clean fleet logs the in sync position and the run publishes the
+    verdict as outputs.
+
+    ## How it works
+
+    1. `post_kustomization_status` (`io.kestra.plugin.core.trigger.Webhook`, keyed with the `FLUX_STATUS_WEBHOOK_KEY` secret)
+       accepts the report after each reconcile. `hourly_drift_safety_net` (`io.kestra.plugin.core.trigger.Schedule`, cron `0 8
+       * * *`) ships `disabled: true` until an operator has reviewed the two thresholds and switched it on.
+    2. `status_workspace` (`io.kestra.plugin.core.flow.WorkingDirectory`) opens one shared directory.
+       `materialize_status_report` (`io.kestra.plugin.scripts.shell.Commands` on the Docker runner, image `python:3.12-slim`)
+       writes the posted body into `kustomizations.json` with a quoted heredoc, and `evaluate_kustomizations`
+       (`io.kestra.plugin.scripts.python.Script`) reads that file plus the two thresholds from `env`. Both children are
+       scripts inside the workspace, and every non runnable task sits after the block, because default tasks are stateless and
+       a temp dir is purged when a task completes.
+    3. The analyst flags a kustomization as stale when `lastAppliedRevision` differs from `lastAttemptedRevision` and the
+       attempt is older than `stale_revision_hours_allowed` (or carries no attempt time at all), as failing when `failures`
+       passes `max_fail_count_allowed` or the `Ready` or `Stalled` conditions say so, and as drifted when `inventory.drift`
+       lists objects. The verdict is printed as one `::{"outputs": ...}::` line.
+    4. `apply_drift_gate` (`io.kestra.plugin.core.flow.If`) is the verdict. A blocked run opens the GitHub issue, posts the
+       Slack summary and then fails through `io.kestra.plugin.core.execution.Fail`; a clean run logs the count and the failure
+       high water mark. The flow level `errors` handler (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) reports
+       any other failure with the execution id.
+
+    ## What you get
+
+    - A release gate that reads what Flux reads, revision lag, failure counters and inventory drift, not a hand list.
+    - Stale, failing and drifted findings stay separate in the outputs, each with its own fix.
+    - A fail safe posture, an unreadable or empty report blocks the release rather than waving it through.
+    - Escalation with an artifact, a labeled issue with the JSON lists, a Slack summary and a failing run.
+
+    ## Who it's for
+
+    - GitOps teams running Flux in production who need CD to stop on a broken base instead of layering commits on top of it.
+    - Platform engineers who own kustomization hygiene and want failures surfaced with numbers, not screenshots.
+    - Release engineers who want one gate output to branch on before promoting across clusters.
+
+    ## Why orchestrate this with Kestra
+
+    Flux reconciles and reports continuously but never says whether the next release may proceed, and its status lives one
+    kustomization at a time with no history of yesterday's failure count. Kestra gives the check a keyed webhook for the
+    cluster reporter, a WorkingDirectory where the posted report and the analysis share one file, two thresholds as typed
+    inputs, a conditional gate that escalates into GitHub and Slack and then fails, and an execution history with the exact
+    verdict a promotion pipeline can branch on. The alternative is a script in a cron job whose failure nobody sees until the
+    deploy is already out.
+
+    ## Prerequisites
+
+    - A worker with Docker access, both workspace children run in `python:3.12-slim`.
+    - A reporter step that POSTs `flux get kustomizations -o json` output shaped as a `kustomizations` array, each entry
+      carrying `metadata.name`, `spec`, `status.lastAppliedRevision`, `status.lastAttemptedRevision`,
+      `status.lastAttemptedTime`, `status.failures`, `status.conditions` and `status.inventory.drift`.
+    - A Slack incoming webhook and a GitHub token that can open issues in `github_repository`.
+
+    ### Secrets
+
+    - `FLUX_STATUS_WEBHOOK_KEY`: key guarding the status webhook URL, anyone holding it can post a report.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL used by the drift summary and the `errors` handler.
+    - `GITHUB_TOKEN`: token used to open the drift issue, classic `repo` scope or fine-grained Issues write.
+
+    ## Quick start
+
+    1. Add the three secrets and set `github_repository` to a repository where issues are welcome.
+    2. Run the flow once with an in sync report and watch it log the clear verdict.
+
+       ```
+       curl -X POST -H "Content-Type: application/json" -d '{"observedAt":"2026-10-15T06:00:00Z","kustomizations":[{"metadata":{"name":"infra-prod"},"spec":{"targetRevision":"main"},"status":{"lastAppliedRevision":"main@sha1:9f8e7d6c","lastAttemptedRevision":"main@sha1:9f8e7d6c","lastAttemptedTime":"2026-10-15T05:30:00Z","failures":0,"conditions":[{"type":"Ready","status":"True"}],"inventory":{"entries":[],"drift":[]}}}]}' "https://<kestra>/api/v1/<tenant>/executions/webhook/<namespace>/flux-kustomization-apply-drift-gate/<FLUX_STATUS_WEBHOOK_KEY>"
+       ```
+
+    3. Re-post with `lastAppliedRevision` behind `lastAttemptedRevision` and `lastAttemptedTime` set to 2026-10-14T02:00:00Z
+       to watch the stale branch open the issue, alert Slack and fail.
+    4. Raise `max_fail_count_allowed` above the report's failure count to see the failing branch go quiet, then point the cluster reporter at the webhook and enable `hourly_drift_safety_net` as the net.
+
+    ## How to extend
+
+    - Add a `io.kestra.plugin.core.flow.Loop` before the gate that calls `io.kestra.plugin.core.http.Request` against the
+      Kubernetes API to capture the live object that differs, and attach it to the issue.
+    - Store each run's `max_fail_count` in the Kestra KV store and escalate only on a count that is higher than the previous
+      run, so a steady failure does not page forever.
+    - Fan the check across clusters with `io.kestra.plugin.core.flow.ForEachItem` over a cluster list, each subflow posting
+      its own report.
+
+    ## Links
+
+    - [Flux Kustomizations](https://fluxcd.io/flux/components/kustomize/kustomizations/)
+    - [Kestra flowable tasks](https://kestra.io/docs/workflow-components/tasks/flowable-tasks)
+    - [Kestra GitHub plugin](https://kestra.io/plugins/plugin-github)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Infrastructure
+  subTags:
+    - GitOps & Flow Sync
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
