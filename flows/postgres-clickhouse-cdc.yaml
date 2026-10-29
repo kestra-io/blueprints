@@ -1,0 +1,342 @@
+id: postgres-clickhouse-cdc
+namespace: company.analytics
+description: |
+  Keep a ClickHouse orders read model current from PostgreSQL WAL changes.
+  Versioned rows and retained delete markers make retries and late batches safe;
+  every batch is read back and checked before the execution succeeds.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: replay_file
+    type: FILE
+    required: false
+    description: Optional saved Debezium INLINE Ion batch to replay. Normally the trigger supplies the file.
+
+variables:
+  postgres_host: localhost
+  postgres_port: "5432"
+  postgres_database: shop
+  clickhouse_url: jdbc:clickhouse://localhost:8123/default
+
+tasks:
+  - id: create_target
+    type: io.kestra.plugin.jdbc.clickhouse.Queries
+    url: "{{ vars.clickhouse_url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS default.orders_cdc (
+        id Int64,
+        customer_id Int64,
+        amount_cents Int64,
+        status String,
+        _cdc_lsn UInt64,
+        _cdc_deleted UInt8
+      ) ENGINE = ReplacingMergeTree(_cdc_lsn)
+      ORDER BY id;
+      CREATE VIEW IF NOT EXISTS default.orders_live AS
+        SELECT id, customer_id, amount_cents, status
+        FROM default.orders_cdc FINAL
+        WHERE _cdc_deleted = 0;
+
+  - id: decode_batch
+    type: io.kestra.plugin.serdes.json.IonToJson
+    from: "{{ inputs.replay_file ?? trigger.uris['data'] }}"
+
+  - id: prepare_batch
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate before writing, retain the latest change per key, and reject ambiguous equal-LSN events.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      changes.jsonl: "{{ outputs.decode_batch.uri }}"
+    outputFiles:
+      - expected.jsonl
+    script: |
+      import json
+
+      def integer(value, name, minimum=-(2**63), maximum=2**63 - 1):
+          if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+              raise ValueError(f"Invalid {name}; refusing the batch")
+          return value
+
+      latest, seen, events = {}, {}, 0
+      with open("changes.jsonl") as source:
+          for line in source:
+              event = json.loads(line)
+              if set(event) - {"id", "customer_id", "amount_cents", "status", "deleted", "metadata"}:
+                  raise ValueError("Source columns changed; update this fixed-schema flow before continuing")
+              source_info = event["metadata"]["source"]
+              if source_info.get("db") != "{{ vars.postgres_database }}" or source_info.get("schema") != "public" or source_info.get("table") != "orders":
+                  raise ValueError("Expected changes from public.orders in the configured source database")
+              lsn = integer(source_info["lsn"], "source LSN", 1, 2**64 - 1)
+              key = integer(event["id"], "id")
+              deleted = event.get("deleted", False)
+              if not isinstance(deleted, bool):
+                  raise ValueError("Invalid delete marker")
+              row = {
+                  "id": key,
+                  "customer_id": 0 if deleted else integer(event["customer_id"], "customer_id"),
+                  "amount_cents": 0 if deleted else integer(event["amount_cents"], "amount_cents"),
+                  "status": "" if deleted else event["status"],
+                  "_cdc_lsn": lsn,
+                  "_cdc_deleted": int(deleted),
+              }
+              if not isinstance(row["status"], str) or len(row["status"]) > 32 or row["status"] == "__debezium_unavailable_value":
+                  raise ValueError("Unsupported status or incomplete TOAST value")
+              version_key = (key, lsn)
+              if version_key in seen and seen[version_key] != row:
+                  raise ValueError("Conflicting changes share an id and LSN")
+              seen[version_key] = row
+              if key not in latest or lsn > latest[key]["_cdc_lsn"]:
+                  latest[key] = row
+              events += 1
+      if not latest:
+          raise ValueError("Empty CDC batch")
+      with open("expected.jsonl", "w") as target:
+          for key in sorted(latest):
+              target.write(json.dumps(latest[key], ensure_ascii=False) + "\n")
+      print("::" + json.dumps({"outputs": {
+          "events": events,
+          "keys": len(latest),
+          "ids_sql": ",".join(str(key) for key in sorted(latest)),
+      }}) + "::")
+
+  - id: read_current
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Read the winning version for only this batch's keys, not a changing full-table total.
+    url: "{{ vars.clickhouse_url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: STORE
+    sql: |
+      SELECT id, customer_id, amount_cents, status,
+             toString(_cdc_lsn) AS _cdc_lsn, _cdc_deleted
+      FROM default.orders_cdc FINAL
+      WHERE id IN ({{ outputs.prepare_batch.vars.ids_sql }})
+
+  - id: current_json
+    type: io.kestra.plugin.serdes.json.IonToJson
+    from: "{{ outputs.read_current.uri }}"
+
+  - id: select_changes
+    type: io.kestra.plugin.scripts.python.Script
+    description: Skip exact replays and older events; never silently resolve a conflicting equal version.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      expected.jsonl: "{{ outputs.prepare_batch.outputFiles['expected.jsonl'] }}"
+      current.jsonl: "{{ outputs.current_json.uri }}"
+    outputFiles:
+      - pending.jsonl
+    script: |
+      import json
+
+      def read_rows(path):
+          with open(path) as source:
+              rows = [json.loads(line) for line in source if line.strip()]
+          for row in rows:
+              row["_cdc_lsn"] = int(row["_cdc_lsn"])
+          return {row["id"]: row for row in rows}
+
+      expected, current = read_rows("expected.jsonl"), read_rows("current.jsonl")
+      pending = []
+      for key, row in expected.items():
+          existing = current.get(key)
+          if existing and existing["_cdc_lsn"] == row["_cdc_lsn"] and existing != row:
+              raise ValueError("Target has a different payload for the same id and LSN")
+          if not existing or existing["_cdc_lsn"] < row["_cdc_lsn"]:
+              pending.append(row)
+      with open("pending.jsonl", "w") as target:
+          for row in pending:
+              target.write(json.dumps(row, ensure_ascii=False) + "\n")
+      print("::" + json.dumps({"outputs": {
+          "pending": len(pending),
+          "skipped": len(expected) - len(pending),
+          "deletes": sum(row["_cdc_deleted"] for row in pending),
+      }}) + "::")
+
+  - id: write_if_newer
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.select_changes.vars.pending > 0 }}"
+    then:
+      - id: encode_changes
+        type: io.kestra.plugin.serdes.json.JsonToIon
+        from: "{{ outputs.select_changes.outputFiles['pending.jsonl'] }}"
+
+      - id: insert_changes
+        type: io.kestra.plugin.jdbc.clickhouse.BulkInsert
+        description: Synchronous prepared inserts. Duplicate physical rows after a partial retry collapse under FINAL.
+        url: "{{ vars.clickhouse_url }}"
+        username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+        password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+        from: "{{ outputs.encode_changes.uri }}"
+        sql: |
+          INSERT INTO default.orders_cdc
+          (id, customer_id, amount_cents, status, _cdc_lsn, _cdc_deleted)
+          VALUES (?, ?, ?, ?, ?, ?)
+        columns:
+          - id
+          - customer_id
+          - amount_cents
+          - status
+          - _cdc_lsn
+          - _cdc_deleted
+
+  - id: read_back
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    url: "{{ vars.clickhouse_url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: STORE
+    sql: |
+      SELECT id, customer_id, amount_cents, status,
+             toString(_cdc_lsn) AS _cdc_lsn, _cdc_deleted
+      FROM default.orders_cdc FINAL
+      WHERE id IN ({{ outputs.prepare_batch.vars.ids_sql }})
+
+  - id: read_back_json
+    type: io.kestra.plugin.serdes.json.IonToJson
+    from: "{{ outputs.read_back.uri }}"
+
+  - id: verify_batch
+    type: io.kestra.plugin.scripts.python.Script
+    description: Every captured key must have this exact payload, or a newer source version, including deletes.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      expected.jsonl: "{{ outputs.prepare_batch.outputFiles['expected.jsonl'] }}"
+      actual.jsonl: "{{ outputs.read_back_json.uri }}"
+    script: |
+      import json
+
+      with open("actual.jsonl") as source:
+          actual = {row["id"]: row for row in (json.loads(line) for line in source if line.strip())}
+      verified = 0
+      with open("expected.jsonl") as source:
+          for line in source:
+              expected = json.loads(line)
+              row = actual.get(expected["id"])
+              if row is None:
+                  raise ValueError("Captured key is missing from ClickHouse")
+              row["_cdc_lsn"] = int(row["_cdc_lsn"])
+              if row["_cdc_lsn"] < expected["_cdc_lsn"] or (row["_cdc_lsn"] == expected["_cdc_lsn"] and row != expected):
+                  raise ValueError("ClickHouse read-back does not match the captured version")
+              verified += 1
+      print(f"Verified {verified} keys against the captured CDC batch, including delete markers.")
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ outputs.prepare_batch.vars.events }} captured events,
+      {{ outputs.select_changes.vars.pending }} newer keys applied
+      ({{ outputs.select_changes.vars.deletes }} deletes),
+      {{ outputs.select_changes.vars.skipped }} replayed/older keys skipped.
+      Read-back verified; query default.orders_live for current rows.
+
+triggers:
+  - id: order_changes
+    type: io.kestra.plugin.debezium.postgres.Trigger
+    description: Capture commits without Kafka; stop capture after a failed execution so an operator can repair the saved batch.
+    hostname: "{{ vars.postgres_host }}"
+    port: "{{ vars.postgres_port }}"
+    database: "{{ vars.postgres_database }}"
+    username: "{{ secret('CDC_POSTGRES_USERNAME') }}"
+    password: "{{ secret('CDC_POSTGRES_PASSWORD') }}"
+    pluginName: PGOUTPUT
+    slotName: kestra_clickhouse_orders
+    publicationName: kestra_clickhouse_orders
+    stateName: postgres-clickhouse-orders
+    snapshotMode: INITIAL
+    includedTables: public.orders
+    splitTable: "OFF"
+    format: INLINE
+    deleted: ADD_FIELD
+    metadata: ADD_FIELD
+    maxRecords: 1000
+    maxWait: PT5S
+    interval: PT30S
+    stopAfter:
+      - FAILED
+
+extend:
+  title: Stream PostgreSQL orders into ClickHouse with replay-safe updates and deletes
+  metaTitle: PostgreSQL to ClickHouse CDC with Debezium | Kestra
+  shortDescription: Capture PostgreSQL orders with Debezium, apply versioned changes in ClickHouse, and verify every batch without Kafka.
+  metaDescription: Stream Postgres orders into ClickHouse with Debezium, versioned updates, retained deletes, replay protection and per-batch read-back checks.
+  description: |
+    Mirror PostgreSQL orders in ClickHouse without Kafka or nightly reloads.
+
+    ## How it works
+
+    1. Debezium polls WAL every 30 seconds and snapshots existing orders once.
+    2. Validate records and retain the latest source LSN per key.
+    3. JDBC reads existing versions; equal replays and older events are skipped.
+       Conflicting equal versions fail before insertion.
+    4. An If runs a prepared BulkInsert only for newer keys.
+    5. Verify each key and delete marker. `orders_live` uses `FINAL` before
+       filtering deletes; background merges are not required.
+
+    ## What you get
+
+    - A current-state view; tombstones prevent old batches resurrecting deletes.
+    - Per-batch verification, not racy comparisons with a changing source table.
+    - Saved files for recovery. Partial retries can leave duplicate physical
+      versions: this is at-least-once, not a distributed transaction.
+
+    ## Who it's for
+
+    Data engineers maintaining a small, near-real-time analytics read model.
+
+    ## Why orchestrate this with Kestra
+
+    Capture, JDBC writes and verification share one execution.
+    Queued concurrency serializes batches; failures retain evidence.
+
+    ## Prerequisites
+
+    - Postgres with `wal_level=logical`, REPLICATION and SELECT.
+      Pre-create `CREATE PUBLICATION kestra_clickhouse_orders FOR TABLE public.orders`
+      as table owner. Use a dedicated slot, flow and empty target, with no
+      other target writers. `maxRecords` does not bound the initial snapshot.
+    - Source: `public.orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL,
+      amount_cents bigint NOT NULL, status varchar(32) NOT NULL)`.
+    - ClickHouse create/insert/select privileges; Python 3 on workers for the
+      Process runner. No Python packages needed.
+
+    ### Secrets
+
+    - `CDC_POSTGRES_USERNAME`, `CDC_POSTGRES_PASSWORD`: replication connection.
+    - `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD`: target credentials.
+
+    ## Quick start
+
+    1. Create the source table/publication; set secrets and connection variables.
+    2. Save the flow. Check the snapshot; then insert, update and delete orders.
+       Read `default.orders_live` after each successful execution.
+    3. On failure the trigger disables. Restart the failed execution, or replay
+       its original Ion file through `replay_file`, before enabling capture again.
+       Offsets advance at capture, not sink success; do not discard failed batches.
+    4. For full-source parity, stop writes, drain capture and compare all rows.
+
+    ## How to extend
+
+    Add columns to the validator, target and bindings together. Do not truncate
+    the source, reset offsets or purge tombstones: rebuild together instead.
+    DDL is not replicated; unexpected columns or incomplete values fail closed.
+
+    ## Links
+
+    - [Debezium trigger](https://kestra.io/plugins/plugin-debezium-postgres/io.kestra.plugin.debezium.postgres.trigger)
+    - [ClickHouse BulkInsert](https://kestra.io/plugins/plugin-jdbc-clickhouse/io.kestra.plugin.jdbc.clickhouse.bulkinsert)
+    - [ReplacingMergeTree](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree)
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - ELT & Warehouse Loading
+  ee: false
+  demo: false
