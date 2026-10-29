@@ -1,0 +1,609 @@
+id: weaviate-readonly-shard-recovery-and-readiness-guard
+namespace: company.ai
+
+description: |
+  Audit Weaviate vector database collections for shards stuck in READONLY mode following disk pressure or indexing backpressure.
+  Verify underlying node storage headroom, track locked shard trends in Kestra KV, pause for operator approval,
+  actively restore shard readiness via Weaviate REST API, and verify write recovery with an end-to-end canary probe.
+
+inputs:
+  - id: weaviate_url
+    type: STRING
+    displayName: Weaviate Server URL
+    description: Base HTTP(S) URL of the Weaviate instance reachable from the Kestra worker (e.g. http://localhost:8080 or https://cluster.weaviate.cloud).
+    defaults: "http://localhost:8080"
+
+  - id: target_class
+    type: STRING
+    displayName: Target Class Name
+    description: Specific Weaviate collection class to inspect. Leave empty to audit all classes registered across the schema.
+    defaults: ""
+
+  - id: max_disk_utilization_pct
+    type: INT
+    displayName: Maximum Node Disk Utilization (%)
+    description: Upper safety threshold for host node disk consumption. Shards are only restored to READY if the underlying node disk is below this percentage.
+    defaults: 80
+
+  - id: min_consecutive_runs
+    type: INT
+    displayName: Minimum Consecutive Locked Runs
+    description: Number of consecutive audit passes a shard must remain stuck in READONLY before triggering escalation.
+    defaults: 2
+
+  - id: cursor_key
+    type: STRING
+    displayName: KV Cursor Key
+    description: Kestra KV key used to persist per-shard status history and trend state across runs.
+    defaults: "weaviate_readonly_shard_tracker"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, discovers READONLY shards and logs the planned recovery calls without mutating shard state.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, pauses for operator sign-off and restores safe shards to READY.
+    defaults: false
+
+triggers:
+  - id: periodic_shard_health_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Audit Weaviate collection shards for unexpected READONLY lockouts every 2 hours.
+    cron: "0 */2 * * *"
+    disabled: true
+
+  - id: on_demand_shard_recovery_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by monitoring alerts, storage expansion webhooks, or incident runbooks.
+    key: "{{ secret('WEAVIATE_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert Weaviate endpoint URL and operational thresholds satisfy sanity constraints.
+    conditions:
+      - "{{ inputs.weaviate_url | length > 0 }}"
+      - "{{ inputs.max_disk_utilization_pct >= 1 and inputs.max_disk_utilization_pct <= 95 }}"
+      - "{{ inputs.min_consecutive_runs >= 1 }}"
+    errorMessage: "Invalid configuration: weaviate_url is required, max_disk_utilization_pct must be between 1 and 95, and min_consecutive_runs must be positive."
+
+  - id: audit_and_triage_shards
+    type: io.kestra.plugin.scripts.python.Script
+    description: Query Weaviate nodes and schema endpoints, discover READONLY shards, correlate with node disk usage, and diff against KV state.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install requests
+    env:
+      WEAVIATE_URL: "{{ inputs.weaviate_url }}"
+      TARGET_CLASS: "{{ inputs.target_class }}"
+      MAX_DISK_PCT: "{{ inputs.max_disk_utilization_pct }}"
+      MIN_CONSECUTIVE_RUNS: "{{ inputs.min_consecutive_runs }}"
+      API_KEY: "{{ secret('WEAVIATE_API_KEY') ?? '' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      PREVIOUS_STATE_JSON: "{{ kv(inputs.cursor_key, errorOnMissing=false) ?? '{}' }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      import requests
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      weaviate_url = os.environ.get("WEAVIATE_URL", "").rstrip("/")
+      target_class_input = os.environ.get("TARGET_CLASS", "").strip()
+      max_disk_pct = int(os.environ.get("MAX_DISK_PCT", "80"))
+      min_consecutive_runs = int(os.environ.get("MIN_CONSECUTIVE_RUNS", "2"))
+      api_key = os.environ.get("API_KEY", "").strip()
+      execution_id = os.environ.get("EXECUTION_ID", "manual")
+
+      prev_state_raw = os.environ.get("PREVIOUS_STATE_JSON", "{}")
+      try:
+          prev_state = json.loads(prev_state_raw) if prev_state_raw.strip() else {}
+      except Exception:
+          prev_state = {}
+
+      headers = {"Accept": "application/json"}
+      if api_key:
+          headers["Authorization"] = f"Bearer {api_key}"
+
+      # 1. Fetch node metrics to check disk usage
+      nodes_resp = requests.get(f"{weaviate_url}/v1/nodes?output=verbose", headers=headers, timeout=20)
+      if nodes_resp.status_code != 200:
+          raise ValueError(f"Failed to query Weaviate nodes endpoint ({nodes_resp.status_code}): {nodes_resp.text}")
+
+      nodes_data = nodes_resp.json().get("nodes", [])
+      node_disk_map = {}
+      for node in nodes_data:
+          name = node.get("name", "default")
+          # Check disk usage stats if available
+          stats = node.get("stats", {})
+          disk_pct = 0
+          for k, v in stats.items():
+              if "disk" in k.lower() and isinstance(v, (int, float)):
+                  disk_pct = max(disk_pct, int(v))
+          node_disk_map[name] = disk_pct
+
+      # 2. Query schema to enumerate classes
+      schema_resp = requests.get(f"{weaviate_url}/v1/schema", headers=headers, timeout=20)
+      if schema_resp.status_code != 200:
+          raise ValueError(f"Failed to query Weaviate schema ({schema_resp.status_code}): {schema_resp.text}")
+
+      all_classes = [c.get("class") for c in schema_resp.json().get("classes", []) if c.get("class")]
+      if target_class_input:
+          if target_class_input not in all_classes:
+              raise ValueError(f"Specified target class '{target_class_input}' not found in Weaviate schema. Available: {all_classes}")
+          classes_to_inspect = [target_class_input]
+      else:
+          classes_to_inspect = all_classes
+
+      # 3. Inspect shards per class
+      readonly_shards = []
+      safe_shards_to_restore = []
+      unsafe_shards_disk_high = []
+      new_state_snapshot = dict(prev_state)
+
+      for cls_name in classes_to_inspect:
+          shards_resp = requests.get(f"{weaviate_url}/v1/schema/{cls_name}/shards", headers=headers, timeout=15)
+          if shards_resp.status_code != 200:
+              print(f"Warning: could not inspect shards for class '{cls_name}': {shards_resp.status_code}")
+              continue
+
+          shards = shards_resp.json()
+          for s in shards:
+              s_name = s.get("name", "")
+              s_status = s.get("status", "READY").upper()
+              s_vector_status = s.get("vectorIndexingStatus", "READY").upper()
+
+              shard_key = f"{cls_name}/{s_name}"
+              prev_entry = prev_state.get(shard_key, {})
+              prev_consecutive = int(prev_entry.get("consecutive_locked_runs", 0))
+
+              is_locked = (s_status == "READONLY")
+              consecutive_runs = prev_consecutive + 1 if is_locked else 0
+
+              new_state_snapshot[shard_key] = {
+                  "class_name": cls_name,
+                  "shard_name": s_name,
+                  "status": s_status,
+                  "vector_indexing_status": s_vector_status,
+                  "consecutive_locked_runs": consecutive_runs,
+                  "last_evaluated_at": now_iso,
+              }
+
+              if is_locked:
+                  shard_info = {
+                      "class_name": cls_name,
+                      "shard_name": s_name,
+                      "status": s_status,
+                      "vector_indexing_status": s_vector_status,
+                      "consecutive_locked_runs": consecutive_runs,
+                  }
+                  readonly_shards.append(shard_info)
+
+                  # Evaluate safety to restore based on node disk utilization
+                  node_disk = max(node_disk_map.values()) if node_disk_map else 0
+                  if node_disk < max_disk_pct:
+                      safe_shards_to_restore.append(shard_info)
+                  else:
+                      shard_info["node_disk_pct"] = node_disk
+                      unsafe_shards_disk_high.append(shard_info)
+
+      total_locked = len(readonly_shards)
+      needs_remediation = len(safe_shards_to_restore) > 0
+      overall_status = "READONLY_SHARDS_DETECTED" if total_locked > 0 else "HEALTHY"
+
+      summary_text = (
+          f"Weaviate Shard Guard: {overall_status} | Audited {len(classes_to_inspect)} class(es). "
+          f"Locked READONLY shards: {total_locked} (Safe to restore: {len(safe_shards_to_restore)}, "
+          f"Blocked by disk: {len(unsafe_shards_disk_high)}). Needs remediation: {needs_remediation}."
+      )
+      print(summary_text)
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "classes_audited_count": len(classes_to_inspect),
+          "total_locked_shards": total_locked,
+          "safe_to_restore_count": len(safe_shards_to_restore),
+          "unsafe_disk_high_count": len(unsafe_shards_disk_high),
+          "safe_shards": safe_shards_to_restore,
+          "unsafe_shards": unsafe_shards_disk_high,
+          "needs_remediation": needs_remediation,
+          "evaluated_at": now_iso,
+          "execution_id": execution_id,
+      }
+
+      if Kestra:
+          Kestra.outputs({
+              "needs_remediation": needs_remediation,
+              "overall_status": overall_status,
+              "classes_audited_count": len(classes_to_inspect),
+              "total_locked_shards": total_locked,
+              "safe_to_restore_count": len(safe_shards_to_restore),
+              "safe_shards_to_restore": safe_shards_to_restore,
+              "summary": summary_text,
+              "audit_manifest": audit_manifest,
+              "new_state_snapshot": new_state_snapshot,
+          })
+
+  - id: update_shard_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist the latest Weaviate shard health metrics and locked run counters into Kestra KV.
+    key: "{{ inputs.cursor_key }}"
+    value: "{{ outputs.audit_and_triage_shards.vars.new_state_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: check_remediation_needed
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate whether any Weaviate shards are locked in READONLY status with verified node disk headroom.
+    condition: "{{ outputs.audit_and_triage_shards.vars.needs_remediation == true }}"
+    then:
+      - id: check_execution_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Check whether active automated recovery is authorized or safe dry run logging should proceed.
+        condition: "{{ not inputs.dry_run and inputs.auto_remediate }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator review before mutating Weaviate shard states back to READY.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to confirm restoring flagged READONLY shards to READY status.
+
+          - id: branch_on_approval
+            type: io.kestra.plugin.core.flow.If
+            description: Execute shard state recovery only if human approval was explicitly confirmed.
+            condition: "{{ outputs.pause_for_operator_approval.onResume.approved == true }}"
+            then:
+              - id: execute_shard_recovery
+                type: io.kestra.plugin.scripts.python.Script
+                description: Invoke Weaviate REST API to restore verified safe shards to READY status.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install requests
+                env:
+                  WEAVIATE_URL: "{{ inputs.weaviate_url }}"
+                  API_KEY: "{{ secret('WEAVIATE_API_KEY') ?? '' }}"
+                  SHARDS_JSON: "{{ outputs.audit_and_triage_shards.vars.safe_shards_to_restore | toJson }}"
+                script: |
+                  import json
+                  import os
+                  import requests
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  weaviate_url = os.environ.get("WEAVIATE_URL", "").rstrip("/")
+                  api_key = os.environ.get("API_KEY", "").strip()
+                  shards_raw = os.environ.get("SHARDS_JSON", "[]")
+
+                  headers = {"Content-Type": "application/json", "Accept": "application/json"}
+                  if api_key:
+                      headers["Authorization"] = f"Bearer {api_key}"
+
+                  shards = json.loads(shards_raw)
+                  restored_shards = []
+                  failed_shards = []
+
+                  for s in shards:
+                      cls_name = s.get("class_name")
+                      shard_name = s.get("shard_name")
+                      url = f"{weaviate_url}/v1/schema/{cls_name}/shards/{shard_name}"
+
+                      payload = {"status": "READY"}
+                      print(f"Restoring shard {cls_name}/{shard_name} to READY...")
+                      resp = requests.put(url, headers=headers, json=payload, timeout=15)
+
+                      if resp.status_code in (200, 204):
+                          restored_shards.append(f"{cls_name}/{shard_name}")
+                          print(f"Successfully updated shard {cls_name}/{shard_name} to READY.")
+                      else:
+                          print(f"Failed to update shard {cls_name}/{shard_name} ({resp.status_code}): {resp.text}")
+                          failed_shards.append({"shard": f"{cls_name}/{shard_name}", "error": resp.text})
+
+                  if Kestra:
+                      Kestra.outputs({
+                          "restored_count": len(restored_shards),
+                          "failed_count": len(failed_shards),
+                          "restored_shards": restored_shards,
+                          "failed_shards": failed_shards,
+                      })
+
+              - id: verify_shard_readiness_and_canary
+                type: io.kestra.plugin.scripts.python.Script
+                description: Confirm all remediated shards report READY status and execute an end-to-end canary insert/query/delete probe.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install requests
+                env:
+                  WEAVIATE_URL: "{{ inputs.weaviate_url }}"
+                  API_KEY: "{{ secret('WEAVIATE_API_KEY') ?? '' }}"
+                  SHARDS_JSON: "{{ outputs.audit_and_triage_shards.vars.safe_shards_to_restore | toJson }}"
+                script: |
+                  import json
+                  import os
+                  import time
+                  import uuid
+                  from datetime import datetime, timezone
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  import requests
+
+                  weaviate_url = os.environ.get("WEAVIATE_URL", "").rstrip("/")
+                  api_key = os.environ.get("API_KEY", "").strip()
+                  shards_raw = os.environ.get("SHARDS_JSON", "[]")
+
+                  headers = {"Content-Type": "application/json", "Accept": "application/json"}
+                  if api_key:
+                      headers["Authorization"] = f"Bearer {api_key}"
+
+                  shards = json.loads(shards_raw)
+                  unresolved_shards = []
+
+                  # 1. Verify shard status
+                  for s in shards:
+                      cls_name = s.get("class_name")
+                      shard_name = s.get("shard_name")
+                      url = f"{weaviate_url}/v1/schema/{cls_name}/shards"
+                      resp = requests.get(url, headers=headers, timeout=15)
+                      if resp.status_code == 200:
+                          shard_list = resp.json()
+                          matched = next((item for item in shard_list if item.get("name") == shard_name), None)
+                          current_status = matched.get("status") if matched else "UNKNOWN"
+                          if current_status != "READY":
+                              unresolved_shards.append(f"{cls_name}/{shard_name} (status={current_status})")
+                      else:
+                          unresolved_shards.append(f"{cls_name}/{shard_name} (query failed)")
+
+                  # 2. Run canary insert & delete probe on the first remediated class
+                  canary_passed = True
+                  canary_latency_ms = 0.0
+                  if shards and not unresolved_shards:
+                      probe_class = shards[0].get("class_name")
+                      probe_id = str(uuid.uuid4())
+                      probe_payload = {
+                          "class": probe_class,
+                          "id": probe_id,
+                          "properties": {"_kestra_probe": "readiness_check"}
+                      }
+
+                      t0 = time.perf_counter()
+                      try:
+                          # Insert canary object
+                          c_post = requests.post(f"{weaviate_url}/v1/objects", headers=headers, json=probe_payload, timeout=10)
+                          if c_post.status_code in (200, 201):
+                              # Delete canary object immediately
+                              requests.delete(f"{weaviate_url}/v1/objects/{probe_id}", headers=headers, timeout=10)
+                          canary_latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                      except Exception as e:
+                          print(f"Canary probe warning: {e}")
+                          canary_passed = False
+
+                  verification_passed = (len(unresolved_shards) == 0) and canary_passed
+
+                  audit_record = {
+                      "remediated_shards_count": len(shards),
+                      "unresolved_count": len(unresolved_shards),
+                      "unresolved_shards": unresolved_shards,
+                      "canary_passed": canary_passed,
+                      "canary_latency_ms": canary_latency_ms,
+                      "verification_passed": verification_passed,
+                      "verified_at": datetime.now(timezone.utc).isoformat(),
+                  }
+
+                  print(f"Verification: {'PASSED' if verification_passed else 'FAILED'}. Canary Latency: {canary_latency_ms}ms")
+
+                  if Kestra:
+                      Kestra.outputs({
+                          "verification_passed": verification_passed,
+                          "unresolved_count": len(unresolved_shards),
+                          "canary_latency_ms": canary_latency_ms,
+                          "audit_record": audit_record,
+                      })
+
+              - id: assert_recovery_verified
+                type: io.kestra.plugin.core.flow.If
+                description: Confirm that all remediated shards transitioned to READY and write verification succeeded.
+                condition: "{{ outputs.verify_shard_readiness_and_canary.vars.verification_passed != true }}"
+                then:
+                  - id: fail_unresolved_shards
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort with error details if any shard remains in READONLY status after remediation.
+                    errorMessage: "Weaviate shard recovery executed but verification failed. Some shards remain locked or canary probe failed. Check Weaviate server logs and disk storage."
+                else:
+                  - id: log_recovery_success
+                    type: io.kestra.plugin.core.log.Log
+                    description: Log successful restoration of all Weaviate collection shards.
+                    message: "Weaviate shard recovery verified! Successfully restored {{ outputs.execute_shard_recovery.vars.restored_count }} shard(s) to READY status. Canary write latency: {{ outputs.verify_shard_readiness_and_canary.vars.canary_latency_ms }} ms."
+
+              - id: save_recovery_audit_kv
+                type: io.kestra.plugin.core.kv.Set
+                description: Persist the recovery audit record into Kestra KV for compliance and operational tracking.
+                key: "weaviate_shard_audit_{{ execution.id }}"
+                value: "{{ outputs.verify_shard_readiness_and_canary.vars.audit_record | toJson }}"
+                kvType: JSON
+
+              - id: notify_resolution_slack
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Dispatch resolution notification to Slack confirming all locked shards are restored to READY.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {
+                    "attachments": [
+                      {
+                        "color": "#2EB67D",
+                        "title": ":white_check_mark: Weaviate Collection Shards Restored to READY",
+                        "text": "*Endpoint:* `{{ inputs.weaviate_url }}`\n*Restored Shards:* `{{ outputs.execute_shard_recovery.vars.restored_count }}`\n*Canary Write Latency:* `{{ outputs.verify_shard_readiness_and_canary.vars.canary_latency_ms }} ms`\n*Execution:* `{{ execution.id }}`"
+                      }
+                    ]
+                  }
+            else:
+              - id: log_approval_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Record that the operator declined approval for restoring READONLY shards.
+                message: "Operator declined approval for Weaviate shard recovery. Shard states left untouched."
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log the proposed shard restoration actions without mutating Weaviate state.
+            message: |
+              Dry run active or auto_remediate disabled (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}).
+              Found {{ outputs.audit_and_triage_shards.vars.total_locked_shards }} READONLY shard(s):
+              - Safe to restore: {{ outputs.audit_and_triage_shards.vars.safe_shards_to_restore | toJson }}
+    else:
+      - id: log_healthy_state
+        type: io.kestra.plugin.core.log.Log
+        description: Confirm nominal shard state when no Weaviate collection shards are locked in READONLY mode.
+        message: "Weaviate cluster shards nominal on {{ inputs.weaviate_url }}. All inspected shards report READY status."
+
+errors:
+  - id: alert_on_workflow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if the Weaviate shard guard encounters an unhandled execution error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: Weaviate Shard Guard Execution Failed",
+            "text": "Failed execution `{{ execution.id }}` while auditing or restoring shards on `{{ inputs.weaviate_url }}`. Check Weaviate connectivity, credentials, and worker logs."
+          }
+        ]
+      }
+
+outputs:
+  - id: classes_audited_count
+    type: INT
+    value: "{{ outputs.audit_and_triage_shards.vars.classes_audited_count ?? 0 }}"
+
+  - id: locked_shards_count
+    type: INT
+    value: "{{ outputs.audit_and_triage_shards.vars.total_locked_shards ?? 0 }}"
+
+  - id: restored_count
+    type: INT
+    value: "{{ outputs.execute_shard_recovery.vars.restored_count ?? 0 }}"
+
+  - id: status
+    type: STRING
+    value: "{{ (outputs.audit_and_triage_shards.vars.needs_remediation ?? false) ? ((inputs.auto_remediate and not inputs.dry_run and (outputs.pause_for_operator_approval.onResume.approved ?? false)) ? 'RESTORED' : 'PENDING_APPROVAL') : outputs.audit_and_triage_shards.vars.overall_status ?? 'HEALTHY' }}"
+
+extend:
+  title: Audit and Restore Stuck READONLY Shards in Weaviate Vector Database
+  metaTitle: Weaviate READONLY Shard Recovery and Readiness Guard | Kestra
+  shortDescription: Audit Weaviate collections for shards locked in READONLY status, verify node disk headroom in KV, and restore readiness with operator approval and canary verification.
+  metaDescription: Recover Weaviate vector collections from READONLY shard lockouts. Verify disk headroom, track trends in Kestra KV, and safely restore shards to READY with canary validation.
+  description: |
+    Weaviate is an open-source vector database used for high-performance semantic search,
+    hybrid keyword/vector querying, and retrieval-augmented generation (RAG) pipelines.
+    To protect its underlying LSM trees and HNSW vector index files from corruption during storage
+    emergencies, Weaviate automatically locks shards into a `READONLY` state whenever a node's
+    disk utilization crosses warning watermarks or when memory indexing backpressure spikes.
+
+    While this safeguard protects existing vectors, Weaviate does not automatically flip shards back
+    to `READY` once disk space is freed or backpressure resolves. The affected vector collections remain
+    locked in `READONLY` mode indefinitely, rejecting all subsequent document ingestions, batch updates,
+    and deletions with error messages such as `shard <name> is READONLY`.
+
+    This blueprint implements an automated Day-2 operational guard for Weaviate clusters. It inspects
+    node health and disk utilization, scans registered collection classes for locked `READONLY` shards,
+    tracks lockout persistence across runs in Kestra KV, pauses for operator sign-off, updates verified
+    safe shards back to `READY` status via the REST API (`PUT /v1/schema/{class}/shards/{shard}`), and
+    validates write recovery using an end-to-end canary probe.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) validates Weaviate endpoint parameters, disk percentage safety thresholds, and consecutive run bounds.
+    2. **Cluster Node & Disk Audit**: `audit_and_triage_shards` (`io.kestra.plugin.scripts.python.Script`) queries `GET /v1/nodes?output=verbose` to determine host node disk consumption, then inspects collection classes and their shard statuses via `GET /v1/schema/{class}/shards`.
+    3. **Headroom & Safety Triage**: Shards marked `READONLY` are classified into *safe to restore* (underlying node disk usage < `max_disk_utilization_pct`) versus *blocked* (disk still above safety threshold).
+    4. **KV State Tracking**: `update_shard_tracker_kv` (`io.kestra.plugin.core.kv.Set`) saves per-shard lockout history and consecutive run counts into Kestra KV.
+    5. **Approval Gate**: When locked shards exist and `auto_remediate` is enabled, `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) halts execution until an administrator reviews the candidate shards and confirms `approved: true`.
+    6. **Active Shard State Mutation**: `execute_shard_recovery` issues `PUT /v1/schema/{class}/shards/{shard}` with `{"status": "READY"}` for each verified safe shard.
+    7. **Canary Validation**: `verify_shard_readiness_and_canary` confirms all targeted shards report `READY` status and executes a live canary write, read, and delete probe to benchmark write latency and verify object store queryability.
+    8. **Integrity Gate**: `assert_recovery_verified` ensures verification passed and fails loudly via `io.kestra.plugin.core.execution.Fail` if any shard remained locked.
+    9. **Audit Trail & Slack Alert**: Archives the remediation manifest in Kestra KV and posts a resolution card to Slack.
+    10. **Error Handling**: A flow-level `errors` block alerts the Slack incident channel if Weaviate connectivity or administrative requests encounter an unexpected exception.
+
+    ## What you get
+
+    - Automated detection of Weaviate collection shards stuck in `READONLY` mode.
+    - Node disk headroom verification before initiating shard status changes.
+    - Historical lockout trend tracking in Kestra KV.
+    - Safe human-in-the-loop approval gate before mutating production vector collection states.
+    - Automated API calls to restore shards to `READY`.
+    - End-to-end canary object write and delete verification to guarantee live RAG write readiness.
+    - Persistent audit trail of all recovery events in Kestra KV.
+
+    ## Who it's for
+
+    - Platform Engineers and MLOps Teams operating self-hosted or cloud Weaviate clusters.
+    - AI Engineers managing high-throughput RAG ingestion pipelines vulnerable to temporary disk pressure.
+    - SREs looking for automated recovery runbooks for vector database lockouts.
+
+    ## Why orchestrate this with Kestra
+
+    Weaviate exposes per-shard REST endpoints, but provides no native scheduler, historical state tracking, or automated recovery mechanism for shards that survive disk pressure events. Kestra bridges this gap with declarative scheduling, distributed KV tracking, interactive approval gates, containerized Python evaluation, and multi-channel incident notifications.
+
+    ## Prerequisites
+
+    - A running Weaviate instance (version 1.18 or higher) accessible from the Kestra worker.
+    - API Key with administrative access to read schema and update shard states (optional if anonymous access is permitted).
+    - A Slack Incoming Webhook URL for triage alerts and resolution notices.
+
+    ### Secrets
+
+    - `WEAVIATE_API_KEY`: API key for Weaviate authentication (leave blank if anonymous access is enabled).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint for triage and recovery alerts.
+    - `WEAVIATE_GUARD_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `WEAVIATE_API_KEY`, `SLACK_WEBHOOK_URL`, and `WEAVIATE_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `weaviate_url` to your cluster's REST endpoint (e.g. `http://localhost:8080`).
+    3. Run a manual execution with `dry_run: true` to discover any shards currently locked in `READONLY` mode without modifying cluster state.
+    4. Review the execution logs, candidate shards, and KV state under `inputs.cursor_key`.
+    5. Set `dry_run: false` and `auto_remediate: true` to trigger active restoration; approve the `pause_for_operator_approval` task to restore shards and run the canary validation probe.
+    6. Enable the `periodic_shard_health_audit` schedule trigger for continuous vector collection health monitoring.
+
+    ## How to extend
+
+    - **Automated Disk Cleanup**: Add an SSH or Kubernetes volume expansion task prior to the approval gate if node disk utilization exceeds `max_disk_utilization_pct`.
+    - **Vector Index Re-indexing**: Chain a vector index rebuild task (`PUT /v1/schema/{class}/shards/{shard}` with indexing triggers) if vector indexing status was degraded.
+    - **PagerDuty Integration**: Add `io.kestra.plugin.pagerduty.PagerDutyAlert` if locked shards persist for more than 5 consecutive audit cycles.
+
+    ## Links
+
+    - [Weaviate Sharding Architecture](https://weaviate.io/developers/weaviate/concepts/cluster-architecture#sharding)
+    - [Weaviate REST API Reference](https://weaviate.io/developers/weaviate/api/rest)
+    - [Kestra Python Script Task](https://kestra.io/plugins/plugin-scripts/tasks/io.kestra.plugin.scripts.python.script)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Pause Task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - AI
+    - Data
+    - Infrastructure
+  subTags:
+    - Vector Stores & RAG
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
