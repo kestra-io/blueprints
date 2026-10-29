@@ -1,0 +1,444 @@
+id: duckdb-cdc-log-compaction-and-asof-merge
+namespace: company.lakehouse
+
+description: |
+  Compacts append-only Change Data Capture (CDC) changelog streams against a base Parquet table.
+  Resolves network duplicates and out-of-order mutations using Log Sequence Number (LSN) Last-Write-Wins,
+  purges tombstone deletions, performs point-in-time currency conversion via DuckDB ASOF JOIN,
+  and gates publication on row-conservation and content-integrity checks.
+
+inputs:
+  - id: base_snapshot_uri
+    type: URI
+    displayName: Base Snapshot Parquet URI
+    description: URI to baseline Parquet table snapshot (kestra://... or s3://...). Leave empty to run the self-contained demo baseline.
+    required: false
+
+  - id: cdc_stream_uri
+    type: URI
+    displayName: Raw CDC Batch Parquet URI
+    description: URI to incoming CDC changelog Parquet batch (Debezium c/u/d or DMS I/U/D format). Leave empty to run the demo batch.
+    required: false
+
+  - id: fx_rates_uri
+    type: URI
+    displayName: Exchange Rates Parquet URI
+    description: URI to historical FX rate timeline Parquet. Leave empty to run demo exchange rates.
+    required: false
+
+  - id: inject_corrupt_cdc
+    type: BOOL
+    displayName: Inject Invariant Corruption
+    description: When true and input URIs are empty, deliberately injects an order with an unsupported currency ('XYZ') lacking an FX exchange rate timeline, verifying that the Reconciliation Gate catches unmapped FX conversions and trips the circuit breaker.
+    defaults: false
+
+
+tasks:
+  - id: stage_demo_datasets
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Generates self-contained demo Parquet files (base orders, CDC changelog, FX rates) when input URIs are not provided.
+    runIf: "{{ inputs.base_snapshot_uri is empty or inputs.cdc_stream_uri is empty or inputs.fx_rates_uri is empty }}"
+    outputFiles:
+      - "*.parquet"
+    sql: |
+      -- 1. Base snapshot: 100 historical orders (order_id 1 to 100)
+      CREATE OR REPLACE TEMP TABLE base_orders AS
+      SELECT
+        i AS order_id,
+        1000 + (i % 20) AS customer_id,
+        ROUND(50.0 + (i * 1.5), 2) AS amount,
+        CASE
+          WHEN i % 4 = 0 THEN 'EUR'
+          WHEN i % 4 = 1 THEN 'GBP'
+          WHEN i % 4 = 2 THEN 'JPY'
+          ELSE 'USD'
+        END AS currency,
+        'CONFIRMED' AS status,
+        TIMESTAMP '2026-10-01 08:00:00' + (i * INTERVAL '10' MINUTE) AS order_timestamp
+      FROM range(1, 101) t(i);
+
+      COPY base_orders TO '{{ workingDir }}/base_orders.parquet' (FORMAT PARQUET);
+
+      -- 2. Historical exchange rates timeline for ASOF JOIN
+      CREATE OR REPLACE TEMP TABLE fx_rates AS
+      SELECT * FROM (
+        VALUES
+          ('EUR', 1.0800, TIMESTAMP '2026-10-01 00:00:00'),
+          ('EUR', 1.0850, TIMESTAMP '2026-10-01 12:00:00'),
+          ('EUR', 1.0900, TIMESTAMP '2026-10-02 00:00:00'),
+          ('GBP', 1.2900, TIMESTAMP '2026-10-01 00:00:00'),
+          ('GBP', 1.2950, TIMESTAMP '2026-10-01 12:00:00'),
+          ('GBP', 1.3000, TIMESTAMP '2026-10-02 00:00:00'),
+          ('JPY', 0.0067, TIMESTAMP '2026-10-01 00:00:00'),
+          ('JPY', 0.0066, TIMESTAMP '2026-10-01 12:00:00'),
+          ('JPY', 0.0068, TIMESTAMP '2026-10-02 00:00:00'),
+          ('USD', 1.0000, TIMESTAMP '2026-10-01 00:00:00')
+      ) AS r(currency, rate_to_usd, effective_ts);
+
+      COPY fx_rates TO '{{ workingDir }}/fx_rates.parquet' (FORMAT PARQUET);
+
+      -- 3. Raw CDC Changelog: 5 Inserts, 3 Updates (with replays & out-of-order LSN), 2 Deletes
+      -- Emits standard Debezium changelog op-codes (c=create, u=update, d=delete)
+      CREATE OR REPLACE TEMP TABLE raw_cdc AS
+      SELECT * FROM (
+        VALUES
+          -- Net Inserts (order_id 101 to 105)
+          ('evt-101', 101, 1001, 120.00, 'USD', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:00:00', 1001),
+          ('evt-102', 102, 1002, 240.50, 'EUR', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:05:00', 1002),
+          ('evt-103', 103, 1003, 85.00,  'GBP', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:10:00', 1003),
+          ('evt-104', 104, 1004, 310.00, 'JPY', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:15:00', 1004),
+          ('evt-105', 105, 1005, 95.00,  'USD', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:20:00', 1005),
+
+          -- Network duplicate replay: evt-dup-20 appears twice with identical event_id
+          ('evt-dup-20', 20, 1000, 500.00, 'EUR', 'SHIPPED', 'u', TIMESTAMP '2026-10-02 10:00:00', 1010),
+          ('evt-dup-20', 20, 1000, 500.00, 'EUR', 'SHIPPED', 'u', TIMESTAMP '2026-10-02 10:00:00', 1010),
+
+          -- Order 30: Clock skew vs LSN conflict demonstration
+          -- evt-30-skewed has a newer wall-clock timestamp (10:35:00) but an older commit (lsn 1015, status 'SHIPPED').
+          -- evt-30-authoritative has an earlier timestamp (10:30:00 due to source NTP clock reset) but a higher LSN (1020, status 'DELIVERED').
+          -- If ordered by timestamp, evt-30-skewed would erroneously win. Ordered by lsn DESC, authoritative LSN 1020 wins.
+          ('evt-30-skewed',        30, 1010, 250.00, 'GBP', 'SHIPPED',   'u', TIMESTAMP '2026-10-02 10:35:00', 1015),
+          ('evt-30-authoritative', 30, 1010, 300.00, 'GBP', 'DELIVERED', 'u', TIMESTAMP '2026-10-02 10:30:00', 1020),
+
+          -- Update on order 40
+          ('evt-40', 40, 1000, 199.99, 'USD', 'SHIPPED', 'u', TIMESTAMP '2026-10-02 10:45:00', 1025),
+
+          -- Tombstones (Deletes for orders 99 and 100)
+          ('evt-99-del',  99,  1019, 0.00, 'USD', 'CANCELLED', 'd', TIMESTAMP '2026-10-02 11:00:00', 1030),
+          ('evt-100-del', 100, 1000, 0.00, 'EUR', 'CANCELLED', 'd', TIMESTAMP '2026-10-02 11:05:00', 1031)
+
+          {% if inputs.inject_corrupt_cdc == true or inputs.inject_corrupt_cdc == 'true' %}
+          -- Deliberately inject unmapped FX currency to trigger the reconciliation circuit breaker
+          ,('evt-corrupt-fx', 201, 9999, 500.00, 'XYZ', 'CONFIRMED', 'c', TIMESTAMP '2026-10-02 09:00:00', 2001)
+          {% endif %}
+      ) AS c(event_id, order_id, customer_id, amount, currency, status, op, source_ts_ms, lsn);
+
+      COPY raw_cdc TO '{{ workingDir }}/raw_cdc.parquet' (FORMAT PARQUET);
+
+  - id: compact_cdc_and_asof_enrich
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Executes two-tier CDC deduplication, resolves LSN-ordered Last-Write-Wins, purges tombstones, enriches with historical ASOF FX rates, and verifies row-conservation and content integrity.
+    fetchType: FETCH
+    inputFiles:
+      base_orders.parquet: '{{ inputs.base_snapshot_uri ? inputs.base_snapshot_uri : outputs.stage_demo_datasets.outputFiles["base_orders.parquet"] }}'
+      raw_cdc.parquet: '{{ inputs.cdc_stream_uri ? inputs.cdc_stream_uri : outputs.stage_demo_datasets.outputFiles["raw_cdc.parquet"] }}'
+      fx_rates.parquet: '{{ inputs.fx_rates_uri ? inputs.fx_rates_uri : outputs.stage_demo_datasets.outputFiles["fx_rates.parquet"] }}'
+    outputFiles:
+      - "*.parquet"
+    sql: |
+      -- 1. Mount baseline and incoming datasets
+      CREATE OR REPLACE TEMP TABLE base_orders AS
+      SELECT * FROM read_parquet('{{ workingDir }}/base_orders.parquet');
+
+      CREATE OR REPLACE TEMP TABLE raw_cdc AS
+      SELECT * FROM read_parquet('{{ workingDir }}/raw_cdc.parquet');
+
+      CREATE OR REPLACE TEMP TABLE fx_rates AS
+      SELECT * FROM read_parquet('{{ workingDir }}/fx_rates.parquet');
+
+      -- 2. Tier 1 Deduplication & Op-Code Normalization: Drop duplicate network replays by event_id
+      -- Deterministic ordering: source_ts_ms ASC with lsn ASC as explicit tiebreaker.
+      -- Normalizes both Debezium (c=create/insert, r=read/snapshot, u=update, d=delete) and AWS DMS (I/U/D) op-codes.
+      -- Note: Tier 2 (PARTITION BY order_id ORDER BY lsn DESC) already guarantees correctness;
+      -- Tier 1 isolates network transport retries to accurately report duplicate_replays_dropped.
+      CREATE OR REPLACE TEMP TABLE cdc_tier1 AS
+      SELECT
+        event_id,
+        order_id,
+        customer_id,
+        amount,
+        currency,
+        status,
+        CASE
+          WHEN lower(op) IN ('c', 'r', 'i') THEN 'I'
+          WHEN lower(op) IN ('u') THEN 'U'
+          WHEN lower(op) IN ('d') THEN 'D'
+          ELSE upper(op)
+        END AS op,
+        source_ts_ms,
+        lsn
+      FROM raw_cdc
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY source_ts_ms ASC, lsn ASC) = 1;
+
+      -- 3. Tier 2 Compaction: Entity-level Last-Write-Wins (LWW) by source WAL commit order (lsn DESC)
+      -- Assumes single-source CDC stream where database WAL LSN is strictly monotonically increasing.
+      CREATE OR REPLACE TEMP TABLE cdc_compacted AS
+      SELECT *
+      FROM cdc_tier1
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY lsn DESC) = 1;
+
+      -- 4. Separate Upserts (I/U) from Tombstones (D)
+      CREATE OR REPLACE TEMP TABLE cdc_tombstones AS
+      SELECT order_id
+      FROM cdc_compacted
+      WHERE op = 'D';
+
+      CREATE OR REPLACE TEMP TABLE cdc_upserts AS
+      SELECT
+        c.order_id,
+        c.customer_id,
+        c.amount,
+        c.currency,
+        c.status,
+        -- Preserve original business order_timestamp for updates; use source_ts_ms for net new inserts
+        COALESCE(b.order_timestamp, c.source_ts_ms) AS order_timestamp
+      FROM cdc_compacted c
+      LEFT JOIN base_orders b ON c.order_id = b.order_id
+      WHERE c.op IN ('I', 'U');
+
+      -- 5. Merge Base Table with Compacted Delta (purge tombstones, apply upserts)
+      CREATE OR REPLACE TEMP TABLE merged_orders AS
+      SELECT
+        b.order_id,
+        b.customer_id,
+        b.amount,
+        b.currency,
+        b.status,
+        b.order_timestamp
+      FROM base_orders b
+      LEFT JOIN cdc_compacted c ON b.order_id = c.order_id
+      WHERE c.order_id IS NULL -- Retain untouched base records
+      UNION ALL
+      SELECT
+        order_id,
+        customer_id,
+        amount,
+        currency,
+        status,
+        order_timestamp
+      FROM cdc_upserts;
+
+      -- 6. ASOF LEFT JOIN: Match historical order timestamp to nearest effective exchange rate
+      CREATE OR REPLACE TEMP TABLE final_compacted_orders AS
+      SELECT
+        o.order_id,
+        o.customer_id,
+        o.amount,
+        o.currency,
+        fx.rate_to_usd AS fx_rate_usd,
+        ROUND(o.amount * fx.rate_to_usd, 2) AS amount_usd,
+        o.status,
+        o.order_timestamp,
+        fx.effective_ts AS fx_rate_timestamp
+      FROM merged_orders o
+      ASOF LEFT JOIN fx_rates fx
+        ON o.currency = fx.currency
+       AND o.order_timestamp >= fx.effective_ts
+      ORDER BY o.order_id;
+
+      -- 7. Persist compacted data to staging
+      COPY final_compacted_orders TO '{{ workingDir }}/staging_compacted_orders.parquet' (FORMAT PARQUET);
+
+      -- 8. Compute Reconciliation Invariants & Audit Scorecard
+      WITH metrics AS (
+        SELECT
+          (SELECT COUNT(*) FROM base_orders) AS base_rows,
+          (SELECT COUNT(*) FROM raw_cdc) AS raw_cdc_events,
+          (SELECT COUNT(*) FROM raw_cdc) - (SELECT COUNT(*) FROM cdc_tier1) AS duplicate_replays_dropped,
+          (SELECT COUNT(*) FROM cdc_compacted WHERE op IN ('I', 'U') AND order_id NOT IN (SELECT order_id FROM base_orders)) AS net_inserts,
+          (SELECT COUNT(*) FROM cdc_compacted WHERE op IN ('I', 'U') AND order_id IN (SELECT order_id FROM base_orders)) AS updates_applied,
+          (SELECT COUNT(*) FROM cdc_tombstones WHERE order_id IN (SELECT order_id FROM base_orders)) AS tombstones_purged,
+          (SELECT COUNT(*) FROM final_compacted_orders) AS final_rows,
+          (SELECT COUNT(*) - COUNT(DISTINCT order_id) FROM final_compacted_orders) AS duplicate_pks,
+          (SELECT COUNT(*) FROM final_compacted_orders WHERE fx_rate_timestamp IS NULL) AS unmapped_fx_rows,
+          (
+            SELECT COUNT(*)
+            FROM final_compacted_orders
+            WHERE order_id IN (SELECT order_id FROM cdc_tombstones)
+          ) AS tombstone_leak_count,
+          (
+            SELECT COUNT(*) FROM (
+              (
+                SELECT order_id, customer_id, amount, currency, status, order_timestamp
+                FROM base_orders
+                WHERE order_id NOT IN (SELECT order_id FROM cdc_compacted)
+                EXCEPT
+                SELECT order_id, customer_id, amount, currency, status, order_timestamp
+                FROM final_compacted_orders
+              )
+              UNION ALL
+              (
+                SELECT order_id, customer_id, amount, currency, status, order_timestamp
+                FROM final_compacted_orders
+                WHERE order_id IN (
+                  SELECT order_id FROM base_orders WHERE order_id NOT IN (SELECT order_id FROM cdc_compacted)
+                )
+                EXCEPT
+                SELECT order_id, customer_id, amount, currency, status, order_timestamp
+                FROM base_orders
+              )
+            )
+          ) AS untouched_base_mismatches,
+          ROUND(COALESCE((SELECT SUM(amount_usd) FROM final_compacted_orders), 0.0), 2) AS total_gross_usd
+      )
+      SELECT
+        base_rows,
+        raw_cdc_events,
+        duplicate_replays_dropped,
+        net_inserts,
+        updates_applied,
+        tombstones_purged,
+        final_rows,
+        duplicate_pks,
+        unmapped_fx_rows,
+        tombstone_leak_count,
+        untouched_base_mismatches,
+        total_gross_usd,
+        -- Reconciliation Invariants:
+        -- 1. Row conservation: Final == Base + Inserts - Deletes
+        -- 2. Primary key uniqueness: Duplicate PKs == 0
+        -- 3. Currency enrichment completeness: Unmapped FX == 0
+        -- 4. Content integrity: No tombstoned order ID in output (tombstone_leak_count == 0)
+        -- 5. Content integrity: Untouched base rows match snapshot identically via EXCEPT (untouched_base_mismatches == 0)
+        (
+          final_rows = (base_rows + net_inserts - tombstones_purged)
+          AND duplicate_pks = 0
+          AND unmapped_fx_rows = 0
+          AND tombstone_leak_count = 0
+          AND untouched_base_mismatches = 0
+        ) AS invariant_passed
+      FROM metrics;
+
+  - id: extract_metrics
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Extracts and exposes the reconciliation scorecard metrics as structured flow outputs.
+    values: "{{ outputs.compact_cdc_and_asof_enrich.outputs[0].rows[0] }}"
+
+  - id: log_compaction_audit
+    type: io.kestra.plugin.core.log.Log
+    description: Formats and outputs the complete reconciliation audit report to execution logs.
+    message: |
+      ==============================================================
+      CDC LOG COMPACTION & LAKEHOUSE RECONCILIATION SCORECARD
+      ==============================================================
+      Base Snapshot Rows:          {{ outputs.extract_metrics.values.base_rows }}
+      Raw CDC Events Ingested:     {{ outputs.extract_metrics.values.raw_cdc_events }}
+      Duplicate Replays Dropped:   {{ outputs.extract_metrics.values.duplicate_replays_dropped }}
+      Net New Inserts:             {{ outputs.extract_metrics.values.net_inserts }}
+      Updates Applied:             {{ outputs.extract_metrics.values.updates_applied }}
+      Tombstone Deletes Purged:    {{ outputs.extract_metrics.values.tombstones_purged }}
+      Final Compacted Rows:        {{ outputs.extract_metrics.values.final_rows }}
+      Duplicate Primary Keys:      {{ outputs.extract_metrics.values.duplicate_pks }}
+      Unmapped FX Rates:           {{ outputs.extract_metrics.values.unmapped_fx_rows }}
+      Tombstone Leaks Detected:    {{ outputs.extract_metrics.values.tombstone_leak_count }}
+      Untouched Base Mismatches:   {{ outputs.extract_metrics.values.untouched_base_mismatches }}
+      Total Compacted Revenue USD: ${{ outputs.extract_metrics.values.total_gross_usd }}
+      Conservation Invariant:      {{ outputs.extract_metrics.values.invariant_passed ? '[PASS]' : '[FAIL]' }}
+      ==============================================================
+
+  - id: reconciliation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Circuit breaker that publishes verified lakehouse artifacts on pass, or halts execution on failure.
+    condition: "{{ outputs.extract_metrics.values.invariant_passed }}"
+    then:
+      - id: publish_compacted_lakehouse_table
+        type: io.kestra.plugin.core.namespace.UploadFiles
+        description: Publishes verified compacted Parquet to Namespace Files for downstream analytical consumption.
+        filesMap:
+          lakehouse/compacted_orders.parquet: "{{ outputs.compact_cdc_and_asof_enrich.outputFiles['staging_compacted_orders.parquet'] }}"
+        namespace: "{{ flow.namespace }}"
+
+      - id: record_lakehouse_manifest
+        type: io.kestra.plugin.core.kv.Set
+        description: Records production table metadata, row counts, and reconciliation audit manifest in the Kestra KV store.
+        key: compacted_orders_manifest
+        value: |
+          {
+            "table": "compacted_orders",
+            "execution_id": "{{ execution.id }}",
+            "timestamp": "{{ execution.startDate }}",
+            "row_count": {{ outputs.extract_metrics.values.final_rows }},
+            "gross_revenue_usd": {{ outputs.extract_metrics.values.total_gross_usd }},
+            "storage_path": "lakehouse/compacted_orders.parquet"
+          }
+        kvType: JSON
+    else:
+      - id: halt_corrupt_execution
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "CDC Compaction Invariant Violated! Row Balance: Base ({{ outputs.extract_metrics.values.base_rows }}) + Inserts ({{ outputs.extract_metrics.values.net_inserts }}) - Deletes ({{ outputs.extract_metrics.values.tombstones_purged }}) vs Final ({{ outputs.extract_metrics.values.final_rows }}), Duplicate PKs: {{ outputs.extract_metrics.values.duplicate_pks }}, Unmapped FX: {{ outputs.extract_metrics.values.unmapped_fx_rows }}, Leaked Tombstones: {{ outputs.extract_metrics.values.tombstone_leak_count }}, Untouched Base Mismatches: {{ outputs.extract_metrics.values.untouched_base_mismatches }}."
+
+triggers:
+  - id: hourly_compaction_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    disabled: true
+
+extend:
+  title: Out-of-Order CDC Log Compaction and Point-in-Time Merger with DuckDB
+  metaTitle: Out-of-Order CDC Log Compaction & ASOF Join | Kestra Blueprint
+  shortDescription: Resolve out-of-order CDC changelogs, purge tombstones, and enrich point-in-time exchange rates in DuckDB with reconciliation invariant gating.
+  metaDescription: Compact out-of-order CDC changelogs with LSN Last-Write-Wins, purge tombstones, and enrich point-in-time FX rates in DuckDB with invariant gating.
+  description: |
+    Change Data Capture (CDC) streams from operational databases often suffer from out-of-order arrivals, duplicate replays, and uncompacted delete tombstones.
+
+    This blueprint implements an in-engine CDC log compaction pipeline using embedded DuckDB. It resolves mutations via WAL Log Sequence Numbers (LSN), purges deleted records, enriches transactions with temporal exchange rates via DuckDB `ASOF LEFT JOIN`, and gates publication on row-conservation and content-integrity checks before publishing to Namespace Files and the KV store.
+
+    ## How it works
+
+    1. **Demo Staging**: When input URIs are empty, `stage_demo_datasets` generates baseline orders, exchange rates, and a CDC changelog with duplicate IDs, clock-skewed commits, and delete tombstones.
+    2. **Two-Tier CDC Compaction**: `compact_cdc_and_asof_enrich` performs multi-stage compaction in DuckDB:
+       - *Transport Dedup*: Drops duplicate replays by event ID, sorting by timestamp and LSN.
+       - *LSN Last-Write-Wins*: Resolves mutations per primary key by transaction LSN descending, preventing clock skew from reverting committed states.
+       - *Tombstone Purging*: Filters deleted entities (`op = 'D'`) while upserting active deltas into baseline orders.
+    3. **Point-in-Time FX Enrichment**: Pairs transactions with effective exchange rates via `ASOF LEFT JOIN`, retaining unmapped currencies as NULL for quality gating.
+    4. **Reconciliation Invariants**: Validates row conservation (`Final == Base + Inserts - Deletes`), primary key uniqueness, tombstone leak prevention, and baseline row identity via SQL `EXCEPT`.
+    5. **Audit Reporting**: `extract_metrics` (`OutputValues`) exposes metrics to flow outputs, and `log_compaction_audit` logs the scorecard.
+    6. **Gating & Publishing**: `reconciliation_gate` (`If`) publishes verified Parquet to Namespace Files (`UploadFiles`) and writes metadata to the KV store (`kv.Set`) on pass. When the gate trips (`else`), `halt_corrupt_execution` (`Fail`) aborts the run before promotion; the staging file (`staging_compacted_orders.parquet`) remains in task outputs for inspection.
+
+    ## What you get
+
+    - In-engine CDC changelog compaction without Spark or Flink clusters.
+    - Authoritative WAL LSN Last-Write-Wins ordering and tombstone purging.
+    - Point-in-time currency conversion with native DuckDB `ASOF LEFT JOIN`.
+    - Row-conservation and content-integrity reconciliation gates.
+    - Table publishing to Namespace Files paired with KV store metadata discovery.
+
+    ## Who it's for
+
+    - Data engineers compacting CDC streams into lakehouses.
+    - Analytics engineers reconciling operational stores with analytical Parquet tables.
+    - Platform teams establishing automated quality gates at ingestion boundaries.
+
+    ## Why orchestrate this with Kestra
+
+    - **Low Operational Footprint**: Runs embedded DuckDB in the Kestra worker without external cluster dependencies.
+    - **Quality Gates**: Flow controls (`If` and `Fail`) isolate anomalies and halt execution before unverified data reaches consumers.
+    - **Native Storage & Metadata**: Integrates with Kestra Namespace Files for table storage and KV Store for downstream metadata discovery.
+    - **Complementary Catalog Positioning**: Unlike CDC sentinels or ML feature gates, this workflow handles in-engine compaction, LSN ordering, and financial joins.
+
+    ## Prerequisites
+
+    - A running Kestra instance with the DuckDB JDBC plugin (`plugin-jdbc-duckdb`).
+    - No external databases, cloud services, or API secrets required.
+
+    ### Secrets
+
+    - None required.
+
+    ## Quick start
+
+    1. **Run Clean Compaction**: Execute with default inputs to generate demo data, compact updates, upload `lakehouse/compacted_orders.parquet` to Namespace Files, and register the KV manifest.
+    2. **Verify Gate Failure**: Execute with `inject_corrupt_cdc: true`. The pipeline catches unmapped currency ('XYZ') and aborts execution via `Fail`. The unpromoted staging Parquet remains in task storage for inspection.
+    3. **Custom Datasets**: Supply storage URIs in `base_snapshot_uri`, `cdc_stream_uri`, and `fx_rates_uri` to compact production tables.
+    4. **Activate the Trigger**: Enable the hourly Schedule trigger in the Triggers tab to compact incoming CDC batches periodically.
+
+    ## How to extend
+
+    - **Automated Scheduling**: Enable the hourly Schedule trigger or attach S3/GCS triggers for continuous compaction.
+    - **Cloud Storage Landing**: Add an `aws.s3.Upload` or `gcp.gcs.Upload` task to publish the compacted Parquet file to an external data lake.
+    - **Alerts & Warehouse Sync**: Wire Slack notifications to `reconciliation_gate` or trigger Snowflake/BigQuery `COPY INTO` tasks upon completion.
+
+    ## Links
+
+    - [Kestra DuckDB Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-duckdb)
+    - [DuckDB ASOF Join Documentation](https://duckdb.org/docs/guides/sql_features/asof_join)
+
+
+
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Testing & Quality
+  ee: false
+  demo: false
