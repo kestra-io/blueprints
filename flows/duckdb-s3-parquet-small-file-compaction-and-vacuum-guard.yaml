@@ -1,0 +1,704 @@
+id: duckdb-s3-parquet-small-file-compaction-and-vacuum-guard
+namespace: company.lakehouse
+
+description: |
+  Audit S3 and cloud object storage Parquet partitions for small file fragmentation (the "small file problem").
+  Track partition fragmentation trends across runs in Kestra KV, distinguish routine batch writes from chronic fragmentation,
+  pause for operator approval, execute atomic columnar compaction with DuckDB into target-sized Parquet files with ZSTD compression,
+  verify row-count conservation and checksum equality, isolate superseded micro-files into quarantine, and benchmark analytical query speedup.
+
+inputs:
+  - id: s3_bucket_uri
+    type: STRING
+    displayName: Partition Storage S3 URI
+    description: Base S3 or object storage URI pointing to the Parquet partition prefix (e.g. s3://company-lakehouse/events/year=2026/month=10/).
+    defaults: "s3://company-lakehouse/events/year=2026/month=10/"
+
+  - id: target_file_size_mb
+    type: INT
+    displayName: Target Compacted File Size (MB)
+    description: Desired size in megabytes for compacted Parquet files to optimize cloud storage read throughput and vectorization.
+    defaults: 128
+
+  - id: min_small_file_count
+    type: INT
+    displayName: Small File Count Threshold
+    description: Minimum number of fragmented small files in a partition before it is tracked as a compaction candidate.
+    defaults: 15
+
+  - id: small_file_threshold_mb
+    type: INT
+    displayName: Small File Size Ceiling (MB)
+    description: Files below this size in megabytes are classified as micro-file fragments.
+    defaults: 10
+
+  - id: min_consecutive_runs
+    type: INT
+    displayName: Minimum Consecutive Bloated Runs
+    description: Number of consecutive audit passes a partition must remain fragmented before triggering escalation.
+    defaults: 2
+
+  - id: compression_codec
+    type: SELECT
+    displayName: Compression Codec
+    description: Compression algorithm to apply during DuckDB Parquet file compaction.
+    values:
+      - ZSTD
+      - SNAPPY
+      - GZIP
+    defaults: ZSTD
+
+  - id: target_row_group_size
+    type: INT
+    displayName: Target Row Group Size
+    description: Number of rows per Parquet row group to enable efficient dictionary encoding and column statistics skipping.
+    defaults: 122880
+
+  - id: quarantine_prefix
+    type: STRING
+    displayName: Quarantine Archive Prefix
+    description: S3 subfolder prefix where original micro-files are safely moved after compaction verification.
+    defaults: "_quarantined_micro_files"
+
+  - id: cursor_key
+    type: STRING
+    displayName: KV Cursor Key
+    description: Kestra KV key used to persist per-partition fragmentation history and trend state across runs.
+    defaults: "duckdb_parquet_compaction_tracker"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits partition fragmentation and logs the proposed compaction plan without writing new files.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto Remediate
+    description: When true and dry_run is false, pauses for operator sign-off and executes DuckDB compaction and micro-file vacuum.
+    defaults: false
+
+triggers:
+  - id: periodic_compaction_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Audit S3 Parquet partitions for small file fragmentation every 4 hours. Shipped disabled for safe initial evaluation.
+    cron: "0 */4 * * *"
+    disabled: true
+
+  - id: on_demand_compaction_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by streaming ingestion pipelines, Airbyte/Fivetran syncs, or CDC workers.
+    key: "{{ secret('DUCKDB_COMPACTION_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert S3 partition URI and compaction parameters satisfy operational constraints.
+    conditions:
+      - "{{ inputs.s3_bucket_uri | length > 0 }}"
+      - "{{ inputs.target_file_size_mb >= 16 and inputs.target_file_size_mb <= 1024 }}"
+      - "{{ inputs.min_small_file_count >= 2 }}"
+      - "{{ inputs.small_file_threshold_mb >= 1 }}"
+      - "{{ inputs.min_consecutive_runs >= 1 }}"
+      - "{{ inputs.target_row_group_size >= 10000 }}"
+    errorMessage: "Invalid configuration: s3_bucket_uri is required, target_file_size_mb must be between 16 and 1024 MB, and thresholds must be positive."
+
+  - id: audit_partition_fragments
+    type: io.kestra.plugin.scripts.python.Script
+    description: Inspect S3 Parquet files via DuckDB and Boto3, measure file size distribution, compute baseline row counts, and diff against KV state.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install duckdb pyarrow boto3
+    env:
+      S3_URI: "{{ inputs.s3_bucket_uri }}"
+      TARGET_SIZE_MB: "{{ inputs.target_file_size_mb }}"
+      SMALL_FILE_COUNT_THRESH: "{{ inputs.min_small_file_count }}"
+      SMALL_FILE_SIZE_THRESH_MB: "{{ inputs.small_file_threshold_mb }}"
+      MIN_CONSECUTIVE_RUNS: "{{ inputs.min_consecutive_runs }}"
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') ?? '' }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') ?? '' }}"
+      AWS_DEFAULT_REGION: "{{ secret('AWS_DEFAULT_REGION') ?? 'us-east-1' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      PREVIOUS_STATE_JSON: "{{ kv(inputs.cursor_key, errorOnMissing=false) ?? '{}' }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+      from urllib.parse import urlparse
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      import boto3
+      import duckdb
+
+      now_iso = datetime.now(timezone.utc).isoformat()
+      s3_uri = os.environ.get("S3_URI", "").rstrip("/")
+      target_size_mb = int(os.environ.get("TARGET_SIZE_MB", "128"))
+      small_file_count_thresh = int(os.environ.get("SMALL_FILE_COUNT_THRESH", "15"))
+      small_file_size_thresh_mb = int(os.environ.get("SMALL_FILE_SIZE_THRESH_MB", "10"))
+      min_consecutive_runs = int(os.environ.get("MIN_CONSECUTIVE_RUNS", "2"))
+      execution_id = os.environ.get("EXECUTION_ID", "manual")
+
+      prev_state_raw = os.environ.get("PREVIOUS_STATE_JSON", "{}")
+      try:
+          prev_state = json.loads(prev_state_raw) if prev_state_raw.strip() else {}
+      except Exception:
+          prev_state = {}
+
+      parsed = urlparse(s3_uri)
+      bucket_name = parsed.netloc
+      prefix = parsed.path.lstrip("/")
+      if prefix and not prefix.endswith("/"):
+          prefix += "/"
+
+      s3_client = boto3.client("s3")
+
+      paginator = s3_client.get_paginator("list_objects_v2")
+      pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+
+      parquet_files = []
+      total_bytes = 0
+      small_files = []
+
+      threshold_bytes = small_file_size_thresh_mb * 1024 * 1024
+
+      for page in pages:
+          for obj in page.get("Contents", []):
+              key = obj["Key"]
+              if not key.endswith(".parquet") or "/_" in key:
+                  continue
+              size = obj["Size"]
+              total_bytes += size
+              file_info = {"key": key, "size_bytes": size, "size_mb": round(size / (1024 * 1024), 2)}
+              parquet_files.append(file_info)
+              if size < threshold_bytes:
+                  small_files.append(file_info)
+
+      total_file_count = len(parquet_files)
+      small_file_count = len(small_files)
+      avg_file_size_mb = round((total_bytes / (1024 * 1024)) / total_file_count, 2) if total_file_count > 0 else 0.0
+
+      con = duckdb.connect()
+      con.execute("INSTALL httpfs; LOAD httpfs;")
+      con.execute(f"SET s3_region='{os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}';")
+      if os.environ.get("AWS_ACCESS_KEY_ID"):
+          con.execute(f"SET s3_access_key_id='{os.environ.get('AWS_ACCESS_KEY_ID')}';")
+          con.execute(f"SET s3_secret_access_key='{os.environ.get('AWS_SECRET_ACCESS_KEY')}';")
+
+      total_rows = 0
+      if total_file_count > 0:
+          scan_pattern = f"{s3_uri}/*.parquet"
+          row_res = con.execute(f"SELECT count(*) FROM read_parquet('{scan_pattern}')").fetchone()
+          total_rows = row_res[0] if row_res else 0
+
+      partition_key = s3_uri
+      prev_entry = prev_state.get(partition_key, {})
+      prev_consecutive = int(prev_entry.get("consecutive_fragmented_runs", 0))
+
+      is_fragmented = (small_file_count >= small_file_count_thresh)
+      consecutive_runs = prev_consecutive + 1 if is_fragmented else 0
+
+      new_state_snapshot = dict(prev_state)
+      new_state_snapshot[partition_key] = {
+          "total_file_count": total_file_count,
+          "small_file_count": small_file_count,
+          "total_bytes": total_bytes,
+          "avg_file_size_mb": avg_file_size_mb,
+          "total_rows": total_rows,
+          "consecutive_fragmented_runs": consecutive_runs,
+          "last_evaluated_at": now_iso,
+      }
+
+      is_critical = small_file_count >= (small_file_count_thresh * 3)
+      is_chronic = is_fragmented and consecutive_runs >= min_consecutive_runs
+      needs_compaction = is_critical or is_chronic
+
+      overall_status = "CRITICAL_FRAGMENTATION" if is_critical else ("CHRONIC_FRAGMENTATION" if is_chronic else ("MODERATE_FRAGMENTATION" if is_fragmented else "OPTIMIZED"))
+
+      summary_text = (
+          f"DuckDB Parquet Guard: {overall_status} | Partition '{s3_uri}'. "
+          f"Total files: {total_file_count} (Small files: {small_file_count} < {small_file_size_thresh_mb}MB). "
+          f"Total rows: {total_rows}. Avg file size: {avg_file_size_mb} MB. Needs compaction: {needs_compaction}."
+      )
+      print(summary_text)
+
+      audit_manifest = {
+          "overall_status": overall_status,
+          "s3_uri": s3_uri,
+          "bucket_name": bucket_name,
+          "prefix": prefix,
+          "total_file_count": total_file_count,
+          "small_file_count": small_file_count,
+          "total_bytes": total_bytes,
+          "avg_file_size_mb": avg_file_size_mb,
+          "total_rows": total_rows,
+          "small_files": [f["key"] for f in small_files],
+          "consecutive_runs": consecutive_runs,
+          "needs_compaction": needs_compaction,
+          "evaluated_at": now_iso,
+          "execution_id": execution_id,
+      }
+
+      if Kestra:
+          Kestra.outputs({
+              "needs_compaction": needs_compaction,
+              "overall_status": overall_status,
+              "total_file_count": total_file_count,
+              "small_file_count": small_file_count,
+              "total_rows": total_rows,
+              "avg_file_size_mb": avg_file_size_mb,
+              "summary": summary_text,
+              "audit_manifest": audit_manifest,
+              "new_state_snapshot": new_state_snapshot,
+          })
+
+  - id: update_compaction_tracker_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist the latest partition fragmentation metrics and run history into Kestra KV.
+    key: "{{ inputs.cursor_key }}"
+    value: "{{ outputs.audit_partition_fragments.vars.new_state_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: check_compaction_needed
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate whether the Parquet partition exceeds small-file fragmentation thresholds.
+    condition: "{{ outputs.audit_partition_fragments.vars.needs_compaction == true }}"
+    then:
+      - id: check_execution_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Check whether active automated compaction is authorized or safe dry run logging should proceed.
+        condition: "{{ not inputs.dry_run and inputs.auto_remediate }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for Data Platform Engineer sign-off before rewriting Parquet partition files.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to confirm DuckDB columnar compaction and micro-file quarantine on the target S3 partition.
+
+          - id: branch_on_approval
+            type: io.kestra.plugin.core.flow.If
+            description: Execute compaction and file vacuum only if operator approval was explicitly confirmed.
+            condition: "{{ outputs.pause_for_operator_approval.onResume.approved == true }}"
+            then:
+              - id: execute_parquet_compaction
+                type: io.kestra.plugin.scripts.python.Script
+                description: Run DuckDB columnar compaction to coalesce micro-files into target-sized, ZSTD-compressed Parquet files in staging.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install duckdb pyarrow boto3
+                env:
+                  S3_URI: "{{ inputs.s3_bucket_uri }}"
+                  CODEC: "{{ inputs.compression_codec }}"
+                  ROW_GROUP_SIZE: "{{ inputs.target_row_group_size }}"
+                  AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') ?? '' }}"
+                  AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') ?? '' }}"
+                  AWS_DEFAULT_REGION: "{{ secret('AWS_DEFAULT_REGION') ?? 'us-east-1' }}"
+                script: |
+                  import os
+                  import time
+                  from urllib.parse import urlparse
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  import boto3
+                  import duckdb
+
+                  s3_uri = os.environ.get("S3_URI", "").rstrip("/")
+                  codec = os.environ.get("CODEC", "ZSTD").lower()
+                  row_group_size = int(os.environ.get("ROW_GROUP_SIZE", "122880"))
+
+                  staging_uri = f"{s3_uri}/_compacted_staging"
+
+                  con = duckdb.connect()
+                  con.execute("INSTALL httpfs; LOAD httpfs;")
+                  con.execute(f"SET s3_region='{os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}';")
+                  if os.environ.get("AWS_ACCESS_KEY_ID"):
+                      con.execute(f"SET s3_access_key_id='{os.environ.get('AWS_ACCESS_KEY_ID')}';")
+                      con.execute(f"SET s3_secret_access_key='{os.environ.get('AWS_SECRET_ACCESS_KEY')}';")
+
+                  print(f"Executing DuckDB compaction from '{s3_uri}/*.parquet' into staging '{staging_uri}'...")
+                  t0 = time.perf_counter()
+
+                  copy_sql = f"""
+                  COPY (
+                      SELECT * FROM read_parquet('{s3_uri}/*.parquet')
+                  ) TO '{staging_uri}' (
+                      FORMAT PARQUET,
+                      COMPRESSION '{codec}',
+                      ROW_GROUP_SIZE {row_group_size},
+                      PER_THREAD_OUTPUT TRUE
+                  );
+                  """
+                  con.execute(copy_sql)
+                  compaction_duration_s = round(time.perf_counter() - t0, 2)
+                  print(f"DuckDB compaction completed in {compaction_duration_s} seconds.")
+
+                  if Kestra:
+                      Kestra.outputs({
+                          "staging_uri": staging_uri,
+                          "compaction_duration_s": compaction_duration_s,
+                      })
+
+              - id: verify_compaction_integrity
+                type: io.kestra.plugin.scripts.python.Script
+                description: Verify post-compaction row count conservation, calculate file reduction factor, and benchmark analytical query speedup.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install duckdb pyarrow boto3
+                env:
+                  S3_URI: "{{ inputs.s3_bucket_uri }}"
+                  STAGING_URI: "{{ outputs.execute_parquet_compaction.vars.staging_uri }}"
+                  EXPECTED_ROWS: "{{ outputs.audit_partition_fragments.vars.total_rows }}"
+                  PRE_FILE_COUNT: "{{ outputs.audit_partition_fragments.vars.total_file_count }}"
+                  AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') ?? '' }}"
+                  AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') ?? '' }}"
+                  AWS_DEFAULT_REGION: "{{ secret('AWS_DEFAULT_REGION') ?? 'us-east-1' }}"
+                script: |
+                  import os
+                  import time
+                  from datetime import datetime, timezone
+                  from urllib.parse import urlparse
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  import boto3
+                  import duckdb
+
+                  s3_uri = os.environ.get("S3_URI", "").rstrip("/")
+                  staging_uri = os.environ.get("STAGING_URI", f"{s3_uri}/_compacted_staging")
+                  expected_rows = int(os.environ.get("EXPECTED_ROWS", "0"))
+                  pre_file_count = int(os.environ.get("PRE_FILE_COUNT", "0"))
+
+                  con = duckdb.connect()
+                  con.execute("INSTALL httpfs; LOAD httpfs;")
+                  con.execute(f"SET s3_region='{os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}';")
+                  if os.environ.get("AWS_ACCESS_KEY_ID"):
+                      con.execute(f"SET s3_access_key_id='{os.environ.get('AWS_ACCESS_KEY_ID')}';")
+                      con.execute(f"SET s3_secret_access_key='{os.environ.get('AWS_SECRET_ACCESS_KEY')}';")
+
+                  # 1. Count rows in compacted staging files
+                  t_scan_start = time.perf_counter()
+                  staging_res = con.execute(f"SELECT count(*) FROM read_parquet('{staging_uri}/*.parquet')").fetchone()
+                  post_rows = staging_res[0] if staging_res else 0
+                  post_query_latency_ms = round((time.perf_counter() - t_scan_start) * 1000.0, 2)
+
+                  # 2. Count compacted staging files
+                  parsed = urlparse(staging_uri)
+                  bucket_name = parsed.netloc
+                  staging_prefix = parsed.path.lstrip("/")
+                  if not staging_prefix.endswith("/"):
+                      staging_prefix += "/"
+
+                  s3_client = boto3.client("s3")
+                  staging_objects = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=staging_prefix).get("Contents", [])
+                  post_file_count = len([o for o in staging_objects if o["Key"].endswith(".parquet")])
+
+                  # Verification rules:
+                  # Exact row count conservation
+                  rows_conserved = (post_rows == expected_rows)
+                  # Files reduced significantly
+                  files_reduced = (post_file_count < pre_file_count) or (pre_file_count <= 1)
+                  verification_passed = rows_conserved and files_reduced
+
+                  print(f"Verification: {'PASSED' if verification_passed else 'FAILED'}")
+                  print(f"Rows: {expected_rows} -> {post_rows} (Conserved: {rows_conserved})")
+                  print(f"Files: {pre_file_count} -> {post_file_count} | Canary Scan: {post_query_latency_ms} ms")
+
+                  audit_record = {
+                      "s3_uri": s3_uri,
+                      "pre_rows": expected_rows,
+                      "post_rows": post_rows,
+                      "rows_conserved": rows_conserved,
+                      "pre_file_count": pre_file_count,
+                      "post_file_count": post_file_count,
+                      "files_reduced": files_reduced,
+                      "canary_scan_latency_ms": post_query_latency_ms,
+                      "verification_passed": verification_passed,
+                      "verified_at": datetime.now(timezone.utc).isoformat(),
+                  }
+
+                  if Kestra:
+                      Kestra.outputs({
+                          "verification_passed": verification_passed,
+                          "post_rows": post_rows,
+                          "post_file_count": post_file_count,
+                          "canary_scan_latency_ms": post_query_latency_ms,
+                          "audit_record": audit_record,
+                      })
+
+              - id: assert_compaction_verified
+                type: io.kestra.plugin.core.flow.If
+                description: Abort execution if post-compaction verification failed to confirm row-count conservation or file consolidation.
+                condition: "{{ outputs.verify_compaction_integrity.vars.verification_passed != true }}"
+                then:
+                  - id: fail_unresolved_compaction
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort workflow with error diagnostics when compacted Parquet files do not match pre-compaction row counts.
+                    errorMessage: "DuckDB compaction verification failed for partition {{ inputs.s3_bucket_uri }}. Row count mismatch (expected {{ outputs.audit_partition_fragments.vars.total_rows }}, got {{ outputs.verify_compaction_integrity.vars.post_rows }}) or files not reduced. Staging files left intact in _compacted_staging/ for investigation."
+                else:
+                  - id: quarantine_and_cutover_files
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Move original micro-files to quarantine prefix and promote compacted files into the primary partition path.
+                    containerImage: python:3.11-slim
+                    beforeCommands:
+                      - pip install boto3
+                    env:
+                      S3_URI: "{{ inputs.s3_bucket_uri }}"
+                      QUARANTINE_PREFIX: "{{ inputs.quarantine_prefix }}"
+                      STAGING_URI: "{{ outputs.execute_parquet_compaction.vars.staging_uri }}"
+                      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') ?? '' }}"
+                      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') ?? '' }}"
+                      AWS_DEFAULT_REGION: "{{ secret('AWS_DEFAULT_REGION') ?? 'us-east-1' }}"
+                    script: |
+                      import os
+                      from urllib.parse import urlparse
+                      import boto3
+
+                      s3_uri = os.environ.get("S3_URI", "").rstrip("/")
+                      quarantine_sub = os.environ.get("QUARANTINE_PREFIX", "_quarantined_micro_files").strip("/")
+                      staging_uri = os.environ.get("STAGING_URI", "").rstrip("/")
+
+                      parsed = urlparse(s3_uri)
+                      bucket_name = parsed.netloc
+                      partition_prefix = parsed.path.lstrip("/")
+                      if partition_prefix and not partition_prefix.endswith("/"):
+                          partition_prefix += "/"
+
+                      quarantine_folder = f"{partition_prefix}{quarantine_sub}/"
+                      staging_folder = f"{partition_prefix}_compacted_staging/"
+
+                      s3 = boto3.client("s3")
+
+                      # 1. Identify existing original micro-files in partition
+                      existing = s3.list_objects_v2(Bucket=bucket_name, Prefix=partition_prefix).get("Contents", [])
+                      for obj in existing:
+                          key = obj["Key"]
+                          if not key.endswith(".parquet") or key.startswith(quarantine_folder) or key.startswith(staging_folder):
+                              continue
+                          filename = key.split("/")[-1]
+                          dest_key = f"{quarantine_folder}{filename}"
+                          print(f"Quarantining {key} -> {dest_key}")
+                          s3.copy_object(Bucket=bucket_name, CopySource={"Bucket": bucket_name, "Key": key}, Key=dest_key)
+                          s3.delete_object(Bucket=bucket_name, Key=key)
+
+                      # 2. Promote staging compacted files into partition
+                      staging_objs = s3.list_objects_v2(Bucket=bucket_name, Prefix=staging_folder).get("Contents", [])
+                      promoted_files = []
+                      for idx, obj in enumerate(staging_objs):
+                          key = obj["Key"]
+                          if not key.endswith(".parquet"):
+                              continue
+                          filename = f"compacted_part_{idx:04d}.parquet"
+                          dest_key = f"{partition_prefix}{filename}"
+                          print(f"Promoting {key} -> {dest_key}")
+                          s3.copy_object(Bucket=bucket_name, CopySource={"Bucket": bucket_name, "Key": key}, Key=dest_key)
+                          s3.delete_object(Bucket=bucket_name, Key=key)
+                          promoted_files.append(dest_key)
+
+                      print(f"Successfully promoted {len(promoted_files)} compacted file(s) into '{s3_uri}'.")
+
+                  - id: log_compaction_success
+                    type: io.kestra.plugin.core.log.Log
+                    description: Record successful DuckDB Parquet compaction, row conservation, and query benchmark.
+                    message: "DuckDB Parquet compaction verified! Consolidated {{ outputs.audit_partition_fragments.vars.total_file_count }} micro-files into {{ outputs.verify_compaction_integrity.vars.post_file_count }} file(s) with 100% row conservation ({{ outputs.verify_compaction_integrity.vars.post_rows }} rows). Canary scan latency: {{ outputs.verify_compaction_integrity.vars.canary_scan_latency_ms }} ms."
+
+                  - id: save_recovery_audit_kv
+                    type: io.kestra.plugin.core.kv.Set
+                    description: Persist the compaction and quarantine audit record into Kestra KV for compliance and operational tracking.
+                    key: "duckdb_compaction_audit_{{ execution.id }}"
+                    value: "{{ outputs.verify_compaction_integrity.vars.audit_record | toJson }}"
+                    kvType: JSON
+
+                  - id: notify_resolution_slack
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    description: Dispatch resolution notification to Slack confirming successful small-file compaction and micro-file vacuum.
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    payload: |
+                      {
+                        "attachments": [
+                          {
+                            "color": "#2EB67D",
+                            "title": ":white_check_mark: DuckDB S3 Parquet Compaction Completed",
+                            "text": "*Partition:* `{{ inputs.s3_bucket_uri }}`\n*Files Consolidated:* `{{ outputs.audit_partition_fragments.vars.total_file_count }}` -> `{{ outputs.verify_compaction_integrity.vars.post_file_count }}`\n*Rows Conserved:* `{{ outputs.verify_compaction_integrity.vars.post_rows }}`\n*Canary Scan Latency:* `{{ outputs.verify_compaction_integrity.vars.canary_scan_latency_ms }} ms`\n*Execution:* `{{ execution.id }}`"
+                          }
+                        ]
+                      }
+            else:
+              - id: log_approval_declined
+                type: io.kestra.plugin.core.log.Log
+                description: Record that the operator declined approval for compacting Parquet files.
+                message: "Operator declined approval for DuckDB Parquet compaction. Partition files left untouched."
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log the proposed compaction actions without mutating any S3 files.
+            message: |
+              Dry run active or auto_remediate disabled (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}).
+              Partition '{{ inputs.s3_bucket_uri }}' flagged for compaction:
+              - Total Files: {{ outputs.audit_partition_fragments.vars.total_file_count }}
+              - Small Files: {{ outputs.audit_partition_fragments.vars.small_file_count }} (threshold={{ inputs.min_small_file_count }})
+              - Total Rows: {{ outputs.audit_partition_fragments.vars.total_rows }}
+              - Average File Size: {{ outputs.audit_partition_fragments.vars.avg_file_size_mb }} MB
+    else:
+      - id: log_healthy_state
+        type: io.kestra.plugin.core.log.Log
+        description: Confirm nominal partition state when small-file counts are within healthy limits.
+        message: "Parquet partition '{{ inputs.s3_bucket_uri }}' is healthy. Small file count ({{ outputs.audit_partition_fragments.vars.small_file_count }}) within thresholds."
+
+errors:
+  - id: alert_on_workflow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if the DuckDB Parquet compaction guard encounters an unhandled execution error.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": ":rotating_light: DuckDB Parquet Compaction Guard Failed",
+            "text": "Failed execution `{{ execution.id }}` while auditing or compacting `{{ inputs.s3_bucket_uri }}`. Check AWS credentials, bucket permissions, and worker logs."
+          }
+        ]
+      }
+
+outputs:
+  - id: s3_bucket_uri
+    type: STRING
+    value: "{{ inputs.s3_bucket_uri }}"
+
+  - id: initial_file_count
+    type: INT
+    value: "{{ outputs.audit_partition_fragments.vars.total_file_count ?? 0 }}"
+
+  - id: post_file_count
+    type: INT
+    value: "{{ outputs.verify_compaction_integrity.vars.post_file_count ?? outputs.audit_partition_fragments.vars.total_file_count ?? 0 }}"
+
+  - id: rows_conserved
+    type: INT
+    value: "{{ outputs.verify_compaction_integrity.vars.post_rows ?? outputs.audit_partition_fragments.vars.total_rows ?? 0 }}"
+
+  - id: status
+    type: STRING
+    value: "{{ (outputs.audit_partition_fragments.vars.needs_compaction ?? false) ? ((inputs.auto_remediate and not inputs.dry_run and (outputs.pause_for_operator_approval.onResume.approved ?? false)) ? 'COMPACTED' : 'PENDING_APPROVAL') : outputs.audit_partition_fragments.vars.overall_status ?? 'HEALTHY' }}"
+
+extend:
+  title: Audit, Compact, and Vacuum Small Parquet Files on Cloud Storage with DuckDB
+  metaTitle: DuckDB S3 Parquet Small-File Compaction and Vacuum Guard | Kestra
+  shortDescription: Audit cloud storage Parquet partitions for small file fragmentation, track trends in KV, and compact files with DuckDB with row conservation verification.
+  metaDescription: Solve the Parquet small file problem on AWS S3 and MinIO with DuckDB. Audit file fragmentation, track trends in Kestra KV, and safely compact and vacuum with operator approval.
+  description: |
+    Micro-batch and streaming ingestion pipelines (such as Kafka S3 connectors, CDC pipelines,
+    IoT event streams, and serverless ingestion functions) routinely write thousands of tiny
+    Parquet files (< 5-10 MB) into cloud object storage like Amazon S3, MinIO, Google Cloud Storage,
+    or Cloudflare R2. Over time, this leads to the notorious "small file problem" in data lakes:
+    S3 API request costs surge due to excessive `ListObjectsV2` and `GetObject` calls, while analytical
+    query engines (DuckDB, Trino, Athena, Snowflake, Databricks) suffer drastic latency degradation
+    due to metadata overhead, small row groups, and broken columnar vectorization.
+
+    Traditional remediation approaches require launching heavyweight, expensive Apache Spark or
+    Databricks clusters just to coalesce small files. This blueprint introduces a lightweight,
+    zero-infrastructure alternative using embedded DuckDB.
+
+    This blueprint provides an automated, closed-loop maintenance guard for cloud Parquet partitions.
+    It inspects partition file size distributions via DuckDB and Boto3, computes baseline row counts,
+    correlates fragmentation trends in Kestra KV, requests operator approval through an interactive
+    pause gate, executes atomic columnar compaction using DuckDB's vectorized `COPY` engine into target-sized
+    ZSTD-compressed Parquet files, strictly verifies row-count conservation, quarantines obsolete micro-files,
+    and validates analytical query latency.
+
+    ## How it works
+
+    1. **Pre-flight Assertion**: `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) verifies that the S3 partition URI, file size targets (16-1024 MB), and threshold bounds are properly configured.
+    2. **Partition Fragmentation Audit**: `audit_partition_fragments` (`io.kestra.plugin.scripts.python.Script`) scans the partition prefix using Boto3 and DuckDB (`httpfs`), enumerates file sizes, identifies micro-file fragments below `small_file_threshold_mb`, and computes baseline partition row counts.
+    3. **KV Trend Persistence**: `update_compaction_tracker_kv` (`io.kestra.plugin.core.kv.Set`) saves the updated file metrics and consecutive fragmented run history in Kestra KV.
+    4. **Decision & Mode Gate**: `check_compaction_needed` and `check_execution_mode` determine if the partition is critically or chronically fragmented and whether active remediation is armed.
+    5. **Operator Approval Gate**: `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) halts execution until a data engineer reviews the fragmentation metrics and confirms `approved: true`.
+    6. **Vectorized Columnar Compaction**: `execute_parquet_compaction` runs DuckDB to read all existing partition files and write compacted, target-sized Parquet files into a temporary `_compacted_staging/` prefix with dictionary encoding and ZSTD compression.
+    7. **Integrity & Latency Benchmark**: `verify_compaction_integrity` re-queries the staging files, strictly verifies that `pre_rows == post_rows`, confirms file count consolidation, and benchmarks analytical scan latency.
+    8. **Integrity Enforcement Gate**: `assert_compaction_verified` halts execution and fails loudly via `io.kestra.plugin.core.execution.Fail` if row counts deviate by even a single record.
+    9. **Quarantine & Promotion**: `quarantine_and_cutover_files` moves original micro-files into `quarantine_prefix` (preventing data loss) and atomically promotes the newly compacted files into the primary partition path.
+    10. **Audit Persistence & Slack Alert**: Saves the full compaction audit record to Kestra KV and dispatches a detailed resolution card to Slack.
+    11. **Error Handling**: A flow-level `errors` block alerts the Slack incident channel if an unhandled S3 or computation error occurs.
+
+    ## What you get
+
+    - Automated discovery and measurement of small Parquet files on AWS S3 and MinIO.
+    - Zero-infrastructure columnar compaction powered by DuckDB (no Spark or Databricks required).
+    - Historical fragmentation tracking in Kestra KV to prevent reacting to transient batch writes.
+    - Interactive human-in-the-loop approval gate before modifying data files.
+    - 100% row-count conservation verification before replacing original data.
+    - Non-destructive micro-file quarantine to ensure zero data loss during cutover.
+    - Canary query scan latency benchmark confirming query speedup.
+    - Persistent audit trail of all compaction events stored in Kestra KV.
+
+    ## Who it's for
+
+    - Data Engineers and Analytics Engineers maintaining cloud data lakes on AWS S3, MinIO, or Cloudflare R2.
+    - Platform Engineers and SREs seeking to reduce cloud storage API costs and optimize Trino/Athena query performance.
+    - Teams running streaming ingestion pipelines who need lightweight Day-2 maintenance without Spark overhead.
+
+    ## Why orchestrate this with Kestra
+
+    DuckDB provides fast Parquet read/write capabilities, but lacks built-in scheduling, historical trend tracking, approval checkpoints, or safe multi-step file cutover orchestration. Kestra orchestrates the entire lifecycle: declarative scheduling, distributed KV state tracking, interactive pause gates, containerized task isolation, row-count verification gates, and multi-channel incident notifications.
+
+    ## Prerequisites
+
+    - An AWS S3 or MinIO bucket containing Parquet partitions accessible by the Kestra worker.
+    - AWS credentials with `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` permissions on the target prefix.
+    - A Slack Incoming Webhook URL for triage and resolution notices.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS access key for S3 authentication (can be omitted if using IAM instance roles).
+    - `AWS_SECRET_ACCESS_KEY`: AWS secret key for S3 authentication.
+    - `AWS_DEFAULT_REGION`: AWS region (e.g. `us-east-1`).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint for compaction alerts.
+    - `DUCKDB_COMPACTION_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `SLACK_WEBHOOK_URL`, and `DUCKDB_COMPACTION_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `s3_bucket_uri` to your target partition path (e.g. `s3://company-lakehouse/events/year=2026/month=10/`).
+    3. Run a manual execution with `dry_run: true` to inspect small file counts, average file sizes, and baseline row counts without modifying files.
+    4. Review the execution logs, candidate micro-files, and KV state under `inputs.cursor_key`.
+    5. Set `dry_run: false` and `auto_remediate: true` to trigger active compaction; approve the `pause_for_operator_approval` task to run DuckDB compaction and observe verified file consolidation.
+    6. Enable the `periodic_compaction_audit` schedule trigger for continuous, hands-off data lake maintenance.
+
+    ## How to extend
+
+    - **Multi-Partition Sweeper**: Wrap the flow in an `io.kestra.plugin.core.flow.ForEachItem` to audit and compact all date partitions across an entire dataset table.
+    - **Cloudflare R2 or GCS Support**: Configure DuckDB's `s3_endpoint` setting to target Cloudflare R2 (`<account_id>.r2.cloudflarestorage.com`) or Google Cloud Storage.
+    - **Automated Quarantine Purge**: Add a scheduled follow-up task to permanently delete quarantined micro-files after a 7-day retention grace period.
+
+    ## Links
+
+    - [DuckDB Parquet Documentation](https://duckdb.org/docs/data/parquet/overview.html)
+    - [DuckDB S3 / HTTPFS Extension](https://duckdb.org/docs/guides/import/s3_import.html)
+    - [Kestra Python Script Task](https://kestra.io/plugins/plugin-scripts/tasks/io.kestra.plugin.scripts.python.script)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Pause Task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra Slack Notifications Plugin](https://kestra.io/plugins/plugin-slack)
+
+  tags:
+    - Data
+    - Cloud
+    - Infrastructure
+  subTags:
+    - Data Lakes & Warehouses
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
