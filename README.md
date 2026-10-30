@@ -69,7 +69,7 @@ Required & recommended fields
 - `id` (required): hyphen-case, must match filename.
 - `namespace` (required): owner/team namespace (e.g., `company.analytics`, `company.ai`, `company.team`).
 - `tasks` (required): fully-defined tasks; add `description` per task when behaviour isn't obvious.
-- `extend` (required): metadata block powering the [Kestra Blueprints Catalog](https://kestra.io/blueprints). All 9 fields are standard across the catalog:
+- `extend` (required): metadata block powering the [Kestra Blueprints Catalog](https://kestra.io/blueprints). All 10 fields are standard across the catalog:
   - `title`: concise human-friendly title (one line, not the id slug).
   - `metaTitle`: SEO title for the browser tab.
   - `shortDescription`: 1–2 sentence summary used for UI preview cards.
@@ -78,6 +78,7 @@ Required & recommended fields
   - `tags`: primary category (`Data`, `AI`, `Infrastructure`, `Business`, `Cloud`, `Core`).
   - `subTags`: faceted filter tags selected from the controlled taxonomy below.
   - `ee`: `true`/`false` (`true` only if using Enterprise Edition plugins).
+  - `verified`: always `false` for contributed blueprints; the Kestra team sets it to `true` on curated blueprints that have been run and meet these guidelines. Only verified blueprints are listed in the Kestra application.
   - `demo`: always `false` for contributed blueprints; the Kestra team flips it on the few flows wired to the public demo instance.
 
 ### Canonical Documentation Sections (`description`)
@@ -161,6 +162,7 @@ extend:
   subTags:
     - Testing & Quality
   ee: false
+  verified: false
   demo: false
 ```
 
