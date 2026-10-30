@@ -1,0 +1,451 @@
+id: etcd-cluster-member-rolling-replacement-verified-promotion
+namespace: company.infrastructure
+
+description: |
+  Rolls an etcd cluster member onto new infrastructure using etcd's own safe
+  learner mechanism: adds the new member as a non-voting learner so it never
+  risks quorum, polls its real raft applied index against the cluster's
+  committed index until it has genuinely caught up, promotes it to a full
+  voting member only after operator approval, removes the old member, then
+  reads the membership list back to verify the new member is a full voter
+  and the old member is actually gone before declaring the roll complete.
+
+inputs:
+  - id: cluster_client_url
+    type: STRING
+    displayName: "Existing Cluster Client URL"
+    description: Client URL of any existing, healthy etcd member, used for all cluster-wide membership calls (list, add, promote, remove).
+  - id: new_member_peer_url
+    type: STRING
+    displayName: "New Member Peer URL"
+    description: Peer URL the new member will advertise to the cluster, e.g. http://etcd-new:2380.
+  - id: new_member_client_url
+    type: STRING
+    displayName: "New Member Client URL"
+    description: Client URL used to query the new member directly for its own raft applied index, e.g. http://etcd-new:2379. Do not start the new member's etcd process before running this flow - start it only after add_learner_member has registered the member, with --initial-cluster-state=existing.
+  - id: old_member_name
+    type: STRING
+    displayName: "Old Member Name"
+    description: The existing member's own etcd --name, used to identify which member is being replaced and removed.
+  - id: max_raft_index_lag
+    type: INT
+    displayName: "Max Raft Applied Index Lag"
+    defaults: 10
+    description: The new learner is considered caught up once (cluster committed raft index) minus (learner's own raft applied index) is at or below this value. 0 demands an exact match, which may never settle on a cluster under constant write load.
+  - id: learner_catchup_max_wait
+    type: STRING
+    displayName: "Max Wait for Learner Catch-Up"
+    defaults: PT30M
+    description: ISO-8601 duration this flow polls for the learner to become reachable and catch up before giving up and removing it. The operator must start the new member's etcd process with --initial-cluster-state=existing after add_learner_member runs; the learner's client URL is unreachable until then.
+
+tasks:
+  - id: inspect_existing_members
+    type: io.kestra.plugin.core.http.Request
+    description: Lists current cluster members via etcd's real v3 JSON gateway, confirmed from etcd's own api/etcdserverpb/rpc.proto (Cluster.MemberList, POST /v3/cluster/member/list) and a real passing e2e test (tests/e2e/v3_curl_cluster_test.go) that pins the exact request/response field casing.
+    uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/list"
+    method: POST
+    headers:
+      Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+    body: "{}"
+
+  - id: evaluate_old_member_exists
+    type: io.kestra.plugin.scripts.python.Script
+    description: Confirms old_member_name is actually a current member before anything is added or removed, and refuses if it is already a learner itself (a learner should never be the one other members get rolled off of).
+    env:
+      MEMBERS_JSON: "{{ outputs.inspect_existing_members.body }}"
+    script: |
+      import json
+      import os
+
+      members_raw = os.environ.get("MEMBERS_JSON", "{}")
+      data = json.loads(members_raw) if members_raw.strip() else {}
+      members = data.get("members", [])
+
+      old_member = None
+      for m in members:
+          if m.get("name") == "{{ inputs.old_member_name }}":
+              old_member = m
+              break
+
+      refusal_reasons = []
+      if old_member is None:
+          refusal_reasons.append(f"No current member named '{{ inputs.old_member_name }}' was found in the cluster member list.")
+      elif old_member.get("isLearner", False):
+          refusal_reasons.append(f"Member '{{ inputs.old_member_name }}' is itself a learner, not a voting member to roll off.")
+
+      is_safe = len(refusal_reasons) == 0
+
+      print("::" + json.dumps({
+          "outputs": {
+              "is_safe": is_safe,
+              "refusal_reasons": refusal_reasons,
+              "old_member_id": old_member.get("ID") if old_member else None,
+          }
+      }) + "::")
+
+  - id: evaluate_preflight_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Stops before adding any new member if the old member could not be confirmed.
+    condition: "{{ outputs.evaluate_old_member_exists.vars.is_safe == false }}"
+    then:
+      - id: alert_preflight_failed
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "etcd member roll REFUSED before adding any new member. Reasons: {{ outputs.evaluate_old_member_exists.vars.refusal_reasons | toJson }}. Execution {{ execution.id }}."
+          }
+      - id: fail_preflight
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Preflight check failed; see the Slack alert and this execution's logs."
+
+  - id: add_learner_member
+    type: io.kestra.plugin.core.http.Request
+    description: Adds the new member as a non-voting raft learner - confirmed from etcd's own MemberAddRequest (PeerURLs, IsLearner) and the real e2e test's exact request casing. A learner can never cost the cluster quorum, which is the entire reason etcd recommends this as the safe way to add a member rather than adding it as a full voter directly.
+    uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/add"
+    method: POST
+    headers:
+      Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+    body: |
+      {
+        "PeerURLs": ["{{ inputs.new_member_peer_url }}"],
+        "IsLearner": true
+      }
+
+  - id: parse_new_member_id
+    type: io.kestra.plugin.scripts.python.Script
+    description: Extracts the new learner's member ID from the add response so every later call (promote, verification) targets it precisely.
+    env:
+      ADD_RESPONSE_JSON: "{{ outputs.add_learner_member.body }}"
+    script: |
+      import json
+      import os
+
+      data = json.loads(os.environ["ADD_RESPONSE_JSON"])
+      new_member_id = data.get("member", {}).get("ID")
+
+      print("::" + json.dumps({
+          "outputs": {
+              "new_member_id": new_member_id,
+          }
+      }) + "::")
+
+  - id: poll_until_learner_caught_up
+    type: io.kestra.plugin.core.flow.LoopUntil
+    description: Polls until the learner is both reachable and caught up. The learner's client URL is unreachable immediately after add_learner_member, since the operator has not started its etcd process yet (it can only be started with --initial-cluster-state=existing once the member is registered); this loop tolerates that instead of calling the learner once and failing.
+    condition: "{{ outputs.poll_learner_catch_up.vars.caught_up == true }}"
+    failOnMaxReached: false
+    checkFrequency:
+      interval: PT15S
+      maxDuration: "{{ inputs.learner_catchup_max_wait }}"
+    tasks:
+      - id: poll_learner_catch_up
+        type: io.kestra.plugin.scripts.python.Script
+        description: Queries the existing cluster's committed raft index (StatusResponse.raftIndex) and the learner's own raft applied index (StatusResponse.raftAppliedIndex) directly on its own client URL, confirmed from etcd's real rpc.proto. Status is per-member, so the learner must be queried on its own client URL, not the existing cluster endpoint. The learner call is wrapped in try/except because the learner's etcd process is not expected to be reachable on the loop's first iterations.
+        env:
+          CLUSTER_CLIENT_URL: "{{ inputs.cluster_client_url }}"
+          NEW_MEMBER_CLIENT_URL: "{{ inputs.new_member_client_url }}"
+          ETCD_AUTH_TOKEN: "{{ secret('ETCD_AUTH_TOKEN') }}"
+          MAX_LAG: "{{ inputs.max_raft_index_lag }}"
+        script: |
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          def post_status(base_url):
+              req = urllib.request.Request(
+                  base_url.rstrip("/") + "/v3/maintenance/status",
+                  data=b"{}",
+                  headers={
+                      "Content-Type": "application/json",
+                      "Authorization": os.environ.get("ETCD_AUTH_TOKEN", ""),
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=5) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          cluster_status = post_status(os.environ["CLUSTER_CLIENT_URL"])
+          cluster_raft_index = int(cluster_status.get("raftIndex", 0))
+
+          learner_reachable = True
+          learner_applied_index = None
+          try:
+              learner_status = post_status(os.environ["NEW_MEMBER_CLIENT_URL"])
+              learner_applied_index = int(learner_status.get("raftAppliedIndex", 0))
+          except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+              learner_reachable = False
+              print(f"Learner not reachable yet at {os.environ['NEW_MEMBER_CLIENT_URL']}: {exc}. Waiting for the operator to start its etcd process with --initial-cluster-state=existing.")
+
+          max_lag = int(os.environ["MAX_LAG"])
+          lag = (cluster_raft_index - learner_applied_index) if learner_reachable else None
+          caught_up = learner_reachable and lag <= max_lag
+
+          print("::" + json.dumps({
+              "outputs": {
+                  "caught_up": caught_up,
+                  "learner_reachable": learner_reachable,
+                  "cluster_raft_index": cluster_raft_index,
+                  "learner_applied_index": learner_applied_index,
+                  "lag": lag,
+              }
+          }) + "::")
+
+  - id: evaluate_catchup_timeout_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Detects that the loop above exited because learner_catchup_max_wait was reached, not because the learner caught up, and removes the never-promoted learner rather than leaving it registered indefinitely.
+    condition: "{{ outputs.poll_learner_catch_up.vars.caught_up == false }}"
+    then:
+      - id: alert_learner_catchup_timeout
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "etcd member roll: new learner {{ outputs.parse_new_member_id.vars.new_member_id }} did not catch up within {{ inputs.learner_catchup_max_wait }} (learner_reachable={{ outputs.poll_learner_catch_up.vars.learner_reachable }}, lag={{ outputs.poll_learner_catch_up.vars.lag }}). Confirm the operator started its etcd process with --initial-cluster-state=existing. The learner is being removed. Execution {{ execution.id }}."
+          }
+      - id: remove_timed_out_learner
+        type: io.kestra.plugin.core.http.Request
+        description: Removes the learner that never caught up, confirmed from etcd's own MemberRemoveRequest (ID), so a stuck or never-started new member does not stay registered against the cluster indefinitely.
+        uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/remove"
+        method: POST
+        headers:
+          Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+        body: |
+          {
+            "ID": {{ outputs.parse_new_member_id.vars.new_member_id }}
+          }
+      - id: fail_catchup_timeout
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "New learner did not catch up within learner_catchup_max_wait and has been removed. Confirm the new member's etcd process was started with --initial-cluster-state=existing, then re-run this flow."
+
+  - id: save_rolling_replacement_plan_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persists the captured old/new member IDs and the lag at approval time, as the audit record for this roll, before anything irreversible (promote, remove) happens.
+    key: "etcd_member_roll_{{ inputs.old_member_name | slugify }}"
+    value: |
+      {
+        "old_member_id": "{{ outputs.evaluate_old_member_exists.vars.old_member_id }}",
+        "old_member_name": "{{ inputs.old_member_name }}",
+        "new_member_id": "{{ outputs.parse_new_member_id.vars.new_member_id }}",
+        "new_member_peer_url": "{{ inputs.new_member_peer_url }}",
+        "lag_at_approval": {{ outputs.poll_learner_catch_up.vars.lag }}
+      }
+    kvType: JSON
+
+  - id: pause_for_operator_approval
+    type: io.kestra.plugin.core.flow.Pause
+    description: Waits indefinitely for an operator to review the caught-up learner before it is promoted to a full voter and the old member is removed. No pauseDuration is set, so an unattended execution waits rather than silently proceeding.
+
+  - id: promote_learner_to_voter
+    type: io.kestra.plugin.core.http.Request
+    description: Promotes the learner to a full voting member - confirmed from etcd's MemberPromoteRequest (ID) - the real cutover step. etcd itself rejects this call server-side if the learner has fallen behind since the check above, confirmed from the real e2e test's own expected rejection message for an out-of-sync learner.
+    uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/promote"
+    method: POST
+    headers:
+      Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+    body: |
+      {
+        "ID": {{ outputs.parse_new_member_id.vars.new_member_id }}
+      }
+
+  - id: remove_old_member
+    type: io.kestra.plugin.core.http.Request
+    description: Removes the old member from the cluster's membership - confirmed from etcd's MemberRemoveRequest (ID).
+    uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/remove"
+    method: POST
+    headers:
+      Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+    body: |
+      {
+        "ID": {{ outputs.evaluate_old_member_exists.vars.old_member_id }}
+      }
+
+  - id: verify_final_membership
+    type: io.kestra.plugin.core.http.Request
+    description: Reads the membership list back after both mutations, rather than trusting their HTTP response codes alone.
+    uri: "{{ inputs.cluster_client_url }}/v3/cluster/member/list"
+    method: POST
+    headers:
+      Authorization: "{{ secret('ETCD_AUTH_TOKEN') }}"
+    body: "{}"
+
+  - id: evaluate_final_verification
+    type: io.kestra.plugin.scripts.python.Script
+    description: Confirms the new member is present as a full voter (isLearner is false) and the old member's ID no longer appears at all, rather than assuming both mutations landed because the requests returned 200.
+    env:
+      FINAL_MEMBERS_JSON: "{{ outputs.verify_final_membership.body }}"
+      NEW_MEMBER_ID: "{{ outputs.parse_new_member_id.vars.new_member_id }}"
+      OLD_MEMBER_ID: "{{ outputs.evaluate_old_member_exists.vars.old_member_id }}"
+    script: |
+      import json
+      import os
+
+      data = json.loads(os.environ["FINAL_MEMBERS_JSON"])
+      members = data.get("members", [])
+      new_member_id = os.environ["NEW_MEMBER_ID"]
+      old_member_id = os.environ["OLD_MEMBER_ID"]
+
+      new_member = next((m for m in members if str(m.get("ID")) == str(new_member_id)), None)
+      old_member_still_present = any(str(m.get("ID")) == str(old_member_id) for m in members)
+
+      new_member_is_full_voter = new_member is not None and not new_member.get("isLearner", True)
+      verified = new_member_is_full_voter and not old_member_still_present
+
+      print("::" + json.dumps({
+          "outputs": {
+              "verified": verified,
+              "new_member_is_full_voter": new_member_is_full_voter,
+              "old_member_still_present": old_member_still_present,
+          }
+      }) + "::")
+
+  - id: evaluate_outcome
+    type: io.kestra.plugin.core.flow.If
+    description: Branches on the real, read-back-verified final state.
+    condition: "{{ outputs.evaluate_final_verification.vars.verified == false }}"
+    then:
+      - id: alert_verification_failed
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Names exactly what did not verify instead of claiming success because the promote/remove calls returned 200.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "etcd member roll for {{ inputs.old_member_name }} completed its calls but FAILED verification. new_member_is_full_voter={{ outputs.evaluate_final_verification.vars.new_member_is_full_voter }}, old_member_still_present={{ outputs.evaluate_final_verification.vars.old_member_still_present }}. Investigate the cluster membership directly before trusting it. Execution {{ execution.id }}."
+          }
+    else:
+      - id: notify_roll_verified
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "etcd member roll verified: {{ inputs.old_member_name }} (ID {{ outputs.evaluate_old_member_exists.vars.old_member_id }}) was removed and the new member (ID {{ outputs.parse_new_member_id.vars.new_member_id }}) is confirmed as a full voting member, read back from the cluster's own membership list. Execution {{ execution.id }}."
+          }
+
+errors:
+  - id: alert_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alerts Slack separately if the flow itself fails, so a partially-applied roll (for example a learner added but never promoted or removed) is never mistaken for a completed or refused one.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "etcd member roll FAILED in execution {{ execution.id }} for old member {{ inputs.old_member_name }}. Check /v3/cluster/member/list directly for the cluster's actual current membership before retrying; a learner may already be present."
+      }
+
+outputs:
+  - id: new_member_id
+    type: STRING
+    value: "{{ outputs.parse_new_member_id.vars.new_member_id }}"
+  - id: verified
+    type: BOOL
+    value: "{{ outputs.evaluate_final_verification.vars.verified }}"
+
+extend:
+  title: "Roll an etcd Cluster Member to New Infrastructure with a Health-Verified Promotion"
+  metaTitle: Roll an etcd Cluster Member with Verified Learner Promotion in Kestra
+  shortDescription: Replace an etcd cluster member using etcd's own safe learner mechanism, verifying it has caught up before promotion and reading the final membership back to confirm the old member is really gone.
+  metaDescription: "Roll an etcd cluster member to new infrastructure via etcd's own learner mechanism, with verified promotion and read-back of the final state."
+  description: |
+    Replacing an etcd cluster member (new hardware, an OS upgrade, a cloud
+    migration) is dangerous to do by hand: add the replacement as a full
+    voter too early and a cluster that was tolerating one failure can lose
+    quorum outright if the new member is still empty when something else
+    hiccups. etcd's own answer is the raft learner: a non-voting member that
+    replicates the log without ever counting toward quorum, promoted to a
+    full voter only once it has genuinely caught up. This blueprint drives
+    that exact mechanism end to end - add as a learner, poll its real raft
+    applied index against the cluster's committed index until it is caught
+    up (removing the learner if it never does), promote only after a human
+    approves, remove the old member, then read the membership list back to
+    confirm the outcome instead of trusting the API calls' response codes.
+
+    ## How it works
+
+    1. `inspect_existing_members` (`io.kestra.plugin.core.http.Request`) calls etcd's real v3 JSON gateway `POST /v3/cluster/member/list`.
+    2. `evaluate_old_member_exists` (`io.kestra.plugin.scripts.python.Script`) refuses to proceed unless `old_member_name` is found and is itself a full voter, not a learner.
+    3. `evaluate_preflight_gate` (`io.kestra.plugin.core.flow.If`) stops with a Slack alert and `io.kestra.plugin.core.execution.Fail` before anything is added if that check fails.
+    4. `add_learner_member` calls `POST /v3/cluster/member/add` with `IsLearner: true` - confirmed from etcd's own `MemberAddRequest` and a real passing e2e test's exact request casing - the only mutation in this flow that can never cost the cluster quorum.
+    5. `poll_until_learner_caught_up` (`io.kestra.plugin.core.flow.LoopUntil`) polls `POST /v3/maintenance/status` against the existing cluster and the new learner's own client URL, reading `raftIndex` and `raftAppliedIndex` - confirmed from etcd's `StatusResponse`. The learner's client URL is only reachable once the operator starts its etcd process with `--initial-cluster-state=existing`, which happens after `add_learner_member` registers it, so the inner script tolerates the learner being unreachable on early iterations instead of failing outright.
+    6. `evaluate_catchup_timeout_gate` (`io.kestra.plugin.core.flow.If`) detects that the loop above exited on `learner_catchup_max_wait` rather than on reaching `max_raft_index_lag`, and removes the never-promoted learner via `POST /v3/cluster/member/remove` before failing, rather than leaving a stuck learner registered indefinitely.
+    7. `save_rolling_replacement_plan_kv` (`io.kestra.plugin.core.kv.Set`) persists the captured plan before anything irreversible happens.
+    8. `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) waits indefinitely for a human to review the caught-up learner.
+    9. `promote_learner_to_voter` calls `POST /v3/cluster/member/promote`, then `remove_old_member` calls `POST /v3/cluster/member/remove` - confirmed from etcd's own `MemberPromoteRequest`/`MemberRemoveRequest`.
+    10. `verify_final_membership` reads the membership list back and `evaluate_final_verification` confirms the new member is a full voter (`isLearner: false`) and the old member's ID no longer appears at all, rather than trusting the promote/remove calls' HTTP status codes.
+    11. `evaluate_outcome` alerts Slack with the specific verification failure if the final state does not match, or confirms the verified outcome if it does.
+    12. The `errors` block alerts Slack separately if the flow itself fails outright, naming that a learner may already be sitting in the cluster unpromoted.
+
+    ## What you get
+
+    - A member replacement that never risks quorum, because the new member only ever joins as a non-voting learner until it is proven caught up.
+    - A real, computed readiness gate (raft applied index lag against the cluster's committed index), polled on an interval up to `learner_catchup_max_wait` instead of a single check or a fixed sleep.
+    - Automatic cleanup of a learner that is never started or never catches up, instead of leaving an orphaned learner registered against the cluster.
+    - A human approval gate between "the learner is caught up" and "the old member is gone for good."
+    - A read-back verification of the final membership list, naming exactly which part failed (new member not a full voter, or old member still present) rather than trusting 200 OK responses.
+    - A full KV audit record of the old and new member IDs and the lag at the moment of approval.
+
+    ## Who it's for
+
+    - Platform and SRE teams rolling etcd clusters that back Kubernetes or their own services onto new infrastructure (cloud migration, instance type change, OS upgrade) without a maintenance window where quorum is at risk.
+    - Anyone who has manually run `etcdctl member add` / `member promote` / `member remove` by hand and wants the same sequence with a real caught-up check and an audit trail instead of "wait a bit and hope."
+
+    ## Why orchestrate this with Kestra
+
+    etcd's HTTP API can add, promote, and remove members, but it has no concept of "wait until genuinely caught up," no approval gate between those calls, and no record of what was done and why. Kestra supplies the lag-based readiness gate as a first-class branch, the KV-backed audit record, the human approval pause, and a visible execution history proving the read-back verification actually happened, all driven off etcd's own real, documented API surface.
+
+    ## Prerequisites
+
+    - An existing etcd v3 cluster reachable at `cluster_client_url`.
+    - **Do not start the new member's etcd process before running this flow.** `add_learner_member` must register the member in the cluster first; only then can the operator start its etcd process with `--initial-cluster-state=existing` and this cluster's peer URLs (including itself) in `--initial-cluster`. `new_member_client_url` is unreachable until that process is started, which is expected and why `poll_until_learner_caught_up` tolerates it. This blueprint only drives the cluster-membership API calls, it does not provision or start the new infrastructure.
+    - Network access from the Kestra worker to both `cluster_client_url` and `new_member_client_url`.
+
+    ### Secrets
+
+    - `ETCD_AUTH_TOKEN`: an etcd v3 auth token sent as the `Authorization` header on every call in this flow. Leave unset if the target cluster has authentication disabled.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used by every alert in this flow.
+    - In Kestra OSS (no Enterprise secrets backend), secrets are supplied as environment variables prefixed `SECRET_`, base64-encoded, and read back in flows with `{{ secret('NAME') }}`.
+
+    ### Inputs
+
+    - `cluster_client_url` (STRING, no default): client URL of any existing, healthy member.
+    - `new_member_peer_url` / `new_member_client_url` (STRING, no default): the new member's peer and client URLs.
+    - `old_member_name` (STRING, no default): the existing member's `--name` to be replaced and removed.
+    - `max_raft_index_lag` (INT, default `10`): maximum acceptable raft applied-index lag before promotion is allowed.
+    - `learner_catchup_max_wait` (STRING, default `PT30M`): ISO-8601 duration to poll for the learner to become reachable and catch up before removing it and failing.
+
+    ### Outputs
+
+    - `outputs.new_member_id` / `outputs.verified`: the new member's ID and whether the final membership read-back confirmed success.
+
+    ## Quick start
+
+    1. Add the `ETCD_AUTH_TOKEN` (if auth is enabled) and `SLACK_WEBHOOK_URL` secrets.
+    2. Run the flow manually. Once `add_learner_member` has executed, start the new member's etcd process with this cluster already listed in its `--initial-cluster` (including itself) and `--initial-cluster-state=existing` - `poll_until_learner_caught_up` is now waiting for exactly this.
+    3. Confirm `poll_learner_catch_up` eventually reports `caught_up: true` within `learner_catchup_max_wait` (if it times out, the learner is removed automatically and the execution fails - check that the etcd process was actually started, then re-run from the top).
+    4. Resume `pause_for_operator_approval` and confirm `evaluate_final_verification` reports `verified: true`.
+    5. Decommission the old member's infrastructure only after `verified: true` is confirmed.
+
+    ## How to extend
+
+    - Loop this flow over every member of a cluster, one at a time, to roll an entire cluster onto new infrastructure with each step gated on the previous one's verified completion.
+    - Extend the preflight check to also refuse the roll if the cluster currently has any unhealthy member (via `/v3/maintenance/status`'s `errors` field), since starting a roll on an already-degraded cluster compounds the risk.
+
+    ## Pitfalls
+
+    - **This blueprint does not start or provision the new member's etcd process.** The operator must start it manually, with `--initial-cluster-state=existing`, after `add_learner_member` runs and while `poll_until_learner_caught_up` is waiting; this blueprint only drives the membership API calls and the promotion decision.
+    - **`max_raft_index_lag: 0` may never be satisfied on a cluster under continuous write load**, since the committed index keeps advancing while the comparison is being made. A small nonzero value (the default `10`) tolerates that without meaningfully weakening the safety check.
+    - **`learner_catchup_max_wait` must comfortably exceed how long the new member takes to replicate the existing data set**, not just how long it takes to start the etcd process. A value that is too short removes a learner that was still legitimately catching up.
+    - **This flow never auto-retries a failed promotion or removal.** If `evaluate_final_verification` reports `verified: false`, the fix is to inspect `/v3/cluster/member/list` directly and resolve the specific gap by hand, not to re-run this flow blindly, since a partially-applied roll (for example a learner promoted but the old member removal failing) needs a human to confirm the cluster's actual state first.
+    - **Removing the old member here does not stop or decommission its etcd process.** If that process keeps running after removal from the cluster's membership, it will log errors trying to participate in a cluster it is no longer a member of; stopping it is a separate, deliberate step outside this flow.
+
+    ## Links
+
+    - [etcd Runtime Reconfiguration (member add/promote/remove)](https://etcd.io/docs/v3.6/op-guide/runtime-configuration/)
+    - [etcd v3 API Reference (rpc.proto)](https://etcd.io/docs/v3.6/dev-guide/api_reference_v3/)
+    - [Kestra KV Store Documentation](https://kestra.io/plugins/core/tasks/kv/io.kestra.plugin.core.kv.set)
+  tags:
+    - Infrastructure
+  subTags:
+    - Infrastructure Automation
+    - Day 2 Operations
+  ee: false
+  demo: false
