@@ -1,0 +1,448 @@
+id: appwrite-custody-audit
+namespace: company.labrelay
+description: Read-only Appwrite custody and receipt consistency audit.
+tasks:
+- id: fetch_export
+  type: io.kestra.plugin.scripts.python.Script
+  containerImage: python:3.12-slim
+  dependencies:
+  - kestra
+  env:
+    APPWRITE_ENDPOINT: '{{ secret(''APPWRITE_ENDPOINT'') }}'
+    APPWRITE_PROJECT_ID: '{{ secret(''APPWRITE_PROJECT_ID'') }}'
+    APPWRITE_AUDIT_FUNCTION_ID: '{{ secret(''APPWRITE_AUDIT_FUNCTION_ID'') }}'
+    APPWRITE_AUDIT_EMAIL: '{{ secret(''APPWRITE_AUDIT_EMAIL'') }}'
+    APPWRITE_AUDIT_PASSWORD: '{{ secret(''APPWRITE_AUDIT_PASSWORD'') }}'
+  outputFiles:
+  - export.json
+  script: |
+    """Fetch the separate Appwrite companion export; never use a database API key."""
+    import http.cookiejar
+    import json
+    import os
+    import re
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise RuntimeError("Appwrite redirects are disabled; configure its exact API endpoint.")
+
+
+    def fetch_export(config, opener=None):
+        endpoint = config["APPWRITE_ENDPOINT"].rstrip("/")
+        parsed = urllib.parse.urlsplit(endpoint)
+        local_test = config.get("ALLOW_LOCAL_HTTP") == "true" and parsed.hostname in ("127.0.0.1", "localhost")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.hostname:
+            raise ValueError("Configure an Appwrite API endpoint without embedded credentials or query parameters.")
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and local_test):
+            raise ValueError("Appwrite HTTPS is required (loopback HTTP is only for explicit local tests).")
+        function_id = config["APPWRITE_AUDIT_FUNCTION_ID"]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,35}", function_id):
+            raise ValueError("Invalid audit Function ID.")
+        project_id = config["APPWRITE_PROJECT_ID"]
+        # Appwrite rejects requests carrying both JWT and session cookie. Keep the
+        # JWT execution transport separate from the login/session-cleanup jar.
+        jwt_opener = opener or urllib.request.build_opener(NoRedirect())
+        opener = opener or urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), NoRedirect())
+
+        logged_in = False
+
+        def request(method, path, body=None, jwt=None):
+            nonlocal logged_in
+            headers = {"X-Appwrite-Project": project_id, "Content-Type": "application/json"}
+            if jwt:
+                headers["X-Appwrite-JWT"] = jwt
+            req = urllib.request.Request(endpoint + path,
+                data=None if body is None else json.dumps(body).encode(), headers=headers, method=method)
+            try:
+                with (jwt_opener if jwt else opener).open(req, timeout=180) as response:
+                    if path == "/account/sessions/email":
+                        # Revoke a successful login even when its response body is malformed.
+                        logged_in = True
+                    raw = response.read(8_000_001)
+            except urllib.error.HTTPError as error:
+                try:
+                    error_type = json.loads(error.read(65536)).get('type', 'unknown')
+                    if not isinstance(error_type, str) or not re.fullmatch(r'[a-zA-Z0-9_]{1,100}', error_type):
+                        error_type = 'unknown'
+                except Exception:
+                    error_type = 'unknown'
+                raise RuntimeError(f"Appwrite {method} {path} request failed (HTTP {error.code}, type {error_type}); check configuration and permissions.") from None
+            except urllib.error.URLError:
+                raise RuntimeError("Appwrite connection failed; check endpoint and network access.") from None
+            if len(raw) > 8_000_000:
+                raise RuntimeError("Export response exceeded the 8 MB safety limit; reduce the audit scope.")
+            return json.loads(raw) if raw else None
+
+        try:
+            request("POST", "/account/sessions/email", {
+                "email": config["APPWRITE_AUDIT_EMAIL"], "password": config["APPWRITE_AUDIT_PASSWORD"]})
+            logged_in = True
+            jwt = request("POST", "/account/jwts", {})["jwt"]
+            if not isinstance(jwt, str) or not jwt:
+                raise ValueError("Appwrite returned an invalid JWT envelope.")
+            execution = request("POST", f"/functions/{function_id}/executions", {
+                "body": "", "async": False, "path": "/export", "method": "GET", "headers": {}}, jwt=jwt)
+            if execution.get("status") != "completed" or execution.get("responseStatusCode") != 200:
+                raise RuntimeError("Audit Function failed; inspect its private execution in Appwrite.")
+            export = json.loads(execution["responseBody"])
+            if not isinstance(export, dict) or type(export.get("schemaVersion")) is not int or export["schemaVersion"] != 1 or \
+                    type(export.get("complete")) is not bool or not isinstance(export.get("orgId"), str) or not export["orgId"]:
+                raise ValueError("Unsupported or incomplete audit export envelope.")
+            for key in ("samples", "events", "handoffs", "receipts", "batches", "issues"):
+                if not isinstance(export.get(key), list):
+                    raise ValueError(f"Audit export requires a {key} array.")
+            return export
+        finally:
+            if logged_in:
+                try:
+                    request("DELETE", "/account/sessions/current")
+                except Exception:
+                    raise RuntimeError("Audit session cleanup failed; revoke the automation account's remaining session in Appwrite.") from None
+
+
+    def main():
+        from kestra import Kestra
+        data = fetch_export(os.environ)
+        Path("export.json").write_text(json.dumps(data), encoding="utf-8")
+        Kestra.outputs({"complete": data["complete"], "sampleCount": len(data["samples"])})
+
+
+    if __name__ == "__main__":
+        main()
+- id: check_records
+  type: io.kestra.plugin.core.flow.Parallel
+  tasks:
+  - id: audit_custody
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.12-slim
+    dependencies:
+    - kestra
+    inputFiles:
+      export.json: '{{ outputs.fetch_export.outputFiles[''export.json''] }}'
+    outputFiles:
+    - custody.json
+    script: |
+      """Check recorded custody invariants without mutating application records."""
+      import json
+      from pathlib import Path
+
+
+      def analyze(data):
+          findings = []
+
+          def add(code, sample_id, message):
+              findings.append({"code": code, "severity": "error", "sampleId": sample_id,
+                               "receiptId": "", "message": message})
+
+          org = data["orgId"]
+          samples = {sample["id"]: sample for sample in data["samples"]}
+          handoffs = {handoff["id"]: handoff for handoff in data["handoffs"]}
+          batches = {}
+          for batch in data["batches"]:
+              if batch.get("orgId") == org:
+                  batches.setdefault(batch.get("batchId"), []).append(batch)
+          if len(samples) != len(data["samples"]) or len(handoffs) != len(data["handoffs"]):
+              add("duplicate_record", "", "Export contains duplicate sample or handoff IDs.")
+          events_by_sample = {}
+          for event in data["events"]:
+              if not isinstance(event, dict) or type(event.get("version")) is not int or event["version"] < 0 or \
+                      not all(isinstance(event.get(key), str) and event[key] for key in
+                              ("sampleId", "orgId", "kind", "fromCustodianId", "toCustodianId")):
+                  add("malformed_event", "", "History contains an invalid revision or incomplete custody fields.")
+                  continue
+              events_by_sample.setdefault(event["sampleId"], []).append(event)
+              if event["orgId"] != org or event["sampleId"] not in samples:
+                  add("event_scope", event["sampleId"], "Event is outside the exported sample scope.")
+          for sample in data["samples"]:
+              sid = sample["id"]
+              if len(batches.get(sample["batchId"], [])) != 1:
+                  add("batch_reference", sid, "Sample must have exactly one batch revision record in its organization.")
+              if sample["orgId"] != org:
+                  add("sample_scope", sid, "Sample does not belong to the exported organization.")
+              events = sorted(events_by_sample.get(sid, []), key=lambda event: event["version"])
+              version = sample["version"]
+              if type(version) is not int or version < 0:
+                  add("invalid_version", sid, "Sample revision must be a nonnegative integer.")
+                  continue
+              if len(events) != version + 1 or any(type(event["version"]) is not int or event["version"] != index
+                                                     for index, event in enumerate(events)):
+                  add("revision_gap", sid, "History must contain exactly one event for each revision from zero through current.")
+              if not events or events[-1]["version"] != version or events[-1]["toCustodianId"] != sample["custodianId"]:
+                  add("current_custody", sid, "Current sample custody or revision disagrees with its latest history event.")
+              if events and (events[0]["kind"] != "register_sample" or
+                             events[0]["fromCustodianId"] != events[0]["toCustodianId"]):
+                  add("registration", sid, "History must start with registration without a custody transfer.")
+              for previous, current in zip(events, events[1:]):
+                  if previous["toCustodianId"] != current["fromCustodianId"]:
+                      add("custody_chain", sid, "Successive history events disagree about the prior custodian.")
+              for event in events:
+                  if event["kind"] not in ("accept_handoff", "receipt_accepted") and event["fromCustodianId"] != event["toCustodianId"]:
+                      add("unauthorized_transfer", sid, "Only recorded acceptance may change the confirmed custodian.")
+              pending = sample.get("pendingHandoffId")
+              if pending:
+                  handoff = handoffs.get(pending)
+                  if not handoff or handoff["orgId"] != org or handoff["sampleId"] != sid or \
+                          handoff["fromUserId"] != sample["custodianId"] or handoff["status"] != "offered" or \
+                          handoff["toUserId"] == sample["custodianId"] or sample["status"] not in ("assigned", "in_transit"):
+                      add("pending_handoff", sid, "Pending handoff is missing or disagrees with the sample's current custody.")
+              if sample["status"] == "received" and pending:
+                  add("received_pending", sid, "A received sample still has a pending handoff.")
+          for handoff in data["handoffs"]:
+              sample = samples.get(handoff["sampleId"])
+              if handoff["orgId"] != org or sample is None:
+                  add("handoff_scope", handoff["sampleId"], "Handoff is outside the exported sample scope.")
+              elif handoff["status"] == "offered" and sample.get("pendingHandoffId") != handoff["id"]:
+                  add("unreferenced_offer", sample["id"], "An open handoff is not the sample's pending offer.")
+          return {"findings": findings, "checkedSamples": len(samples)}
+
+
+      def main():
+          from kestra import Kestra
+          result = analyze(json.loads(Path("export.json").read_text(encoding="utf-8")))
+          Path("custody.json").write_text(json.dumps(result), encoding="utf-8")
+          Kestra.outputs({"findingCount": len(result["findings"]), "checkedSamples": result["checkedSamples"]})
+
+
+      if __name__ == "__main__":
+          main()
+  - id: audit_receipts
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.12-slim
+    dependencies:
+    - kestra
+    inputFiles:
+      export.json: '{{ outputs.fetch_export.outputFiles[''export.json''] }}'
+    outputFiles:
+    - receipts.json
+    script: |
+      """Reconcile receipt snapshots, preserving historical missing outcomes."""
+      import json
+      from pathlib import Path
+
+
+      def analyze(data):
+          findings = []
+          resolved = unresolved = 0
+          samples = {sample["id"]: sample for sample in data["samples"]}
+          valid_events = [event for event in data["events"] if isinstance(event, dict) and
+                          type(event.get("version")) is int and event["version"] >= 0]
+          events = {(event["sampleId"], event["version"]): event for event in valid_events}
+
+          def add(code, receipt, message, sample_id="", severity="error"):
+              findings.append({"code": code, "severity": severity, "sampleId": sample_id,
+                               "receiptId": receipt["id"], "message": message})
+
+          seen_receipts = set()
+          for receipt in data["receipts"]:
+              if receipt["id"] in seen_receipts:
+                  add("duplicate_receipt", receipt, "Export contains a repeated receipt ID.")
+              seen_receipts.add(receipt["id"])
+              details = receipt["details"]
+              arrays = ("items", "scannedIds", "missing", "unexpected", "duplicateScans")
+              if not isinstance(details, dict) or not all(isinstance(details.get(key), list) for key in arrays) or \
+                      not all(isinstance(value, str) for key in arrays[1:] for value in details[key]) or \
+                      not all(isinstance(item, dict) and isinstance(item.get("sampleId"), str) and
+                              type(item.get("versionBefore")) is int and type(item.get("versionAfter")) is int and
+                              item["versionBefore"] >= 0 and item["versionAfter"] >= 0 and
+                              all(isinstance(item.get(key), str) for key in ("fromCustodianId", "toCustodianId", "outcome"))
+                              for item in details["items"]):
+                  add("malformed_receipt", receipt, "Receipt details are unavailable or malformed; inspect the export issues.")
+                  continue
+              items = details["items"]
+              expected = [item["sampleId"] for item in items]
+              scans = details["scannedIds"]
+              scan_set = set(scans)
+              missing = [sid for sid in expected if sid not in scan_set]
+              unexpected = list(dict.fromkeys(sid for sid in scans if sid not in set(expected)))
+              seen = set()
+              duplicates = set()
+              for sid in scans:
+                  if sid in seen:
+                      duplicates.add(sid)
+                  seen.add(sid)
+              counts = {"expectedCount": len(items), "receivedCount": len(expected) - len(missing),
+                        "missingCount": len(missing), "unexpectedCount": len(unexpected), "duplicateCount": len(duplicates)}
+              if receipt["orgId"] != data["orgId"]:
+                  add("receipt_scope", receipt, "Receipt does not belong to the exported organization.")
+              if len(set(expected)) != len(expected) or any(type(receipt.get(key)) is not int or receipt[key] != value
+                                                           for key, value in counts.items()):
+                  add("receipt_counts", receipt, "Receipt counts or expected sample IDs disagree with its scans.")
+              if sorted(details["missing"]) != sorted(missing) or sorted(details["unexpected"]) != sorted(unexpected) or \
+                      sorted(details["duplicateScans"]) != sorted(duplicates):
+                  add("receipt_details", receipt, "Stored discrepancy lists disagree with expected IDs and scans.")
+              expected_status = "discrepancy" if missing or unexpected or duplicates else "matched"
+              if receipt["status"] != expected_status:
+                  add("receipt_status", receipt, "Receipt status disagrees with its recorded discrepancy lists.")
+              for item in items:
+                  sid = item["sampleId"]
+                  sample = samples.get(sid)
+                  accepted = sid in scan_set
+                  outcome = "received" if accepted else "missing"
+                  event = events.get((sid, item["versionAfter"]))
+                  expected_kind = "receipt_accepted" if accepted else "receipt_missing"
+                  if not sample or sample["batchId"] != receipt["batchId"] or item["outcome"] != outcome or \
+                          item["versionAfter"] != item["versionBefore"] + 1 or \
+                          sample["version"] < item["versionAfter"] or not event or event["kind"] != expected_kind or \
+                          event["actorId"] != receipt["actorId"] or event["orgId"] != data["orgId"] or \
+                          event["fromCustodianId"] != item["fromCustodianId"] or event["toCustodianId"] != item["toCustodianId"] or \
+                          (not accepted and item["fromCustodianId"] != item["toCustodianId"]) or \
+                          (accepted and item["toCustodianId"] != receipt["actorId"]):
+                      add("receipt_event", receipt, "Receipt item disagrees with its sample revision or recorded custody event.", sid)
+                  if not accepted and sample:
+                      later_acceptance = any(e["sampleId"] == sid and e["version"] > item["versionAfter"] and
+                          e["kind"] in ("accept_handoff", "receipt_accepted") and e["toCustodianId"] == sample["custodianId"]
+                          for e in valid_events)
+                      if sample["status"] == "received" and later_acceptance:
+                          resolved += 1
+                      else:
+                          unresolved += 1
+                          add("missing_unresolved", receipt, "Missing at this receipt with no confirmed later laboratory acceptance.", sid, "warning")
+          return {"findings": findings, "checkedReceipts": len(data["receipts"]),
+                  "resolvedMissing": resolved, "unresolvedMissing": unresolved}
+
+
+      def main():
+          from kestra import Kestra
+          result = analyze(json.loads(Path("export.json").read_text(encoding="utf-8")))
+          Path("receipts.json").write_text(json.dumps(result), encoding="utf-8")
+          Kestra.outputs({"findingCount": len(result["findings"]), "resolvedMissing": result["resolvedMissing"],
+                          "unresolvedMissing": result["unresolvedMissing"]})
+
+
+      if __name__ == "__main__":
+          main()
+- id: build_report
+  type: io.kestra.plugin.scripts.python.Script
+  containerImage: python:3.12-slim
+  dependencies:
+  - kestra
+  inputFiles:
+    export.json: '{{ outputs.fetch_export.outputFiles[''export.json''] }}'
+    custody.json: '{{ outputs.audit_custody.outputFiles[''custody.json''] }}'
+    receipts.json: '{{ outputs.audit_receipts.outputFiles[''receipts.json''] }}'
+  outputFiles:
+  - audit.json
+  - audit.csv
+  script: |
+    """Combine audit evidence; incomplete or unstable reads can never be clean."""
+    import csv
+    import json
+    from pathlib import Path
+
+
+    def build_report(data, custody, receipts):
+        findings = custody["findings"] + receipts["findings"]
+        complete = data.get("complete") is True and not data.get("issues")
+        return {"schemaVersion": 1, "orgId": data["orgId"], "collectedAt": data["collectedAt"],
+                "status": "inconclusive" if not complete else "findings" if findings else "clean",
+                "complete": complete, "issues": data.get("issues", []), "coverage": data.get("coverage", {}),
+                "checkedSamples": custody["checkedSamples"], "checkedReceipts": receipts["checkedReceipts"],
+                "resolvedMissing": receipts["resolvedMissing"], "unresolvedMissing": receipts["unresolvedMissing"],
+                "findings": findings,
+                "scope": "Application record consistency; not proof of physical possession or absence of orphan records."}
+
+
+    def write_reports(report):
+        Path("audit.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        # Include status/completeness on every finding; a summary row remains when there are no findings.
+        fields = ["status", "complete", "code", "severity", "sampleId", "receiptId", "message"]
+        rows = report["findings"] or [{"code": "audit_summary", "severity": "info",
+            "message": report["scope"]}]
+        with Path("audit.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            for finding in rows:
+                row = {"status": report["status"], "complete": report["complete"], **finding}
+                # Prevent spreadsheet formula execution when these CSV fields are opened in Excel.
+                writer.writerow({key: "'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@"))
+                                 else value for key, value in row.items()})
+
+
+    def main():
+        from kestra import Kestra
+        data = json.loads(Path("export.json").read_text(encoding="utf-8"))
+        custody = json.loads(Path("custody.json").read_text(encoding="utf-8"))
+        receipts = json.loads(Path("receipts.json").read_text(encoding="utf-8"))
+        result = build_report(data, custody, receipts)
+        write_reports(result)
+        Kestra.outputs({"status": result["status"], "findingCount": len(result["findings"])})
+
+
+    if __name__ == "__main__":
+        main()
+- id: require_complete_clean_audit
+  type: io.kestra.plugin.core.flow.If
+  condition: '{{ outputs.build_report.vars.status != ''clean'' }}'
+  then:
+  - id: audit_requires_attention
+    type: io.kestra.plugin.core.execution.Fail
+    errorMessage: 'Audit findings or incomplete data: inspect build_report artifacts.'
+triggers:
+- id: daily_audit
+  type: io.kestra.plugin.core.trigger.Schedule
+  cron: 0 6 * * *
+  timezone: UTC
+  disabled: true
+extend:
+  title: Audit Appwrite sample custody and laboratory receipts
+  metaTitle: Appwrite Custody and Receipt Audit | Kestra
+  shortDescription: Check sample-custody history and receipt consistency in Appwrite, preserving historical discrepancies
+    and reporting incomplete reads.
+  metaDescription: Audit Appwrite sample custody and receipt consistency with parallel checks, scheduled runs, JSON/CSV
+    reports and incomplete-read safeguards.
+  description: |
+    Audit an Appwrite-backed sample-custody dataset through an authenticated, read-only companion Function. Detect inconsistent history and receipt records while preserving historical delivery discrepancies.
+
+    ## How it works
+    1. A disabled-by-default daily schedule starts the flow after configuration.
+    2. Fetch signs in, creates a short-lived JWT, calls GET /export through Appwrite executions, then revokes its session.
+    3. Parallel Python tasks check custody revisions and reconcile receipt snapshots with later acceptance events.
+    4. Combine emits JSON/CSV reports. An If gate fails executions with findings or incomplete reads after artifacts are saved.
+
+    ## What you get
+    - Downloadable reports with completeness, counts and record-level findings.
+    - Historical missing observations distinguished from confirmed later arrivals.
+    - No custody updates, receipt rewrites or database administrator key in Kestra.
+
+    ## Who it's for
+    Engineers maintaining Appwrite sample-tracking or similar event-history applications.
+
+    ## Why orchestrate this with Kestra
+    Keep authenticated extraction, independent checks, reporting and failure routing observable as separate tasks. Scheduled runs retain execution evidence without embedding audit logic in the product UI.
+
+    ## Prerequisites
+    Kestra with the Python plugin and Docker-capable workers; an Appwrite project using the documented LabRelay schema; a separately deployed read-only audit Function with rows.read; and a dedicated active organization member. Export coverage excludes orphan records and administrator edits bypassing revision guards. Incomplete or unstable data is inconclusive, never clean.
+
+    ### Secrets
+    - APPWRITE_ENDPOINT: exact HTTPS API endpoint including /v1.
+    - APPWRITE_PROJECT_ID: target project ID.
+    - APPWRITE_AUDIT_FUNCTION_ID: separate companion Function ID.
+    - APPWRITE_AUDIT_EMAIL and APPWRITE_AUDIT_PASSWORD: dedicated member credentials.
+
+    ## Quick start
+    1. Configure the schema and companion Function from the accompanying setup guide.
+    2. Store the five secrets and execute manually against fictional records.
+    3. Inspect audit.json and audit.csv; verify a later arrival and an incomplete export.
+    4. Enable the schedule only after a verified integration run. Reports contain private identifiers; limit access and retention.
+
+    ## How to extend
+    Add an alert channel after reporting, or adapt the export contract to another event-history schema. Keep source records read-only.
+
+    ## Links
+    - [Companion and setup](https://github.com/D33PAKsoni/kestra-appwrite-custody-audit)
+    - [Schema](https://github.com/D33PAKsoni/kestra-appwrite-custody-audit/blob/main/docs/SCHEMA.md)
+    - [Python plugin](https://kestra.io/plugins/plugin-script-python)
+    - [Appwrite executions](https://appwrite.io/docs/references/cloud/client-web/functions)
+    - [Appwrite Function development](https://appwrite.io/docs/products/functions/develop)
+  tags:
+  - Data
+  subTags:
+  - Testing & Quality
+  ee: false
+  demo: false
