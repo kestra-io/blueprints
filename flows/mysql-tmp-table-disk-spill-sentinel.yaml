@@ -1,0 +1,327 @@
+id: mysql-tmp-table-disk-spill-sentinel
+namespace: company.data
+
+description: |
+  Monitor MySQL in-memory temporary table disk spills and sort buffer saturation using performance_schema.
+  Calculates disk spill ratios from global status metrics, isolates offending digest queries spilling to disk,
+  exports a downloadable CSV diagnostic report, provides an operator approval gate for dynamic buffer tuning,
+  persists telemetry in KV, and dispatches Slack incident alerts to DBAs.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: max_disk_spill_ratio_pct
+    type: FLOAT
+    displayName: Maximum Disk Spill Ratio (%)
+    description: Maximum acceptable percentage of temporary tables converted to disk before triggering an alert.
+    defaults: 15.0
+    min: 1.0
+    max: 100.0
+
+  - id: min_total_tmp_tables
+    type: INT
+    displayName: Minimum Temporary Table Volume
+    description: Minimum cumulative temporary tables created before evaluating percentage thresholds, preventing alert noise on idle servers.
+    defaults: 100
+    min: 10
+    max: 100000
+
+  - id: max_reported_queries
+    type: INT
+    displayName: Maximum Offending Queries to Report
+    description: Maximum number of digest queries with high disk table creation to include in the diagnostic summary.
+    defaults: 15
+    min: 1
+    max: 50
+
+  - id: database_name
+    type: STRING
+    displayName: MySQL Target Database
+    description: Database schema name used for scoping audit watermarks and telemetry records.
+    defaults: production
+    validator: ^[A-Za-z_][A-Za-z0-9_]{0,63}$
+
+  - id: auto_apply_buffer_tuning
+    type: BOOL
+    displayName: Enable Remediation Approval Gate
+    description: When true, prompts an operator for manual review before applying recommended global buffer sizing adjustments to reduce disk spills for new connections.
+    defaults: false
+
+  - id: target_buffer_size_mb
+    type: INT
+    displayName: Target Temporary Table Buffer Size (MB)
+    description: Recommended buffer size in megabytes to apply to tmp_table_size and max_heap_table_size upon operator approval.
+    defaults: 64
+    min: 32
+    max: 2048
+
+tasks:
+  - id: evaluate_tmp_table_metrics
+    type: io.kestra.plugin.jdbc.mysql.Query
+    description: Query performance_schema global status and variables to compute disk spill ratios and buffer sizes.
+    url: "{{ secret('MYSQL_JDBC_URL') }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    timeZoneId: UTC
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        tmp.created_tmp_tables,
+        tmp_disk.created_tmp_disk_tables,
+        ROUND((tmp_disk.created_tmp_disk_tables / NULLIF(tmp.created_tmp_tables, 0)) * 100.0, 2) AS disk_spill_ratio_pct,
+        ROUND(CAST(vars_tmp.variable_value AS UNSIGNED) / (1024 * 1024), 2) AS tmp_table_size_mb,
+        ROUND(CAST(vars_heap.variable_value AS UNSIGNED) / (1024 * 1024), 2) AS max_heap_table_size_mb,
+        CASE
+          WHEN tmp.created_tmp_tables >= {{ inputs.min_total_tmp_tables }}
+            AND (ROUND((tmp_disk.created_tmp_disk_tables / NULLIF(tmp.created_tmp_tables, 0)) * 100.0, 2) >= {{ inputs.max_disk_spill_ratio_pct }})
+          THEN true
+          ELSE false
+        END AS is_degraded
+      FROM
+        (SELECT CAST(variable_value AS UNSIGNED) AS created_tmp_tables FROM performance_schema.global_status WHERE variable_name = 'Created_tmp_tables') tmp
+      CROSS JOIN
+        (SELECT CAST(variable_value AS UNSIGNED) AS created_tmp_disk_tables FROM performance_schema.global_status WHERE variable_name = 'Created_tmp_disk_tables') tmp_disk
+      CROSS JOIN
+        (SELECT variable_value FROM performance_schema.global_variables WHERE variable_name = 'tmp_table_size') vars_tmp
+      CROSS JOIN
+        (SELECT variable_value FROM performance_schema.global_variables WHERE variable_name = 'max_heap_table_size') vars_heap;
+
+  - id: fetch_offending_digest_queries
+    type: io.kestra.plugin.jdbc.mysql.Query
+    description: Stream top queries responsible for on-disk temporary table spills to internal storage.
+    url: "{{ secret('MYSQL_JDBC_URL') }}"
+    username: "{{ secret('MYSQL_USERNAME') }}"
+    password: "{{ secret('MYSQL_PASSWORD') }}"
+    timeZoneId: UTC
+    fetchType: STORE
+    sql: |
+      SELECT
+        schema_name,
+        digest,
+        LEFT(digest_text, 120) AS query_preview,
+        count_star AS execution_count,
+        sum_created_tmp_tables AS total_tmp_tables,
+        sum_created_tmp_disk_tables AS total_disk_spills,
+        ROUND((sum_created_tmp_disk_tables / NULLIF(sum_created_tmp_tables, 0)) * 100.0, 2) AS query_disk_spill_pct,
+        ROUND(sum_timer_wait / 1000000000000.0, 2) AS total_latency_seconds,
+        ROUND((sum_timer_wait / NULLIF(count_star, 0)) / 1000000000.0, 2) AS avg_latency_ms
+      FROM performance_schema.events_statements_summary_by_digest
+      WHERE sum_created_tmp_disk_tables > 0
+        AND schema_name = '{{ inputs.database_name }}'
+      ORDER BY sum_created_tmp_disk_tables DESC
+      LIMIT {{ inputs.max_reported_queries }};
+
+  - id: export_diagnostic_csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    description: Serialize the offending query digest telemetry into a downloadable CSV artifact.
+    from: "{{ outputs.fetch_offending_digest_queries.uri }}"
+
+  - id: check_disk_spill_threshold
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate disk spill ratio and trigger notifications when temporary storage spills exceed boundaries.
+    condition: "{{ outputs.evaluate_tmp_table_metrics.row.is_degraded }}"
+    then:
+      - id: log_spill_warning
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          MySQL Disk Spill Warning on database '{{ inputs.database_name }}':
+          Disk Spill Ratio: {{ outputs.evaluate_tmp_table_metrics.row.disk_spill_ratio_pct }}% (Threshold: {{ inputs.max_disk_spill_ratio_pct }}%).
+          Total Disk Spills: {{ outputs.evaluate_tmp_table_metrics.row.created_tmp_disk_tables }} of {{ outputs.evaluate_tmp_table_metrics.row.created_tmp_tables }} temporary tables.
+          Configured tmp_table_size: {{ outputs.evaluate_tmp_table_metrics.row.tmp_table_size_mb }} MB.
+          Configured max_heap_table_size: {{ outputs.evaluate_tmp_table_metrics.row.max_heap_table_size_mb }} MB.
+          Recommended Target Buffer: {{ inputs.target_buffer_size_mb }} MB.
+          Diagnostic CSV Report URI: {{ outputs.export_diagnostic_csv.uri }}
+
+      - id: notify_slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send incident alert to Slack with disk spill metrics and report artifact.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: >-
+          [PERFORMANCE ALERT] *MySQL Temporary Table Disk Spill Saturation*
+          *Database:* `{{ inputs.database_name }}`
+          *Disk Spill Ratio:* `{{ outputs.evaluate_tmp_table_metrics.row.disk_spill_ratio_pct }}%` (Threshold: `{{ inputs.max_disk_spill_ratio_pct }}%`)
+          *Disk Spills:* `{{ outputs.evaluate_tmp_table_metrics.row.created_tmp_disk_tables }}` / `{{ outputs.evaluate_tmp_table_metrics.row.created_tmp_tables }}` total temporary tables
+          *Allocated Buffer Sizes:* `tmp_table_size`: `{{ outputs.evaluate_tmp_table_metrics.row.tmp_table_size_mb }} MB` | `max_heap_table_size`: `{{ outputs.evaluate_tmp_table_metrics.row.max_heap_table_size_mb }} MB`
+          *Recommended Target Buffer:* `{{ inputs.target_buffer_size_mb }} MB`
+          *Diagnostic CSV Report:* `{{ outputs.export_diagnostic_csv.uri }}`
+          *Execution ID:* `{{ execution.id }}`
+
+      - id: execute_buffer_remediation
+        type: io.kestra.plugin.core.flow.If
+        description: Operator-approved buffer tuning remediation gate triggered when disk spill thresholds are breached.
+        condition: "{{ inputs.auto_apply_buffer_tuning }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator review before dynamically resizing temporary table buffers. Resume in the Kestra UI to apply tuning, or cancel to skip.
+            pauseDuration: PT30M
+            behavior: CANCEL
+
+          - id: apply_buffer_sizing_remediation
+            type: io.kestra.plugin.jdbc.mysql.Query
+            description: >-
+              Dynamically adjust global tmp_table_size and max_heap_table_size buffers to mitigate disk conversions for new sessions.
+              Note that SET GLOBAL applies to runtime connections until server restart; configure my.cnf or execute SET PERSIST on MySQL 8.0+ for persistence across restarts.
+            url: "{{ secret('MYSQL_JDBC_URL') }}"
+            username: "{{ secret('MYSQL_USERNAME') }}"
+            password: "{{ secret('MYSQL_PASSWORD') }}"
+            timeZoneId: UTC
+            sql: |
+              SET GLOBAL tmp_table_size = {{ inputs.target_buffer_size_mb }} * 1024 * 1024;
+              SET GLOBAL max_heap_table_size = {{ inputs.target_buffer_size_mb }} * 1024 * 1024;
+
+          - id: verify_buffer_reconfiguration
+            type: io.kestra.plugin.jdbc.mysql.Query
+            description: Query performance_schema global variables post-remediation to verify updated buffer capacities.
+            url: "{{ secret('MYSQL_JDBC_URL') }}"
+            username: "{{ secret('MYSQL_USERNAME') }}"
+            password: "{{ secret('MYSQL_PASSWORD') }}"
+            timeZoneId: UTC
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT
+                ROUND(CAST(vars_tmp.variable_value AS UNSIGNED) / (1024 * 1024), 2) AS updated_tmp_table_size_mb,
+                ROUND(CAST(vars_heap.variable_value AS UNSIGNED) / (1024 * 1024), 2) AS updated_max_heap_table_size_mb
+              FROM
+                (SELECT variable_value FROM performance_schema.global_variables WHERE variable_name = 'tmp_table_size') vars_tmp
+              CROSS JOIN
+                (SELECT variable_value FROM performance_schema.global_variables WHERE variable_name = 'max_heap_table_size') vars_heap;
+
+          - id: log_remediation_metrics
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              MySQL buffer remediation successfully applied on database '{{ inputs.database_name }}':
+              Updated tmp_table_size: {{ outputs.verify_buffer_reconfiguration.row.updated_tmp_table_size_mb }} MB.
+              Updated max_heap_table_size: {{ outputs.verify_buffer_reconfiguration.row.updated_max_heap_table_size_mb }} MB.
+
+          - id: notify_slack_remediation_resolution
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Send Slack notification confirming operator-approved buffer reconfiguration has been applied.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: >-
+              [REMEDIATION COMPLETE] *MySQL Buffer Tuning Applied*
+              *Database:* `{{ inputs.database_name }}`
+              *New tmp_table_size:* `{{ outputs.verify_buffer_reconfiguration.row.updated_tmp_table_size_mb }} MB`
+              *New max_heap_table_size:* `{{ outputs.verify_buffer_reconfiguration.row.updated_max_heap_table_size_mb }} MB`
+              *Approved Execution ID:* `{{ execution.id }}`
+    else:
+      - id: log_healthy_state
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          MySQL temporary tables on database '{{ inputs.database_name }}' are healthy.
+          Disk spill ratio is {{ outputs.evaluate_tmp_table_metrics.row.disk_spill_ratio_pct }}% (< {{ inputs.max_disk_spill_ratio_pct }}%),
+          with {{ outputs.evaluate_tmp_table_metrics.row.created_tmp_disk_tables }} disk spills out of {{ outputs.evaluate_tmp_table_metrics.row.created_tmp_tables }} temporary tables.
+
+  - id: update_telemetry_watermark
+    type: io.kestra.plugin.core.kv.Set
+    description: Record telemetry snapshot in Kestra KV store for historical capacity and memory sizing trend analysis.
+    key: "mysql_tmp_table_audit_{{ inputs.database_name }}"
+    value:
+      last_audit_timestamp: "{{ now() }}"
+      created_tmp_tables: "{{ outputs.evaluate_tmp_table_metrics.row.created_tmp_tables }}"
+      created_tmp_disk_tables: "{{ outputs.evaluate_tmp_table_metrics.row.created_tmp_disk_tables }}"
+      disk_spill_ratio_pct: "{{ outputs.evaluate_tmp_table_metrics.row.disk_spill_ratio_pct }}"
+      tmp_table_size_mb: "{{ outputs.evaluate_tmp_table_metrics.row.tmp_table_size_mb }}"
+      is_degraded: "{{ outputs.evaluate_tmp_table_metrics.row.is_degraded }}"
+      diagnostic_csv_uri: "{{ outputs.export_diagnostic_csv.uri }}"
+
+errors:
+  - id: alert_audit_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notify on task failure if database connectivity or query execution fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      [ERROR] MySQL Temporary Table Audit failed in execution `{{ execution.id }}` on database `{{ inputs.database_name }}`.
+      Failed task: `{{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}`.
+      Error message: `{{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'inspect execution logs' }}`.
+
+triggers:
+  - id: hourly_spill_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+
+extend:
+  title: MySQL Temporary Table Disk Spill and Buffer Sizing Advisor
+  metaTitle: MySQL Temporary Table Disk Spill Sentinel | Kestra
+  shortDescription: Audit MySQL in-memory temporary table disk spills via performance_schema, export CSV diagnostic reports, and alert on sort buffer saturation.
+  metaDescription: Monitor MySQL Created_tmp_disk_tables ratios using performance_schema, export CSV diagnostics, and detect sort buffer bottlenecks in Kestra.
+  description: |
+    MySQL processes complex intermediate operations—such as `GROUP BY`, `ORDER BY`, `DISTINCT`, and multi-table `JOIN` queries—using in-memory temporary tables bounded by `tmp_table_size` and `max_heap_table_size`. When an execution exceeds these thresholds or queries unindexed `BLOB`/`TEXT` columns, MySQL automatically converts the in-memory structure into an on-disk InnoDB table. Disk spills incur significant I/O penalties, resulting in 10x-100x query latency degradations and storage contention. This workflow continuously audits MySQL's `performance_schema.global_status` and `global_variables`, evaluates the ratio of `Created_tmp_disk_tables` to `Created_tmp_tables`, isolates the top offending query digests from `events_statements_summary_by_digest`, exports a downloadable CSV diagnostic report, persists telemetry history in Kestra's Key-Value store, alerts to Slack when disk spills breach safe operational limits, and provides an operator-in-the-loop approval gate to dynamically apply recommended buffer sizing adjustments without database restarts.
+
+    ## How it works
+
+    1. The `Schedule` trigger initiates the workflow hourly, or database administrators can trigger executions on-demand via the UI.
+    2. `evaluate_tmp_table_metrics` queries `performance_schema.global_status` to compute total temporary table counts, disk spills, and the spill ratio percentage, while cross-joining `performance_schema.global_variables` to inspect current memory limits.
+    3. `fetch_offending_digest_queries` queries `performance_schema.events_statements_summary_by_digest` to isolate the SQL statements responsible for the highest volume of on-disk temporary tables (`STORE` fetch type).
+    4. `export_diagnostic_csv` transforms the raw query digest telemetry into a downloadable CSV artifact using `IonToCsv`.
+    5. `check_disk_spill_threshold` (`If` condition) verifies whether the disk spill ratio exceeds the configured threshold (default 15%) after minimum volume requirements are satisfied.
+    6. If degraded, `notify_slack_alert` posts an alert with the spill ratio, configured buffer sizes, recommended target buffer, and the direct CSV report download link for immediate DBA inspection.
+    7. When `auto_apply_buffer_tuning` is enabled, `execute_buffer_remediation` pauses execution (`io.kestra.plugin.core.flow.Pause`, `pauseDuration: PT30M`, `behavior: CANCEL`) for operator review before executing dynamic buffer reconfiguration (`SET GLOBAL tmp_table_size` and `SET GLOBAL max_heap_table_size`), canceling automatically on timeout to prevent unapproved changes, followed by `verify_buffer_reconfiguration` confirming the updated buffer limits took effect. Note that SET GLOBAL dynamically adjusts runtime limits for new sessions until MySQL restarts; DBAs running MySQL 8.0+ can use SET PERSIST or update my.cnf to persist changes across server reboots.
+    8. `update_telemetry_watermark` updates the `mysql_tmp_table_audit_<database>` key in Kestra's KV store for trend analysis.
+    9. The `errors` block intercepts connection or query failures and immediately alerts the on-call channel.
+
+    ## What you get
+
+    - Proactive detection of MySQL queries causing severe storage I/O degradation through on-disk table conversion.
+    - Visibility into configured `tmp_table_size` and `max_heap_table_size` parameters versus actual workload demands.
+    - Automated identification of exact query digests and average latencies responsible for disk spills.
+    - Automated export of offending SQL statements into downloadable CSV artifacts.
+    - Operator-in-the-loop remediation gate pausing for confirmation before dynamically tuning temporary table buffers.
+    - Post-remediation verification ensuring new global buffer limits are applied immediately for future client connections.
+    - Persistent state tracking via Kestra KV store without third-party monitoring infrastructure.
+    - Automated incident alerts and resolution receipts delivered directly to Slack with report links.
+
+    ## Who it's for
+
+    - Database Administrators (DBAs) optimizing MySQL and Percona Server performance.
+    - Site Reliability Engineers (SREs) investigating intermittent database CPU and disk I/O latency spikes.
+    - Backend Engineers seeking proactive query optimization insights.
+
+    ## Why orchestrate this with Kestra
+
+    Monitoring temporary table disk spills directly through declarative Kestra workflows eliminates the need for proprietary APM agents. Kestra natively handles database retries, credential isolation via secrets, conditional branching, human-in-the-loop pauses, artifact generation, and key-value state persistence in a single audited YAML pipeline.
+
+    ## Prerequisites
+
+    - MySQL 5.7, 8.0, or newer (or MariaDB 10.3+) with `performance_schema = ON`.
+    - Database user with `SELECT` permissions on `performance_schema.global_status`, `performance_schema.global_variables`, and `performance_schema.events_statements_summary_by_digest`, and `SYSTEM_VARIABLES_ADMIN` (or `SUPER`) if executing buffer tuning remediation.
+    - Incoming Slack Webhook URL for alerting notifications.
+
+    ### Secrets
+
+    - `MYSQL_JDBC_URL`: JDBC connection string (e.g., `jdbc:mysql://mysql.company.internal:3306/production`).
+    - `MYSQL_USERNAME`: Database username with read and administration permissions.
+    - `MYSQL_PASSWORD`: Database user password.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint for alerting.
+
+    ## Quick start
+
+    1. Configure the `MYSQL_JDBC_URL`, `MYSQL_USERNAME`, `MYSQL_PASSWORD`, and `SLACK_WEBHOOK_URL` secrets in your Kestra namespace.
+    2. Import this blueprint into your Kestra workspace.
+    3. Click **Execute** with default inputs to perform an initial audit.
+    4. Verify the generated output logs, download the generated CSV report from the **Outputs** tab, and inspect the stored record in the **KV Store** tab.
+    5. Enable the hourly schedule trigger for continuous monitoring.
+
+    ## How to extend
+
+    - Add an automated ticket creation task in Jira or GitHub to assign query rewriting tasks to product engineering teams.
+    - Archive weekly disk spill audit logs to Amazon S3 or Google Cloud Storage using `io.kestra.plugin.aws.s3.Upload`.
+    - Integrate with PagerDuty or Opsgenie using Kestra's notification plugins for critical disk spill surges.
+
+    ## Links
+
+    - [MySQL JDBC Plugin](https://kestra.io/plugins/plugin-jdbc-mysql)
+    - [Serdes Plugin](https://kestra.io/plugins/plugin-serdes)
+    - [Slack Notification Plugin](https://kestra.io/plugins/plugin-slack)
+    - [Kestra Key-Value Store](https://kestra.io/docs/concepts/kv)
+    - [MySQL Temporary Table Optimization Documentation](https://dev.mysql.com/doc/refman/8.0/en/internal-temporary-tables.html)
+  tags:
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Performance Optimization
+    - Monitoring & Alerting
+  ee: false
+  demo: false
