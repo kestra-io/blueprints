@@ -1,0 +1,409 @@
+id: postgres-default-partition-recovery
+namespace: company.data
+description: Recover one month of DATE-keyed rows from DEFAULT into a new attached PostgreSQL partition after reviewing
+  a fingerprinted plan.
+labels:
+  team: data-platform
+  use-case: partition-recovery
+concurrency:
+  limit: 1
+  behavior: QUEUE
+inputs:
+- id: jdbc_url
+  type: STRING
+  defaults: jdbc:postgresql://postgres:5432/partition_demo
+  description: PostgreSQL JDBC URL; credentials come from secrets.
+- id: table_schema
+  type: STRING
+  defaults: public
+  description: Schema of the root partitioned table.
+  validator: ^[a-z_][a-z0-9_]{0,62}$
+- id: parent_table
+  type: STRING
+  defaults: events
+  description: Root RANGE table; target is <parent>_pYYYYMM.
+  validator: ^[a-z_][a-z0-9_]{0,47}$
+- id: month_start
+  type: DATE
+  defaults: '2026-10-01'
+  description: First day of the month to recover; upper bound is exclusive.
+- id: dry_run
+  type: BOOL
+  defaults: true
+  description: Save a plan without changing persistent tables. False still requires approval.
+- id: max_rows
+  type: INT
+  defaults: 10000
+  description: Maximum rows to move; does not bound DEFAULT scan or index build cost.
+  min: 1
+  max: 100000
+- id: lock_timeout_ms
+  type: INT
+  defaults: 2000
+  description: Maximum wait for each database lock, in milliseconds.
+  min: 100
+  max: 10000
+- id: statement_timeout_seconds
+  type: INT
+  defaults: 60
+  description: Timeout per SQL statement, including each DO block.
+  min: 5
+  max: 300
+- id: kestra_url
+  type: STRING
+  defaults: http://localhost:8080
+  description: Externally reachable Kestra base URL for failure links.
+variables:
+  settings_sql: |
+    SET LOCAL search_path = pg_catalog, pg_temp;
+    SET LOCAL DateStyle = 'ISO, YMD';
+    SET LOCAL timezone = 'UTC';
+    SET LOCAL extra_float_digits = 3;
+    SET LOCAL lock_timeout = '{{ inputs.lock_timeout_ms }}ms';
+    SET LOCAL statement_timeout = '{{ inputs.statement_timeout_seconds }}s';
+  inspect_sql: |
+    CREATE TEMP TABLE recovery_context (
+      parent_oid oid, default_oid oid, parent_relation text, default_relation text,
+      key_name text, column_list text, target_relation text, target_oid oid,
+      range_from date, range_to date, already_partitioned boolean, metadata_sha256 text
+    ) ON COMMIT DROP;
+    DO $inspect$
+    DECLARE
+      p oid := to_regclass(format('%I.%I', '{{ inputs.table_schema }}', '{{ inputs.parent_table }}'));
+      d oid; k text; cols text; target text; target_id oid; lo date := DATE '{{ inputs.month_start }}';
+      hi date := (lo + interval '1 month')::date; expected_bound text; family oid[]; meta text;
+    BEGIN
+      IF current_setting('server_version_num')::int < 160000 THEN RAISE EXCEPTION 'PostgreSQL 16+ required'; END IF;
+      IF p IS NULL THEN RAISE EXCEPTION 'Parent table does not exist'; END IF;
+      EXECUTE format('LOCK TABLE ONLY %s IN SHARE UPDATE EXCLUSIVE MODE',p::regclass);
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_partitioned_table pt ON pt.partrelid=c.oid
+        JOIN pg_attribute a ON a.attrelid=p AND a.attnum=pt.partattrs[0]
+        JOIN pg_opclass op ON op.oid=pt.partclass[0]
+        WHERE c.oid=p AND NOT c.relispartition AND c.relpersistence='p' AND pt.partstrat='r'
+          AND pt.partnatts=1 AND a.atttypid='date'::regtype AND op.opcdefault AND op.opcintype='date'::regtype)
+      THEN RAISE EXCEPTION 'Requires a root RANGE table with one ordinary DATE key and default operator class'; END IF;
+      SELECT a.attname INTO k FROM pg_partitioned_table pt JOIN pg_attribute a
+        ON a.attrelid=p AND a.attnum=pt.partattrs[0] WHERE pt.partrelid=p;
+      SELECT partdefid INTO d FROM pg_partitioned_table WHERE partrelid=p;
+      IF d=0 THEN RAISE EXCEPTION 'Parent has no DEFAULT partition'; END IF;
+      EXECUTE format('LOCK TABLE ONLY %s IN ACCESS SHARE MODE',d::regclass);
+      SELECT array_agg(relid::oid ORDER BY relid) INTO family FROM pg_partition_tree(p);
+      IF EXISTS (SELECT 1 FROM pg_class WHERE oid=ANY(family) AND
+        (relpersistence<>'p' OR relrowsecurity OR relforcerowsecurity OR (oid<>p AND relkind<>'r')))
+      THEN RAISE EXCEPTION 'Only logged plain leaves without RLS are supported'; END IF;
+      IF EXISTS (SELECT 1 FROM pg_class WHERE oid=ANY(family) AND NOT pg_has_role(relowner,'USAGE'))
+         OR NOT has_schema_privilege('{{ inputs.table_schema }}','CREATE')
+      THEN RAISE EXCEPTION 'Role must own the partition family and have schema CREATE permission'; END IF;
+      IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid=ANY(family) AND attnum>0
+          AND (attgenerated<>'' OR attidentity<>''))
+         OR EXISTS (SELECT 1 FROM pg_constraint WHERE contype='f' AND (conrelid=ANY(family) OR confrelid=ANY(family)))
+         OR EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=ANY(family) AND NOT tgisinternal)
+         OR EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class=ANY(family))
+      THEN RAISE EXCEPTION 'Generated/identity columns, foreign keys, table triggers and rewrite rules are unsupported'; END IF;
+      SELECT string_agg(format('%I',attname),', ' ORDER BY attnum) INTO cols
+        FROM pg_attribute WHERE attrelid=p AND attnum>0 AND NOT attisdropped;
+      target := format('%I.%I','{{ inputs.table_schema }}','{{ inputs.parent_table }}_p'||to_char(lo,'YYYYMM'));
+      target_id := to_regclass(target);
+      expected_bound := format('FOR VALUES FROM (%L) TO (%L)',lo,hi);
+      IF target_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+        WHERE i.inhparent=p AND c.oid=target_id AND pg_get_expr(c.relpartbound,c.oid)=expected_bound)
+      THEN RAISE EXCEPTION 'Destination % exists but is not attached with the exact requested bounds',target; END IF;
+      IF target_id IS NULL AND EXISTS (
+        SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+        CROSS JOIN LATERAL regexp_match(pg_get_expr(c.relpartbound,c.oid),'^FOR VALUES FROM \((.+)\) TO \((.+)\)$') m
+        WHERE i.inhparent=p AND c.oid<>d
+          AND (CASE WHEN m[1]='MINVALUE' THEN '-infinity'::date ELSE trim(both '''' from m[1])::date END)<hi
+          AND (CASE WHEN m[2]='MAXVALUE' THEN 'infinity'::date ELSE trim(both '''' from m[2])::date END)>lo)
+      THEN RAISE EXCEPTION 'Requested month overlaps an existing partition'; END IF;
+      SELECT encode(sha256(convert_to(jsonb_build_object(
+        'relations',(SELECT jsonb_agg(jsonb_build_array(c.oid,c.relname,c.relnamespace,c.relowner,c.relacl,
+          c.relkind,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity,c.reloptions,pg_get_expr(c.relpartbound,c.oid)) ORDER BY c.oid)
+          FROM pg_class c WHERE c.oid=ANY(family)),
+        'columns',(SELECT jsonb_agg(jsonb_build_array(a.attrelid,a.attnum,a.attname,a.atttypid,a.atttypmod,a.attnotnull,
+          a.attcollation,a.attgenerated,a.attidentity,a.attisdropped,pg_get_expr(ad.adbin,ad.adrelid)) ORDER BY a.attrelid,a.attnum)
+          FROM pg_attribute a LEFT JOIN pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
+          WHERE a.attrelid=ANY(family) AND a.attnum>0),
+        'constraints',(SELECT jsonb_agg(jsonb_build_array(oid,conrelid,convalidated,pg_get_constraintdef(oid)) ORDER BY oid)
+          FROM pg_constraint WHERE conrelid=ANY(family)),
+        'indexes',(SELECT jsonb_agg(jsonb_build_array(indexrelid,indisvalid,indisready,pg_get_indexdef(indexrelid)) ORDER BY indexrelid)
+          FROM pg_index WHERE indrelid=ANY(family)))::text,'UTF8')),'hex') INTO meta;
+      INSERT INTO pg_temp.recovery_context VALUES(p,d,format('%I.%I','{{ inputs.table_schema }}','{{ inputs.parent_table }}'),
+        (SELECT format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=d),
+        k,cols,target,target_id,lo,hi,target_id IS NOT NULL,meta);
+    END $inspect$;
+  plan_sql: |
+    CREATE TEMP TABLE recovery_rows (row_data jsonb) ON COMMIT DROP;
+    CREATE TEMP TABLE recovery_plan (candidate_count bigint, default_count bigint, rows_sha256 text, plan_sha256 text) ON COMMIT DROP;
+    DO $plan$
+    DECLARE c record; n bigint; total bigint; h text;
+    BEGIN
+      SELECT * INTO STRICT c FROM pg_temp.recovery_context;
+      -- Both scans use the same statement snapshot; candidate values never leave the database.
+      EXECUTE format('WITH copied AS (INSERT INTO pg_temp.recovery_rows SELECT to_jsonb(t) FROM ONLY %s t WHERE %I >= %L::date AND %I < %L::date LIMIT %s RETURNING 1) SELECT (SELECT count(*) FROM ONLY %s), (SELECT count(*) FROM copied)',
+        c.default_relation,c.key_name,c.range_from,c.key_name,c.range_to,{{ inputs.max_rows }}+1,c.default_relation) INTO total,n;
+      IF n>{{ inputs.max_rows }} THEN RAISE EXCEPTION 'Candidate rows exceed max_rows; narrow the recovery or plan a dedicated migration'; END IF;
+      SELECT encode(sha256(convert_to(coalesce(string_agg(encode(sha256(convert_to(row_data::text,'UTF8')),'hex'),'' ORDER BY row_data::text),''),'UTF8')),'hex')
+        INTO h FROM pg_temp.recovery_rows;
+      IF c.already_partitioned AND n<>0 THEN RAISE EXCEPTION 'Attached destination still has matching rows in DEFAULT'; END IF;
+      INSERT INTO pg_temp.recovery_plan VALUES(n,total,h,
+        encode(sha256(convert_to(c.metadata_sha256||h||c.range_from::text||c.range_to::text,'UTF8')),'hex'));
+    END $plan$;
+triggers:
+- id: daily_audit
+  type: io.kestra.plugin.core.trigger.Schedule
+  description: Audit the configured month daily; enable after choosing a table and month. Scheduled executions always
+    dry-run.
+  cron: 15 2 * * *
+  timezone: Etc/UTC
+  disabled: true
+  inputs:
+    dry_run: true
+tasks:
+- id: validate_inputs
+  type: io.kestra.plugin.core.execution.Assert
+  description: Reject non-month boundaries before contacting PostgreSQL.
+  conditions:
+  - '{{ inputs.month_start | date(''dd'') == ''01'' }}'
+  errorMessage: month_start must be the first day of a month.
+- id: inspect
+  type: io.kestra.plugin.jdbc.postgresql.Queries
+  description: Check live table ownership, DATE partitioning, existing bounds and unsupported features. No persistent
+    changes.
+  url: '{{ inputs.jdbc_url }}'
+  username: '{{ secret(''POSTGRES_USERNAME'') }}'
+  password: '{{ secret(''POSTGRES_PASSWORD'') }}'
+  transaction: true
+  fetchType: FETCH_ONE
+  retry:
+    type: constant
+    interval: PT3S
+    maxAttempts: 2
+  timeout: PT6M
+  sql: |-
+    {{ render(vars.settings_sql) }}
+    {{ render(vars.inspect_sql) }}
+    SELECT * FROM pg_temp.recovery_context;
+- id: plan
+  type: io.kestra.plugin.jdbc.postgresql.Queries
+  description: Take a consistent source snapshot, cap candidates, and fingerprint metadata plus all matching rows.
+    Temporary rows stay in PostgreSQL.
+  url: '{{ inputs.jdbc_url }}'
+  username: '{{ secret(''POSTGRES_USERNAME'') }}'
+  password: '{{ secret(''POSTGRES_PASSWORD'') }}'
+  transaction: true
+  fetchType: FETCH_ONE
+  retry:
+    type: constant
+    interval: PT3S
+    maxAttempts: 2
+  timeout: PT6M
+  sql: |
+    {{ render(vars.settings_sql) }}
+    {{ render(vars.inspect_sql) }}
+    {{ render(vars.plan_sql) }}
+    SELECT c.parent_relation,c.default_relation,c.target_relation,c.key_name,c.range_from,c.range_to,
+      c.already_partitioned,c.metadata_sha256,p.*,
+      CASE WHEN c.already_partitioned THEN 'already_partitioned' WHEN p.candidate_count=0 THEN 'nothing_to_move' ELSE 'recovery_required' END AS status
+    FROM pg_temp.recovery_context c CROSS JOIN pg_temp.recovery_plan p;
+- id: save_plan
+  type: io.kestra.plugin.core.storage.Write
+  description: Save the exact range, destination, count, fingerprints and operations for review; no source row values
+    leave PostgreSQL.
+  extension: .json
+  content: |
+    {{ {'plan': outputs.plan.outputs[0].row, 'dry_run': inputs.dry_run,
+        'operations': outputs.plan.outputs[0].row.status == 'recovery_required' ? ['Lock parent and DEFAULT briefly', 'Recheck the approved fingerprints', 'Create the named destination with parent columns and indexes', 'Move exactly the candidate rows; compare complete row multisets', 'Attach for the reported half-open month interval; reconcile counts; commit'] : ['No persistent changes; no recovery or approval needed'],
+        'safeguards': {'max_rows': inputs.max_rows, 'lock_timeout_ms': inputs.lock_timeout_ms, 'statement_timeout_seconds': inputs.statement_timeout_seconds},
+        'impact': 'ACCESS EXCLUSIVE locks briefly block parent access and direct access to DEFAULT. DEFAULT scans and index builds may exceed the row movement cost. No persistent changes in dry-run.'} | toJson }}
+- id: needs_recovery
+  type: io.kestra.plugin.core.flow.If
+  description: An existing exact partition or an empty candidate set is a no-op.
+  condition: '{{ outputs.plan.outputs[0].row.status == ''recovery_required'' }}'
+  then:
+  - id: apply_requested
+    type: io.kestra.plugin.core.flow.If
+    description: Only explicit apply executions can request human approval.
+    condition: '{{ not inputs.dry_run }}'
+    then:
+    - id: approval
+      type: io.kestra.plugin.core.flow.Pause
+      description: Review save_plan before approving. No database locks are held during this pause.
+      pauseDuration: PT2H
+      behavior: FAIL
+      onResume:
+      - id: approved
+        type: BOOL
+        defaults: false
+        description: Approve the saved range, row count, fingerprints and brief exclusive locks.
+    - id: approved
+      type: io.kestra.plugin.core.flow.If
+      description: A declined request leaves the database unchanged.
+      condition: '{{ outputs.approval.onResume.approved ?? false }}'
+      then:
+      - id: recover
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        description: Lock, reject stale approval, move and compare rows, attach, and verify in ONE transaction.
+          Any SQL failure rolls back all changes. Retry recognizes an exact existing attachment as a no-op.
+        url: '{{ inputs.jdbc_url }}'
+        username: '{{ secret(''POSTGRES_USERNAME'') }}'
+        password: '{{ secret(''POSTGRES_PASSWORD'') }}'
+        transaction: true
+        fetchType: FETCH_ONE
+        retry:
+          type: constant
+          interval: PT3S
+          maxAttempts: 2
+        timeout: PT6M
+        sql: |
+          {{ render(vars.settings_sql) }}
+          -- Lock ONLY the parent first, then its planned DEFAULT leaf; no recursive sibling locks.
+          LOCK TABLE ONLY "{{ inputs.table_schema }}"."{{ inputs.parent_table }}" IN ACCESS EXCLUSIVE MODE;
+          LOCK TABLE ONLY {{ outputs.plan.outputs[0].row.default_relation }} IN ACCESS EXCLUSIVE MODE;
+          {{ render(vars.inspect_sql) }}
+          {{ render(vars.plan_sql) }}
+          CREATE TEMP TABLE recovery_result (status text, moved_rows bigint, default_before bigint, default_after bigint,
+            rows_equal boolean, attached boolean, plan_sha256 text) ON COMMIT DROP;
+          DO $recover$
+          DECLARE c record; r record; moved bigint; remaining bigint; unequal boolean;
+          BEGIN
+            SELECT * INTO STRICT c FROM pg_temp.recovery_context;
+            SELECT * INTO STRICT r FROM pg_temp.recovery_plan;
+            IF c.already_partitioned THEN
+              INSERT INTO pg_temp.recovery_result VALUES('already_partitioned',0,r.default_count,r.default_count,NULL,true,r.plan_sha256);
+              RETURN;
+            END IF;
+            IF r.plan_sha256<>'{{ outputs.plan.outputs[0].row.plan_sha256 }}' THEN
+              RAISE EXCEPTION 'Approved plan is stale: candidate rows or partition metadata changed; rerun and approve a new plan';
+            END IF;
+            EXECUTE format('CREATE TABLE %s (LIKE %s INCLUDING ALL)',c.target_relation,c.parent_relation);
+            EXECUTE format('WITH moved AS (DELETE FROM ONLY %s WHERE %I >= %L::date AND %I < %L::date RETURNING %s) INSERT INTO %s (%s) SELECT %s FROM moved',
+              c.default_relation,c.key_name,c.range_from,c.key_name,c.range_to,c.column_list,c.target_relation,c.column_list,c.column_list);
+            GET DIAGNOSTICS moved=ROW_COUNT;
+            IF moved<>r.candidate_count THEN RAISE EXCEPTION 'Moved row count differs from approved plan'; END IF;
+            EXECUTE format('SELECT EXISTS ((SELECT row_data FROM pg_temp.recovery_rows EXCEPT ALL SELECT to_jsonb(t) FROM %s t) UNION ALL (SELECT to_jsonb(t) FROM %s t EXCEPT ALL SELECT row_data FROM pg_temp.recovery_rows))',
+              c.target_relation,c.target_relation) INTO unequal;
+            IF unequal THEN RAISE EXCEPTION 'Moved row contents differ from captured source'; END IF;
+            EXECUTE format('ALTER TABLE %s ADD CHECK (%I >= %L::date AND %I < %L::date)',c.target_relation,c.key_name,c.range_from,c.key_name,c.range_to);
+            EXECUTE format('ALTER TABLE %s ATTACH PARTITION %s FOR VALUES FROM (%L) TO (%L)',c.parent_relation,c.target_relation,c.range_from,c.range_to);
+            EXECUTE format('SELECT count(*) FROM ONLY %s',c.default_relation) INTO remaining;
+            IF remaining<>r.default_count-moved THEN RAISE EXCEPTION 'DEFAULT row count did not reconcile'; END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent=c.parent_oid AND inhrelid=to_regclass(c.target_relation))
+              THEN RAISE EXCEPTION 'Destination was not attached'; END IF;
+            INSERT INTO pg_temp.recovery_result VALUES('recovered',moved,r.default_count,remaining,true,true,r.plan_sha256);
+          END $recover$;
+          SELECT * FROM pg_temp.recovery_result;
+      - id: verify
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        description: Read committed attachment bounds and prove no rows for the recovered month remain in DEFAULT;
+          does not insert test data.
+        url: '{{ inputs.jdbc_url }}'
+        username: '{{ secret(''POSTGRES_USERNAME'') }}'
+        password: '{{ secret(''POSTGRES_PASSWORD'') }}'
+        transaction: true
+        fetchType: FETCH_ONE
+        retry:
+          type: constant
+          interval: PT3S
+          maxAttempts: 2
+        timeout: PT6M
+        sql: |
+          {{ render(vars.settings_sql) }}
+          {{ render(vars.inspect_sql) }}
+          {{ render(vars.plan_sql) }}
+          SELECT c.already_partitioned AS attached, p.candidate_count AS remaining_in_default,
+            c.target_relation,c.range_from,c.range_to
+          FROM pg_temp.recovery_context c CROSS JOIN pg_temp.recovery_plan p;
+      - id: verify_result
+        type: io.kestra.plugin.core.execution.Assert
+        description: Never report recovery success without an exact attachment and empty source month.
+        conditions:
+        - '{{ outputs.verify.outputs[0].row.attached }}'
+        - '{{ outputs.verify.outputs[0].row.remaining_in_default == 0 }}'
+        errorMessage: Recovery postconditions failed. Inspect PostgreSQL before rerunning; recovery may already
+          have committed.
+errors:
+- id: alert_failure
+  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+  description: Send failed task IDs and an execution link. Does not include source row values or SQL error text.
+  url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+  messageText: |
+    PostgreSQL DEFAULT recovery failed.
+    Flow: {{ flow.namespace }}.{{ flow.id }}
+    Execution: {{ execution.id }}
+    Failed tasks: {{ tasksWithState('FAILED') | jq('.[].taskId') | join(', ') }}
+    Inspect: {{ inputs.kestra_url }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+    Check the recovery result: a later verification/reporting failure does not undo a committed attachment.
+  retry:
+    type: constant
+    interval: PT3S
+    maxAttempts: 3
+finally:
+- id: save_result
+  type: io.kestra.plugin.core.storage.Write
+  description: Retain an outcome even for dry-run, rejection or failure. Database temporary tables drop on commit/rollback
+    or session close; the attached destination is retained.
+  extension: .json
+  content: |
+    {{ {'execution_id': execution.id, 'dry_run': inputs.dry_run,
+        'plan': outputs.plan.outputs[0].row ?? null,
+        'approved': outputs.approval.onResume.approved ?? null,
+        'recovery': outputs.recover.outputs[0].row ?? null,
+        'verification': outputs.verify.outputs[0].row ?? null,
+        'failed_tasks': tasksWithState('FAILED') | jq('.[].taskId'),
+        'cleanup': 'Transaction-local snapshots and context are dropped automatically; committed destination is retained.'} | toJson }}
+extend:
+  title: Recover PostgreSQL DEFAULT Partition Rows with Approved Attachment
+  metaTitle: Recover PostgreSQL DEFAULT Partitions with Approval | Kestra
+  shortDescription: Move one month of stranded DEFAULT rows into an attached partition after reviewing a fingerprinted
+    plan. Verify row contents inside the transaction and attachment afterwards.
+  metaDescription: Recover stranded PostgreSQL DEFAULT rows with a dry-run plan, human approval, atomic movement
+    and attachment, retries, and verified results.
+  description: |
+    Recover a missed monthly partition when its rows already occupy DEFAULT and block ordinary partition creation.
+
+    ## How it works
+    1. A disabled daily UTC schedule always dry-runs. Inspect a root RANGE table with one DATE key.
+    2. Save a count and SHA-256 plan; source values stay in PostgreSQL.
+    3. Apply pauses for approval (default reject; two-hour expiry). Under exclusive parent/DEFAULT locks, recheck fingerprints, move rows, compare full row multisets and attach in one transaction.
+    4. Independently verify bounds and empty source month. Existing exact attachments and empty candidate sets are no-ops.
+
+    ## What you get
+    - Plan: `{{ outputs.save_plan.uri }}`; outcome, including failures/rejections: `{{ outputs.save_result.uri }}`.
+    - Recovery counts: `{{ outputs.recover.outputs[0].row }}` when applied.
+    - SQL failure rolls back movement and creation. Temporary snapshots are session-local. Post-commit verification failure alerts without undoing recovery.
+
+    ## Who it's for
+    DBAs repairing small DEFAULT backlogs in a maintenance window.
+
+    ## Why orchestrate this with Kestra
+    Separate inspection, saved evidence, durable approval, atomic SQL, independent verification and failure alerts replace an unaudited manual repair.
+
+    ## Prerequisites
+    PostgreSQL 16+, JDBC plugin, family ownership, schema CREATE and database TEMP permission. Only logged plain leaves; no RLS, foreign keys, table triggers, rules, generated or identity columns. Exclusive locks block parent/DEFAULT access. DEFAULT scans and index builds can be expensive even below the row limit. Applications use the parent; direct-leaf grants are not copied.
+    ### Secrets
+    - `POSTGRES_USERNAME`: database owner role.
+    - `POSTGRES_PASSWORD`: its password.
+    - `SLACK_WEBHOOK_URL`: failure-alert destination.
+
+    ## Quick start
+    1. Configure secrets and JDBC connectivity; import without catalog `extend` metadata.
+    2. Inputs: `jdbc_url` STRING defaults to `jdbc:postgresql://postgres:5432/partition_demo`; `table_schema`/`parent_table` STRING default `public`/`events` (lowercase identifiers, 63/48 chars); `month_start` DATE defaults `2026-10-01`, first day only.
+    3. Run `dry_run` BOOL=true. Review the plan for derived `<parent>_pYYYYMM`.
+    4. Set false, approve, inspect the outcome and query `tableoid` through the parent. `max_rows` INT=10000 (1–100000); `lock_timeout_ms` INT=2000 (100–10000); `statement_timeout_seconds` INT=60 (5–300). `kestra_url` STRING=`http://localhost:8080` builds alert links.
+    5. Select the audit month before enabling the schedule; it never applies automatically.
+
+    ## How to extend
+    Add timestamp handling only with explicit timezone bounds. Large backlogs need a dedicated migration. Changed fingerprints require a fresh plan and approval.
+
+    ## Links
+    - [JDBC Queries](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.queries)
+    - [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [PostgreSQL partitioning](https://www.postgresql.org/docs/16/ddl-partitioning.html)
+  tags:
+  - Data
+  - Infrastructure
+  subTags:
+  - Day 2 Operations
+  - Approval Gates
+  ee: false
+  demo: false
