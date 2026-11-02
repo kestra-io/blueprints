@@ -1,0 +1,447 @@
+id: prometheus-cardinality-explosion-purge-with-regrowth-check
+namespace: company.team
+
+description: |
+  Contain a Prometheus cardinality explosion. Every run compares the series count of the biggest metrics with the
+  snapshot of the previous run and only acts on a metric that keeps growing, then finds the label that explodes. After an
+  approval it deletes the series that carry that label through the TSDB admin API and cleans the tombstones. It then
+  proves the purge took, and waits to see whether the source keeps creating new series, because a purge cannot hold
+  while the application or scrape config still emits the label.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Plan and report only. Nothing is deleted and no approval is requested. The snapshot for the next run is still saved, because trends need it.
+
+  - id: prometheus_url
+    type: STRING
+    defaults: "http://host.docker.internal:9090"
+    description: Base URL of Prometheus, as both the Kestra worker and the Docker task runner reach it.
+
+  - id: min_series
+    type: INT
+    defaults: 5000
+    description: A metric must have at least this many series before its growth counts.
+
+  - id: growth_pct
+    type: INT
+    defaults: 50
+    description: Growth in series count since the previous run, in percent, that counts as a growing run.
+
+  - id: strikes_required
+    type: INT
+    defaults: 2
+    description: Consecutive growing runs before a metric is treated as exploding. One spike never triggers a purge.
+
+  - id: top_n
+    type: INT
+    defaults: 50
+    description: How many of the biggest metrics are read from /api/v1/status/tsdb on each run.
+
+  - id: max_purges
+    type: INT
+    defaults: 3
+    description: At most this many metrics are purged in one run. The rest wait for the next run.
+
+  - id: protected_metrics
+    type: STRING
+    defaults: "up|scrape_.*|prometheus_.*|go_.*|process_.*|alertmanager_.*"
+    description: Regular expression, matched against the whole metric name, of metrics that are never purged.
+
+  - id: allow_whole_metric
+    type: BOOL
+    defaults: false
+    description: When no single label explains the growth, allow deleting the whole metric. Off by default, so such a metric is only reported.
+
+  - id: purge_from
+    type: SELECT
+    values: [explosion_start, all_time]
+    defaults: explosion_start
+    description: explosion_start deletes the series data created since the first growing run, all_time deletes the matching series entirely.
+
+  - id: regrowth_wait
+    type: DURATION
+    defaults: PT45S
+    description: How long to wait after the purge before checking whether new series appeared. Use several scrape intervals.
+
+  - id: regrowth_tolerance
+    type: INT
+    defaults: 0
+    description: Series allowed to appear after the purge. Above this the source is still emitting and the run fails.
+
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT12H
+    description: How long a review waits. Without an answer nothing is deleted, and the next run plans again.
+
+variables:
+  state_scope: main
+  state_key: "prometheus_cardinality_state_{{ vars.state_scope }}"
+  purge_log_key: "prometheus_cardinality_purges_{{ vars.state_scope }}"
+
+triggers:
+  - id: series_churn_detected
+    type: io.kestra.plugin.prometheus.Trigger
+    description: Fires when a job added more than 20000 new series in the last 10 minutes. Shipped disabled. A trigger has no inputs, so the threshold is a literal here.
+    url: "{{ secret('PROMETHEUS_URL') }}"
+    query: "sum by (job) (sum_over_time(scrape_series_added[10m])) > 20000"
+    interval: PT5M
+    fetchType: FETCH_ONE
+    disabled: true
+
+  - id: alertmanager_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Point an Alertmanager webhook receiver at it for a series-growth alert, so the guard runs when the alert fires.
+    key: "{{ secret('PROM_CARDINALITY_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: load_state
+    type: io.kestra.plugin.core.kv.Get
+    description: The series counts, strikes and growth start times saved by the previous run. Empty on the first run, which only records a baseline.
+    key: "{{ render(vars.state_key) }}"
+    errorOnMissing: false
+
+  - id: inspect
+    type: io.kestra.plugin.scripts.node.Script
+    description: Reads the TSDB status, compares it with the previous snapshot, finds the metrics that keep growing and the label that explodes, and checks that the admin API is on. Deletes nothing.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: node:22-alpine
+    env:
+      PROM_URL: "{{ inputs.prometheus_url }}"
+      STATE_JSON: "{{ outputs.load_state.value is defined ? (outputs.load_state.value | toJson) : '{}' }}"
+      MIN_SERIES: "{{ inputs.min_series }}"
+      GROWTH_PCT: "{{ inputs.growth_pct }}"
+      STRIKES_REQUIRED: "{{ inputs.strikes_required }}"
+      TOP_N: "{{ inputs.top_n }}"
+      MAX_PURGES: "{{ inputs.max_purges }}"
+      PROTECTED_METRICS: "{{ inputs.protected_metrics }}"
+      ALLOW_WHOLE_METRIC: "{{ inputs.allow_whole_metric }}"
+      PURGE_FROM: "{{ inputs.purge_from }}"
+    outputFiles:
+      - state.json
+    script: |
+      // inspect: read Prometheus' TSDB status, compare it with the snapshot from the previous run, find metrics whose series count keeps growing,
+      // and work out which label is exploding. Reads only; writes nothing to Prometheus (the admin probe sends no matcher, so it deletes nothing).
+      const fs = require('fs');
+      const PROM = (process.env.PROM_URL || '').replace(/\/+$/, '');
+      const MIN_SERIES = parseInt(process.env.MIN_SERIES || '5000', 10);
+      const GROWTH_PCT = parseFloat(process.env.GROWTH_PCT || '50');
+      const STRIKES_REQUIRED = parseInt(process.env.STRIKES_REQUIRED || '2', 10);
+      const TOP_N = parseInt(process.env.TOP_N || '50', 10);
+      const MAX_PURGES = parseInt(process.env.MAX_PURGES || '3', 10);
+      const PURGE_FROM = process.env.PURGE_FROM || 'explosion_start';
+      const ALLOW_WHOLE_METRIC = String(process.env.ALLOW_WHOLE_METRIC || 'false') === 'true';
+      const STATE_MAX_AGE_MS = 6 * 3600 * 1000;
+      const prev = JSON.parse(process.env.STATE_JSON || '{}') || {};
+      const fail = m => { console.error('CARDINALITY GUARD FAILED: ' + m); process.exit(1); };
+      let protectedRe;
+      try { protectedRe = new RegExp('^(?:' + (process.env.PROTECTED_METRICS || 'a^') + ')$'); } catch (e) { fail('protected_metrics is not a valid regular expression: ' + e.message); }
+
+      async function api(method, path, params) {
+        const u = new URL(PROM + path);
+        for (const [k, v] of params || []) u.searchParams.append(k, v);
+        const r = await fetch(u, { method });
+        const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch (e) { /* not JSON */ }
+        return { status: r.status, json, text };
+      }
+
+      (async () => {
+        if (!PROM) fail('PROM_URL is required');
+        const now = Date.now();
+        // 1. Is the admin API on? delete_series without a matcher is rejected before it deletes anything: 400 means on, 500 "admin APIs disabled" means off.
+        const probe = await api('POST', '/api/v1/admin/tsdb/delete_series');
+        const adminApi = probe.status === 400 && !!probe.json && /match\[\]/.test(probe.json.error || '');
+        const adminDetail = adminApi ? 'enabled' : (probe.status === 500 && probe.json && /admin APIs disabled/.test(probe.json.error || '') ? 'disabled (start Prometheus with --web.enable-admin-api)' : `unexpected answer HTTP ${probe.status}`);
+
+        // 2. Current series count per metric, from the head block.
+        const st = await api('GET', '/api/v1/status/tsdb', [['limit', String(TOP_N)]]);
+        if (st.status !== 200 || !st.json || st.json.status !== 'success') fail(`/api/v1/status/tsdb returned HTTP ${st.status}: ${st.text.slice(0, 120)}`);
+        const top = st.json.data.seriesCountByMetricName || [];
+        const headSeries = st.json.data.headStats.numSeries;
+
+        // 3. Compare with the previous snapshot. A metric needs STRIKES_REQUIRED consecutive growing runs, so one spike never triggers a purge.
+        const fresh = prev.at && (now - prev.at) <= STATE_MAX_AGE_MS;
+        const prevMetrics = fresh ? (prev.metrics || {}) : {};
+        const metrics = {}, watching = [];
+        for (const { name, value } of top) {
+          const p = prevMetrics[name];
+          let growth = null, strikes = 0, since = null;
+          if (p && p.series > 0) {
+            growth = Math.round((value - p.series) * 1000 / p.series) / 10;
+            if (growth >= GROWTH_PCT && value >= MIN_SERIES) { strikes = (p.strikes || 0) + 1; since = p.strikes > 0 ? p.since : prev.at; }
+          }
+          metrics[name] = { series: value, strikes, ...(since ? { since } : {}) };
+          if (strikes > 0) watching.push({ metric: name, series: value, previous: p.series, growth_pct: growth, strikes });
+        }
+
+        // 4. Offenders: enough strikes, not protected. Then find the label that explodes by sampling its series.
+        const offenders = [], byMetric = {}, skipped = [];
+        const candidates = Object.entries(metrics).filter(([, m]) => m.strikes >= STRIKES_REQUIRED).sort((a, b) => b[1].series - a[1].series);
+        for (const [name, m] of candidates) {
+          if (protectedRe.test(name)) { skipped.push({ metric: name, why: 'protected_metrics' }); continue; }
+          if (offenders.length >= MAX_PURGES) { skipped.push({ metric: name, why: 'max_purges reached, handled on a later run' }); continue; }
+          const sel = `{__name__="${name}"}`;
+          const sr = await api('GET', '/api/v1/series', [['match[]', sel], ['start', String(Math.floor(now / 1000) - 1800)], ['end', String(Math.floor(now / 1000))], ['limit', '5000']]);
+          if (sr.status !== 200 || !sr.json || !Array.isArray(sr.json.data)) fail(`/api/v1/series for ${name} returned HTTP ${sr.status}`);
+          const sample = sr.json.data; const distinct = {};
+          for (const s of sample) for (const [k, v] of Object.entries(s)) if (!['__name__', 'instance', 'job'].includes(k)) (distinct[k] = distinct[k] || new Set()).add(v);
+          const ranked = Object.entries(distinct).map(([k, set]) => [k, set.size]).sort((a, b) => b[1] - a[1]);
+          const [culprit, culpritDistinct] = ranked.length && ranked[0][1] > 1 ? ranked[0] : [null, 0];
+          const wholeMetric = culprit === null;
+          if (wholeMetric && !ALLOW_WHOLE_METRIC) { skipped.push({ metric: name, why: 'no single label explains the growth; allow_whole_metric is off, so it needs a manual decision' }); continue; }
+          const from = PURGE_FROM === 'all_time' ? 0 : Math.floor((m.since || now) / 1000);
+          const selector = wholeMetric ? sel : `{__name__="${name}",${culprit}=~".+"}`;
+          byMetric[name] = { selector, culprit: culprit || '(whole metric)', culprit_distinct: culpritDistinct, sampled: sample.length, truncated: sample.length >= 5000, from };
+          offenders.push(name);
+        }
+
+        // 5. The state for the next run. Metrics that stopped growing lose their strikes.
+        fs.writeFileSync('state.json', JSON.stringify({ at: now, metrics }));
+        console.log(`inspect: head ${headSeries} series, ${top.length} metrics read, ${watching.length} growing, ${offenders.length} offender(s), admin API ${adminDetail}${fresh ? '' : ' (no usable previous snapshot: baseline only)'}`);
+        console.log('::' + JSON.stringify({ outputs: { admin_api: adminApi, admin_detail: adminDetail, head_series: headSeries, baseline: !fresh, watching, skipped, offenders: offenders.length, names: offenders, by_metric: byMetric } }) + '::');
+      })().catch(e => fail(e.message));
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Saved on every run, also a dry run, because the next run needs it to see a trend. Expires after two days, so an old snapshot is never compared with a new one.
+    key: "{{ render(vars.state_key) }}"
+    kvType: JSON
+    ttl: P2D
+    value: "{{ read(outputs.inspect.outputFiles['state.json']) }}"
+
+  - id: announce_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Stays quiet unless a metric is exploding or was left alone on purpose.
+    condition: "{{ outputs.inspect.vars.offenders > 0 or (outputs.inspect.vars.skipped | length) > 0 }}"
+    then:
+      - id: announce_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Prometheus cardinality guard ({% if inputs.dry_run %}dry run{% else %}live{% endif %}): {{ outputs.inspect.vars.head_series }} series in the head, admin API {{ outputs.inspect.vars.admin_detail }}.
+          {% for w in outputs.inspect.vars.watching %}- `{{ w.metric }}`: {{ w.previous }} -> {{ w.series }} series (+{{ w.growth_pct }}%), growing for {{ w.strikes }} run(s){% if outputs.inspect.vars.names contains w.metric %}; the exploding label is `{{ outputs.inspect.vars.by_metric[w.metric].culprit }}` ({{ outputs.inspect.vars.by_metric[w.metric].culprit_distinct }} distinct values in {{ outputs.inspect.vars.by_metric[w.metric].sampled }} sampled series); purge selector {{ outputs.inspect.vars.by_metric[w.metric].selector }}{% endif %}
+          {% endfor %}{% for s in outputs.inspect.vars.skipped %}- `{{ s.metric }}` is left alone: {{ s.why }}
+          {% endfor %}{% if outputs.inspect.vars.offenders > 0 and not inputs.dry_run and outputs.inspect.vars.admin_api %}A purge deletes data for those series. Resume execution {{ execution.id }} in Kestra and tick Approve; without an answer within {{ inputs.approval_timeout }} nothing is deleted.{% endif %}
+
+  - id: offenders_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only an exploding, unprotected metric with a known culprit label goes on.
+    condition: "{{ outputs.inspect.vars.offenders > 0 }}"
+    then:
+      - id: admin_gate
+        type: io.kestra.plugin.core.flow.If
+        description: The purge needs --web.enable-admin-api. Without it the run reports and stops.
+        condition: "{{ outputs.inspect.vars.admin_api and not inputs.dry_run }}"
+        then:
+          - id: approve_purge
+            type: io.kestra.plugin.core.flow.Pause
+            description: Human gate. The default is false and a timeout resumes with the default, so silence never deletes anything.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            behavior: RESUME
+            onResume:
+              - id: approve
+                type: BOOL
+                displayName: Delete the series of the metrics listed in the plan?
+                defaults: false
+              - id: exclude
+                type: STRING
+                displayName: Metric names to leave out, comma separated without spaces
+                required: false
+
+          - id: purge_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approve_purge.onResume.approve is defined and outputs.approve_purge.onResume.approve == true }}"
+            then:
+              - id: purge_clock
+                type: io.kestra.plugin.core.output.OutputValues
+                description: One fixed purge time, in epoch seconds, for the delete, the check of the old data and the check for new series. Also holds the reviewer's exclusion list.
+                values:
+                  t: "{{ now() | timestamp }}"
+                  excluded: "{{ outputs.approve_purge.onResume.exclude is defined ? outputs.approve_purge.onResume.exclude : '' }}"
+
+              - id: purge_loop
+                type: io.kestra.plugin.core.flow.Loop
+                description: One delete per exploding metric, one at a time. Each deletes the series that carry the exploding label, from the start of the explosion up to the purge time, never anything newer.
+                values: "{{ outputs.inspect.vars.names }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: purge_if_not_excluded
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ not (outputs.purge_clock.values.excluded | split(',') contains item.value) }}"
+                    then:
+                      - id: delete_series
+                        type: io.kestra.plugin.core.http.Request
+                        description: POST /api/v1/admin/tsdb/delete_series answers 204. Any other answer fails the task.
+                        uri: "{{ inputs.prometheus_url }}/api/v1/admin/tsdb/delete_series"
+                        method: POST
+                        params:
+                          "match[]": "{{ outputs.inspect.vars.by_metric[item.value].selector }}"
+                          start: "{{ outputs.inspect.vars.by_metric[item.value].from }}"
+                          end: "{{ outputs.purge_clock.values.t }}"
+
+              - id: clean_tombstones
+                type: io.kestra.plugin.core.http.Request
+                description: Frees the disk space of the deleted data. The deletion itself already holds for queries.
+                uri: "{{ inputs.prometheus_url }}/api/v1/admin/tsdb/clean_tombstones"
+                method: POST
+
+              - id: record_purge
+                type: io.kestra.plugin.core.kv.Set
+                description: What was approved and deleted, and when, for the audit trail.
+                key: "{{ render(vars.purge_log_key) }}"
+                kvType: JSON
+                value: "{{ {'at': outputs.purge_clock.values.t, 'execution': execution.id, 'metrics': outputs.inspect.vars.names, 'excluded': outputs.purge_clock.values.excluded} | toJson }}"
+
+              - id: regrowth_wait
+                type: io.kestra.plugin.core.flow.Sleep
+                description: Gives the source time to create new series if it is still emitting the label.
+                duration: "{{ inputs.regrowth_wait }}"
+
+              - id: verify_loop
+                type: io.kestra.plugin.core.flow.Loop
+                description: For each purged metric, two checks that use samples. The series API would still list deleted series, so it is not used.
+                values: "{{ outputs.inspect.vars.names }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: verify_if_not_excluded
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ not (outputs.purge_clock.values.excluded | split(',') contains item.value) }}"
+                    then:
+                      - id: check_old_data
+                        type: io.kestra.plugin.prometheus.Query
+                        description: Series that still have samples between the start of the purge and the purge time. The answer must be empty.
+                        url: "{{ inputs.prometheus_url }}"
+                        time: "{{ outputs.purge_clock.values.t }}"
+                        query: "count(count_over_time({{ outputs.inspect.vars.by_metric[item.value].selector }}[{{ (outputs.purge_clock.values.t | number) - outputs.inspect.vars.by_metric[item.value].from }}s])) > 0"
+                        fetchType: FETCH_ONE
+
+                      - id: purge_did_not_take
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ outputs.check_old_data.size > 0 }}"
+                        then:
+                          - id: report_purge_failed
+                            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                            messageText: "Prometheus purge of `{{ item.value }}` did NOT take: {{ outputs.check_old_data.metric.value }} series still have samples before the purge time. Check the admin API answer and the selector {{ outputs.inspect.vars.by_metric[item.value].selector }}."
+
+                          - id: fail_purge_did_not_take
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: "The purge of {{ item.value }} did not remove its old series."
+
+                      - id: check_new_series
+                        type: io.kestra.plugin.prometheus.Query
+                        description: Series that have samples after the purge time. Above the tolerance, the source is still emitting the label.
+                        url: "{{ inputs.prometheus_url }}"
+                        query: "count(count_over_time({{ outputs.inspect.vars.by_metric[item.value].selector }}[{{ (now() | timestamp) - (outputs.purge_clock.values.t | number) }}s])) > {{ inputs.regrowth_tolerance }}"
+                        fetchType: FETCH_ONE
+
+                      - id: source_still_emitting
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ outputs.check_new_series.size > 0 }}"
+                        then:
+                          - id: report_regrowth
+                            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                            messageText: "Prometheus purge of `{{ item.value }}` worked, but {{ outputs.check_new_series.metric.value }} new series appeared within {{ inputs.regrowth_wait }}. The source still emits the label `{{ outputs.inspect.vars.by_metric[item.value].culprit }}`, so a purge will not hold. Fix the application or add a metric_relabel_configs rule that drops the label, then run again."
+
+                          - id: fail_source_still_emitting
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: "{{ item.value }} is still growing after the purge; the source has to be fixed."
+                        else:
+                          - id: report_contained
+                            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                            messageText: "Prometheus series of `{{ item.value }}` purged and verified: nothing left before the purge time, and no new series for the label `{{ outputs.inspect.vars.by_metric[item.value].culprit }}` after {{ inputs.regrowth_wait }}."
+            else:
+              - id: report_not_purged
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: The review was declined or timed out.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: "Prometheus cardinality purge was not approved. Nothing was deleted. The next run plans again from the saved snapshot."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "Prometheus cardinality guard failed in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | abbreviate(300) }}{% endif %}. If this is after delete_series, series may already be deleted: see the purge record in the KV store."
+
+extend:
+  title: Prometheus Cardinality Explosion Purge with Regrowth Check
+  metaTitle: Prometheus Cardinality Explosion Purge and Regrowth Check | Kestra
+  shortDescription: Find Prometheus metrics whose series count keeps growing, locate the exploding label, delete its series after approval, prove the purge took and check that the source stopped emitting.
+  metaDescription: Contain a Prometheus cardinality explosion. Detect growth across runs, find the exploding label, purge after approval and check that the source stopped.
+  description: |
+    A new release puts a request id into a metric label and Prometheus gains thousands of series a minute until it runs out of memory. Deleting the series is a one-line admin call, but it is destructive, it is useless while the source keeps emitting the label, and `/api/v1/series` still lists series after they were deleted. This blueprint decides from a trend, asks a person, and then checks the result the right way.
+
+    ## How it works
+
+    1. `alertmanager_webhook` (or the disabled `series_churn_detected` trigger, a PromQL poll on `scrape_series_added`) starts a run. `load_state` reads the snapshot of the previous run from KV.
+    2. `inspect` (`io.kestra.plugin.scripts.node.Script`) reads `/api/v1/status/tsdb`, whose per-metric counts Prometheus refreshes only about every 40 seconds, so run the flow every few minutes and not more often. It compares each metric with the snapshot. A run counts as growing when the series count grew by `growth_pct` and is at least `min_series`. A metric needs `strikes_required` growing runs in a row, so one spike changes nothing, and it must not match `protected_metrics`.
+    3. For each exploding metric it samples `/api/v1/series` and picks the label with the most distinct values as the culprit, then builds the selector `{__name__="m",culprit=~".+"}`. It also sends `delete_series` without a matcher, which Prometheus rejects before deleting anything: a 400 means the admin API is on, a 500 "admin APIs disabled" means it is off.
+    4. `save_state` stores the new snapshot on every run, also a dry run. `announce_findings` lists each growing metric, the culprit label and the selector.
+    5. `approve_purge` (`io.kestra.plugin.core.flow.Pause`) waits for approval. The default is false, and `exclude` leaves metrics out.
+    6. `purge_loop` posts `delete_series` for each metric, from the start of the explosion to a fixed purge time, then `clean_tombstones` frees the disk and `record_purge` writes an audit record.
+    7. After `regrowth_wait`, `verify_loop` runs `check_old_data`, which must find no series with samples before the purge time, and `check_new_series`, which must find at most `regrowth_tolerance` series after it. New series mean the source still emits the label, and the run fails with that advice.
+
+    ## What you get
+
+    - A purge triggered by a trend, not by one number, with protected metrics that are never touched.
+    - The exploding label named, with how many distinct values it has.
+    - Verification from samples, which honour deletions, and a regrowth check that tells you the purge cannot hold yet.
+    - An audit record of every purge and a snapshot that expires after two days.
+
+    ## Who it's for
+
+    - Platform and SRE teams that run Prometheus and own its memory and disk.
+    - Teams whose applications can start emitting unbounded labels.
+
+    ## Why orchestrate this with Kestra
+
+    Prometheus keeps no history of what its series counts were an hour ago and has no approval step. Kestra keeps the snapshot in KV, pauses for a person, runs the delete, the wait and the verification in order, and starts from an Alertmanager webhook.
+
+    ## Prerequisites
+
+    - Prometheus started with `--web.enable-admin-api` (tested on 3.15.0), reachable from the Kestra worker and the Docker task runner at `prometheus_url`.
+    - If Prometheus sits behind authentication, add the headers to the HTTP and Query tasks and to the script.
+
+    ### Secrets
+
+    - `PROMETHEUS_URL`: base URL for the polling trigger, which cannot read inputs.
+    - `PROM_CARDINALITY_WEBHOOK_KEY`: key for the webhook trigger.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for findings and results.
+
+    ## Quick start
+
+    1. Start an application that can explode: `docker run -d -p 9101:9101 node:22-alpine node -e "let n=0,on=0;require('http').createServer((q,r)=>{if(q.url=='/on')on=1;if(q.url=='/off')on=0;let o='x_total 1\n';if(on)for(let i=0;i<400;i++)o+='req_seconds_count{request_id=\"r'+(++n)+'\"} 1\n';r.end(o)}).listen(9101)"`.
+    2. Start Prometheus with a `prometheus.yml` that has `scrape_interval: 5s` and a job for `host.docker.internal:9101`: `docker run -d -p 9090:9090 -v ./prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus:v3.15.0 --config.file=/etc/prometheus/prometheus.yml --web.enable-admin-api`.
+    3. Add the three secrets, set `min_series` to 1000 and run with `dry_run: true`. The first run only saves a baseline.
+    4. Open `http://localhost:9101/on`, then run the flow twice, a minute apart. The second dry run names `req_seconds_count`, the label `request_id` and the selector.
+    5. Run with `dry_run: false` and tick Approve. The purge is verified, and the run fails with the regrowth advice because the source is still on.
+    6. Open `http://localhost:9101/off`, wait for a scrape, and run again. The metric is contained and verified.
+
+    ## How to extend
+
+    - Add a task that opens a ticket for the team that owns the `job` when a regrowth failure is reported.
+    - Add a `metric_relabel_configs` rule to your Prometheus config in Git once the culprit label is known.
+    - Run one flow per Prometheus by changing `state_scope` and `prometheus_url`.
+
+    ## Links
+
+    - [Prometheus TSDB admin API](https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-admin-apis)
+    - [Prometheus TSDB status](https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats)
+    - [Kestra Prometheus plugin](https://kestra.io/plugins/plugin-prometheus)
+    - [Kestra Node.js script plugin](https://kestra.io/plugins/plugin-script-node)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false

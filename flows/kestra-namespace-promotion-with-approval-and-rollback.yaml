@@ -1,0 +1,751 @@
+id: kestra-namespace-promotion-with-approval-and-rollback
+namespace: company.team
+
+description: |
+  Promotes flows from a staging namespace to a production namespace through the Kestra API, without Git: per-flow diff,
+  validation, an approval with a per-flow pick, a snapshot with a TTL, one-by-one deploy, smoke tests, automatic
+  rollback and an audit CSV. `rollback_to_snapshot` restores a stored snapshot by hand.
+
+inputs:
+  - id: mode
+    type: SELECT
+    values: [promote, rollback_to_snapshot]
+    defaults: promote
+    description: promote copies changed flows from the source to the target. rollback_to_snapshot restores the target flows saved by an earlier run.
+  - id: source_namespace
+    type: STRING
+    defaults: company.staging
+    description: Namespace the flows are promoted from (promote mode). Exact namespace; child namespaces are not included.
+  - id: target_namespace
+    type: STRING
+    defaults: company.prod
+    description: Namespace the flows are deployed to. In rollback mode it must be the namespace stored in the snapshot.
+  - id: flows
+    type: ARRAY
+    itemType: STRING
+    required: false
+    description: Optional flow ids to consider. Empty means every flow of the source namespace (or of the snapshot).
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: true (default) only exports, diffs and validates. false deploys, after the approval.
+  - id: require_approval
+    type: BOOL
+    defaults: true
+    description: Pause for a human decision before deploying. Set false only for a trusted automated pipeline.
+  - id: smoke_test_flows
+    type: ARRAY
+    itemType: STRING
+    required: false
+    description: Deployed flows to execute once (default inputs, label promotion:smoke-test). Any result other than SUCCESS rolls everything back.
+  - id: snapshot_id
+    type: STRING
+    required: false
+    description: Snapshot to restore in rollback_to_snapshot mode. A real run's snapshot id is its execution id.
+  - id: kestra_api_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of the Kestra API as seen from the worker, without a trailing slash.
+
+variables:
+  tenant: main
+  snapshot_ttl: P30D
+  smoke_test_timeout: PT10M
+
+checks:
+  - when: "{{ {'v': inputs.target_namespace} | jq('.v | test(\"^[a-z0-9][a-z0-9_-]*([.][a-z0-9_-]+)*$\")') | first }}"
+    message: target_namespace must be one exact namespace such as company.prod. Empty values and wildcards are refused.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.mode != 'promote' or (({'v': inputs.source_namespace ?? ''} | jq('.v | test(\"^[a-z0-9][a-z0-9_-]*([.][a-z0-9_-]+)*$\")') | first) and inputs.source_namespace != inputs.target_namespace) }}"
+    message: source_namespace must be one exact namespace, different from target_namespace.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.target_namespace != flow.namespace and not (flow.namespace | startsWith(inputs.target_namespace ~ '.')) }}"
+    message: target_namespace must not contain this promotion flow, otherwise a promotion could overwrite the promoter itself.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.mode != 'rollback_to_snapshot' or (inputs.snapshot_id ?? '') | trim != '' }}"
+    message: rollback_to_snapshot needs a snapshot_id (the execution id of the run that took the snapshot).
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ {'v': inputs.kestra_api_url} | jq('.v | test(\"^https?://[^ ]*[^/ ]$\")') | first }}"
+    message: kestra_api_url must be an http(s) URL without a trailing slash.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+sla:
+  - id: max_runtime
+    type: MAX_DURATION
+    duration: PT6H
+    behavior: FAIL
+    labels:
+      promotion_sla: breached
+
+triggers:
+  - id: staging_changed
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call it from CI after a merge to staging. It runs with the defaults, so it only produces a dry-run diff report.
+    key: "{{ secret('PROMOTION_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: export
+    type: io.kestra.plugin.core.flow.Dag
+    description: |
+      Reads everything the diff needs. Both namespace lists and the two KV reads start together; `fetch_sources` waits
+      for both lists. Every failure here is a hard fail: nothing has changed yet, and a diff on partial data would be wrong.
+    concurrent: 4
+    tasks:
+      - task:
+          id: list_source
+          type: io.kestra.plugin.core.http.Request
+          runIf: "{{ inputs.mode == 'promote' }}"
+          uri: "{{ inputs.kestra_api_url }}/api/v1/{{ vars.tenant }}/flows/{{ inputs.source_namespace }}"
+          options:
+            auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+          timeout: PT1M
+          retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+      - task:
+          id: list_target
+          type: io.kestra.plugin.core.http.Request
+          uri: "{{ inputs.kestra_api_url }}/api/v1/{{ vars.tenant }}/flows/{{ inputs.target_namespace }}"
+          options:
+            auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+          timeout: PT1M
+          retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+      - task:
+          id: load_snapshot
+          type: io.kestra.plugin.core.kv.Get
+          description: Hard fail on a missing key, which means a wrong id or a snapshot older than its 30-day TTL.
+          runIf: "{{ inputs.mode == 'rollback_to_snapshot' }}"
+          key: "promotion_snapshot_{{ inputs.snapshot_id | trim }}"
+          errorOnMissing: true
+      - task:
+          id: load_state
+          type: io.kestra.plugin.core.kv.Get
+          description: Hash of every flow this blueprint last deployed to the target, to detect edits made directly in production.
+          key: "promotion_state_{{ inputs.target_namespace | replace({'.': '_'}) }}"
+          errorOnMissing: false
+      - task:
+          id: fetch_sources
+          type: io.kestra.plugin.core.flow.Loop
+          description: The namespace list has no YAML, so each flow source is read with `?source=true`, 4 at a time.
+          values: >-
+            {{ {'api': inputs.kestra_api_url ~ '/api/v1/' ~ vars.tenant, 's': outputs.list_source.body is defined ? fromJson(outputs.list_source.body) : [], 't': fromJson(outputs.list_target.body)}
+               | jq('[.api as $a | (.s[] | {side: "source", api: $a, namespace, id}), (.t[] | {side: "target", api: $a, namespace, id})]') | first | toJson }}
+          concurrencyLimit: 4
+          transmitFailed: true
+          tasks:
+            - id: get_source
+              type: io.kestra.plugin.core.http.Request
+              uri: "{{ fromJson(item.value).api }}/flows/{{ fromJson(item.value).namespace }}/{{ fromJson(item.value).id }}?source=true"
+              options:
+                auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+              timeout: PT1M
+              retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+          outputs:
+            - id: row
+              type: JSON
+              value: "{{ {'side': fromJson(item.value).side, 'f': fromJson(outputs.get_source.body)} | jq('{side, flow_id: .f.id, revision: .f.revision, source: .f.source, tasks: (.f.tasks // []), triggers: (.f.triggers // []), exception: (.f.exception // null)}') | first | toJson }}"
+        dependsOn: [list_source, list_target]
+
+  - id: diff
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Builds the wanted state per flow and compares it with the target. promote: the source YAML with every reference to
+      the source namespace rewritten (the `namespace:` line, Subflow calls, Flow triggers). rollback: the snapshot
+      sources, and a delete for flows the snapshot did not have. Per flow: a status, a line diff, the top-level tasks and
+      triggers added, removed or modified, and a flag when the target was edited outside this blueprint. Wrong scopes
+      (empty source, unknown flow ids, a snapshot of another namespace) fail here, before anything changes.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT5M
+    parameters:
+      mode: "{{ inputs.mode }}"
+      src_ns: "{{ inputs.mode == 'promote' ? inputs.source_namespace : '' }}"
+      tgt_ns: "{{ inputs.target_namespace }}"
+      pick: "{{ (inputs.flows ?? []) | toJson }}"
+      smoke: "{{ (inputs.smoke_test_flows ?? []) | toJson }}"
+      rows: "{{ (outputs.fetch_sources.outputs ?? []) | jq('[.[].outputs.row]') | first | toJson }}"
+      snapshot: "{{ (outputs.load_snapshot.value ?? {}) | toJson }}"
+      state: "{{ (outputs.load_state.value ?? {}) | toJson }}"
+      api: "{{ inputs.kestra_api_url }}/api/v1/{{ vars.tenant }}"
+    sql: |
+      CREATE TABLE p AS SELECT :mode AS mode, :src_ns AS src_ns, :tgt_ns AS tgt_ns, :api AS api, from_json(:pick, '["VARCHAR"]') AS pick,
+        from_json(:smoke, '["VARCHAR"]') AS smoke, CAST(:snapshot AS JSON) AS snap, CAST(:state AS JSON) AS state;
+      CREATE MACRO ns_re(a) AS '(^|[^A-Za-z0-9_.-])' || replace(a, '.', '\.') || '([^A-Za-z0-9_-]|$)';
+      CREATE MACRO rw(t, a, b) AS CASE WHEN a = '' OR t IS NULL THEN t ELSE regexp_replace(t, ns_re(a), '\1' || b || '\2', 'g') END;
+      CREATE TABLE fl AS SELECT json_extract_string(r, '$.side') AS side, json_extract_string(r, '$.flow_id') AS flow_id,
+        TRY_CAST(json_extract_string(r, '$.revision') AS INTEGER) AS revision, json_extract_string(r, '$.source') AS source,
+        CAST(json_extract(r, '$.tasks') AS VARCHAR) AS tasks, CAST(json_extract(r, '$.triggers') AS VARCHAR) AS triggers,
+        json_extract_string(r, '$.exception') AS exception FROM (SELECT unnest(from_json(:rows, '["JSON"]')) AS r);
+      CREATE TABLE snapf AS SELECT json_extract_string(f, '$.flow_id') AS flow_id, CAST(json_extract_string(f, '$.existed') AS BOOLEAN) AS existed,
+        json_extract_string(f, '$.source') AS source, CAST(json_extract(f, '$.tasks') AS VARCHAR) AS tasks, CAST(json_extract(f, '$.triggers') AS VARCHAR) AS triggers
+        FROM (SELECT unnest(from_json(CAST(json_extract(snap, '$.flows') AS VARCHAR), '["JSON"]')) AS f FROM p WHERE mode = 'rollback_to_snapshot');
+
+      CREATE TABLE problems AS
+      SELECT 'source namespace ' || src_ns || ' has no flows (typo, or wrong instance)' AS msg FROM p WHERE mode = 'promote' AND NOT EXISTS (SELECT 1 FROM fl WHERE side = 'source')
+      UNION ALL SELECT 'flow ' || f || ' is not in ' || CASE WHEN mode = 'promote' THEN 'source namespace ' || src_ns ELSE 'the snapshot' END
+        FROM p, unnest(pick) u(f) WHERE f NOT IN (SELECT flow_id FROM fl WHERE side = 'source' UNION ALL SELECT flow_id FROM snapf)
+      UNION ALL SELECT 'snapshot was taken of ' || coalesce(json_extract_string(snap, '$.target_namespace'), '?') || ', not of ' || tgt_ns || '; refusing to restore it elsewhere'
+        FROM p WHERE mode = 'rollback_to_snapshot' AND coalesce(json_extract_string(snap, '$.target_namespace'), '') <> tgt_ns;
+      CREATE TABLE gate AS SELECT CASE WHEN count(*) > 0 THEN error('Nothing was changed. ' || string_agg(msg, '; ')) END AS ok FROM problems;
+
+      CREATE TABLE desired AS
+      SELECT s.flow_id, rw(s.source, p.src_ns, p.tgt_ns) AS want_source, rw(s.tasks, p.src_ns, p.tgt_ns) AS want_tasks, rw(s.triggers, p.src_ns, p.tgt_ns) AS want_triggers,
+             s.exception, greatest(len(regexp_extract_all(s.source, ns_re(p.src_ns))) - 1, 0) AS refs_rewritten
+        FROM fl s, p WHERE s.side = 'source' AND (len(p.pick) = 0 OR list_contains(p.pick, s.flow_id))
+      UNION ALL SELECT f.flow_id, CASE WHEN f.existed THEN f.source END, f.tasks, f.triggers, NULL, 0 FROM snapf f, p WHERE len(p.pick) = 0 OR list_contains(p.pick, f.flow_id);
+      CREATE TABLE cmp AS
+      SELECT coalesce(d.flow_id, t.flow_id) AS flow_id, d.flow_id IS NOT NULL AS in_desired, d.want_source, d.want_tasks, d.want_triggers, d.exception,
+             t.source AS cur_source, t.revision AS cur_revision, t.tasks AS cur_tasks, t.triggers AS cur_triggers, coalesce(d.refs_rewritten, 0) AS refs_rewritten,
+             sha256(t.source) AS cur_sha, sha256(d.want_source) AS want_sha, p.mode,
+             json_extract_string(p.state, '$."' || coalesce(d.flow_id, t.flow_id) || '".sha') AS last_sha
+        FROM desired d FULL JOIN (SELECT * FROM fl WHERE side = 'target') t ON d.flow_id = t.flow_id, p
+       WHERE d.flow_id IS NOT NULL OR (p.mode = 'promote' AND len(p.pick) = 0);
+      CREATE TABLE it AS
+      SELECT *, CASE WHEN status IN ('new', 'deleted_after_snapshot') THEN 'create' WHEN status IN ('changed', 'changed_after_snapshot') THEN 'update'
+                     WHEN status = 'created_after_snapshot' THEN 'delete' ELSE 'none' END AS action
+        FROM (SELECT *, CASE WHEN NOT in_desired THEN 'removed_in_source'
+                  WHEN mode = 'promote' THEN CASE WHEN cur_source IS NULL THEN 'new' WHEN cur_sha = want_sha THEN 'unchanged' ELSE 'changed' END
+                  WHEN want_source IS NULL THEN CASE WHEN cur_source IS NULL THEN 'unchanged' ELSE 'created_after_snapshot' END
+                  WHEN cur_source IS NULL THEN 'deleted_after_snapshot' WHEN cur_sha = want_sha THEN 'unchanged' ELSE 'changed_after_snapshot' END AS status,
+                coalesce(last_sha <> cur_sha, false) AS target_edited FROM cmp);
+
+      CREATE TABLE ln AS
+      WITH x AS (SELECT flow_id, 1 AS side, coalesce(want_source, '') AS s FROM it WHERE action <> 'none' UNION ALL SELECT flow_id, -1, coalesce(cur_source, '') FROM it WHERE action <> 'none'),
+           y AS (SELECT flow_id, side, unnest(string_split(s, chr(10))) AS l, generate_subscripts(string_split(s, chr(10)), 1) AS pos FROM x)
+      SELECT flow_id, rtrim(l, chr(13) || ' ') AS l, sum(side) AS delta, min(pos) AS pos FROM y WHERE trim(l, chr(13) || ' ') <> '' GROUP BY 1, 2 HAVING sum(side) <> 0;
+      CREATE TABLE ls AS SELECT flow_id, CAST(sum(greatest(delta, 0)) AS INTEGER) AS added, CAST(sum(greatest(-delta, 0)) AS INTEGER) AS removed,
+             array_to_string(list_slice(list(CASE WHEN delta > 0 THEN '      + ' ELSE '      - ' END || left(l, 110) ORDER BY pos, delta), 1, 6), chr(10)) AS preview
+        FROM ln GROUP BY flow_id;
+      CREATE TABLE tk AS
+      WITH x AS (SELECT flow_id, 'w' AS side, want_tasks AS a, want_triggers AS b FROM it WHERE action = 'update' UNION ALL SELECT flow_id, 'c', cur_tasks, cur_triggers FROM it WHERE action = 'update'),
+           y AS (SELECT flow_id, side, '' AS pre, unnest(from_json(coalesce(a, '[]'), '["JSON"]')) AS t FROM x UNION ALL SELECT flow_id, side, 'trigger ', unnest(from_json(coalesce(b, '[]'), '["JSON"]')) FROM x),
+           z AS (SELECT flow_id, side, pre || json_extract_string(t, '$.id') AS id, CAST(t AS VARCHAR) AS body FROM y)
+      SELECT coalesce(w.flow_id, c.flow_id) AS flow_id,
+             string_agg(CASE WHEN c.id IS NULL THEN '+' WHEN w.id IS NULL THEN '-' ELSE '~' END || coalesce(w.id, c.id), ' ' ORDER BY coalesce(w.id, c.id)) AS task_changes
+        FROM (SELECT * FROM z WHERE side = 'w') w FULL JOIN (SELECT * FROM z WHERE side = 'c') c ON w.flow_id = c.flow_id AND w.id = c.id
+       WHERE w.body IS DISTINCT FROM c.body GROUP BY 1;
+      CREATE TABLE out AS
+      SELECT *, CASE WHEN action IN ('create', 'update') THEN CAST(row_number() OVER (PARTITION BY action IN ('create', 'update') ORDER BY action_rank, flow_id) - 1 AS INTEGER) END AS vindex,
+             flow_id || ' | ' || status || CASE WHEN action = 'update' AND added + removed = 0 THEN ' | whitespace or line endings only'
+                                                WHEN action <> 'none' THEN ' | +' || added || ' -' || removed || ' lines' ELSE '' END
+               || CASE WHEN task_changes <> '' THEN ' | ' || task_changes ELSE '' END || CASE WHEN target_edited THEN ' | TARGET EDITED OUTSIDE PROMOTION' ELSE '' END AS option
+        FROM (SELECT it.*, coalesce(ls.added, 0) AS added, coalesce(ls.removed, 0) AS removed, coalesce(ls.preview, '') AS preview, coalesce(tk.task_changes, '') AS task_changes,
+                     CASE action WHEN 'create' THEN 1 WHEN 'update' THEN 2 WHEN 'delete' THEN 3 ELSE 4 END AS action_rank,
+                     list_contains(p.smoke, it.flow_id) AND action IN ('create', 'update') AS smoke_test, p.api, p.tgt_ns
+                FROM it LEFT JOIN ls USING (flow_id) LEFT JOIN tk USING (flow_id), p);
+
+      SELECT count(*) AS flows_compared, count(*) FILTER (WHERE action <> 'none') AS candidates, count(*) FILTER (WHERE vindex IS NOT NULL) AS to_validate,
+             count(*) FILTER (WHERE status = 'unchanged') AS unchanged, count(*) FILTER (WHERE status = 'removed_in_source') AS removed_in_source,
+             count(*) FILTER (WHERE target_edited) AS target_edited,
+             coalesce(string_agg(want_source, chr(10) || '---' || chr(10) ORDER BY vindex) FILTER (WHERE vindex IS NOT NULL), '') AS validate_yaml,
+             CAST(to_json(list(json_object('flow_id', flow_id, 'status', status, 'action', action, 'option', option, 'vindex', vindex, 'added', added,
+                 'removed', removed, 'task_changes', task_changes, 'preview', preview, 'refs_rewritten', refs_rewritten, 'target_edited', target_edited,
+                 'exception', exception, 'smoke_test', smoke_test, 'api', api, 'target_namespace', tgt_ns, 'cur_revision', cur_revision, 'want_sha', want_sha,
+                 'want_source', want_source, 'cur_source', cur_source, 'cur_tasks', CAST(cur_tasks AS JSON), 'cur_triggers', CAST(cur_triggers AS JSON))
+                 ORDER BY action_rank, flow_id)) AS VARCHAR) AS items
+        FROM out;
+
+  - id: validate
+    type: io.kestra.plugin.core.http.Request
+    description: |
+      One request validates every flow to create or update, as one multi-document YAML, against the target namespace and
+      the plugins installed on this server. Retried: validation has no side effects. Sources are passed as data, so their
+      own `{{ }}` expressions are never rendered here.
+    runIf: "{{ outputs.diff.outputs[0].row.to_validate > 0 }}"
+    uri: "{{ inputs.kestra_api_url }}/api/v1/{{ vars.tenant }}/flows/validate"
+    method: POST
+    contentType: application/x-yaml
+    body: "{{ outputs.diff.outputs[0].row.validate_yaml }}"
+    options:
+      auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+    timeout: PT2M
+    retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+  - id: review
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Joins the validation result to each flow and renders the diff report. Blocking: a constraint violation, a deprecated
+      property written in the source, a plugin the server reports as replaced, a Subflow call to a flow that is neither in
+      the target nor in this promotion. Deprecated paths the source does not contain are ignored (on 2.0.5 the DuckDB
+      plugin reports its unset `connectionPooling` defaults for every flow). Other warnings are shown, not blocking.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT2M
+    parameters:
+      items: "{{ outputs.diff.outputs[0].row.items }}"
+      vres: "{{ outputs.validate.body ?? '[]' }}"
+      header: "{{ inputs.dry_run ? 'DRY RUN' : 'PLAN' }} {{ inputs.mode }} {{ inputs.mode == 'promote' ? inputs.source_namespace : 'snapshot ' ~ (inputs.snapshot_id ?? '') }} -> {{ inputs.target_namespace }}"
+    sql: |
+      CREATE TABLE i AS SELECT r, json_extract_string(r, '$.flow_id') AS flow_id, TRY_CAST(json_extract_string(r, '$.vindex') AS INTEGER) AS vindex,
+             json_extract_string(r, '$.action') AS action FROM (SELECT unnest(from_json(:items, '["JSON"]')) AS r);
+      CREATE MACRO strs(x, k) AS from_json(coalesce(CAST(json_extract(x, k) AS VARCHAR), '[]'), '["VARCHAR"]');
+      CREATE TABLE v AS SELECT CAST(json_extract_string(x, '$.index') AS INTEGER) AS idx, json_extract_string(x, '$.constraints') AS constraints,
+             strs(x, '$.deprecationPaths') AS dep, strs(x, '$.warnings') AS warns, strs(x, '$.infos') AS infos FROM (SELECT unnest(from_json(:vres, '["JSON"]')) AS x);
+      CREATE TABLE j AS
+      SELECT i.*, v.constraints, coalesce(v.warns, []) AS warns,
+             list_filter(coalesce(v.dep, []), x -> contains(json_extract_string(i.r, '$.want_source'), regexp_extract(x, '([A-Za-z0-9_]+)$', 1) || chr(58))) AS dep,
+             list_filter(coalesce(v.infos, []), x -> lower(x) LIKE '%replaced by%' OR lower(x) LIKE '%deprecated%') AS dep_infos,
+             list_distinct(flatten(list_transform(coalesce(v.warns, []), x -> regexp_extract_all(x, 'subflow ''([^'']+)'' not found', 1)))) AS missing
+        FROM i LEFT JOIN v ON i.vindex = v.idx;
+      CREATE TABLE g AS
+      SELECT *, CASE WHEN action NOT IN ('create', 'update') THEN '' WHEN len(blockers) > 0 THEN 'BLOCKED' WHEN len(warns) > 0 THEN 'warnings' ELSE 'valid' END AS validation
+        FROM (SELECT j.*, list_filter(missing, m -> list_contains(c.ids, m)) AS missing_in_batch,
+                     list_concat(CASE WHEN constraints IS NOT NULL THEN [left(constraints, 300)] ELSE [] END, list_transform(dep, x -> 'deprecated property ' || x), dep_infos,
+                       list_transform(list_filter(missing, m -> NOT list_contains(c.ids, m)), m -> 'calls subflow ' || m || ' which is neither in the target nor in this promotion')) AS blockers
+                FROM j, (SELECT coalesce(list(flow_id), []) AS ids FROM i WHERE vindex IS NOT NULL) c);
+      SELECT coalesce(string_agg(flow_id || ': ' || array_to_string(blockers, ' / '), '; ' ORDER BY flow_id) FILTER (WHERE len(blockers) > 0), '') AS problems,
+        :header || chr(10) || coalesce(string_agg('[' || json_extract_string(r, '$.status') || '] ' || json_extract_string(r, '$.option')
+            || CASE WHEN validation <> '' THEN ' | validation ' || validation ELSE '' END
+            || CASE WHEN CAST(json_extract_string(r, '$.refs_rewritten') AS INTEGER) > 0 THEN ' | ' || json_extract_string(r, '$.refs_rewritten') || ' namespace reference(s) rewritten' ELSE '' END
+            || CASE WHEN json_extract_string(r, '$.exception') IS NOT NULL THEN ' | source does not parse' ELSE '' END
+            || CASE WHEN len(blockers) > 0 THEN chr(10) || '      ! ' || array_to_string(blockers, chr(10) || '      ! ')
+                    WHEN len(warns) > 0 THEN chr(10) || '      ? ' || array_to_string(warns, chr(10) || '      ? ') ELSE '' END
+            || CASE WHEN json_extract_string(r, '$.preview') <> '' THEN chr(10) || json_extract_string(r, '$.preview') ELSE '' END,
+            chr(10) ORDER BY action = 'none', flow_id), '(no flows)') AS report,
+        CAST(to_json(list(json_merge_patch(r, json_object('validation', validation, 'missing_subflows', missing_in_batch)))) AS VARCHAR) AS items,
+        CAST(to_json(coalesce(list(json_extract_string(r, '$.option') ORDER BY flow_id) FILTER (WHERE action <> 'none'), [])) AS VARCHAR) AS options
+        FROM g;
+
+  - id: log_report
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.review.outputs[0].row.report }}
+      {{ outputs.diff.outputs[0].row.candidates }} flow(s) to change, {{ outputs.diff.outputs[0].row.unchanged }} unchanged, {{ outputs.diff.outputs[0].row.removed_in_source }} only in the target (reported, never deleted by a promotion), {{ outputs.diff.outputs[0].row.target_edited }} edited in the target outside this blueprint.
+
+  - id: validation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Hard fail before the approval, so nobody is asked to approve flows the server would reject or that would break in production.
+    condition: "{{ outputs.review.outputs[0].row.problems != '' }}"
+    then:
+      - id: blocked
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Validation blocked the {{ inputs.mode }}, nothing was changed: {{ outputs.review.outputs[0].row.problems }}"
+
+  - id: in_sync
+    type: io.kestra.plugin.core.flow.If
+    description: The idempotent path. A re-run after a successful promotion finds every flow unchanged and stops here.
+    condition: "{{ outputs.diff.outputs[0].row.candidates == 0 }}"
+    then:
+      - id: log_in_sync
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ inputs.target_namespace }} already matches, nothing to deploy ({{ outputs.diff.outputs[0].row.flows_compared }} flow(s) compared)."
+
+  - id: approval
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ not inputs.dry_run and inputs.require_approval and outputs.diff.outputs[0].row.candidates > 0 }}"
+    then:
+      - id: request_approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: |
+          The form lists one option per flow with its diff summary (status, changed lines, changed tasks, edits made outside
+          the promotion), all preselected: untick a flow to hold it back. The line preview is in `log_report`. Without an
+          answer in 4 hours the run fails and nothing is deployed.
+        pauseDuration: PT4H
+        behavior: FAIL
+        onResume:
+          - id: approve
+            type: BOOL
+            displayName: Deploy the ticked flows to the target namespace? (the diff is in the log_report task)
+            defaults: false
+          - id: promote_flows
+            type: MULTISELECT
+            displayName: Flows to change (untick to hold one back)
+            expression: "{{ fromJson(outputs.review.outputs[0].row.options) }}"
+            defaults: "{{ fromJson(outputs.review.outputs[0].row.options) }}"
+            required: true
+          - id: reason
+            type: STRING
+            displayName: Reason or change ticket (kept in the audit CSV)
+      - id: check_decision
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ not (outputs.request_approval.onResume.approve ?? false) }}"
+        then:
+          - id: rejected
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "Rejected by the approver{{ (outputs.request_approval.onResume.reason ?? '') != '' ? ': ' ~ outputs.request_approval.onResume.reason : '' }}. Nothing was deployed."
+
+  - id: selection
+    type: io.kestra.plugin.core.output.OutputValues
+    description: The flows to change after the approver's pick (all candidates when no approval ran).
+    values:
+      selected: >-
+        {{ {'items': fromJson(outputs.review.outputs[0].row.items), 'picked': outputs.request_approval.onResume.promote_flows ?? null}
+           | jq('[.picked as $p | .items[] | select(.action != "none") | select(. as $i | $p == null or ($p | any(. == $i.option)))]') | first | toJson }}
+
+  - id: dependency_gate
+    type: io.kestra.plugin.core.flow.If
+    description: A new Subflow that a ticked flow calls must be ticked too, or the caller would break in production.
+    condition: "{{ fromJson(outputs.selection.values.selected) | jq('[map(.flow_id) as $ids | .[].missing_subflows[]? | select(. as $m | $ids | index($m) | not)] | length') | first > 0 }}"
+    then:
+      - id: dependency_missing
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Nothing was deployed: {{ fromJson(outputs.selection.values.selected) | jq('[map(.flow_id) as $ids | .[] | . as $i | .missing_subflows[]? | select(. as $m | $ids | index($m) | not) | $i.flow_id + \" calls new subflow \" + . + \" which was not ticked\"] | join(\"; \")') | first }}."
+
+  - id: apply
+    type: io.kestra.plugin.core.flow.If
+    description: |
+      The only branch that changes the target. An `If`, not `runIf`, on purpose: on Kestra 2.0.5 a Loop with
+      `runIf: false` is marked SKIPPED but still starts its iterations.
+    condition: "{{ not inputs.dry_run and (fromJson(outputs.selection.values.selected) | length) > 0 }}"
+    then:
+      - id: recheck_target
+        type: io.kestra.plugin.core.http.Request
+        description: Lists the target again right before deploying, because the approval may have waited for hours.
+        uri: "{{ inputs.kestra_api_url }}/api/v1/{{ vars.tenant }}/flows/{{ inputs.target_namespace }}"
+        options:
+          auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+        timeout: PT1M
+        retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+      - id: freshness_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Optimistic lock. A selected flow whose revision changed (or that appeared or disappeared) since the diff stops the run.
+        condition: "{{ ({'sel': fromJson(outputs.selection.values.selected), 'now': fromJson(outputs.recheck_target.body)} | jq('[(.now | map({(.id): .revision}) | add // {}) as $r | .sel[] | select(($r[.flow_id] // null) != (.cur_revision // null))] | length') | first) > 0 }}"
+        then:
+          - id: target_moved
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "{{ {'sel': fromJson(outputs.selection.values.selected), 'now': fromJson(outputs.recheck_target.body)} | jq('[(.now | map({(.id): .revision}) | add // {}) as $r | .sel[] | select(($r[.flow_id] // null) != (.cur_revision // null)) | .flow_id] | join(\", \")') | first }} changed in {{ inputs.target_namespace }} while the approval was pending. Nothing was deployed; run again for a fresh diff."
+
+      - id: backup
+        type: io.kestra.plugin.core.kv.Set
+        description: |
+          The rollback point: the target source of every selected flow (or the fact that it did not exist), proven current by
+          `freshness_gate`. It expires after 30 days (`ttl`). Its id is this execution id, also in the audit CSV.
+        key: "promotion_snapshot_{{ execution.id }}"
+        kvType: JSON
+        ttl: "{{ vars.snapshot_ttl }}"
+        kvDescription: "Flows of {{ inputs.target_namespace }} before execution {{ execution.id }} ({{ inputs.mode }})"
+        value: >-
+          {{ {'snapshot_id': execution.id, 'target_namespace': inputs.target_namespace, 'mode': inputs.mode, 'taken_at': execution.startDate ~ '',
+              'flows': fromJson(outputs.selection.values.selected) | jq('[.[] | {flow_id, existed: (.cur_source != null), revision: .cur_revision, source: .cur_source, tasks: .cur_tasks, triggers: .cur_triggers}]') | first} | toJson }}
+
+      - id: deploy
+        type: io.kestra.plugin.core.flow.Loop
+        description: |
+          One flow at a time (`concurrencyLimit: 1`); `transmitFailed: true` stops at the first failure, so later flows are
+          never touched. `allowFailure` lets the run continue into `verdict`, which rolls back everything attempted. Creates
+          (POST) and updates (PUT) are retried; a retry after a create that did succeed answers 409, and the rollback then
+          deletes that flow. Deletes (rollback mode only) accept 404 as already done and are not retried; they are sent as JSON
+          because the API answers 415 to a DELETE declared as YAML.
+        values: "{{ outputs.selection.values.selected }}"
+        concurrencyLimit: 1
+        transmitFailed: true
+        allowFailure: true
+        tasks:
+          - id: apply_flow
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ fromJson(item.value).api }}/flows{{ fromJson(item.value).action == 'create' ? '' : '/' ~ fromJson(item.value).target_namespace ~ '/' ~ fromJson(item.value).flow_id }}"
+            method: "{{ fromJson(item.value).action == 'create' ? 'POST' : (fromJson(item.value).action == 'update' ? 'PUT' : 'DELETE') }}"
+            contentType: "{{ fromJson(item.value).action == 'delete' ? 'application/json' : 'application/x-yaml' }}"
+            body: "{{ fromJson(item.value).want_source ?? '' }}"
+            options:
+              allowFailed: "{{ fromJson(item.value).action == 'delete' }}"
+              auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+            timeout: PT1M
+            retry: {type: exponential, interval: PT5S, maxInterval: PT30S, maxAttempts: 3}
+          - id: check_applied
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ ['200', '204', '404'] contains (outputs.apply_flow.code ~ '') }}"
+            errorMessage: "{{ fromJson(item.value).action }} of {{ fromJson(item.value).flow_id }} answered HTTP {{ outputs.apply_flow.code }}"
+        outputs:
+          - id: row
+            type: JSON
+            value: |
+              {{ {'flow_id': fromJson(item.value).flow_id, 'action': fromJson(item.value).action,
+                  'ok': outputs.apply_flow.code is defined and (['200', '204', '404'] contains (outputs.apply_flow.code ~ '')),
+                  'revision': fromJson(item.value).action != 'delete' and outputs.apply_flow.body is defined ? fromJson(outputs.apply_flow.body).revision : null} | toJson }}
+
+      - id: deployed
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          rows: "{{ (outputs.deploy.outputs ?? []) | jq('[.[].outputs.row]') | first | toJson }}"
+          all_ok: "{{ {'d': (outputs.deploy.outputs ?? []) | jq('[.[].outputs.row]') | first, 's': fromJson(outputs.selection.values.selected)} | jq('([.d[] | select(.ok == true)] | length) == (.s | length)') | first }}"
+          smoke_items: "{{ {'s': fromJson(outputs.selection.values.selected), 't': vars.smoke_test_timeout} | jq('[.t as $t | .s[] | select(.smoke_test == true) | {flow_id, api, target_namespace, timeout: $t}]') | first | toJson }}"
+
+      - id: smoke_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.deployed.values.all_ok == 'true' and (fromJson(outputs.deployed.values.smoke_items) | length) > 0 }}"
+        then:
+          - id: smoke_tests
+            type: io.kestra.plugin.core.flow.Loop
+            description: |
+              Starts after every flow is deployed, so a new Subflow is already in place. One at a time, stop at the first
+              failure. No retry: re-running a test execution could repeat its side effects.
+            values: "{{ outputs.deployed.values.smoke_items }}"
+            concurrencyLimit: 1
+            transmitFailed: true
+            allowFailure: true
+            tasks:
+              - id: run_smoke_test
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ fromJson(item.value).api }}/executions/{{ fromJson(item.value).target_namespace }}/{{ fromJson(item.value).flow_id }}"
+                method: POST
+                contentType: multipart/form-data
+                params:
+                  wait: "true"
+                  labels: "promotion:smoke-test"
+                options:
+                  auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+                timeout: "{{ fromJson(item.value).timeout }}"
+              - id: check_smoke_test
+                type: io.kestra.plugin.core.execution.Assert
+                conditions:
+                  - "{{ fromJson(outputs.run_smoke_test.body).state.current == 'SUCCESS' }}"
+                errorMessage: "Smoke test of {{ fromJson(item.value).flow_id }} ended {{ fromJson(outputs.run_smoke_test.body).state.current }} (execution {{ fromJson(outputs.run_smoke_test.body).id }})"
+            outputs:
+              - id: row
+                type: JSON
+                value: "{{ {'flow_id': fromJson(item.value).flow_id, 'state': outputs.run_smoke_test.body is defined ? fromJson(outputs.run_smoke_test.body).state.current : 'NOT_STARTED', 'ok': outputs.run_smoke_test.body is defined and fromJson(outputs.run_smoke_test.body).state.current == 'SUCCESS'} | toJson }}"
+
+      - id: verdict
+        type: io.kestra.plugin.core.output.OutputValues
+        description: What failed, and the flows to restore (every flow the deploy attempted, with its snapshot source).
+        values:
+          smoke_rows: "{{ (outputs.smoke_tests.outputs ?? []) | jq('[.[].outputs.row]') | first | toJson }}"
+          failed: "{{ outputs.deployed.values.all_ok != 'true' or ({'s': (outputs.smoke_tests.outputs ?? []) | jq('[.[].outputs.row]') | first, 'n': fromJson(outputs.deployed.values.smoke_items)} | jq('([.s[] | select(.ok == true)] | length) < (.n | length)') | first) }}"
+          failed_at: "{{ {'d': fromJson(outputs.deployed.values.rows), 's': (outputs.smoke_tests.outputs ?? []) | jq('[.[].outputs.row]') | first} | jq('([.d[] | select(.ok != true) | \"deploy of \" + .flow_id] + [.s[] | select(.ok != true) | \"smoke test of \" + .flow_id + \" (\" + .state + \")\"]) | first // \"none\"') | first }}"
+          restore_items: "{{ {'d': fromJson(outputs.deployed.values.rows), 'sel': fromJson(outputs.selection.values.selected)} | jq('[(.d | map(.flow_id)) as $done | .sel[] | select(. as $i | $done | index($i.flow_id)) | {flow_id, api, target_namespace, existed: (.cur_source != null), source: .cur_source}]') | first | toJson }}"
+
+      - id: rollback_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.verdict.values.failed == 'true' }}"
+        then:
+          - id: restore
+            type: io.kestra.plugin.core.flow.Loop
+            description: |
+              Automatic rollback to the snapshot. Every attempted flow is restored, even when one restore fails
+              (`transmitFailed: false`): an existing flow gets its old source back, a flow this run created is deleted.
+            values: "{{ outputs.verdict.values.restore_items }}"
+            concurrencyLimit: 1
+            transmitFailed: false
+            tasks:
+              - id: restore_flow
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ fromJson(item.value).api }}/flows/{{ fromJson(item.value).target_namespace }}/{{ fromJson(item.value).flow_id }}"
+                method: "{{ fromJson(item.value).existed ? 'PUT' : 'DELETE' }}"
+                contentType: "{{ fromJson(item.value).existed ? 'application/x-yaml' : 'application/json' }}"
+                body: "{{ fromJson(item.value).source ?? '' }}"
+                options:
+                  allowFailed: "{{ not fromJson(item.value).existed }}"
+                  auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+                timeout: PT1M
+                retry: {type: exponential, interval: PT5S, maxInterval: PT30S, maxAttempts: 4}
+            outputs:
+              - id: row
+                type: JSON
+                value: "{{ {'flow_id': fromJson(item.value).flow_id, 'ok': outputs.restore_flow.code is defined and (['200', '204', '404'] contains (outputs.restore_flow.code ~ ''))} | toJson }}"
+          - id: rolled_back
+            type: io.kestra.plugin.core.output.OutputValues
+            values:
+              rows: "{{ (outputs.restore.outputs ?? []) | jq('[.[].outputs.row]') | first | toJson }}"
+              failed: "{{ (outputs.restore.outputs ?? []) | jq('[.[].outputs.row | select(.ok != true) | .flow_id]') | first | toJson }}"
+          - id: report_rollback
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: >-
+              {{ inputs.mode }} failed at {{ outputs.verdict.values.failed_at }}.
+              {{ fromJson(outputs.rolled_back.values.failed) | length == 0
+                 ? 'Rolled back ' ~ (fromJson(outputs.rolled_back.values.rows) | length) ~ ' flow(s) to snapshot ' ~ execution.id ~ '.'
+                 : 'ROLLBACK INCOMPLETE for ' ~ (fromJson(outputs.rolled_back.values.failed) | join(', ')) ~ ': run mode rollback_to_snapshot with snapshot_id ' ~ execution.id ~ '.' }}
+        else:
+          - id: record_state
+            type: io.kestra.plugin.core.kv.Set
+            description: Hash of what is now deployed per flow. The next diff flags a target flow whose hash differs, i.e. an edit made outside this blueprint.
+            key: "promotion_state_{{ inputs.target_namespace | replace({'.': '_'}) }}"
+            kvType: JSON
+            value: >-
+              {{ {'s': outputs.load_state.value ?? {}, 'sel': fromJson(outputs.selection.values.selected), 'x': execution.id}
+                 | jq('.x as $x | reduce .sel[] as $f (.s; if $f.action == "delete" then del(.[$f.flow_id]) else .[$f.flow_id] = {sha: $f.want_sha, execution: $x} end)') | first | toJson }}
+          - id: log_done
+            type: io.kestra.plugin.core.log.Log
+            message: "{{ inputs.mode }} done: {{ fromJson(outputs.deployed.values.rows) | jq('map(.flow_id + \" \" + .action + (if .revision then \" rev \" + (.revision | tostring) else \"\" end)) | join(\", \")') | first }}. Smoke tests passed: {{ fromJson(outputs.verdict.values.smoke_rows) | length }}. Snapshot {{ execution.id }} (rollback_to_snapshot restores it for {{ vars.snapshot_ttl }})."
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Promotion to {{ inputs.target_namespace }} failed in task {{ ((errorLogs() | length) > 0 and ((errorLogs() | last).taskId ?? '') != '') ? (errorLogs() | last).taskId : 'none' }}: {{ (errorLogs() | length) > 0 ? (errorLogs() | last).message : 'no task error was logged (an expired approval ends the run this way)' }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: allowFailure so a missing `SLACK_WEBHOOK_URL` never hides the original error; the same text is in the ERROR log above.
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":rotating_light: Kestra {{ inputs.mode }} to `{{ inputs.target_namespace }}` failed in `{{ ((errorLogs() | length) > 0 and ((errorLogs() | last).taskId ?? '') != '') ? (errorLogs() | last).taskId : 'none' }}`: {{ (errorLogs() | length) > 0 ? (errorLogs() | last).message : 'no task error was logged (expired approval)' }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+finally:
+  - id: write_audit
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Always runs (success, dry run, validation block, rejection, rollback), so every run leaves one CSV row per flow.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT5M
+    outputFiles:
+      - audit_csv
+    parameters:
+      items: "{{ outputs.review.outputs[0].row.items ?? '[]' }}"
+      selected: "{{ outputs.selection.values.selected ?? '[]' }}"
+      deployed: "{{ outputs.deployed.values.rows ?? '[]' }}"
+      smoke: "{{ outputs.verdict.values.smoke_rows ?? '[]' }}"
+      restored: "{{ outputs.rolled_back.values.rows ?? '[]' }}"
+      snapshot: "{{ outputs.backup is defined ? execution.id : '' }}"
+      reason: "{{ outputs.request_approval.onResume.reason ?? '' }}"
+      approved: "{{ outputs.request_approval.onResume.approve ?? '' }}"
+      run: "{{ execution.id }}"
+      mode: "{{ inputs.mode }}"
+      dry_run: "{{ inputs.dry_run }}"
+      src: "{{ inputs.mode == 'promote' ? inputs.source_namespace : 'snapshot ' ~ (inputs.snapshot_id ?? '') }}"
+      tgt: "{{ inputs.target_namespace }}"
+    sql: |
+      CREATE MACRO jrows(j) AS TABLE SELECT r, json_extract_string(r, '$.flow_id') AS flow_id FROM (SELECT unnest(from_json(j, '["JSON"]')) AS r);
+      CREATE MACRO js(x, k) AS json_extract_string(x, '$.' || k);
+      CREATE TABLE audit AS
+      SELECT :run AS run_execution_id, :mode AS mode, CAST(:dry_run AS BOOLEAN) AS dry_run, :src AS source, :tgt AS target_namespace, i.flow_id,
+             js(i.r, 'status') AS status, js(i.r, 'action') AS action, TRY_CAST(js(i.r, 'added') AS INTEGER) AS lines_added,
+             TRY_CAST(js(i.r, 'removed') AS INTEGER) AS lines_removed, js(i.r, 'task_changes') AS task_changes,
+             CAST(js(i.r, 'target_edited') AS BOOLEAN) AS target_edited_outside, js(i.r, 'validation') AS validation,
+             TRY_CAST(js(i.r, 'cur_revision') AS INTEGER) AS revision_before, TRY_CAST(js(d.r, 'revision') AS INTEGER) AS revision_after,
+             CASE WHEN js(i.r, 'action') = 'none' THEN 'no_change'
+                  WHEN js(i.r, 'validation') = 'BLOCKED' THEN 'blocked_by_validation'
+                  WHEN CAST(:dry_run AS BOOLEAN) THEN 'dry_run'
+                  WHEN s.flow_id IS NULL AND :approved = 'false' THEN 'rejected'
+                  WHEN s.flow_id IS NULL AND (SELECT count(*) FROM jrows(:selected)) > 0 THEN 'held_back_by_approver'
+                  WHEN s.flow_id IS NULL THEN 'not_deployed'
+                  WHEN x.flow_id IS NOT NULL THEN CASE WHEN CAST(js(x.r, 'ok') AS BOOLEAN) THEN 'rolled_back' ELSE 'ROLLBACK_FAILED' END
+                  WHEN d.flow_id IS NOT NULL THEN CASE WHEN CAST(js(d.r, 'ok') AS BOOLEAN) THEN 'deployed' ELSE 'deploy_failed' END
+                  ELSE 'not_deployed' END AS outcome,
+             coalesce(js(t.r, 'state'), '') AS smoke_test, :snapshot AS snapshot_id, :reason AS approver_reason
+        FROM jrows(:items) i LEFT JOIN jrows(:selected) s ON s.flow_id = i.flow_id LEFT JOIN jrows(:deployed) d ON d.flow_id = i.flow_id
+        LEFT JOIN jrows(:smoke) t ON t.flow_id = i.flow_id LEFT JOIN jrows(:restored) x ON x.flow_id = i.flow_id
+       ORDER BY i.flow_id;
+      COPY audit TO '{{ outputFiles.audit_csv }}' (HEADER, DELIMITER ',');
+      SELECT count(*) AS flows, count(*) FILTER (WHERE action <> 'none') AS candidates, count(*) FILTER (WHERE outcome = 'deployed') AS deployed,
+             count(*) FILTER (WHERE outcome = 'rolled_back') AS rolled_back, count(*) FILTER (WHERE outcome = 'ROLLBACK_FAILED') AS rollback_failed,
+             count(*) FILTER (WHERE validation = 'BLOCKED') AS blocked, count(*) FILTER (WHERE outcome = 'held_back_by_approver') AS held_back, :snapshot AS snapshot_id
+        FROM audit;
+
+  - id: log_audit
+    type: io.kestra.plugin.core.log.Log
+    message: "Audit ({{ inputs.mode }}, {{ inputs.dry_run ? 'dry run' : 'real' }}): {{ outputs.write_audit.outputs[0].row | toJson }}"
+
+afterExecution:
+  - id: notify_outcome
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: |
+      Runs once the final state is known. On 2.0.5 an SLA breach fails the run at once and skips `finally`, so this is the
+      only hook that reports it. Ordinary failures were already reported by `errors`.
+    runIf: "{{ execution.state != 'FAILED' or (labels.promotion_sla ?? '') == 'breached' }}"
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "Kestra {{ inputs.mode }} {{ inputs.dry_run ? '(dry run) ' : '' }}to {{ inputs.target_namespace }} ended {{ execution.state }}{{ (labels.promotion_sla ?? '') == 'breached' ? ' because the 6-hour SLA was breached; compare the target with snapshot ' ~ execution.id : '' }}. {{ (outputs.write_audit.outputs[0].row ?? {}) | toJson }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+outputs:
+  - id: diff_report
+    type: STRING
+    value: "{{ outputs.review.outputs[0].row.report ?? '' }}"
+  - id: audit_csv
+    type: FILE
+    value: "{{ outputs.write_audit.outputFiles.audit_csv }}"
+  - id: summary
+    type: JSON
+    value: "{{ outputs.write_audit.outputs[0].row }}"
+
+extend:
+  title: Promote Kestra flows from staging to production with approval, snapshot and rollback
+  metaTitle: Kestra Namespace Promotion with Approval and Rollback | Kestra
+  shortDescription: Promote flows from a staging namespace to production through the Kestra API, without Git. Per-flow diff, validation, a per-flow approval, a 30-day snapshot, smoke tests, automatic rollback and an audit CSV.
+  metaDescription: Promote Kestra flows between namespaces without Git. Per-flow diff, validation, approval, TTL snapshot, smoke tests, automatic rollback and audit CSV.
+  description: |
+    Many Kestra teams build in a `staging` namespace and copy flows to `prod` by hand, or with an export and import that overwrites everything at once. Nobody sees what changes, a flow can reach production with a plugin the server reports as replaced, a hotfix made in prod is silently overwritten, and when a release breaks there is no saved state to go back to. This flow is the release process for that setup: it promotes flows between namespaces through the Kestra REST API, without Git. Every diff, validation, deploy and rollback is a real API call on the instance it runs against.
+
+    ## How it works
+
+    1. A manual run, or the `staging_changed` webhook from CI, starts the flow. Flow `checks` refuse empty or wildcard namespaces, a target containing the promoter and a rollback without a snapshot id.
+    2. `export` (a `Dag`) lists both namespaces and reads the stored snapshot and the promotion state, then `fetch_sources` reads each flow's YAML with `?source=true`.
+    3. `diff` (DuckDB) rewrites every reference to the source namespace (the `namespace:` line, Subflow calls, Flow triggers) and classifies each flow as new, changed, unchanged or only in the target. It counts changed lines, lists added, removed and modified tasks and triggers, and flags flows edited directly in the target since the last promotion.
+    4. `validate` sends all candidates to `/flows/validate` in one request. `review` blocks the run on a constraint error, a deprecated property, a plugin the server reports as replaced, or a Subflow that exists neither in the target nor in the batch. `log_report` prints the readable diff.
+    5. `request_approval` (a `Pause`) shows one preselected option per flow with its diff summary. The approver unticks flows to hold them back, or rejects with a reason.
+    6. `apply` lists the target again (optimistic lock), saves a snapshot to KV with a 30-day `ttl`, deploys one flow at a time, then runs the optional smoke-test executions. Any failure restores every attempted flow from the snapshot.
+    7. `finally` writes an audit CSV, `errors` alerts with the failed task and an execution link, and `afterExecution` reports the final state.
+
+    ## Edge cases handled
+
+    - Namespace references are rewritten and counted per flow; the flows' own `{{ }}` expressions are passed as data and never rendered.
+    - A flow that no longer parses (for example saved as a draft with a typo in a task type) is reported and blocks the run.
+    - On 2.0.5 the DuckDB plugin reports its unset `connectionPooling` defaults as deprecated paths for every flow, so only deprecated properties actually written in the source block.
+    - A new Subflow called by a ticked flow must be ticked too, otherwise nothing is deployed.
+    - A target flow edited while the approval is pending stops the run before any change.
+    - A prod hotfix is flagged `TARGET EDITED OUTSIDE PROMOTION`, so the approver can hold it back.
+    - Flows that exist only in the target are reported and never deleted by a promotion. Whitespace-only changes are labelled.
+
+    ## What this blueprint teaches
+
+    - **Flow `checks`** (`checks`): reject unsafe scopes before an execution is created. Their messages are static: `checks` messages are not rendered.
+    - **`Dag`** (`export`): `list_source`, `list_target`, `load_snapshot` and `load_state` start together; `fetch_sources` waits for both lists through `dependsOn`.
+    - **`Pause` with a dynamic `MULTISELECT`** (`request_approval`): `expression` and `defaults` render the diff summary as preselected options, so the approver picks a subset.
+    - **`Loop` as a transaction** (`deploy`, `smoke_tests`, `restore`): `concurrencyLimit: 1` with `transmitFailed: true` stops at the first failure, `allowFailure` keeps the run going, and `restore` (`transmitFailed: false`) undoes exactly what was attempted. Loop `outputs` keep one row per flow, failed ones included.
+    - **KV `ttl`** (`backup`): snapshots expire on their own after 30 days; `promotion_state` keeps the last deployed hash per flow.
+    - **`finally`** (`write_audit`): one CSV row per flow after a success, a dry run, a block, a rejection or a rollback.
+    - **`errors`, `sla` and `afterExecution`** (`log_failure`, `max_runtime`, `notify_outcome`): on 2.0.5 an SLA breach fails the run at once and skips `finally`; `afterExecution` still reports it (label `promotion_sla: breached`).
+    - **`concurrency`** (`limit: 1`, `FAIL`): a second promotion fails at once instead of interleaving deploys.
+
+    ## How this differs from the GitOps blueprints
+
+    `kestra-gitops-deploy-smoke-test-rollback` and `git-sync-flows-source-of-truth` sync a Git branch with the Git and Kestra plugins, and `copy-flows-to-new-tenant` imports a whole export. This flow needs no Git: it promotes namespace to namespace, rewrites namespace references, validates each flow against the target, lets the approver pick flows, keeps a snapshot that can still be restored days later with `rollback_to_snapshot`, never deletes in promote mode, and writes an audit CSV.
+
+    ## What you get
+
+    - A readable per-flow diff and a validation verdict before anything changes (`diff_report` output).
+    - One-by-one deploys with automatic rollback, and a manual rollback mode that is itself reversible.
+    - An audit CSV (`audit_csv`) with status, changed lines, revisions before and after, smoke-test state, outcome, snapshot id and approver reason. Re-runs are idempotent.
+
+    ## Who it's for
+
+    - Platform teams running Kestra with staging and production namespaces, who want reviewed releases without a Git workflow.
+
+    ## Why orchestrate this with Kestra
+
+    The release becomes one execution with an approval form, retries and timeouts on every API call, a stored rollback point and an audit file, instead of a script that copies YAML.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the DuckDB and Slack plugins, and a basic-auth user allowed to read, create, update and delete flows in both namespaces and to start executions in the target.
+    - `kestra_api_url` reachable from the worker. Smoke-test flows should be safe to run with their default inputs (they get the label `promotion:smoke-test`).
+
+    ### Secrets
+
+    - `KESTRA_API_USERNAME` and `KESTRA_API_PASSWORD`: the Kestra API user (required).
+    - `PROMOTION_WEBHOOK_KEY`: key of the `staging_changed` webhook (required for the trigger).
+    - `SLACK_WEBHOOK_URL`: alerts and outcome messages (optional; every message is also logged).
+
+    ## Quick start
+
+    1. Add the secrets, set `source_namespace` and `target_namespace`, keep `dry_run: true` and run the flow. Read `log_report`.
+    2. Run with `dry_run: false`, review the options in the approval form and resume.
+    3. Note the snapshot id in `log_done` or in the audit CSV, and restore it later with `mode: rollback_to_snapshot` if needed.
+
+    ## How to extend
+
+    - Promote namespace files with the same snapshot pattern.
+    - Point `kestra_api_url` at another instance to promote between instances.
+    - Post `diff_report` to a pull request or a change ticket.
+
+    ## Links
+
+    - [Kestra API reference](https://kestra.io/docs/api-reference/open-source), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause), [Dag](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.dag), [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop)
+    - [HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set), [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+  tags:
+    - Infrastructure
+    - Core
+  subTags:
+    - CI/CD & Deployment
+    - Approval Gates
+    - Namespace & Git Management
+  ee: false
+  demo: false

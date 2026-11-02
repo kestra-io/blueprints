@@ -1,0 +1,389 @@
+id: pgvector-search-recall-check
+namespace: company.team
+description: |
+  Measure how often your pgvector index returns the true nearest neighbours (recall@k). The flow compares approximate
+  (HNSW or IVFFlat) results with an exact scan for a sample of query vectors, sweeps hnsw.ef_search or ivfflat.probes,
+  and when recall at your current setting is below target, asks on-call to apply the lowest setting that meets it.
+
+triggers:
+  - id: after_bulk_load
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this after a bulk load, a re-embedding or an index rebuild.
+    key: "{{ secret('RECALL_CHECK_WEBHOOK_KEY') }}"
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Weekly check. Shipped disabled; enable it once the inputs point at your table.
+    cron: "17 4 * * 1"
+    disabled: true
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: mode
+    type: SELECT
+    values: [demo, existing]
+    defaults: demo
+    description: demo creates recall_demo.documents (30,000 vectors, a cheaply built HNSW index) in the target database first.
+  - id: table
+    type: STRING
+    defaults: recall_demo.documents
+  - id: column
+    type: STRING
+    defaults: embedding
+  - id: id_column
+    type: STRING
+    defaults: id
+  - id: k
+    type: INT
+    defaults: 10
+    description: Top-k your application asks for.
+  - id: sample_size
+    type: INT
+    defaults: 100
+    description: Query vectors to test. Each one costs one exact scan of the table.
+  - id: sample_sql
+    type: STRING
+    required: false
+    description: Optional SQL returning a column `v` with real query vectors (e.g. from a query log). Default is a repeatable sample of the table's own rows.
+  - id: target_recall
+    type: FLOAT
+    defaults: 0.95
+  - id: max_drop
+    type: FLOAT
+    defaults: 0.02
+    description: Alert when recall fell by more than this since the last run, even above target.
+  - id: settings
+    type: ARRAY
+    itemType: INT
+    required: false
+    description: Values to sweep. Default 20..640 for hnsw.ef_search, 1..100 for ivfflat.probes. The current value is always included.
+  - id: app_role
+    type: STRING
+    required: false
+    description: The role your application connects as. An approved setting is applied to this role in this database; empty applies it to the whole database.
+
+variables:
+  # find_sql uses CAST(), not the double-colon cast: the JDBC named parameters would misread it
+  find_sql: |
+    WITH idx AS (
+      SELECT i.relname AS index_name, am.amname AS method, op.opcname AS opclass, x.indisvalid AS valid,
+             format_type(a.atttypid, a.atttypmod) AS column_type, pg_size_pretty(pg_relation_size(i.oid)) AS index_size,
+             CAST(greatest(c.reltuples, 0) AS bigint) AS rows_estimate, coalesce(array_to_string(i.reloptions, ', '), 'default build options') AS build_options,
+             CASE am.amname WHEN 'hnsw' THEN 'hnsw.ef_search' ELSE 'ivfflat.probes' END AS guc
+      FROM pg_index x
+      JOIN pg_class c ON c.oid = x.indrelid
+      JOIN pg_class i ON i.oid = x.indexrelid
+      JOIN pg_am am ON am.oid = i.relam
+      JOIN pg_opclass op ON op.oid = x.indclass[0]
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.indkey[0]
+      WHERE c.oid = to_regclass(:table) AND a.attname = :column AND am.amname IN ('hnsw', 'ivfflat')
+      ORDER BY x.indisvalid DESC, i.relname LIMIT 1
+    ), s AS (
+      SELECT split_part(cfg, '=', 2) AS value, CASE WHEN s.setrole = 0 THEN 'database' ELSE 'role ' || :role END AS scope,
+             CAST(s.setrole <> 0 AS int) * 2 + CAST(s.setdatabase <> 0 AS int) AS rank
+      FROM idx, pg_db_role_setting s, unnest(s.setconfig) cfg
+      WHERE cfg LIKE idx.guc || '=%'
+        AND ((s.setrole = 0 AND s.setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()))
+          OR (s.setrole = (SELECT oid FROM pg_roles WHERE rolname = :role) AND s.setdatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))))
+    )
+    SELECT to_regclass(:table) IS NOT NULL AS table_found, idx.*,
+           CASE WHEN opclass LIKE '%cosine_ops' THEN '<=>' WHEN opclass LIKE '%ip_ops' THEN '<#>' WHEN opclass LIKE '%l1_ops' THEN '<+>'
+                WHEN opclass LIKE '%hamming_ops' THEN '<~>' WHEN opclass LIKE '%jaccard_ops' THEN '<%>' ELSE '<->' END AS operator,
+           CAST(coalesce((SELECT value FROM s ORDER BY rank DESC LIMIT 1), CASE method WHEN 'hnsw' THEN '40' ELSE '1' END) AS int) AS current_value,
+           coalesce((SELECT scope FROM s ORDER BY rank DESC LIMIT 1), 'pgvector default') AS current_scope
+    FROM (SELECT 1) one LEFT JOIN idx ON true
+  measure_sql: |
+    DO $m$
+    DECLARE
+      c json := current_setting('recall.cfg')::json;
+      tbl regclass := (c->>'table')::regclass;
+      ann_sql text := format('SELECT array_agg(%I::text) FROM (SELECT %I FROM %s ORDER BY %I %s $1::%s LIMIT %s) x',
+                             c->>'id_column', c->>'id_column', tbl, c->>'column', c->>'operator', c->>'column_type', (c->>'k')::int);
+      sample text := coalesce(nullif(c->>'sample_sql', ''), format('SELECT %I AS v FROM %s TABLESAMPLE BERNOULLI (%s) REPEATABLE (42) WHERE %I IS NOT NULL LIMIT %s',
+                             c->>'column', tbl, least(100, 300.0 * (c->>'sample_size')::int / greatest((c->>'rows_estimate')::bigint, 1)), c->>'column', (c->>'sample_size')::int));
+      q record; s int; ids text[]; hits bigint; t0 timestamptz; ann interval; exact interval := '0'; n int; plan text;
+    BEGIN
+      CREATE TEMP TABLE recall_truth (v text, ids text[]) ON COMMIT DROP;
+      CREATE TEMP TABLE recall_result (setting int, recall numeric, ann_ms numeric, exact_ms numeric, queries int) ON COMMIT DROP;
+      PERFORM set_config('enable_indexscan', 'off', true), set_config('enable_bitmapscan', 'off', true);
+      FOR q IN EXECUTE sample LOOP
+        t0 := clock_timestamp();
+        EXECUTE ann_sql INTO ids USING q.v::text;
+        exact := exact + (clock_timestamp() - t0);
+        INSERT INTO recall_truth VALUES (q.v::text, ids);
+      END LOOP;
+      SELECT count(*) INTO n FROM recall_truth;
+      IF n = 0 THEN RAISE EXCEPTION 'no query vectors: the sample returned no rows'; END IF;
+      PERFORM set_config('enable_indexscan', 'on', true), set_config('enable_bitmapscan', 'on', true);
+      EXECUTE 'EXPLAIN (FORMAT JSON) ' || ann_sql INTO plan USING (SELECT v FROM recall_truth LIMIT 1);
+      IF position(c->>'index_name' IN plan) = 0 THEN
+        RAISE EXCEPTION 'the planner did not use index % for ORDER BY % % <query> LIMIT % (too few rows, or a query shape it cannot serve), so recall cannot be measured', c->>'index_name', c->>'column', c->>'operator', c->>'k';
+      END IF;
+      FOR s IN SELECT json_array_elements_text(c->'settings')::int AS x UNION SELECT (c->>'current')::int ORDER BY x LOOP
+        PERFORM set_config(c->>'guc', s::text, true);
+        ann := '0'; hits := 0;
+        FOR q IN SELECT * FROM recall_truth LOOP
+          t0 := clock_timestamp();
+          EXECUTE ann_sql INTO ids USING q.v;
+          ann := ann + (clock_timestamp() - t0);
+          hits := hits + (SELECT count(*) FROM unnest(ids) i WHERE i = ANY (q.ids));
+        END LOOP;
+        INSERT INTO recall_result VALUES (s, round(hits::numeric / (n * (c->>'k')::int), 3),
+          round(extract(epoch FROM ann)::numeric * 1000 / n, 2), round(extract(epoch FROM exact)::numeric * 1000 / n, 2), n);
+      END LOOP;
+    END $m$;
+    SELECT (SELECT json_agg(r ORDER BY setting) FROM recall_result r)::text AS sweep, cur.recall AS current_recall, cur.ann_ms AS current_ms,
+           best.setting AS best_setting, best.recall AS best_recall, best.ann_ms AS best_ms, (SELECT max(recall) FROM recall_result) AS max_recall,
+           CASE WHEN cur.recall >= (c->>'target')::numeric THEN
+                  CASE WHEN cur.recall < (c->>'previous')::numeric - (c->>'max_drop')::numeric THEN 'dropped' ELSE 'ok' END
+                WHEN best.setting IS NOT NULL THEN 'tune' ELSE 'rebuild' END AS outcome
+    FROM (SELECT current_setting('recall.cfg')::json AS c) cfg
+    LEFT JOIN recall_result cur ON cur.setting = (c->>'current')::int
+    LEFT JOIN LATERAL (SELECT * FROM recall_result WHERE recall >= (c->>'target')::numeric ORDER BY setting LIMIT 1) best ON true
+  kv_key: "pgvector_recall_{{ (inputs.table ~ '.' ~ inputs.column) | sha256 }}"
+
+tasks:
+  - id: demo_setup
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.mode == 'demo' }}"
+    then:
+      - id: create_demo_table
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        description: 30,000 clustered 64-dimension vectors and an HNSW index built with low m / ef_construction. Created once.
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        sql: |
+          CREATE EXTENSION IF NOT EXISTS vector;
+          CREATE SCHEMA IF NOT EXISTS recall_demo;
+          DO $d$
+          BEGIN
+            IF to_regclass('recall_demo.documents') IS NULL THEN
+              PERFORM setseed(0.42), set_config('max_parallel_maintenance_workers', '0', true);
+              CREATE TABLE recall_demo.documents (id bigint PRIMARY KEY, embedding vector(64));
+              WITH centers AS (SELECT g AS cid, array_agg(random() * 2 - 1) AS center FROM generate_series(1, 200) g, generate_series(1, 64) d GROUP BY g)
+              INSERT INTO recall_demo.documents
+              SELECT i, (SELECT array_agg(c.center[d] + (random() - 0.5) * 0.6 ORDER BY d) FROM generate_series(1, 64) d)::vector
+              FROM generate_series(1, 30000) i JOIN centers c ON c.cid = 1 + i % 200;
+              CREATE INDEX documents_embedding_hnsw ON recall_demo.documents USING hnsw (embedding vector_cosine_ops) WITH (m = 8, ef_construction = 32);
+              ANALYZE recall_demo.documents;
+            END IF;
+          END $d$;
+
+  - id: find_index
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters: {table: "{{ inputs.table }}", column: "{{ inputs.column }}", role: "{{ inputs.app_role ?? '' }}"}
+    sql: "{{ vars.find_sql }}"
+
+  - id: index_guard
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.find_index.row.index_name == null or outputs.find_index.row.valid != true }}"
+    then:
+      - id: no_usable_index
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "{% if not outputs.find_index.row.table_found %}table {{ inputs.table }} does not exist{% elseif outputs.find_index.row.index_name == null %}no HNSW or IVFFlat index on {{ inputs.table }}({{ inputs.column }}): searches are exact scans{% else %}index {{ outputs.find_index.row.index_name }} is INVALID (a failed CREATE INDEX CONCURRENTLY?); rebuild it first{% endif %}"
+
+  - id: measure
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One transaction. The settings travel as a JSON literal in a session variable; `$` is escaped, so input cannot end the literal.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    timeout: PT30M
+    sql: |
+      {%- set f = outputs.find_index.row -%}
+      {%- set old = kv(render(vars.kv_key), errorOnMissing=false) ?? {} -%}
+      SELECT set_config('recall.cfg', $cfg${{ {'table': inputs.table, 'column': inputs.column, 'id_column': inputs.id_column, 'column_type': f.column_type,
+        'operator': f.operator, 'index_name': f.index_name, 'guc': f.guc, 'k': inputs.k, 'sample_size': inputs.sample_size, 'sample_sql': inputs.sample_sql ?? '',
+        'rows_estimate': f.rows_estimate, 'settings': inputs.settings ?? (f.method == 'hnsw' ? [20, 40, 80, 160, 320, 640] : [1, 2, 5, 10, 20, 50, 100]), 'current': f.current_value, 'target': inputs.target_recall, 'max_drop': inputs.max_drop,
+        'previous': old.recall ?? 0} | toJson | replace({'$': '$'}) }}$cfg$, true) AS cfg;
+      {{ vars.measure_sql }}
+
+  - id: remember
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ render(vars.kv_key) }}"
+    kvType: JSON
+    value: "{% set old = kv(render(vars.kv_key), errorOnMissing=false) ?? {} %}{{ {'at': execution.startDate, 'setting': outputs.find_index.row.current_value, 'recall': (outputs.measure.outputs | last).row.current_recall, 'previous': {'at': old.at ?? null, 'recall': old.recall ?? null}} | toJson }}"
+
+  - id: decide
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ (outputs.measure.outputs | last).row.outcome }}"
+    cases:
+      ok:
+        - id: report_ok
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: "{% set m = (outputs.measure.outputs | last).row %}{% set f = outputs.find_index.row %}pgvector recall OK for {{ inputs.table }}({{ inputs.column }}): recall@{{ inputs.k }} {{ m.current_recall }} at {{ f.guc }} = {{ f.current_value }} (target {{ inputs.target_recall }}), {{ m.current_ms }} ms per query."
+      dropped:
+        - id: report_drop
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: "{% set m = (outputs.measure.outputs | last).row %}{% set f = outputs.find_index.row %}pgvector recall DROPPED for {{ inputs.table }}({{ inputs.column }}): recall@{{ inputs.k }} {{ m.current_recall }} at {{ f.guc }} = {{ f.current_value }}, was {{ kv(render(vars.kv_key)).previous.recall }} on {{ kv(render(vars.kv_key)).previous.at }}. Still above the {{ inputs.target_recall }} target; a bulk load or many deletes since the index was built are the usual cause."
+      tune:
+        - id: ask_on_call
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            {% set m = (outputs.measure.outputs | last).row %}{% set f = outputs.find_index.row %}pgvector recall BELOW TARGET for {{ inputs.table }}({{ inputs.column }}), index {{ f.index_name }} ({{ f.method }}, {{ f.build_options }}): recall@{{ inputs.k }} {{ m.current_recall }} at {{ f.guc }} = {{ f.current_value }} ({{ f.current_scope }}), target {{ inputs.target_recall }}.
+            {% for r in fromJson(m.sweep) %}- {{ f.guc }} = {{ r.setting }}: recall {{ r.recall }}, {{ r.ann_ms }} ms/query
+            {% endfor %}(an exact scan takes {{ fromJson(m.sweep)[0].exact_ms }} ms/query). To apply {{ f.guc }} = {{ m.best_setting }}, resume execution {{ execution.id }} in Kestra within 24 hours.
+        - id: wait_for_approval
+          type: io.kestra.plugin.core.flow.Pause
+          description: No answer within 24 hours keeps the current setting.
+          pauseDuration: PT24H
+          behavior: RESUME
+          onResume:
+            - id: decision
+              type: SELECT
+              displayName: Search setting
+              expression: "{{ ['Apply ' ~ outputs.find_index.row.guc ~ ' = ' ~ (outputs.measure.outputs | last).row.best_setting, 'Keep ' ~ outputs.find_index.row.current_value] }}"
+              required: false
+        - id: apply_gate
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ (outputs.wait_for_approval.onResume.decision ?? '') contains 'Apply' }}"
+          then:
+            - id: apply_setting
+              type: io.kestra.plugin.jdbc.postgresql.Queries
+              description: ALTER ROLE ... IN DATABASE ... SET (or ALTER DATABASE ... SET). New sessions get it; pooled connections after they reconnect.
+              url: "{{ secret('POSTGRES_URL') }}"
+              username: "{{ secret('POSTGRES_USER') }}"
+              password: "{{ secret('POSTGRES_PASSWORD') }}"
+              sql: |
+                SELECT set_config('recall.cfg', $cfg${{ {'guc': outputs.find_index.row.guc, 'value': (outputs.measure.outputs | last).row.best_setting, 'role': inputs.app_role ?? ''} | toJson | replace({'$': '$'}) }}$cfg$, true);
+                DO $a$
+                DECLARE c json := current_setting('recall.cfg')::json;
+                BEGIN
+                  IF c->>'guc' NOT IN ('hnsw.ef_search', 'ivfflat.probes') THEN RAISE EXCEPTION 'unexpected setting %', c->>'guc'; END IF;
+                  IF coalesce(c->>'role', '') = '' THEN
+                    EXECUTE format('ALTER DATABASE %I SET %s = %s', current_database(), c->>'guc', (c->>'value')::int);
+                  ELSE
+                    EXECUTE format('ALTER ROLE %I IN DATABASE %I SET %s = %s', c->>'role', current_database(), c->>'guc', (c->>'value')::int);
+                  END IF;
+                END $a$;
+            - id: confirm_setting
+              type: io.kestra.plugin.jdbc.postgresql.Query
+              description: Read the catalog again, in a new session, to prove the setting is what the application now gets.
+              url: "{{ secret('POSTGRES_URL') }}"
+              username: "{{ secret('POSTGRES_USER') }}"
+              password: "{{ secret('POSTGRES_PASSWORD') }}"
+              fetchType: FETCH_ONE
+              parameters: {table: "{{ inputs.table }}", column: "{{ inputs.column }}", role: "{{ inputs.app_role ?? '' }}"}
+              sql: "{{ vars.find_sql }}"
+            - id: report_applied
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              messageText: "{% set m = (outputs.measure.outputs | last).row %}pgvector search setting applied for {{ inputs.table }}({{ inputs.column }}): {{ outputs.find_index.row.guc }} = {{ outputs.confirm_setting.row.current_value }} ({{ outputs.confirm_setting.row.current_scope }}), was {{ outputs.find_index.row.current_value }}. Measured recall@{{ inputs.k }} {{ m.best_recall }} at {{ m.best_ms }} ms/query (was {{ m.current_recall }}). Pooled connections pick it up when they reconnect."
+          else:
+            - id: report_kept
+              type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+              url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+              messageText: "pgvector search setting kept for {{ inputs.table }}({{ inputs.column }}): {{ outputs.find_index.row.guc }} = {{ outputs.find_index.row.current_value }}, recall@{{ inputs.k }} {{ (outputs.measure.outputs | last).row.current_recall }} stays below the {{ inputs.target_recall }} target."
+      rebuild:
+        - id: report_rebuild
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            {% set m = (outputs.measure.outputs | last).row %}{% set f = outputs.find_index.row %}pgvector recall BELOW TARGET at every tested setting for {{ inputs.table }}({{ inputs.column }}): best recall@{{ inputs.k }} {{ m.max_recall }}, target {{ inputs.target_recall }}. Index {{ f.index_name }} ({{ f.method }}, {{ f.build_options }}, {{ f.index_size }}, ~{{ f.rows_estimate }} rows) needs a rebuild: {% if f.method == 'hnsw' %}higher m and ef_construction (e.g. m = 16, ef_construction = 64){% else %}lists near rows / 1000 (sqrt(rows) above 1M rows), built after the data is loaded{% endif %}, with CREATE INDEX CONCURRENTLY then DROP INDEX CONCURRENTLY on the old one.
+            {% for r in fromJson(m.sweep) %}- {{ f.guc }} = {{ r.setting }}: recall {{ r.recall }}, {{ r.ann_ms }} ms/query
+            {% endfor %}
+        - id: needs_rebuild
+          type: io.kestra.plugin.core.execution.Exit
+          state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "pgvector recall check FAILED for {{ inputs.table }}({{ inputs.column }}) in execution {{ execution.id }}{% if errorLogs() | length > 0 %} at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs() | jq('([.[] | select(.message | test(\"ERROR:\"))] + .)[0].message | sub(\"^.*ERROR: \"; \"\") | split(\"\\n\")[0]') | first }}{% endif %}"
+
+outputs:
+  - id: recall
+    type: JSON
+    value: "{{ outputs.measure is defined ? (outputs.measure.outputs | last).row : {} }}"
+
+extend:
+  title: Know When Your Vector Search Stops Finding the Right Results
+  shortDescription: Measure pgvector recall@k by comparing HNSW or IVFFlat results with an exact scan, sweep ef_search or probes, and apply the lowest setting that meets your target after approval.
+  metaTitle: pgvector Recall Check and Search Tuning with Kestra
+  metaDescription: Compare pgvector HNSW or IVFFlat results with exact search, find the ef_search or probes value that meets your recall target, and apply it after approval.
+  description: |
+    An approximate nearest-neighbour index (HNSW or IVFFlat) makes vector search fast by not looking at every row. The price is recall: some of the true top-k neighbours are missed. Nothing reports it. Queries still return k rows, only some of them are the wrong ones, and a RAG answer quietly gets worse after a bulk load, a re-embedding, an index built with cheap settings, or an IVFFlat index created before most of the data arrived.
+
+    This blueprint measures recall the only reliable way, by asking the same questions with and without the index, and turns the result into a decision.
+
+    ## How it works
+    1. `after_bulk_load` (`Webhook`) or `weekly` (`Schedule`, shipped disabled) starts a check. `concurrency` runs one at a time.
+    2. `demo_setup` (`If`, demo mode) creates `recall_demo.documents`: 30,000 clustered 64-dimension vectors with an HNSW index built cheaply (`m = 8, ef_construction = 32`).
+    3. `find_index` reads the catalog: the HNSW or IVFFlat index on the column, its operator class (so the query uses `<=>`, `<->`, `<#>` or `<+>` like your application), the build options, and the `hnsw.ef_search` / `ivfflat.probes` value your application actually gets (role setting, database setting or the pgvector default). `index_guard` fails early when there is no usable index.
+    4. `measure` (one `Queries` transaction) samples query vectors, finds the true top-k with index scans turned off, then repeats each query through the index at every sweep value, timing both. It checks with `EXPLAIN` that the index is really used.
+    5. The result is stored in the KV store, and `decide` (`Switch`) picks one of four outcomes:
+       - **ok**: recall at the current setting meets `target_recall`. A one-line report.
+       - **dropped**: still above target, but more than `max_drop` lower than at the last run.
+       - **tune**: a higher value in the sweep meets the target. Slack shows the sweep (recall and latency for each value), and `wait_for_approval` (`Pause`, 24 h) offers "Apply hnsw.ef_search = 640" or "Keep 40". Applying runs `ALTER ROLE ... IN DATABASE ... SET` (or `ALTER DATABASE ... SET`), then `confirm_setting` reads the catalog again.
+       - **rebuild**: no value reaches the target. Slack says what to rebuild with, and the run ends `WARNING`.
+
+    ## Error handling
+    - **No index, an invalid index, or a missing table** stops at `index_guard` with the reason ("no HNSW or IVFFlat index on recall_demo.plain(embedding): searches are exact scans").
+    - **The planner skipped the index** (a tiny table, or a query shape it cannot serve): the measurement would compare exact with exact, so it fails instead: "the planner did not use index tiny_hnsw …".
+    - **A broken `sample_sql`** fails with the database error, quoted in the alert.
+    - **Input never becomes SQL text.** The table, column and every other input travel as one JSON value whose `$` signs are escaped, inside a dollar-quoted literal; identifiers are quoted by PostgreSQL with `format('%I')` and the table is resolved with `regclass`. `find_index` uses bind parameters.
+    - **Nothing is changed without approval**, and only the two search settings can be changed. No answer within 24 hours keeps the current value.
+    - Every failure sends one Slack message naming the task and the database error.
+
+    ## What this blueprint teaches about Kestra
+    - **`Switch`** on a value computed in SQL, with a different path for each outcome, including a `Pause` with a **dynamic `SELECT`** whose choices are built from the measurement.
+    - **Flow `variables` as reusable SQL**: `find_sql` runs before the change and again after it.
+    - The JDBC `Queries` task running a PL/pgSQL `DO` block and a `SELECT` in one transaction, so `SET LOCAL`-style settings and temporary tables stay inside the run.
+    - The KV store as memory between runs (recall last time), and `Exit` with `WARNING` for a finding that is not an error.
+
+    ## Prerequisites
+    - PostgreSQL with the `vector` extension (pgvector 0.5+ for HNSW). Demo mode runs `CREATE EXTENSION IF NOT EXISTS vector` and creates the `recall_demo` schema.
+    - A role that can read the table. To apply settings it must own the database (`ALTER DATABASE`) or have `CREATEROLE` (`ALTER ROLE`).
+    - A Slack incoming webhook.
+
+    ### Secrets
+    - `POSTGRES_URL` (JDBC URL, e.g. `jdbc:postgresql://db:5432/search`), `POSTGRES_USER`, `POSTGRES_PASSWORD`.
+    - `SLACK_WEBHOOK_URL`.
+    - `RECALL_CHECK_WEBHOOK_KEY`: a long random string, the key in the webhook URL.
+
+    ### Inputs
+    - `mode` (`demo` or `existing`), `table`, `column`, `id_column`.
+    - `k` (default 10), `sample_size` (default 100), `sample_sql` (optional: real query vectors as column `v`).
+    - `target_recall` (default 0.95), `max_drop` (default 0.02).
+    - `settings` (values to sweep; defaults to 20–640 for `hnsw.ef_search`, 1–100 for `ivfflat.probes`).
+    - `app_role`: the role your application connects as. Empty applies to the whole database.
+
+    ### Outputs
+    - `recall` (JSON): the sweep (recall and ms per query for each value, exact scan ms), recall at the current setting, the best setting and the outcome.
+
+    ## Quick start
+    1. Add the secrets and run the flow with the defaults. The demo index misses some of the true neighbours at the pgvector default `hnsw.ef_search = 40` (8 to 12% in our runs; HNSW builds are not deterministic), so the run pauses and offers the lowest value that reaches 0.95.
+    2. Resume with "Apply …". The next run reports "recall OK".
+    3. Switch `mode` to `existing`, point `table` / `column` / `id_column` at your data, set `app_role`, and enable `weekly`. Call the webhook after bulk loads.
+
+    ## How to extend
+    - Use real query vectors: log them to a table and pass `sample_sql: SELECT embedding AS v FROM search_log ORDER BY created_at DESC LIMIT 200`.
+    - Measure a filtered search (`WHERE tenant_id = …`) by putting it in your own copy of the `measure` SQL; filtered HNSW searches often need `hnsw.iterative_scan` (pgvector 0.8+).
+    - Point `POSTGRES_URL` at a replica to measure off the primary; apply the setting on the primary.
+
+    ## Plugins used
+    - [PostgreSQL Query](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.query) and [Queries](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.queries)
+    - [Slack incoming webhook](https://kestra.io/plugins/plugin-slack/slack-notifications/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [Switch](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause), [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if), [Exit](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.exit), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [Webhook trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.webhook), [Schedule trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - AI
+    - Data
+  subTags:
+    - Vector Stores & RAG
+    - Monitoring & Alerting
+  ee: false
+  demo: false

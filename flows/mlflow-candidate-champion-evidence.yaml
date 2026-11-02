@@ -1,0 +1,790 @@
+id: mlflow-candidate-champion-evidence
+namespace: company.mlops
+description: Evaluate pinned MLflow classifiers on one CPU dataset, compare evidence, pause for approval, and verify an opted-in
+  champion alias promotion.
+inputs:
+- id: model_name
+  type: STRING
+  defaults: cpu-lifecycle-demo
+- id: candidate_alias
+  type: STRING
+  defaults: candidate
+- id: champion_alias
+  type: STRING
+  defaults: champion
+- id: min_accuracy
+  type: FLOAT
+  defaults: 0.9
+- id: max_accuracy_drop
+  type: FLOAT
+  description: Absolute accuracy difference, not a percentage; 0.01 permits a one percentage point drop.
+  defaults: 0.01
+- id: max_p95_latency_ms
+  type: FLOAT
+  defaults: 100
+- id: max_peak_rss_mib
+  type: FLOAT
+  defaults: 512
+- id: max_resource_increase
+  type: FLOAT
+  description: Relative increase allowed over champion latency and memory; 0.10 permits ten percent.
+  defaults: 0.1
+- id: evaluation_data
+  type: FILE
+  required: false
+  description: 'Held-out CSV: one target column and model feature columns, at most 10 MiB / 100000 rows.'
+- id: target_column
+  type: STRING
+  defaults: target
+- id: evaluation_experiment
+  type: STRING
+  defaults: kestra-model-validation
+- id: batch_size
+  type: INT
+  defaults: 16
+- id: benchmark_iterations
+  type: INT
+  defaults: 300
+- id: warmup_iterations
+  type: INT
+  defaults: 50
+- id: enable_promotion
+  type: BOOL
+  defaults: false
+- id: exclusive_registry_access
+  type: BOOL
+  defaults: false
+  description: 'Promotion only: acknowledge that this flow is the sole alias/artifact writer for the whole execution, including
+    approval.'
+- id: max_review_age_minutes
+  type: INT
+  defaults: 60
+tasks:
+- id: resolve_aliases
+  type: io.kestra.plugin.core.flow.Parallel
+  tasks:
+  - id: resolve_candidate
+    type: io.kestra.plugin.core.http.Request
+    timeout: PT30S
+    method: GET
+    headers:
+      Accept: application/json
+      Authorization: Bearer {{ secret('MLFLOW_TOKEN') }}
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+    uri: '{{ secret(''MLFLOW_TRACKING_URI'') }}/api/2.0/mlflow/registered-models/alias?name={{ inputs.model_name | urlencode
+      }}&alias={{ inputs.candidate_alias | urlencode }}'
+  - id: resolve_champion
+    type: io.kestra.plugin.core.http.Request
+    timeout: PT30S
+    method: GET
+    headers:
+      Accept: application/json
+      Authorization: Bearer {{ secret('MLFLOW_TOKEN') }}
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+    uri: '{{ secret(''MLFLOW_TRACKING_URI'') }}/api/2.0/mlflow/registered-models/alias?name={{ inputs.model_name | urlencode
+      }}&alias={{ inputs.champion_alias | urlencode }}'
+- id: pin_versions
+  type: io.kestra.plugin.scripts.python.Script
+  description: Pin READY numbered versions and their source/training-run identities before loading any model.
+  timeout: PT1M
+  taskRunner:
+    type: io.kestra.plugin.core.runner.Process
+  inputFiles:
+    candidate.json: '{{ outputs.resolve_candidate.body }}'
+    champion.json: '{{ outputs.resolve_champion.body }}'
+    config.json: '{{ inputs | toJson }}'
+  script: |
+    import json
+    import re
+    from pathlib import Path
+
+    config = json.loads(Path('config.json').read_text())
+    if not config.get('evaluation_data'):
+        raise ValueError('Upload evaluation_data; scheduled runs must configure this FILE input')
+    if config['candidate_alias'] == config['champion_alias']:
+        raise ValueError('Candidate and champion aliases must differ')
+    if config['enable_promotion'] and not config['exclusive_registry_access']:
+        raise ValueError('Promotion requires exclusive registry-writer access')
+    pins = {'model_name': config['model_name']}
+    for role in ('candidate', 'champion'):
+        version = json.loads(Path(role + '.json').read_text())['model_version']
+        number = str(version.get('version', ''))
+        if version.get('name') != config['model_name'] or not re.fullmatch(r'[1-9][0-9]*', number):
+            raise ValueError('Unexpected model identity for ' + role)
+        if version.get('status') != 'READY' or not version.get('source') or not version.get('run_id'):
+            raise ValueError('Require a READY model with a source and training run')
+        pins[role] = {'version': number, 'source': version['source'], 'training_run_id': version['run_id']}
+    if pins['candidate']['version'] == pins['champion']['version']:
+        raise ValueError('Candidate and champion must be different versions')
+    print('::' + json.dumps({'outputs': pins}) + '::')
+- id: evaluate_models
+  type: io.kestra.plugin.scripts.python.Script
+  description: Sequential fresh CPU processes load both pinned models, measure quality/latency/RSS, and log new evaluation
+    runs and raw samples to MLflow.
+  timeout: PT10M
+  taskRunner:
+    type: io.kestra.plugin.core.runner.Process
+  env:
+    MLFLOW_TRACKING_URI: '{{ secret(''MLFLOW_TRACKING_URI'') }}'
+    MLFLOW_TRACKING_TOKEN: '{{ secret(''MLFLOW_TOKEN'') }}'
+    KESTRA_EXECUTION_ID: '{{ execution.id }}'
+    OMP_NUM_THREADS: '1'
+    OPENBLAS_NUM_THREADS: '1'
+    MKL_NUM_THREADS: '1'
+    MLFLOW_DISABLE_AGENT_HINT: '1'
+    MLFLOW_HTTP_REQUEST_TIMEOUT: '20'
+    MLFLOW_HTTP_REQUEST_MAX_RETRIES: '0'
+  inputFiles:
+    config.json: '{{ inputs | toJson }}'
+    pins.json: '{{ outputs.pin_versions.vars | toJson }}'
+    evaluation.csv: '{{ inputs.evaluation_data }}'
+    benchmark.py: |
+      import hashlib
+      import json
+      import os
+      import platform
+      import resource
+      import time
+      from pathlib import Path
+
+      # These are set in the task environment before Python/numerical libraries start.
+      import mlflow
+      import numpy as np
+      import pandas as pd
+      from integrity import artifact_digest, prediction_digest, version_identity
+
+      config = json.loads(Path('config.json').read_text())
+      pins = json.loads(Path('pins.json').read_text())
+      role = os.environ['BENCHMARK_ROLE']
+      client = mlflow.MlflowClient()
+      version = client.get_model_version(pins['model_name'], pins[role]['version'])
+      if version_identity(version) != pins[role] or version.status != 'READY':
+          raise ValueError('Pinned version identity changed before evaluation')
+      data_bytes = Path('evaluation.csv').read_bytes()
+      if not 0 < len(data_bytes) <= 10 * 1024 * 1024:
+          raise ValueError('Dataset must contain at most 10 MiB')
+      data = pd.read_csv('evaluation.csv')
+      if not 2 <= len(data) <= 100000 or not data.columns.is_unique:
+          raise ValueError('Require 2 to 100000 rows and distinct columns')
+      if config['target_column'] not in data or data.isna().any().any():
+          raise ValueError('Missing target column or missing values')
+      labels = data.pop(config['target_column'])
+      if not len(data.columns):
+          raise ValueError('No feature columns')
+      batch_size = config['batch_size']
+      if not isinstance(batch_size, int) or not 1 <= batch_size <= len(data):
+          raise ValueError('batch_size must fit the dataset')
+      iterations, warmup = config['benchmark_iterations'], config['warmup_iterations']
+      if not isinstance(iterations, int) or not 30 <= iterations <= 2000:
+          raise ValueError('Require 30 to 2000 measured iterations')
+      if not isinstance(warmup, int) or not 1 <= warmup <= 200:
+          raise ValueError('Require 1 to 200 warm-up iterations')
+      model_path = mlflow.artifacts.download_artifacts(
+          artifact_uri='models:/' + pins['model_name'] + '/' + pins[role]['version'],
+          dst_path='model-' + role)
+      if 'sklearn' not in mlflow.models.Model.load(model_path).flavors:
+          raise ValueError('Require a trusted scikit-learn pyfunc classifier')
+      model_sha = artifact_digest(model_path)
+      model = mlflow.pyfunc.load_model(model_path)
+      predictions = np.asarray(model.predict(data))
+      if predictions.ndim != 1 or predictions.shape[0] != len(labels):
+          raise ValueError('Require one classification label per dataset row')
+      accuracy = float(np.mean(predictions == labels.to_numpy()))
+      batch = data.iloc[:batch_size]
+      for _ in range(warmup):
+          model.predict(batch)
+      samples = []
+      for _ in range(iterations):
+          started = time.perf_counter_ns()
+          model.predict(batch)
+          samples.append((time.perf_counter_ns() - started) / 1e6)
+      metrics = {'accuracy': accuracy, 'p95_latency_ms': float(np.percentile(samples, 95)),
+                 'peak_rss_mib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024}
+      if not all(np.isfinite(value) for value in metrics.values()):
+          raise ValueError('Non-finite evaluation metric')
+      # Include dependency/runtime identity; both processes must use the same environment.
+      import sklearn
+      cpu = '\n'.join(line for line in Path('/proc/cpuinfo').read_text().splitlines()
+                      if line.split(':', 1)[0].strip() in ('model name', 'vendor_id', 'cpu family', 'model', 'stepping', 'microcode', 'flags'))
+      hardware = platform.node() + '-' + platform.machine() + '-' + hashlib.sha256(cpu.encode()).hexdigest()
+      hardware += '-affinity:' + ','.join(map(str, sorted(os.sched_getaffinity(0))))
+      protocol = json.dumps({'method': 'pyfunc-predict-v1', 'python': platform.python_version(),
+          'mlflow': mlflow.__version__, 'numpy': np.__version__, 'pandas': pd.__version__,
+          'sklearn': sklearn.__version__, 'threads': 1, 'warmup': warmup,
+          'iterations': iterations, 'rss': 'linux-process-peak-mib',
+          'target_column': config['target_column'], 'features': list(data.columns)}, sort_keys=True)
+      result = {'metrics': metrics, 'latency_samples_ms': samples,
+                'dataset_digest': hashlib.sha256(data_bytes).hexdigest(),
+                'hardware_id': hardware, 'batch_size': str(batch_size),
+                'benchmark_protocol': protocol, 'device': 'cpu', 'model_sha256': model_sha,
+                'predictions_sha256': prediction_digest(predictions)}
+      Path(role + '-benchmark.json').write_text(json.dumps(result, indent=2, allow_nan=False))
+    integrity.py: '{{ vars.integrity_script }}'
+  outputFiles:
+  - evaluations.json
+  - candidate-benchmark.json
+  - champion-benchmark.json
+  script: |
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import mlflow
+    from mlflow.entities import Metric, RunTag
+    from integrity import evidence_digest
+
+    config = json.loads(Path('config.json').read_text())
+    pins = json.loads(Path('pins.json').read_text())
+    client = mlflow.MlflowClient()
+    experiment = client.get_experiment_by_name(config['evaluation_experiment'])
+    if experiment is None or experiment.lifecycle_stage != 'active':
+        raise ValueError('Create the active evaluation experiment before executing')
+    # Sequential fresh processes avoid comparing two models competing for the same CPU/RSS.
+    for role in ('champion', 'candidate'):
+        run = client.create_run(experiment.experiment_id, tags={
+            'mlflow.runName': os.environ['KESTRA_EXECUTION_ID'] + '-' + role,
+            'kestra.execution_id': os.environ['KESTRA_EXECUTION_ID'],
+            'evaluation.model_name': pins['model_name'],
+            'evaluation.model_version': pins[role]['version']})
+        run_id = run.info.run_id
+        try:
+            child_env = dict(os.environ, BENCHMARK_ROLE=role)
+            subprocess.run([sys.executable, 'benchmark.py'], env=child_env,
+                           check=True, timeout=240)
+            result = json.loads(Path(role + '-benchmark.json').read_text())
+            tags = {key: str(value) for key, value in result.items()
+                    if key not in ('metrics', 'latency_samples_ms')}
+            import time
+            client.log_batch(run_id, metrics=[Metric(key, value, int(time.time() * 1000), 0)
+                for key, value in result['metrics'].items()],
+                tags=[RunTag('evaluation.' + key, value) for key, value in tags.items()])
+            client.log_artifact(run_id, role + '-benchmark.json')
+            client.set_terminated(run_id, status='FINISHED')
+            pins[role].update(run_id=run_id, model_sha256=result['model_sha256'],
+                             predictions_sha256=result['predictions_sha256'],
+                             evidence_sha256=evidence_digest(client.get_run(run_id)))
+        except Exception:
+            client.set_terminated(run_id, status='FAILED')
+            raise
+    Path('evaluations.json').write_text(json.dumps(pins, indent=2))
+    print('::' + json.dumps({'outputs': {'candidate_run_id': pins['candidate']['run_id'],
+                                      'champion_run_id': pins['champion']['run_id']}}) + '::')
+- id: fetch_evaluations
+  type: io.kestra.plugin.core.flow.Parallel
+  tasks:
+  - id: fetch_candidate_run
+    type: io.kestra.plugin.core.http.Request
+    timeout: PT30S
+    method: GET
+    headers:
+      Accept: application/json
+      Authorization: Bearer {{ secret('MLFLOW_TOKEN') }}
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+    uri: '{{ secret(''MLFLOW_TRACKING_URI'') }}/api/2.0/mlflow/runs/get?run_id={{ outputs.evaluate_models.vars.candidate_run_id
+      }}'
+  - id: fetch_champion_run
+    type: io.kestra.plugin.core.http.Request
+    timeout: PT30S
+    method: GET
+    headers:
+      Accept: application/json
+      Authorization: Bearer {{ secret('MLFLOW_TOKEN') }}
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT10S
+      maxAttempts: 3
+    uri: '{{ secret(''MLFLOW_TRACKING_URI'') }}/api/2.0/mlflow/runs/get?run_id={{ outputs.evaluate_models.vars.champion_run_id
+      }}'
+- id: assess
+  type: io.kestra.plugin.scripts.python.Script
+  description: Reject missing or incomparable evidence, then apply absolute limits and champion-relative regression checks.
+  timeout: PT1M
+  taskRunner:
+    type: io.kestra.plugin.core.runner.Process
+  inputFiles:
+    pins.json: '{{ outputs.evaluate_models.outputFiles[''evaluations.json''] }}'
+    config.json: '{{ inputs | toJson }}'
+    candidate.json: '{{ outputs.fetch_candidate_run.body }}'
+    champion.json: '{{ outputs.fetch_champion_run.body }}'
+  outputFiles:
+  - report.json
+  - report.md
+  script: |
+    import datetime
+    import hashlib
+    import os
+    import json
+    import math
+
+    def load(path):
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    pins, config = load("pins.json"), load("config.json")
+    reasons, measurements, contracts = [], {}, {}
+    threshold_keys = ("min_accuracy", "max_accuracy_drop", "max_p95_latency_ms",
+                      "max_peak_rss_mib", "max_resource_increase")
+    thresholds = {}
+    for key in threshold_keys:
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("Threshold must be finite: " + key)
+        if value < 0 or (key in ("min_accuracy", "max_accuracy_drop") and value > 1):
+            raise ValueError("Threshold outside its supported range: " + key)
+        if key in ("max_p95_latency_ms", "max_peak_rss_mib") and value == 0:
+            raise ValueError("Resource limits must be positive")
+        thresholds[key] = value
+
+    contract_keys = ("dataset_digest", "hardware_id", "batch_size", "benchmark_protocol", "device")
+    for role in ("candidate", "champion"):
+        run = load(role + ".json")["run"]
+        info = run["info"]
+        tags = {item["key"]: item["value"] for item in run.get("data", {}).get("tags", [])}
+        if info.get("run_id") != pins[role]["run_id"] or info.get("status") != "FINISHED" or info.get("lifecycle_stage") != "active":
+            reasons.append(role + ": evaluation identity/status is invalid")
+        if tags.get("evaluation.model_name") != pins["model_name"] or tags.get("evaluation.model_version") != pins[role]["version"]:
+            reasons.append(role + ": evaluation is not linked to the pinned model version")
+        contracts[role] = {key: tags.get("evaluation." + key) for key in contract_keys}
+        if any(not isinstance(value, str) or not value.strip() for value in contracts[role].values()):
+            reasons.append(role + ": missing benchmark contract tags")
+        batch_size = contracts[role].get("batch_size") or ""
+        if not batch_size.isdecimal() or int(batch_size) < 1:
+            reasons.append(role + ": batch_size must be a positive integer")
+        if contracts[role].get("device") != "cpu":
+            reasons.append(role + ": benchmark device must be cpu")
+        raw = {item["key"]: item["value"] for item in run.get("data", {}).get("metrics", [])}
+        measurements[role] = {}
+        for key in ("accuracy", "p95_latency_ms", "peak_rss_mib"):
+            value = raw.get(key)
+            valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            valid = valid and (0 <= value <= 1 if key == "accuracy" else value > 0)
+            measurements[role][key] = value if valid else None
+            if not valid:
+                reasons.append(role + ": missing or invalid " + key)
+    for key in contract_keys:
+        if contracts["candidate"][key] != contracts["champion"][key]:
+            reasons.append("Benchmark mismatch: " + key)
+
+    gate_specs = (
+        ("Accuracy floor", "accuracy below absolute floor", "accuracy", ">=", thresholds["min_accuracy"]),
+        ("Accuracy regression", "accuracy regressed beyond tolerance", "accuracy", ">=", None),
+        ("p95 latency ceiling", "p95 latency exceeds absolute limit", "p95_latency_ms", "<=", thresholds["max_p95_latency_ms"]),
+        ("Peak RSS ceiling", "peak RSS exceeds absolute limit", "peak_rss_mib", "<=", thresholds["max_peak_rss_mib"]),
+        ("p95 latency regression", "p95 latency regressed beyond tolerance", "p95_latency_ms", "<=", None),
+        ("Peak RSS regression", "peak RSS regressed beyond tolerance", "peak_rss_mib", "<=", None),
+    )
+    gates = []
+    comparable = not reasons
+    for name, reason, metric, operator, bound in gate_specs:
+        observed = measurements["candidate"][metric]
+        if comparable:
+            if bound is None:
+                baseline = measurements["champion"][metric]
+                bound = (baseline - thresholds["max_accuracy_drop"] if metric == "accuracy"
+                         else baseline * (1 + thresholds["max_resource_increase"]))
+            passed = observed >= bound if operator == ">=" else observed <= bound
+            if not passed:
+                reasons.append(reason)
+        else:
+            passed = None
+        gates.append({"name": name, "metric": metric, "operator": operator,
+                      "observed": observed, "bound": bound, "passed": passed})
+    eligible = not reasons
+    verdict = "ELIGIBLE_FOR_REVIEW" if eligible else "BLOCKED"
+    report = {
+        "schema_version": 3, "execution_id": os.environ["KESTRA_EXECUTION_ID"], "verdict": verdict, "eligible": eligible,
+        "approval_required": True, "pinned": pins, "measurements": measurements,
+        "benchmark_contracts": contracts, "thresholds": thresholds, "reasons": reasons,
+        "comparable": comparable, "gates": gates,
+        "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    with open("report.json", "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, allow_nan=False)
+    def cell(value):
+        if value is None:
+            return "missing/invalid"
+        return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`").replace("<", "&lt;").replace(">", "&gt;").replace("\r", " ").replace("\n", " ")
+
+    lines = ["# MLflow model evidence review", "", "Verdict: **" + verdict + "**", "",
+             "Human approval is still required. No alias or deployment was changed.", "",
+             "Model: " + cell(pins["model_name"]),
+             "Candidate v" + cell(pins["candidate"]["version"]) + "; champion v" + cell(pins["champion"]["version"]),
+             "", "| Metric | Candidate | Champion |", "| --- | --- | --- |"]
+    for metric in ("accuracy", "p95_latency_ms", "peak_rss_mib"):
+        lines.append("| " + metric + " | " + cell(measurements["candidate"][metric]) +
+                     " | " + cell(measurements["champion"][metric]) + " |")
+    lines += ["", "| Gate | Observed | Required | Result |", "| --- | --- | --- | --- |"]
+    for gate in gates:
+        status = "NOT_EVALUATED" if gate["passed"] is None else ("PASS" if gate["passed"] else "FAIL")
+        bound = "n/a" if gate["passed"] is None else gate["operator"] + " " + cell(gate["bound"])
+        lines.append("| " + gate["name"] + " | " + cell(gate["observed"]) + " | " + bound + " | " + status + " |")
+    lines += ["", "## Findings", ""] + (["- " + cell(reason) for reason in reasons] or ["- All six gates passed on comparable evidence."])
+    lines += ["", "## Evaluation provenance", ""]
+    for role in ("candidate", "champion"):
+        lines += ["- " + role + " run: " + cell(pins[role]["run_id"])]
+        lines += ["  - " + key + ": " + cell(value) for key, value in contracts[role].items()]
+    lines += ["", "Checked at: " + report["checked_at"], "",
+              "See report.json for machine-readable limits, gates and provenance."]
+    with open("report.md", "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    report_sha256 = hashlib.sha256(open("report.json", "rb").read()).hexdigest()
+    summary = "MLflow candidate v%s vs champion v%s: %s. %s" % (
+        pins["candidate"]["version"], pins["champion"]["version"], verdict,
+        "; ".join(reasons) if reasons else "Review report.md and approve the pinned version in your release process; nothing was promoted.",
+    )
+    print("::" + json.dumps({"outputs": {"eligible": eligible, "verdict": verdict, "summary": summary, "report_sha256": report_sha256}}) + "::")
+  env:
+    KESTRA_EXECUTION_ID: '{{ execution.id }}'
+- id: route_report
+  type: io.kestra.plugin.core.flow.If
+  condition: '{{ outputs.assess.vars.eligible }}'
+  then:
+  - id: request_review
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+    messageText: '{{ outputs.assess.vars.summary }} Download assess/report.md. Report SHA256: {{ outputs.assess.vars.report_sha256
+      }}. Execution: {{ execution.id }}. Promotion opt-in: {{ inputs.enable_promotion }}'
+  - id: promotion_opt_in
+    type: io.kestra.plugin.core.flow.If
+    condition: '{{ inputs.enable_promotion }}'
+    then:
+    - id: approval
+      type: io.kestra.plugin.core.flow.Pause
+      timeout: PT1H
+      onResume:
+      - id: approved
+        type: BOOL
+        defaults: false
+        description: Approve only after reviewing the pinned versions, metrics, and gate results.
+      - id: report_sha256
+        type: STRING
+        defaults: ''
+        description: Copy the exact report SHA256 from request_review or assess outputs.
+      - id: reason
+        type: STRING
+        defaults: ''
+        description: Record why you approve or reject this release.
+    - id: approved_release
+      type: io.kestra.plugin.core.flow.If
+      condition: '{{ outputs.approval.onResume.approved ?? false }}'
+      then:
+      - id: promote
+        type: io.kestra.plugin.scripts.python.Script
+        description: Reject stale approval/evidence/artifacts; update champion once and verify alias, artifact digest and
+          inference. No automatic rollback or write retry.
+        timeout: PT10M
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          MLFLOW_TRACKING_URI: '{{ secret(''MLFLOW_TRACKING_URI'') }}'
+          MLFLOW_TRACKING_TOKEN: '{{ secret(''MLFLOW_TOKEN'') }}'
+          KESTRA_EXECUTION_ID: '{{ execution.id }}'
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+          MLFLOW_DISABLE_AGENT_HINT: '1'
+          MLFLOW_HTTP_REQUEST_TIMEOUT: '20'
+          MLFLOW_HTTP_REQUEST_MAX_RETRIES: '0'
+        inputFiles:
+          config.json: '{{ inputs | toJson }}'
+          approval.json: '{{ outputs.approval.onResume | toJson }}'
+          report.json: '{{ outputs.assess.outputFiles[''report.json''] }}'
+          evaluation.csv: '{{ inputs.evaluation_data }}'
+          integrity.py: '{{ vars.integrity_script }}'
+        outputFiles:
+        - promotion.json
+        script: |
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          import mlflow
+          import numpy as np
+          import pandas as pd
+          from integrity import artifact_digest, evidence_digest, prediction_digest, version_identity
+
+          report_bytes = Path('report.json').read_bytes()
+          report = json.loads(report_bytes)
+          config = json.loads(Path('config.json').read_text())
+          approval = json.loads(Path('approval.json').read_text())
+          if approval.get('approved') is not True:
+              raise ValueError('Explicit approval is required')
+          if approval.get('report_sha256') != hashlib.sha256(report_bytes).hexdigest():
+              raise ValueError('Approval does not match this report')
+          if not approval.get('reason', '').strip():
+              raise ValueError('Record an approval reason')
+          if report.get('eligible') is not True or report.get('comparable') is not True:
+              raise ValueError('Evidence is not eligible')
+          if config['enable_promotion'] is not True or config['exclusive_registry_access'] is not True:
+              raise ValueError('Promotion requires opt-in and exclusive registry-writer access')
+          age = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.datetime.fromisoformat(report['checked_at'])).total_seconds()
+          if not 1 <= config['max_review_age_minutes'] <= 1440 or age < -60 or age > config['max_review_age_minutes'] * 60:
+              raise ValueError('Approval is stale; evaluate again')
+          pins = report['pinned']
+          if hashlib.sha256(Path('evaluation.csv').read_bytes()).hexdigest() != report['benchmark_contracts']['candidate']['dataset_digest']:
+              raise ValueError('Evaluation dataset changed')
+          client = mlflow.MlflowClient()
+          for role in ('candidate', 'champion'):
+              alias = config[role + '_alias']
+              current = client.get_model_version_by_alias(pins['model_name'], alias)
+              expected = {key: pins[role][key] for key in ('version', 'source', 'training_run_id')}
+              if version_identity(current) != expected or current.status != 'READY':
+                  raise ValueError('Approval is stale: ' + role + ' alias/version changed')
+              if evidence_digest(client.get_run(pins[role]['run_id'])) != pins[role]['evidence_sha256']:
+                  raise ValueError('Approval is stale: evaluation evidence changed')
+              local = mlflow.artifacts.download_artifacts(
+                  artifact_uri='models:/' + pins['model_name'] + '/' + pins[role]['version'],
+                  dst_path='recheck-' + role)
+              if artifact_digest(local) != pins[role]['model_sha256']:
+                  raise ValueError('Approval is stale: model artifacts changed')
+              if role == 'candidate':
+                  data = pd.read_csv('evaluation.csv')
+                  data.pop(config['target_column'])
+                  predictions = np.asarray(mlflow.pyfunc.load_model(local).predict(data))
+                  if prediction_digest(predictions) != pins[role]['predictions_sha256']:
+                      raise ValueError('Candidate predictions changed before promotion')
+          # MLflow alias updates have no compare-and-swap predicate. Concurrency=1 covers
+          # this flow only; the operator must exclude ALL other alias/artifact writers.
+          for role in ('candidate', 'champion'):
+              if str(client.get_model_version_by_alias(pins['model_name'], config[role + '_alias']).version) != pins[role]['version']:
+                  raise ValueError('Alias changed immediately before promotion')
+          receipt = {'execution_id': os.environ['KESTRA_EXECUTION_ID'],
+                     'model_name': pins['model_name'], 'alias': config['champion_alias'],
+                     'previous_version': pins['champion']['version'],
+                     'requested_version': pins['candidate']['version'],
+                     'report_sha256': hashlib.sha256(report_bytes).hexdigest(),
+                     'approval_reason': approval['reason'], 'promoted': False,
+                     'verdict': 'WRITE_OUTCOME_UNKNOWN',
+                     'rollback_instruction': 'Inspect the live alias first. Restore previous_version only under exclusive writer access.'}
+          Path('promotion.json').write_text(json.dumps(receipt, indent=2))
+          try:
+              # Intentionally no automatic retry: a lost response can follow a successful write.
+              client.set_registered_model_alias(pins['model_name'], config['champion_alias'], pins['candidate']['version'])
+              if str(client.get_model_version_by_alias(pins['model_name'], config['champion_alias']).version) != pins['candidate']['version']:
+                  raise ValueError('Promoted alias read-back differs from requested version')
+              local = mlflow.artifacts.download_artifacts(
+                  artifact_uri='models:/' + pins['model_name'] + '@' + config['champion_alias'],
+                  dst_path='verify-promoted')
+              if artifact_digest(local) != pins['candidate']['model_sha256']:
+                  raise ValueError('Promoted alias artifact digest differs')
+              data = pd.read_csv('evaluation.csv')
+              data.pop(config['target_column'])
+              predictions = np.asarray(mlflow.pyfunc.load_model(local).predict(data))
+              if prediction_digest(predictions) != pins['candidate']['predictions_sha256']:
+                  raise ValueError('Promoted alias inference differs from evaluated candidate')
+              if str(client.get_model_version_by_alias(pins['model_name'], config['champion_alias']).version) != pins['candidate']['version']:
+                  raise ValueError('Alias changed during verification')
+              receipt.update(promoted=True, verdict='PROMOTED', verified_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+          except Exception:
+              receipt['verdict'] = 'PROMOTION_UNVERIFIED'
+              Path('promotion.json').write_text(json.dumps(receipt, indent=2))
+              raise
+          Path('promotion.json').write_text(json.dumps(receipt, indent=2))
+          print('::' + json.dumps({'outputs': {'promoted': True, 'verdict': 'PROMOTED'}}) + '::')
+      - id: notify_promoted
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+        messageText: Verified champion alias promotion for execution {{ execution.id }}. Inspect promotion.json. Serving processes
+          are not redeployed by this flow.
+      else:
+      - id: notify_rejected
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+        messageText: Release approval rejected for execution {{ execution.id }}; no alias was changed.
+  else:
+  - id: notify_blocked
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+    messageText: '{{ outputs.assess.vars.summary }} Download report.md from the assess task. Execution: {{ execution.id }}.
+      Registry and serving deployment unchanged.'
+- id: release_result
+  type: io.kestra.plugin.scripts.python.Script
+  timeout: PT1M
+  taskRunner:
+    type: io.kestra.plugin.core.runner.Process
+  inputFiles:
+    config.json: '{{ inputs | toJson }}'
+    report.json: '{{ outputs.assess.outputFiles[''report.json''] }}'
+    approval.json: '{{ (outputs.approval.onResume ?? {}) | toJson }}'
+    promotion.json: '{{ (outputs.promote.vars ?? {}) | toJson }}'
+  script: |
+    import json
+    from pathlib import Path
+
+    def read(name):
+        return json.loads(Path(name + '.json').read_text())
+    config, report, approval, promotion = (read(name) for name in ('config', 'report', 'approval', 'promotion'))
+    if not report['eligible']:
+        verdict = 'BLOCKED'
+    elif not config['enable_promotion']:
+        verdict = 'ELIGIBLE_FOR_REVIEW'
+    elif approval.get('approved') is not True:
+        verdict = 'APPROVAL_REJECTED'
+    elif promotion.get('promoted') is True:
+        verdict = 'PROMOTED'
+    else:
+        raise ValueError('Approved release did not produce a verified promotion')
+    print('::' + json.dumps({'outputs': {'verdict': verdict, 'promoted': verdict == 'PROMOTED'}}) + '::')
+errors:
+- id: notify_check_failure
+  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+  url: '{{ secret(''SLACK_WEBHOOK_URL'') }}'
+  messageText: 'MLflow lifecycle failed in execution {{ execution.id }}. Inspect logs and any promotion.json receipt. If promotion
+    started, the alias may have changed: inspect it before rerunning; no automatic rollback is attempted.'
+outputs:
+- id: eligible
+  type: BOOL
+  value: '{{ outputs.assess.vars.eligible ?? false }}'
+- id: verdict
+  type: STRING
+  value: '{{ outputs.release_result.vars.verdict ?? ''CHECK_FAILED'' }}'
+- id: report
+  type: FILE
+  value: '{{ outputs.assess.outputFiles[''report.json''] ?? '''' }}'
+- id: review_report
+  type: FILE
+  value: '{{ outputs.assess.outputFiles[''report.md''] ?? '''' }}'
+- id: report_sha256
+  type: STRING
+  value: '{{ outputs.assess.vars.report_sha256 ?? '''' }}'
+- id: promoted
+  type: BOOL
+  value: '{{ outputs.release_result.vars.promoted ?? false }}'
+- id: promotion_receipt
+  type: STRING
+  value: '{{ outputs.promote.outputFiles[''promotion.json''] ?? '''' }}'
+triggers:
+- id: daily_evidence_review
+  type: io.kestra.plugin.core.trigger.Schedule
+  cron: 0 6 * * *
+  disabled: true
+extend:
+  title: Evaluate CPU Models and Approve MLflow Champion Promotion
+  metaTitle: CPU Model Evaluation and Approved MLflow Promotion | Kestra
+  shortDescription: Benchmark pinned MLflow classifiers, compare quality and CPU resources, pause for approval, and verify
+    an opted-in champion alias promotion.
+  metaDescription: Evaluate MLflow classifiers on one CPU dataset, compare quality and resource limits, and verify a champion
+    alias promotion after human approval.
+  description: |
+    ## How it works
+
+    1. Resolve candidate/champion aliases and pin READY version/source identities.
+    2. Load both trusted classification models in fresh, sequential CPU processes on one worker. Evaluate one held-out CSV, warm up, measure p95 prediction latency and Linux process peak RSS, and log new MLflow runs plus raw samples.
+    3. Compare dataset/runtime/hardware contracts, quality floors and resource regressions; save JSON and Markdown gate reports.
+    4. With promotion enabled, Pause for approval (default reject) and the exact report SHA256. Recheck report age, aliases, evaluation evidence and artifact hashes; update champion once and verify its artifact and predictions. Rejection or failed gates do not promote.
+
+    ## What you get
+
+    - Metrics, provenance, six gate results, report SHA256 and a promotion receipt.
+    - BLOCKED, ELIGIBLE_FOR_REVIEW, APPROVAL_REJECTED or verified PROMOTED outcomes. Check execution state too: a failed write/verification can leave an unknown alias outcome.
+    - A single execution slot, including while paused, and failure alerts.
+
+    ## Who it's for
+
+    MLOps teams releasing CPU tabular classifiers through MLflow aliases.
+
+    ## Why orchestrate this with Kestra
+
+    Tie evaluation, stored evidence, approval and verification to one execution, with native retries, branching and concurrency control.
+
+    ## Prerequisites
+
+    Linux Process worker with Python 3.12, MLflow 3.17.1, scikit-learn 1.9.1, NumPy and pandas; Python/Slack plugins; reachable registry/artifacts. Both trusted scikit-learn pyfunc models must return one deterministic label per row. Create the evaluation experiment. Supply a held-out CSV (target plus features, no missing values); use an idle dedicated CPU worker for meaningful comparisons. Peak RSS includes imports/model loading.
+
+    Promotion is off by default. Before enabling it, exclude ALL other alias/artifact writers for the full execution and set exclusive_registry_access=true. MLflow alias updates have no compare-and-swap; flow concurrency does not lock other clients. Restrict Kestra resume permissions to release approvers. No serving rollout or automatic rollback occurs.
+
+    ### Secrets
+
+    - MLFLOW_TRACKING_URI: registry base URL.
+    - MLFLOW_TOKEN: bearer credential for reads and evaluation logging; alias-write permission only when promoting.
+    - SLACK_WEBHOOK_URL: incoming webhook for release notices.
+
+    ## Quick start
+
+    1. Register two trusted versions, set distinct aliases, create the experiment, and configure secrets/dependencies.
+    2. Upload the held-out CSV as evaluation_data; run with promotion disabled and choose limits appropriate to the worker.
+    3. Test a blocked candidate. Then opt into exclusive promotion and review assess/report.md. Resume with approved=true, its report_sha256 and a reason; inspect promotion.json and the live alias.
+    4. Keep the schedule disabled until its required dataset input is configured.
+
+    ## How to extend
+
+    Adapt evaluation for regression/detection, add deployment/canary verification after registry promotion, or archive receipts externally.
+
+    ## Links
+
+    - [MLflow REST API](https://mlflow.org/docs/latest/api_reference/rest-api.html)
+    - [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Python](https://kestra.io/plugins/plugin-script-python)
+  tags:
+    - AI
+  subTags:
+    - Testing & Quality
+    - Monitoring & Alerting
+  ee: false
+  demo: false
+concurrency:
+  limit: 1
+  behavior: FAIL
+variables:
+  integrity_script: |
+    import hashlib
+    import json
+    from pathlib import Path
+
+
+    def artifact_digest(directory):
+        root = Path(directory)
+        digest, total, count = hashlib.sha256(), 0, 0
+        for path in sorted(root.rglob('*')):
+            if path.is_symlink():
+                raise ValueError('Model artifacts must not contain symlinks')
+            if not path.is_file():
+                continue
+            count += 1
+            total += path.stat().st_size
+            if count > 10000 or total > 512 * 1024 * 1024:
+                raise ValueError('Model artifact exceeds the 512 MiB / 10000-file bound')
+            name = path.relative_to(root).as_posix().encode()
+            digest.update(len(name).to_bytes(8, 'big') + name)
+            with path.open('rb') as handle:
+                content = hashlib.file_digest(handle, 'sha256').digest()
+            digest.update(content)
+        if not count:
+            raise ValueError('Empty model artifact')
+        return digest.hexdigest()
+
+
+    def prediction_digest(predictions):
+        return hashlib.sha256(json.dumps(predictions.tolist(), allow_nan=False,
+                                        separators=(',', ':')).encode()).hexdigest()
+
+
+    def version_identity(version):
+        return {'version': str(version.version), 'source': version.source,
+                'training_run_id': version.run_id}
+
+
+    def evidence_digest(run):
+        evidence = {'id': run.info.run_id, 'status': run.info.status,
+                    'lifecycle_stage': run.info.lifecycle_stage,
+                    'metrics': run.data.metrics, 'tags': run.data.tags}
+        return hashlib.sha256(json.dumps(evidence, sort_keys=True, allow_nan=False,
+                                        separators=(',', ':')).encode()).hexdigest()

@@ -1,0 +1,521 @@
+id: postgres-forced-checkpoint-max-wal-tuning-guard
+namespace: company.team
+
+inputs:
+  - id: postgres_url
+    type: STRING
+    defaults: jdbc:postgresql://localhost:5432/postgres
+    description: >-
+      PostgreSQL JDBC URL for the instance whose checkpoint behaviour is measured. The setting is instance wide, so any database on the cluster works. Example jdbc:postgresql://postgres:5432/app.
+
+  - id: use_secret_auth
+    type: BOOL
+    defaults: true
+    description: >-
+      Leave true in production so the connection reads POSTGRES_USERNAME and POSTGRES_PASSWORD from secrets. Set false only to pass credentials inline in a disposable test environment.
+
+  - id: postgres_username
+    type: STRING
+    defaults: postgres
+    description: Username used only when use_secret_auth is false. Ignored in production.
+
+  - id: postgres_password
+    type: STRING
+    defaults: ""
+    description: Password used only when use_secret_auth is false. Ignored in production.
+
+  - id: min_window_checkpoints
+    type: INT
+    defaults: 20
+    description: >-
+      Minimum number of checkpoints inside the measured window before the ratio is judged. A window with two checkpoints says nothing, so below this count the run reports and stops.
+
+  - id: max_requested_share
+    type: FLOAT
+    defaults: 0.5
+    description: >-
+      Share of the checkpoints in the window that may be requested by WAL volume rather than fired by the timer. Above this the instance is treated as checkpointing under WAL pressure. 0.5 means more than half were volume forced.
+
+  - id: headroom_factor
+    type: FLOAT
+    defaults: 2.0
+    description: >-
+      Multiple of the WAL volume actually measured over one checkpoint_timeout period to propose as the new max_wal_size. 1.0 proposes exactly the measured volume, which leaves no room for a busier hour.
+
+  - id: max_wal_ceiling_mb
+    type: INT
+    defaults: 4096
+    description: >-
+      Hard cap in MB on the proposed max_wal_size, whatever the measurement derives. Keeps a short burst of heavy writes from proposing an absurd value.
+
+  - id: wal_volume_free_mb
+    type: INT
+    defaults: 0
+    description: >-
+      Free space in MB on the filesystem holding pg_wal, from your own monitoring. PostgreSQL exposes no free space function, so this number has to come from outside. Left at 0 the flow refuses to raise anything, because it cannot prove the volume has room.
+
+  - id: wal_disk_fraction
+    type: FLOAT
+    defaults: 0.25
+    description: >-
+      Largest share of the WAL volume (free space plus what pg_wal already holds) that max_wal_size may claim. The proposal is clamped to this. A ceiling at or below the current setting is refused.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, report the measured checkpoint pressure plus the max_wal_size the measurement derives, without changing anything.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: >-
+      When true and dry_run is false, run ALTER SYSTEM SET max_wal_size behind an approval gate, reload the configuration, then re-read the live setting.
+
+variables:
+  baseline_key: "ckpt_window_{{ inputs.postgres_url | slugify }}"
+  empty_baseline: '{"timed":-1,"req":-1,"lsn":"","at":"","reset":""}'
+  detect_sql: |
+    WITH b AS (
+      SELECT
+        {{ outputs.read_baseline.values.b_timed }}::bigint AS b_timed,
+        {{ outputs.read_baseline.values.b_req }}::bigint AS b_req,
+        nullif('{{ outputs.read_baseline.values.b_lsn }}', '')::pg_lsn AS b_lsn,
+        nullif('{{ outputs.read_baseline.values.b_at }}', '')::timestamptz AS b_at,
+        nullif('{{ outputs.read_baseline.values.b_reset }}', '') AS b_reset
+    ),
+    cfg AS (
+      SELECT
+        (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS current_max_wal_mb,
+        (SELECT setting::bigint FROM pg_settings WHERE name = 'checkpoint_timeout') AS checkpoint_timeout_s,
+        (SELECT context FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_context,
+        (SELECT source FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_source,
+        (SELECT pending_restart FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_pending_restart,
+        (SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()) AS wal_dir_bytes
+    ),
+    live AS (
+      SELECT
+        checkpoints_timed AS now_timed,
+        checkpoints_req AS now_req,
+        stats_reset::text AS now_reset,
+        pg_current_wal_lsn()::text AS now_lsn,
+        now() AS now_at
+      FROM pg_stat_bgwriter
+    ),
+    win AS (
+      SELECT
+        b.*, cfg.*, n.*,
+        (b.b_timed >= 0 AND b.b_at IS NOT NULL) AS baseline_known,
+        (b.b_timed >= 0 AND (n.now_timed < b.b_timed OR n.now_req < b.b_req
+          OR (b.b_reset IS NOT NULL AND n.now_reset <> b.b_reset))) AS counters_rolled_back,
+        GREATEST(EXTRACT(epoch FROM (n.now_at - b.b_at)), 1) AS window_seconds,
+        CASE WHEN b.b_timed >= 0 THEN GREATEST(n.now_timed - b.b_timed, 0) ELSE 0 END AS timed_delta,
+        CASE WHEN b.b_req >= 0 THEN GREATEST(n.now_req - b.b_req, 0) ELSE 0 END AS req_delta,
+        CASE WHEN b.b_lsn IS NOT NULL
+          THEN GREATEST(pg_wal_lsn_diff(n.now_lsn::pg_lsn, b.b_lsn), 0) ELSE 0 END AS wal_bytes_in_window
+      FROM b, cfg, live n
+    ),
+    calc AS (
+      SELECT
+        w.*,
+        w.timed_delta + w.req_delta AS total_delta,
+        CASE WHEN w.timed_delta + w.req_delta > 0
+          THEN round(w.req_delta::numeric / (w.timed_delta + w.req_delta), 4) ELSE 0 END AS requested_share,
+        CASE WHEN w.now_timed + w.now_req > 0
+          THEN round(w.now_req::numeric / (w.now_timed + w.now_req), 4) ELSE 0 END AS lifetime_requested_share,
+        round(w.wal_bytes_in_window / 1048576.0 / w.window_seconds, 3) AS wal_mb_per_second,
+        round(w.wal_dir_bytes / 1048576.0) AS wal_dir_mb,
+        GREATEST(ceil(w.wal_bytes_in_window / 1048576.0 / w.window_seconds
+          * w.checkpoint_timeout_s * {{ inputs.headroom_factor }}), 0)::bigint AS wal_per_timeout_mb,
+        floor({{ inputs.wal_disk_fraction }}
+          * ({{ inputs.wal_volume_free_mb }} + w.wal_dir_bytes / 1048576.0))::bigint AS disk_ceiling_mb
+      FROM win w
+    ),
+    plan AS (
+      SELECT
+        c.*,
+        GREATEST(
+          LEAST(
+            GREATEST(c.wal_per_timeout_mb, c.current_max_wal_mb),
+            {{ inputs.max_wal_ceiling_mb }}::bigint,
+            c.disk_ceiling_mb
+          ),
+          c.current_max_wal_mb
+        ) AS proposed_mb
+      FROM calc c
+    )
+    SELECT
+      current_max_wal_mb,
+      checkpoint_timeout_s,
+      max_wal_context,
+      max_wal_source,
+      max_wal_pending_restart,
+      baseline_known,
+      counters_rolled_back,
+      round(window_seconds)::bigint AS window_seconds,
+      timed_delta,
+      req_delta,
+      total_delta,
+      requested_share,
+      lifetime_requested_share,
+      now_timed,
+      now_req,
+      now_reset,
+      now_lsn,
+      now_at::text AS now_at,
+      wal_bytes_in_window,
+      wal_mb_per_second,
+      wal_dir_mb,
+      wal_per_timeout_mb,
+      disk_ceiling_mb,
+      proposed_mb,
+      (baseline_known AND NOT counters_rolled_back
+        AND total_delta >= {{ inputs.min_window_checkpoints }}
+        AND requested_share > {{ inputs.max_requested_share }}) AS pressured,
+      (proposed_mb > current_max_wal_mb AND max_wal_source <> 'command line') AS raise_possible,
+      CASE
+        WHEN max_wal_source = 'command line'
+          THEN format('max_wal_size is pinned on the postmaster command line (pg_settings.source is %L), which outranks postgresql.auto.conf. ALTER SYSTEM would write the new value and the reload would keep serving %s MB. Change the container flag or the service unit instead.', max_wal_source, current_max_wal_mb)
+        WHEN {{ inputs.wal_volume_free_mb }} <= 0
+          THEN format('wal_volume_free_mb is 0, so free space on the WAL volume is unknown. Raising max_wal_size is refused rather than guessed. Current setting %s MB.', current_max_wal_mb)
+        WHEN disk_ceiling_mb <= current_max_wal_mb
+          THEN format('Disk ceiling %s MB is not above the current %s MB, so there is no headroom to raise into. %s percent of (free %s MB plus pg_wal %s MB) is all max_wal_size may claim.', disk_ceiling_mb, current_max_wal_mb, round(100 * {{ inputs.wal_disk_fraction }}), {{ inputs.wal_volume_free_mb }}, wal_dir_mb)
+        WHEN wal_per_timeout_mb <= current_max_wal_mb
+          THEN format('The measured WAL rate produces %s MB per checkpoint_timeout period, which already fits inside the current %s MB, so no raise is derived.', wal_per_timeout_mb, current_max_wal_mb)
+        ELSE ''
+      END AS refusal_reason,
+      format('ALTER SYSTEM SET max_wal_size = %L', proposed_mb::text || 'MB') AS fix_sql
+    FROM plan
+  reverify_sql: |
+    SELECT
+      current_setting('max_wal_size') AS effective_max_wal_size,
+      (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS effective_max_wal_mb,
+      (SELECT pending_restart FROM pg_settings WHERE name = 'max_wal_size') AS pending_restart,
+      (SELECT context FROM pg_settings WHERE name = 'max_wal_size') AS setting_context,
+      (
+        (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size')
+          < {{ outputs.detect.row.proposed_mb }}::bigint
+        OR (SELECT pending_restart FROM pg_settings WHERE name = 'max_wal_size')
+      ) AS verify_failed
+  close_sql: |
+    SELECT
+      checkpoints_timed AS now_timed,
+      checkpoints_req AS now_req,
+      stats_reset::text AS now_reset,
+      pg_current_wal_lsn()::text AS now_lsn,
+      now()::text AS now_at
+    FROM pg_stat_bgwriter
+
+triggers:
+  - id: hourly_checkpoint_pressure_window
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "7 * * * *"
+    description: >-
+      Hourly sample of the checkpoint counters. Each run measures the window since the previous run, so the ratio describes the last hour rather than the life of the server. Disabled by default and pinned to safe mode so it reports without changing anything until an operator enables it.
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: read_baseline
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      Read the counters this flow stored at the end of its previous run from the namespace KV store. They are the start of the measured window. A missing key means this is the first run, so the flow records a baseline and judges nothing.
+    values:
+      b_timed: "{{ (kv(render(vars.baseline_key), errorOnMissing=false) ?? vars.empty_baseline) | jq('.timed') | first }}"
+      b_req: "{{ (kv(render(vars.baseline_key), errorOnMissing=false) ?? vars.empty_baseline) | jq('.req') | first }}"
+      b_lsn: "{{ (kv(render(vars.baseline_key), errorOnMissing=false) ?? vars.empty_baseline) | jq('.lsn') | first }}"
+      b_at: "{{ (kv(render(vars.baseline_key), errorOnMissing=false) ?? vars.empty_baseline) | jq('.at') | first }}"
+      b_reset: "{{ (kv(render(vars.baseline_key), errorOnMissing=false) ?? vars.empty_baseline) | jq('.reset') | first }}"
+
+  - id: detect
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read pg_stat_bgwriter, the WAL position, the live settings plus the size of pg_wal, then derive the window. checkpoints_req counts the checkpoints WAL volume forced, checkpoints_timed counts the ones checkpoint_timeout fired. The deltas against the stored baseline give the ratio for this window only. The WAL bytes written in the same window give the rate the new max_wal_size is derived from.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.use_secret_auth ? secret('POSTGRES_USERNAME') : inputs.postgres_username }}"
+    password: "{{ inputs.use_secret_auth ? secret('POSTGRES_PASSWORD') : inputs.postgres_password }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.detect_sql) }}"
+
+  - id: log_detect
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Checkpoint window: {{ outputs.detect.row.window_seconds }}s, {{ outputs.detect.row.req_delta }} requested and {{ outputs.detect.row.timed_delta }} timed checkpoints, requested share {{ outputs.detect.row.requested_share }} against a threshold of {{ inputs.max_requested_share }}.
+      Lifetime share since stats_reset {{ outputs.detect.row.now_reset }} is {{ outputs.detect.row.lifetime_requested_share }} over {{ outputs.detect.row.now_req }} requested and {{ outputs.detect.row.now_timed }} timed. That number is reported for context and is never judged, because it cannot improve once the history is in it.
+      WAL written in the window: {{ outputs.detect.row.wal_bytes_in_window }} bytes, {{ outputs.detect.row.wal_mb_per_second }} MB per second.
+      max_wal_size is {{ outputs.detect.row.current_max_wal_mb }} MB (context {{ outputs.detect.row.max_wal_context }}, source {{ outputs.detect.row.max_wal_source }}, pending_restart {{ outputs.detect.row.max_wal_pending_restart }}). checkpoint_timeout is {{ outputs.detect.row.checkpoint_timeout_s }}s.
+      Derived need {{ outputs.detect.row.wal_per_timeout_mb }} MB, disk ceiling {{ outputs.detect.row.disk_ceiling_mb }} MB, proposal {{ outputs.detect.row.proposed_mb }} MB.
+      baseline_known={{ outputs.detect.row.baseline_known }} counters_rolled_back={{ outputs.detect.row.counters_rolled_back }} pressured={{ outputs.detect.row.pressured }} raise_possible={{ outputs.detect.row.raise_possible }}
+      Mode: dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}
+
+  - id: guard
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.detect.row.pressured }}"
+    then:
+      - id: findings_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: >-
+          Alert on every detection, in dry run as well as in remediate mode, so a human sees the checkpoint pressure even when nothing is changed.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "PostgreSQL forced checkpoint guard: {{ outputs.detect.row.req_delta }} of {{ outputs.detect.row.total_delta }} checkpoints in the last {{ outputs.detect.row.window_seconds }}s were forced by WAL volume (share {{ outputs.detect.row.requested_share }}). max_wal_size is {{ outputs.detect.row.current_max_wal_mb }} MB, the measured WAL rate of {{ outputs.detect.row.wal_mb_per_second }} MB/s derives {{ outputs.detect.row.wal_per_timeout_mb }} MB per checkpoint_timeout period, proposal {{ outputs.detect.row.proposed_mb }} MB. dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}. {{ outputs.detect.row.refusal_reason }}"}
+
+      - id: mode
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: headroom
+            type: io.kestra.plugin.core.flow.If
+            description: >-
+              Disk is the real limit on this change. A larger max_wal_size lets pg_wal grow further before a checkpoint, so the proposal is only taken forward when it stays inside the operator supplied share of the WAL volume.
+            condition: "{{ outputs.detect.row.raise_possible }}"
+            then:
+              - id: approval_gate
+                type: io.kestra.plugin.core.flow.Pause
+                description: >-
+                  Hold the run until a human approves the new value. The change is instance wide, it is written to postgresql.auto.conf and it trades disk for fewer checkpoints. Read the proposal against the free space on the WAL volume before approving.
+                pauseDuration: PT2H
+                behavior: FAIL
+                onResume:
+                  - id: approved
+                    type: BOOL
+                    defaults: false
+                    description: >-
+                      Set true to run ALTER SYSTEM SET max_wal_size at the proposed value and reload the configuration. Anything else leaves the setting alone.
+
+              - id: apply
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+                then:
+                  - id: apply_setting
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: >-
+                      Write the new value. ALTER SYSTEM appends it to postgresql.auto.conf, which PostgreSQL reads after postgresql.conf, so nothing in the main file has to be edited. allowFailure keeps a rejected statement from hiding the outcome, because the re-read below is the real gate.
+                    allowFailure: true
+                    url: "{{ inputs.postgres_url }}"
+                    username: "{{ inputs.use_secret_auth ? secret('POSTGRES_USERNAME') : inputs.postgres_username }}"
+                    password: "{{ inputs.use_secret_auth ? secret('POSTGRES_PASSWORD') : inputs.postgres_password }}"
+                    fetchType: NONE
+                    sql: "{{ outputs.detect.row.fix_sql }}"
+
+                  - id: reload_conf
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: >-
+                      Signal the postmaster to re-read its configuration files. max_wal_size has context sighup, so the reload is enough for it to take effect and no restart is scheduled by this flow.
+                    allowFailure: true
+                    url: "{{ inputs.postgres_url }}"
+                    username: "{{ inputs.use_secret_auth ? secret('POSTGRES_USERNAME') : inputs.postgres_username }}"
+                    password: "{{ inputs.use_secret_auth ? secret('POSTGRES_PASSWORD') : inputs.postgres_password }}"
+                    fetchType: FETCH_ONE
+                    sql: SELECT pg_reload_conf() AS reloaded
+
+                  - id: settle
+                    type: io.kestra.plugin.core.flow.Sleep
+                    description: >-
+                      pg_reload_conf() returns before the postmaster has processed the signal, so a read fired in the same instant can still see the old value. Two seconds removes that race from the verification.
+                    duration: PT2S
+
+                  - id: reverify
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: >-
+                      Read the live value back with current_setting, plus pending_restart to prove the reload was enough. This step proves the setting changed. It does not prove the pressure is gone, which is what the next window measures.
+                    url: "{{ inputs.postgres_url }}"
+                    username: "{{ inputs.use_secret_auth ? secret('POSTGRES_USERNAME') : inputs.postgres_username }}"
+                    password: "{{ inputs.use_secret_auth ? secret('POSTGRES_PASSWORD') : inputs.postgres_password }}"
+                    fetchType: FETCH_ONE
+                    sql: "{{ render(vars.reverify_sql) }}"
+
+                  - id: verify_result
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ outputs.reverify.row.verify_failed }}"
+                    then:
+                      - id: remediation_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          max_wal_size did not land. Wanted at least {{ outputs.detect.row.proposed_mb }} MB, read back {{ outputs.reverify.row.effective_max_wal_mb }} MB (current_setting reports {{ outputs.reverify.row.effective_max_wal_size }}, pending_restart {{ outputs.reverify.row.pending_restart }}, source at detection time {{ outputs.detect.row.max_wal_source }}). ALTER SYSTEM needs a superuser or a role granted SET on that parameter, pg_reload_conf needs the same, so a role without either leaves the value untouched while the statements fail. A value pinned on the postmaster command line also outranks postgresql.auto.conf, so the write lands in the file while the live value never moves.
+                    else:
+                      - id: remediated
+                        type: io.kestra.plugin.core.log.Log
+                        message: |
+                          max_wal_size moved from {{ outputs.detect.row.current_max_wal_mb }} MB to {{ outputs.reverify.row.effective_max_wal_mb }} MB. current_setting reports {{ outputs.reverify.row.effective_max_wal_size }}, setting context is {{ outputs.reverify.row.setting_context }} and pending_restart is {{ outputs.reverify.row.pending_restart }}, so the reload was enough and no restart is needed.
+                          What this proves: the value changed. What it does not prove: that the pressure is gone. The pg_stat_bgwriter counters are cumulative, so the ratio only improves in the windows measured from here. The baseline recorded at the end of this run is the start of the first window that measures the fix.
+                          The trade is explicit. Fewer checkpoints, each flushing more, more WAL kept between them and a longer crash recovery.
+                else:
+                  - id: not_approved
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Approval not granted, so max_wal_size stays at {{ outputs.detect.row.current_max_wal_mb }} MB and WAL volume keeps forcing checkpoints."
+            else:
+              - id: headroom_refused
+                type: io.kestra.plugin.core.log.Log
+                message: |
+                  Refusing to raise max_wal_size. {{ outputs.detect.row.refusal_reason }}
+                  Nothing was changed. Fix the cause named above, then run this again. Shortening checkpoint_timeout is not the way out, because that fires more checkpoints rather than fewer.
+        else:
+          - id: report_only
+            type: io.kestra.plugin.core.log.Log
+            message: "Report only (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}). max_wal_size would move from {{ outputs.detect.row.current_max_wal_mb }} MB to {{ outputs.detect.row.proposed_mb }} MB. No change made. {{ outputs.detect.row.refusal_reason }}"
+    else:
+      - id: clean
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          No checkpoint pressure to act on. Window {{ outputs.detect.row.window_seconds }}s with {{ outputs.detect.row.req_delta }} requested of {{ outputs.detect.row.total_delta }} checkpoints, requested share {{ outputs.detect.row.requested_share }}.
+          baseline_known={{ outputs.detect.row.baseline_known }} counters_rolled_back={{ outputs.detect.row.counters_rolled_back }}. A first run or a stats reset records a fresh baseline and judges nothing. A window under {{ inputs.min_window_checkpoints }} checkpoints is too small to read.
+
+  - id: close_window
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read the counters again at the end of the run. These become the start of the next window, so after a remediation the next run measures only post change behaviour.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.use_secret_auth ? secret('POSTGRES_USERNAME') : inputs.postgres_username }}"
+    password: "{{ inputs.use_secret_auth ? secret('POSTGRES_PASSWORD') : inputs.postgres_password }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.close_sql) }}"
+
+  - id: record_baseline
+    type: io.kestra.plugin.core.kv.Set
+    description: >-
+      Store the closing counters, the WAL position plus the stats_reset stamp under a key derived from the target URL. No TTL, because an expiring cursor would silently restart the window.
+    key: "{{ render(vars.baseline_key) }}"
+    value: "{{ {'timed': outputs.close_window.row.now_timed, 'req': outputs.close_window.row.now_req, 'lsn': outputs.close_window.row.now_lsn, 'at': outputs.close_window.row.now_at, 'reset': outputs.close_window.row.now_reset} | toJson }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: >-
+      Post to Slack on any failure, including a connection error, a rejected ALTER SYSTEM or a max_wal_size that did not change after the reload.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "PostgreSQL forced checkpoint max_wal_size guard FAILED (execution {{ execution.id }}). A connection error, a rejected ALTER SYSTEM or a setting that did not move after pg_reload_conf. Check the run."}
+
+extend:
+  title: PostgreSQL Forced Checkpoint max_wal_size Tuning Guard
+  shortDescription: Measure how many PostgreSQL checkpoints are forced by WAL volume rather than fired by the timer, derive a larger max_wal_size from the measured WAL rate, apply it with ALTER SYSTEM plus pg_reload_conf behind a disk headroom check and an approval gate, then read the live setting back.
+  metaTitle: PostgreSQL Forced Checkpoint max_wal_size Tuning Guard with Kestra
+  metaDescription: Detect PostgreSQL checkpoints forced by WAL volume, raise max_wal_size behind a disk check and approval, then read the live setting back.
+  description: |
+    A PostgreSQL checkpoint happens for one of two reasons. `checkpoint_timeout` fires it on a timer, which is paced over `checkpoint_completion_target` and cheap. Or WAL volume hits `max_wal_size`, which forces one immediately and flushes every dirty buffer as fast as the storage takes them. On a write heavy instance with `max_wal_size` set too small, almost every checkpoint is the second kind, so the instance spends its day in back to back IO storms.
+
+    The evidence is already in the server. `pg_stat_bgwriter.checkpoints_req` climbs far past `checkpoints_timed`. PostgreSQL also writes `checkpoints are occurring too frequently` into its own log with a hint naming `max_wal_size`. Both go unread, because nothing watches them.
+
+    This guard samples those counters, judges the ratio over the window since its own previous run, derives a new `max_wal_size` from the WAL bytes actually written in that window, refuses to raise beyond a share of the WAL volume, applies the change with `ALTER SYSTEM` plus `pg_reload_conf()` behind an approval gate, then reads the live setting back and fails the run if it did not move.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Safety
+
+    - Read-only by default. `dry_run` is true and `auto_remediate` is false, so a plain run measures, reports and changes nothing.
+    - A change happens only when `auto_remediate` is true and `dry_run` is false, the disk headroom check passes, then a human resumes the `Pause` with `approved` set true. An unanswered gate reads as not approved.
+    - No restart is scheduled by this flow. That is checked rather than claimed. `ALTER SYSTEM` writes to `postgresql.auto.conf`, which PostgreSQL reads after `postgresql.conf`. `max_wal_size` has setting context `sighup`, so `pg_reload_conf()` is enough for the new value to take effect. The re-read reports `pending_restart`, which stays false. The run fails if it is ever true.
+    - What the re-verify proves is narrow, so it is worth stating. It proves the setting changed. It does not prove the checkpoint pressure is gone. `pg_stat_bgwriter` counters are cumulative since the last reset, so a lifetime ratio cannot improve however good the fix is. That is why this flow judges a delta instead. It keeps the previous run's counters in the namespace KV store, measures the window between them, then writes the closing counters at the end of every run. After a remediation the next window starts from post change counters, so the following run is the one that shows whether the fix worked. The lifetime ratio is still logged, labelled, never judged.
+    - `pg_stat_reset_shared('bgwriter')` would be the other way to get a clean window. This flow does not call it. Resetting is destructive to every other consumer of those counters, including your own monitoring. The delta gives the same measurement without touching shared state.
+    - Raising `max_wal_size` costs disk. WAL is allowed to grow further before a checkpoint, so the proposal is clamped to `wal_disk_fraction` of the free space on the WAL volume plus what `pg_wal` already holds. PostgreSQL exposes no free space function, so that number comes from the operator through `wal_volume_free_mb`. Left at 0 the flow refuses to raise anything rather than guessing. A ceiling at or below the current setting is refused with the numbers printed.
+    - The trade is real and it is not hidden. Fewer checkpoints, each flushing more, means more WAL retained between them and a longer crash recovery window. `max_wal_ceiling_mb` is the hard cap on how far that can go.
+    - A `max_wal_size` pinned on the postmaster command line outranks `postgresql.auto.conf`, so `ALTER SYSTEM` would write the new value while the server keeps serving the old one. The detection reads `pg_settings.source`, refuses the change when it says `command line` and names the container flag or service unit as the place to fix it.
+    - The value is derived, never picked. It is the WAL bytes measured in the window, scaled to one `checkpoint_timeout` period, times `headroom_factor`. It is also never lowered, because this flow only raises.
+
+    ## How it works
+
+    1. `read_baseline` (`io.kestra.plugin.core.output.OutputValues`) reads the counters this flow stored at the end of its previous run from the namespace KV store. A missing key means a first run.
+    2. `detect` (`io.kestra.plugin.jdbc.postgresql.Query`) reads `pg_stat_bgwriter`, `pg_current_wal_lsn()`, the live settings plus the size of `pg_wal` in one query. It returns the per window deltas, the requested share, the WAL rate, the derived need, the disk ceiling, the clamped proposal plus the exact `ALTER SYSTEM` statement. Every comparison is done in SQL, so one row carries the verdict.
+    3. `log_detect` (`io.kestra.plugin.core.log.Log`) logs the window, both ratios, the WAL rate plus the mode.
+    4. `guard` (`io.kestra.plugin.core.flow.If`) branches on the verdict. With no pressure, `clean` explains why and the run ends. Otherwise `findings_alert` posts the measurement on every detection.
+    5. `mode` (`io.kestra.plugin.core.flow.If`) enters the remediation branch only when `auto_remediate` is true and `dry_run` is false. Otherwise `report_only` states what would change.
+    6. `headroom` (`io.kestra.plugin.core.flow.If`) is the disk gate. If the proposal is not above the current setting, `headroom_refused` prints the reason and nothing is touched. The same happens when `pg_settings.source` says the value is pinned on the command line.
+    7. `approval_gate` (`io.kestra.plugin.core.flow.Pause`) waits for a human. `apply_setting` then runs `ALTER SYSTEM SET max_wal_size` and `reload_conf` runs `pg_reload_conf()`.
+    8. `reverify` reads `current_setting('max_wal_size')` plus `pending_restart` back. `verify_result` fails the run through `io.kestra.plugin.core.execution.Fail` if the value is short of the proposal or a restart is pending.
+    9. `close_window` reads the counters once more and `record_baseline` (`io.kestra.plugin.core.kv.Set`) stores them as the start of the next window.
+
+    ## What you get
+
+    - A ratio you can act on. The share of checkpoints forced by WAL volume over the last window, not over the life of the server.
+    - A `max_wal_size` derived from the WAL bytes the instance actually wrote, scaled to one `checkpoint_timeout` period.
+    - A disk gate that refuses the change when the WAL volume cannot hold it, with the free space, the ceiling plus the current value all printed.
+    - Proof that no restart is needed, read from `pg_settings.pending_restart` rather than asserted.
+    - A real verification step. The run passes only when a second read shows the new value live.
+    - An honest line on what is still unknown after a successful run, plus the window that will answer it.
+    - Slack alerts on the findings and on any failure.
+
+    ## Who it's for
+
+    - DBAs and platform engineers on write heavy PostgreSQL instances that stall in bursts, where IO spikes line up with checkpoints.
+    - Teams who inherited an instance still carrying a small default `max_wal_size` from an old config or a container flag.
+    - Anyone who has seen `checkpoints are occurring too frequently` in the log and wants the follow up measured, applied plus proven instead of guessed.
+
+    ## Why orchestrate this with Kestra
+
+    The counters are cumulative, so reading them once tells you about the whole life of the server rather than today. Measuring a window needs something that remembers the last reading, runs on a schedule, holds the state between runs then does the arithmetic the same way every time. Kestra has the KV store for the cursor, the scheduler for the sampling, an approval gate for a change that is instance wide, a re-read step that turns a hopeful fix into a verified one plus a Slack alert the moment any of it fails. A one-off script that raises `max_wal_size` reports success whether or not the value moved. It also has nowhere to keep the previous reading.
+
+    ## Tested end to end
+
+    Run on Kestra 2.0.5 against PostgreSQL 16 configured through `postgresql.auto.conf` with `max_wal_size=48MB`, `min_wal_size=32MB` plus `checkpoint_timeout=30min`, with a local HTTP sink standing in for Slack. A sustained write loop forced repeated volume checkpoints while the timer fired none. Every number was confirmed with psql against `pg_stat_bgwriter` and `pg_settings`. The server also wrote `checkpoints are occurring too frequently` into its own log during the seed, which is the same condition read from the other side.
+
+    - Detector can fail: the same write loop produced 22 forced checkpoints of 22 at `max_wal_size=48MB`, then 1 of 1 after the setting was raised to 768MB and the counters were reset. The second window is reported clean, because a one checkpoint window is below `min_window_checkpoints` however bad its share looks.
+    - Dry run reported the proposal (48MB to 256MB, derived from 503528928 bytes of WAL in 93 seconds) and left `max_wal_size` at 48MB, confirmed with psql.
+    - Remediate with approval moved it to 256MB, the value the disk ceiling allowed. `current_setting('max_wal_size')` read `256MB` back, `pending_restart` stayed false and `pg_postmaster_start_time()` was identical before and after, so the server was never restarted.
+    - A role with `pg_monitor` but not superuser had its `ALTER SYSTEM` rejected, the re-read found 48MB unchanged and the run failed and alerted rather than reporting success.
+    - On an instance started with `-c max_wal_size=48MB` the write landed in `postgresql.auto.conf` while the live value never moved, because the command line outranks that file. The re-read caught it, which is why the detection now reads `pg_settings.source` and refuses that case up front.
+    - The disk gate refused with `wal_volume_free_mb` left at 0, then refused again at a 28MB ceiling against a 48MB setting, both times printing the numbers and changing nothing.
+    - Declining the approval left the setting alone.
+    - An unreachable host failed the first query and fired the Slack alert.
+
+    ## Prerequisites
+
+    A PostgreSQL server reachable over JDBC. The connecting role needs to read `pg_stat_bgwriter`, `pg_settings` plus `pg_ls_waldir()`, which means membership of `pg_monitor` or superuser. To apply the change it must be a superuser or hold `GRANT SET ON PARAMETER max_wal_size`. It also needs `EXECUTE` on `pg_reload_conf()`.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`: PostgreSQL user, read when `use_secret_auth` is true.
+    - `POSTGRES_PASSWORD`: password for that user.
+    - `SLACK_WEBHOOK_URL`: used by `findings_alert` and the `errors` block.
+    - In Kestra OSS, provide each secret as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Name | Type | Default | Description |
+    | :--- | :--- | :--- | :--- |
+    | `postgres_url` | STRING | `jdbc:postgresql://localhost:5432/postgres` | JDBC URL for the target instance. |
+    | `use_secret_auth` | BOOL | `true` | Read credentials from secrets. Set false only for inline test credentials. |
+    | `min_window_checkpoints` | INT | `20` | Minimum checkpoints in the window before the ratio is judged. |
+    | `max_requested_share` | FLOAT | `0.5` | Share of window checkpoints that may be forced by WAL volume. |
+    | `headroom_factor` | FLOAT | `2.0` | Multiple of the measured WAL per `checkpoint_timeout` period to propose. |
+    | `max_wal_ceiling_mb` | INT | `4096` | Hard cap in MB on the proposal. |
+    | `wal_volume_free_mb` | INT | `0` | Free space in MB on the filesystem holding `pg_wal`. 0 refuses any raise. |
+    | `wal_disk_fraction` | FLOAT | `0.25` | Largest share of the WAL volume `max_wal_size` may claim. |
+    | `dry_run` | BOOL | `true` | Report without changing anything. |
+    | `auto_remediate` | BOOL | `false` | Apply behind the approval gate when dry_run is false. |
+
+    ## Quick start
+
+    1. Set `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` plus `SLACK_WEBHOOK_URL` as namespace secrets.
+    2. Import this flow.
+    3. Run it once against a write heavy instance. The first run records a baseline and judges nothing, which is expected.
+    4. Enable the hourly trigger so the sampling runs on its own. From the second run on, each run reports the ratio for the window since the last one.
+    5. To apply a proposal, set `wal_volume_free_mb` from your monitoring, run with `dry_run` false and `auto_remediate` true, then resume the paused execution with `approved` true.
+
+    ## How to extend
+
+    - On PostgreSQL 17 and later these counters moved to `pg_stat_checkpointer` as `num_requested` and `num_timed`. Point the two reads at that view and the rest of the flow is unchanged.
+    - Add `checkpoint_write_time` plus `buffers_checkpoint` to the baseline to report the IO each checkpoint actually flushed, not just how many there were.
+    - Raise `checkpoint_timeout` in the same gated step for an instance that can afford an even longer recovery window, since the derived need scales with it.
+    - Point the flow at each instance in turn from a parent flow. The KV key is derived from the URL, so every instance keeps its own window.
+    - Fail the run as soon as pressure is detected, for a read-only check with no remediation.
+    - Feed `wal_volume_free_mb` from a node exporter query ahead of the run instead of an input, so the disk gate reads live free space.
+
+    ## Links
+
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+    - WAL configuration and max_wal_size: https://www.postgresql.org/docs/current/runtime-config-wal.html
+    - pg_stat_bgwriter: https://www.postgresql.org/docs/current/monitoring-stats.html
+    - WAL internals and checkpoints: https://www.postgresql.org/docs/current/wal-configuration.html
+    - ALTER SYSTEM: https://www.postgresql.org/docs/current/sql-altersystem.html
+    - KV store: https://kestra.io/docs/concepts/kv-store
+    - Schedule trigger: https://kestra.io/plugins/core/triggers/io.kestra.plugin.core.trigger.schedule
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false

@@ -1,0 +1,678 @@
+id: pgvector-hnsw-index-maintenance-and-rebuild-gate
+namespace: company.team
+
+description: |
+  Audit pgvector HNSW vector indexes for storage bloat, dead tuple accumulation, and approximate nearest neighbor
+  (ANN) recall degradation caused by iterative vector updates. Execute concurrent index rebuilds with lock timeout guards
+  during off-peak windows, record reindex duration and reclaimed storage in Kestra KV, and notify Slack.
+
+inputs:
+  - id: postgres_url
+    type: STRING
+    defaults: "jdbc:postgresql://localhost:5432/postgres"
+    displayName: PostgreSQL JDBC URL
+    description: JDBC connection string to the PostgreSQL database with pgvector extension enabled.
+
+  - id: postgres_username
+    type: STRING
+    defaults: "postgres"
+    displayName: PostgreSQL Username
+    description: Database user with privileges to inspect pg_class, pg_statio_user_indexes, and execute REINDEX.
+
+  - id: target_schema
+    type: STRING
+    defaults: "public"
+    displayName: Target Schema
+    description: Database schema name to scan for HNSW vector indexes.
+
+  - id: target_table
+    type: STRING
+    defaults: "documents"
+    displayName: Target Table
+    description: Base table name storing vector embeddings. If specified, restricts inspection and performance benchmarks to this table.
+
+  - id: target_index
+    type: STRING
+    defaults: ""
+    displayName: Target Index Name
+    description: Specific HNSW index name to evaluate. Leave empty to evaluate all discovered HNSW indexes on the table.
+
+  - id: vector_column
+    type: STRING
+    defaults: "embedding"
+    displayName: Vector Column Name
+    description: Vector column name used for ANN query benchmark and recall evaluation.
+
+  - id: id_column
+    type: STRING
+    defaults: "id"
+    displayName: Primary Key ID Column
+    description: Primary key column name in the vector table for ground-truth top-k recall comparison.
+
+  - id: bloat_ratio_threshold
+    type: FLOAT
+    defaults: 1.20
+    displayName: Index-to-Table Bloat Ratio Threshold
+    description: Ratio threshold of index relation size to base table data size (pg_relation_size / pg_table_size) indicating graph fragmentation.
+
+  - id: dead_tuple_ratio_threshold_pct
+    type: FLOAT
+    defaults: 20.0
+    displayName: Dead Tuple Ratio Threshold (%)
+    description: Base table dead tuple percentage threshold (n_dead_tup / total_tuples * 100) indicating MVCC vector update churn.
+
+  - id: ann_latency_threshold_ms
+    type: FLOAT
+    defaults: 40.0
+    displayName: ANN Query Latency Threshold (ms)
+    description: Maximum acceptable ANN query execution latency in milliseconds before triggering a rebuild gate.
+
+  - id: min_recall_threshold
+    type: FLOAT
+    defaults: 0.90
+    displayName: Minimum Recall@k Threshold
+    description: Minimum acceptable recall accuracy ratio compared to exact sequential scan ground truth.
+
+  - id: top_k
+    type: INT
+    defaults: 10
+    displayName: Top-K Nearest Neighbors
+    description: Number of nearest neighbors to retrieve during latency and recall benchmark queries.
+
+  - id: sample_queries_count
+    type: INT
+    defaults: 20
+    displayName: Sample Queries Count
+    description: Number of sample vector queries to evaluate for ANN latency and recall measurement.
+
+  - id: lock_timeout_seconds
+    type: INT
+    defaults: 10
+    displayName: Lock Timeout (seconds)
+    description: Lock acquisition timeout in seconds for REINDEX INDEX CONCURRENTLY to prevent blocking production transactions.
+
+  - id: auto_reindex
+    type: BOOL
+    defaults: true
+    displayName: Auto Reindex Enabled
+    description: Whether to execute REINDEX INDEX CONCURRENTLY when bloat, latency, or recall breach thresholds.
+
+  - id: dry_run
+    type: BOOL
+    defaults: false
+    displayName: Dry Run Mode
+    description: Audit bloat and evaluate recall benchmarks without executing index rebuilds.
+
+triggers:
+  - id: off_peak_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Weekly Sunday 03:00 UTC maintenance window for pgvector HNSW health audit and concurrent rebuilds.
+    cron: "0 3 * * 0"
+    disabled: true
+
+  - id: maintenance_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Inbound webhook trigger for initiating on-demand HNSW index audit after batch vector ingestion or updates.
+    key: "{{ secret('PGVECTOR_MAINTENANCE_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: inspect_hnsw_indexes
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Inspect pg_class, pg_index, pg_stat_user_tables, and pg_statio_user_indexes for HNSW vector index bloat and dead tuple accumulation.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.postgres_username }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT
+        n.nspname AS table_schema,
+        t.relname AS table_name,
+        ic.relname AS index_name,
+        ic.oid AS index_oid,
+        t.oid AS table_oid,
+        pg_relation_size(ic.oid) AS index_size_bytes,
+        pg_size_pretty(pg_relation_size(ic.oid)) AS index_size_pretty,
+        pg_table_size(t.oid) AS table_size_bytes,
+        pg_size_pretty(pg_table_size(t.oid)) AS table_size_pretty,
+        ROUND((pg_relation_size(ic.oid)::numeric / GREATEST(pg_table_size(t.oid), 1)::numeric), 3) AS index_to_table_ratio,
+        GREATEST(t.reltuples, 0)::bigint AS est_rows,
+        COALESCE(st.n_live_tup, 0) AS n_live_tup,
+        COALESCE(st.n_dead_tup, 0) AS n_dead_tup,
+        COALESCE(st.n_tup_upd, 0) AS n_tup_upd,
+        COALESCE(st.n_tup_del, 0) AS n_tup_del,
+        CASE
+          WHEN (COALESCE(st.n_live_tup, 0) + COALESCE(st.n_dead_tup, 0)) > 0 THEN
+            ROUND((COALESCE(st.n_dead_tup, 0)::numeric / (st.n_live_tup + st.n_dead_tup)::numeric) * 100, 2)
+          ELSE 0.00
+        END AS dead_tuple_ratio_pct,
+        COALESCE(sio.idx_blks_read, 0) AS idx_blks_read,
+        COALESCE(sio.idx_blks_hit, 0) AS idx_blks_hit,
+        (SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY u(k, o)
+           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = u.k WHERE o = 1) AS column_name,
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM unnest(i.indkey::int2[]) WITH ORDINALITY u(k, o)
+           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = u.k WHERE o = 1) AS column_type,
+        (SELECT op.opcname FROM unnest(i.indclass::oid[]) WITH ORDINALITY u(cls, o)
+           JOIN pg_opclass op ON op.oid = u.cls WHERE o = 1) AS opclass,
+        CASE
+          WHEN (SELECT op.opcname FROM unnest(i.indclass::oid[]) WITH ORDINALITY u(cls, o) JOIN pg_opclass op ON op.oid = u.cls WHERE o = 1) LIKE '%cosine%' THEN '<=>'
+          WHEN (SELECT op.opcname FROM unnest(i.indclass::oid[]) WITH ORDINALITY u(cls, o) JOIN pg_opclass op ON op.oid = u.cls WHERE o = 1) LIKE '%ip%' THEN '<#>'
+          WHEN (SELECT op.opcname FROM unnest(i.indclass::oid[]) WITH ORDINALITY u(cls, o) JOIN pg_opclass op ON op.oid = u.cls WHERE o = 1) LIKE '%l1%' THEN '<+>'
+          ELSE '<->'
+        END AS distance_operator,
+        i.indisvalid
+      FROM pg_index i
+      JOIN pg_class ic ON ic.oid = i.indexrelid
+      JOIN pg_class t ON t.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+      JOIN pg_am am ON am.oid = ic.relam
+      LEFT JOIN pg_stat_user_tables st ON st.relid = t.oid
+      LEFT JOIN pg_statio_user_indexes sio ON sio.indexrelid = ic.oid
+      WHERE am.amname = 'hnsw'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND ('{{ inputs.target_schema }}' = '' OR n.nspname = '{{ inputs.target_schema }}')
+        AND ('{{ inputs.target_table }}' = '' OR t.relname = '{{ inputs.target_table }}')
+        AND ('{{ inputs.target_index }}' = '' OR ic.relname = '{{ inputs.target_index }}')
+      ORDER BY index_to_table_ratio DESC, st.n_dead_tup DESC;
+
+  - id: benchmark_ann_performance
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Sample vectors from target table to measure HNSW query latency and compare against exact sequential scan ground truth for recall@k.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ inputs.postgres_username }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      DO $bench$
+      DECLARE
+        v_tbl regclass;
+        v_count bigint;
+        v_topk int := {{ inputs.top_k }};
+        v_samples int := {{ inputs.sample_queries_count }};
+        v_q record;
+        v_t0 timestamptz;
+        v_exact_dur interval := '0';
+        v_ann_dur interval := '0';
+        v_hits bigint := 0;
+        v_total_queries int := 0;
+        v_exact_ids text[];
+        v_ann_ids text[];
+        v_dist_op text;
+        v_col_type text;
+      BEGIN
+        CREATE TEMP TABLE IF NOT EXISTS hnsw_bench_result (
+          benchmark_status text,
+          queries_tested int,
+          avg_ann_latency_ms numeric,
+          avg_exact_latency_ms numeric,
+          measured_recall numeric,
+          speedup_ratio numeric
+        ) ON COMMIT DROP;
+        DELETE FROM hnsw_bench_result;
+
+        SELECT to_regclass(format('%I.%I', '{{ inputs.target_schema }}', '{{ inputs.target_table }}')) INTO v_tbl;
+        IF v_tbl IS NULL THEN
+          INSERT INTO hnsw_bench_result VALUES ('SKIPPED_TABLE_NOT_FOUND', 0, 0, 0, 1.0, 1.0);
+          RETURN;
+        END IF;
+
+        EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %s WHERE %I IS NOT NULL LIMIT 10) s', v_tbl, '{{ inputs.vector_column }}') INTO v_count;
+        IF v_count = 0 THEN
+          INSERT INTO hnsw_bench_result VALUES ('SKIPPED_EMPTY_TABLE', 0, 0, 0, 1.0, 1.0);
+          RETURN;
+        END IF;
+
+        SELECT
+          format_type(a.atttypid, a.atttypmod),
+          CASE
+            WHEN op.opcname LIKE '%cosine%' THEN '<=>'
+            WHEN op.opcname LIKE '%ip%' THEN '<#>'
+            WHEN op.opcname LIKE '%l1%' THEN '<+>'
+            ELSE '<->'
+          END
+        INTO v_col_type, v_dist_op
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = ic.relam
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        JOIN pg_opclass op ON op.oid = i.indclass[0]
+        WHERE i.indrelid = v_tbl AND am.amname = 'hnsw' AND a.attname = '{{ inputs.vector_column }}'
+        LIMIT 1;
+
+        IF v_dist_op IS NULL THEN
+          v_dist_op := '<->';
+          v_col_type := 'vector';
+        END IF;
+
+        CREATE TEMP TABLE hnsw_sample_queries (v text) ON COMMIT DROP;
+        EXECUTE format('INSERT INTO hnsw_sample_queries SELECT %I::text FROM %s WHERE %I IS NOT NULL LIMIT %s',
+                       '{{ inputs.vector_column }}', v_tbl, '{{ inputs.vector_column }}', v_samples);
+
+        FOR v_q IN SELECT v FROM hnsw_sample_queries LOOP
+          PERFORM set_config('enable_indexscan', 'off', true);
+          PERFORM set_config('enable_bitmapscan', 'off', true);
+          v_t0 := clock_timestamp();
+          EXECUTE format('SELECT array_agg(%I::text) FROM (SELECT %I FROM %s ORDER BY %I %s $1::%s LIMIT %s) x',
+                         '{{ inputs.id_column }}', '{{ inputs.id_column }}', v_tbl, '{{ inputs.vector_column }}', v_dist_op, v_col_type, v_topk)
+            INTO v_exact_ids USING v_q.v;
+          v_exact_dur := v_exact_dur + (clock_timestamp() - v_t0);
+
+          PERFORM set_config('enable_indexscan', 'on', true);
+          PERFORM set_config('enable_bitmapscan', 'on', true);
+          v_t0 := clock_timestamp();
+          EXECUTE format('SELECT array_agg(%I::text) FROM (SELECT %I FROM %s ORDER BY %I %s $1::%s LIMIT %s) x',
+                         '{{ inputs.id_column }}', '{{ inputs.id_column }}', v_tbl, '{{ inputs.vector_column }}', v_dist_op, v_col_type, v_topk)
+            INTO v_ann_ids USING v_q.v;
+          v_ann_dur := v_ann_dur + (clock_timestamp() - v_t0);
+
+          IF v_exact_ids IS NOT NULL AND v_ann_ids IS NOT NULL THEN
+            v_hits := v_hits + (SELECT count(*) FROM unnest(v_ann_ids) id WHERE id = ANY(v_exact_ids));
+          END IF;
+          v_total_queries := v_total_queries + 1;
+        END LOOP;
+
+        IF v_total_queries > 0 THEN
+          INSERT INTO hnsw_bench_result VALUES (
+            'SUCCESS',
+            v_total_queries,
+            ROUND(EXTRACT(epoch FROM v_ann_dur)::numeric * 1000 / v_total_queries, 2),
+            ROUND(EXTRACT(epoch FROM v_exact_dur)::numeric * 1000 / v_total_queries, 2),
+            ROUND(v_hits::numeric / (v_total_queries * v_topk)::numeric, 3),
+            ROUND(GREATEST(EXTRACT(epoch FROM v_exact_dur), 0.0001)::numeric / GREATEST(EXTRACT(epoch FROM v_ann_dur), 0.0001)::numeric, 2)
+          );
+        ELSE
+          INSERT INTO hnsw_bench_result VALUES ('SKIPPED_NO_QUERIES', 0, 0, 0, 1.0, 1.0);
+        END IF;
+      END $bench$;
+
+      SELECT
+        benchmark_status,
+        queries_tested,
+        avg_ann_latency_ms,
+        avg_exact_latency_ms,
+        measured_recall,
+        speedup_ratio
+      FROM hnsw_bench_result;
+
+  - id: evaluate_maintenance_gate
+    type: io.kestra.plugin.scripts.python.Script
+    description: Evaluate bloat ratio, dead tuple churn, ANN query latency, and recall degradation against maintenance thresholds.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.12-slim
+    inputFiles:
+      indexes.json: "{{ outputs.inspect_hnsw_indexes.rows | toJson }}"
+      benchmark.json: "{{ outputs.benchmark_ann_performance.row | toJson }}"
+    env:
+      BLOAT_RATIO_THRESHOLD: "{{ inputs.bloat_ratio_threshold }}"
+      DEAD_TUPLE_RATIO_THRESHOLD_PCT: "{{ inputs.dead_tuple_ratio_threshold_pct }}"
+      ANN_LATENCY_THRESHOLD_MS: "{{ inputs.ann_latency_threshold_ms }}"
+      MIN_RECALL_THRESHOLD: "{{ inputs.min_recall_threshold }}"
+      TARGET_TABLE: "{{ inputs.target_table }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      AUTO_REINDEX: "{{ inputs.auto_reindex }}"
+    outputFiles:
+      - maintenance-gate-report.json
+    script: |
+      import json
+      import os
+      from pathlib import Path
+
+      idx_path = Path("indexes.json")
+      bench_path = Path("benchmark.json")
+
+      indexes_data = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.exists() else []
+      bench_data = json.loads(bench_path.read_text(encoding="utf-8")) if bench_path.exists() else {}
+
+      bloat_threshold = float(os.environ.get("BLOAT_RATIO_THRESHOLD", "1.20"))
+      dead_tuple_threshold = float(os.environ.get("DEAD_TUPLE_RATIO_THRESHOLD_PCT", "20.0"))
+      ann_latency_threshold = float(os.environ.get("ANN_LATENCY_THRESHOLD_MS", "40.0"))
+      min_recall_threshold = float(os.environ.get("MIN_RECALL_THRESHOLD", "0.90"))
+      target_table = os.environ.get("TARGET_TABLE", "documents")
+      dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+      auto_reindex = os.environ.get("AUTO_REINDEX", "true").lower() == "true"
+
+      bench_status = bench_data.get("benchmark_status", "SKIPPED")
+      avg_ann_latency_ms = float(bench_data.get("avg_ann_latency_ms", 0.0) or 0.0)
+      measured_recall = float(bench_data.get("measured_recall", 1.0) or 1.0)
+      queries_tested = int(bench_data.get("queries_tested", 0) or 0)
+
+      candidates = []
+      total_indexes = len(indexes_data)
+
+      for idx in indexes_data:
+          schema = idx.get("table_schema", "public")
+          table = idx.get("table_name", "")
+          index_name = idx.get("index_name", "")
+          bloat_ratio = float(idx.get("index_to_table_ratio", 0.0) or 0.0)
+          dead_tuple_pct = float(idx.get("dead_tuple_ratio_pct", 0.0) or 0.0)
+          n_dead_tup = int(idx.get("n_dead_tup", 0) or 0)
+          n_live_tup = int(idx.get("n_live_tup", 0) or 0)
+          n_tup_upd = int(idx.get("n_tup_upd", 0) or 0)
+          is_valid = bool(idx.get("indisvalid", True))
+          index_size_bytes = int(idx.get("index_size_bytes", 0) or 0)
+          index_size_pretty = str(idx.get("index_size_pretty", "0 bytes"))
+          table_size_bytes = int(idx.get("table_size_bytes", 0) or 0)
+          table_size_pretty = str(idx.get("table_size_pretty", "0 bytes"))
+
+          reasons = []
+
+          if not is_valid:
+              reasons.append("HNSW index is marked invalid in pg_index")
+
+          if bloat_ratio >= bloat_threshold:
+              reasons.append(f"Index-to-table bloat ratio {bloat_ratio:.3f} >= threshold {bloat_threshold:.2f}")
+
+          if dead_tuple_pct >= dead_tuple_threshold:
+              reasons.append(f"Table dead tuple ratio {dead_tuple_pct:.2f}% >= threshold {dead_tuple_threshold:.2f}%")
+
+          # Benchmark metrics apply if this is the target table and benchmark succeeded
+          if table == target_table and bench_status == "SUCCESS":
+              if avg_ann_latency_ms >= ann_latency_threshold:
+                  reasons.append(f"ANN query latency {avg_ann_latency_ms:.2f}ms >= threshold {ann_latency_threshold:.2f}ms")
+              if measured_recall < min_recall_threshold:
+                  reasons.append(f"ANN recall@k {measured_recall:.3f} < threshold {min_recall_threshold:.2f}")
+
+          if len(reasons) > 0:
+              candidates.append({
+                  "schema": schema,
+                  "table": table,
+                  "index": index_name,
+                  "bloat_ratio": bloat_ratio,
+                  "dead_tuple_pct": dead_tuple_pct,
+                  "n_dead_tup": n_dead_tup,
+                  "n_live_tup": n_live_tup,
+                  "n_tup_upd": n_tup_upd,
+                  "index_size_bytes": index_size_bytes,
+                  "index_size_pretty": index_size_pretty,
+                  "table_size_bytes": table_size_bytes,
+                  "table_size_pretty": table_size_pretty,
+                  "is_valid": is_valid,
+                  "reasons": reasons,
+                  "avg_ann_latency_ms": avg_ann_latency_ms if table == target_table else 0.0,
+                  "measured_recall": measured_recall if table == target_table else 1.0,
+                  "rebuild_sql": f'REINDEX INDEX CONCURRENTLY "{schema}"."{index_name}";'
+              })
+
+      rebuild_required = len(candidates) > 0
+      candidate_names = [c["index"] for c in candidates]
+
+      report = {
+          "total_hnsw_indexes_evaluated": total_indexes,
+          "rebuild_required": rebuild_required,
+          "candidate_count": len(candidates),
+          "candidate_indexes": candidate_names,
+          "benchmark_metrics": {
+              "benchmark_status": bench_status,
+              "queries_tested": queries_tested,
+              "avg_ann_latency_ms": avg_ann_latency_ms,
+              "measured_recall": measured_recall
+          },
+          "candidates": candidates,
+          "dry_run": dry_run,
+          "auto_reindex": auto_reindex
+      }
+
+      Path("maintenance-gate-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+      print(f"HNSW Maintenance Gate: evaluated={total_indexes}, candidates={len(candidates)}, rebuild_required={rebuild_required}")
+
+      print("::" + json.dumps({
+          "outputs": {
+              "rebuild_required": rebuild_required,
+              "candidate_count": len(candidates),
+              "candidates": candidates,
+              "candidate_names": candidate_names,
+              "benchmark_status": bench_status,
+              "avg_ann_latency_ms": avg_ann_latency_ms,
+              "measured_recall": measured_recall
+          }
+      }))
+
+  - id: log_gate_evaluation
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      pgvector HNSW Maintenance Gate Summary:
+      - Total Indexes Evaluated: {{ outputs.inspect_hnsw_indexes.size }}
+      - Benchmark Status: {{ outputs.evaluate_maintenance_gate.vars.benchmark_status }}
+      - Measured Recall@k: {{ outputs.evaluate_maintenance_gate.vars.measured_recall }}
+      - Measured ANN Latency: {{ outputs.evaluate_maintenance_gate.vars.avg_ann_latency_ms }} ms
+      - Candidates for Rebuild: {{ outputs.evaluate_maintenance_gate.vars.candidate_count }}
+      - Target Index Names: {{ outputs.evaluate_maintenance_gate.vars.candidate_names | join(', ') }}
+      - Mode: dry_run={{ inputs.dry_run }}, auto_reindex={{ inputs.auto_reindex }}
+
+  - id: if_rebuild_candidates_detected
+    type: io.kestra.plugin.core.flow.If
+    description: Branch execution when degraded HNSW vector indexes exceed maintenance thresholds.
+    condition: "{{ outputs.evaluate_maintenance_gate.vars.rebuild_required }}"
+    then:
+      - id: alert_bloat_detected_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert Slack channel of degraded HNSW index bloat and recall loss.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "pgvector HNSW Alert: {{ outputs.evaluate_maintenance_gate.vars.candidate_count }} degraded index(es) detected ({{ outputs.evaluate_maintenance_gate.vars.candidate_names | join(', ') }}). Recall: {{ outputs.evaluate_maintenance_gate.vars.measured_recall }}, ANN Latency: {{ outputs.evaluate_maintenance_gate.vars.avg_ann_latency_ms }} ms. Rebuild: {{ inputs.auto_reindex and not inputs.dry_run ? 'Executing concurrent reindex.' : 'Skipped (dry run active).' }}"}
+
+      - id: if_execute_rebuild
+        type: io.kestra.plugin.core.flow.If
+        description: Execute non-blocking REINDEX INDEX CONCURRENTLY when auto_reindex is enabled and dry_run is false.
+        condition: "{{ inputs.auto_reindex and not inputs.dry_run }}"
+        then:
+          - id: rebuild_hnsw_indexes
+            type: io.kestra.plugin.core.flow.Loop
+            description: Sequentially rebuild degraded HNSW vector indexes concurrently with lock timeout guard.
+            concurrencyLimit: 1
+            values: "{{ outputs.evaluate_maintenance_gate.vars.candidates | toJson }}"
+            tasks:
+              - id: log_rebuild_start
+                type: io.kestra.plugin.core.log.Log
+                message: "Commencing REINDEX INDEX CONCURRENTLY on {{ fromJson(item.value).schema }}.{{ fromJson(item.value).index }}..."
+
+              - id: capture_start_time
+                type: io.kestra.plugin.scripts.python.Script
+                description: Capture start timestamp before concurrent reindex execution.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: python:3.12-slim
+                script: |
+                  import time
+                  import json
+                  print("::" + json.dumps({"outputs": {"start_time": time.time()}}))
+
+              - id: execute_concurrent_reindex
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Run REINDEX INDEX CONCURRENTLY with session lock timeout to avoid blocking concurrent database queries.
+                url: "{{ inputs.postgres_url }}{{ inputs.postgres_url contains '?' ? '&' : '?' }}options=-c%20lock_timeout%3D{{ inputs.lock_timeout_seconds * 1000 }}"
+                username: "{{ inputs.postgres_username }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: NONE
+                sql: |
+                  REINDEX INDEX CONCURRENTLY "{{ fromJson(item.value).schema }}"."{{ fromJson(item.value).index }}";
+
+              - id: query_post_reindex_metrics
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Read post-rebuild relation size and index validity from pg_class and pg_index.
+                url: "{{ inputs.postgres_url }}"
+                username: "{{ inputs.postgres_username }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                sql: |
+                  SELECT
+                    ic.relname AS index_name,
+                    pg_relation_size(ic.oid) AS post_index_size_bytes,
+                    pg_size_pretty(pg_relation_size(ic.oid)) AS post_index_size_pretty,
+                    pg_table_size(t.oid) AS table_size_bytes,
+                    pg_size_pretty(pg_table_size(t.oid)) AS table_size_pretty,
+                    ROUND((pg_relation_size(ic.oid)::numeric / GREATEST(pg_table_size(t.oid), 1)::numeric), 3) AS post_index_to_table_ratio,
+                    i.indisvalid AS is_valid
+                  FROM pg_index i
+                  JOIN pg_class ic ON ic.oid = i.indexrelid
+                  JOIN pg_class t ON t.oid = i.indrelid
+                  JOIN pg_namespace n ON n.oid = t.relnamespace
+                  WHERE n.nspname = '{{ fromJson(item.value).schema }}'
+                    AND ic.relname = '{{ fromJson(item.value).index }}';
+
+              - id: compute_rebuild_telemetry
+                type: io.kestra.plugin.scripts.python.Script
+                description: Compute index rebuild duration, reclaimed bytes, and storage reduction percentages.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: python:3.12-slim
+                inputFiles:
+                  candidate.json: "{{ item.value | toJson }}"
+                  post_metrics.json: "{{ outputs.query_post_reindex_metrics.row | toJson }}"
+                env:
+                  START_TIME: "{{ outputs.capture_start_time.vars.start_time }}"
+                script: |
+                  import time
+                  import json
+                  import os
+                  from pathlib import Path
+
+                  start_time = float(os.environ.get("START_TIME", str(time.time())))
+                  duration_seconds = round(time.time() - start_time, 2)
+
+                  cand_file = Path("candidate.json")
+                  post_file = Path("post_metrics.json")
+
+                  cand = json.loads(cand_file.read_text(encoding="utf-8")) if cand_file.exists() else {}
+                  post = json.loads(post_file.read_text(encoding="utf-8")) if post_file.exists() else {}
+
+                  size_before = int(cand.get("index_size_bytes", 0) or 0)
+                  size_after = int(post.get("post_index_size_bytes", 0) or 0)
+                  reclaimed_bytes = max(0, size_before - size_after)
+                  reclaimed_mb = round(reclaimed_bytes / (1024 * 1024), 2)
+                  reduction_pct = round((reclaimed_bytes / size_before) * 100.0, 2) if size_before > 0 else 0.0
+
+                  telemetry = {
+                      "index_name": cand.get("index"),
+                      "table_name": cand.get("table"),
+                      "schema_name": cand.get("schema"),
+                      "build_duration_seconds": duration_seconds,
+                      "size_before_bytes": size_before,
+                      "size_before_pretty": cand.get("index_size_pretty"),
+                      "size_after_bytes": size_after,
+                      "size_after_pretty": post.get("post_index_size_pretty"),
+                      "reclaimed_bytes": reclaimed_bytes,
+                      "reclaimed_mb": reclaimed_mb,
+                      "size_reduction_pct": reduction_pct,
+                      "initial_bloat_ratio": float(cand.get("bloat_ratio", 0.0) or 0.0),
+                      "post_bloat_ratio": float(post.get("post_index_to_table_ratio", 0.0) or 0.0),
+                      "is_valid": bool(post.get("is_valid", True)),
+                      "pre_recall": float(cand.get("measured_recall", 1.0) or 1.0),
+                      "pre_ann_latency_ms": float(cand.get("avg_ann_latency_ms", 0.0) or 0.0)
+                  }
+
+                  print("::" + json.dumps({
+                      "outputs": {
+                          "telemetry": telemetry,
+                          "duration_seconds": duration_seconds,
+                          "reclaimed_mb": reclaimed_mb,
+                          "reduction_pct": reduction_pct,
+                          "post_ratio": float(post.get("post_index_to_table_ratio", 0.0) or 0.0),
+                          "is_valid": bool(post.get("is_valid", True))
+                      }
+                  }))
+
+              - id: record_rebuild_in_kv
+                type: io.kestra.plugin.core.kv.Set
+                description: Persist HNSW rebuild telemetry in Kestra KV store.
+                key: "pgvector_hnsw_rebuild_{{ fromJson(item.value).index }}"
+                kvType: JSON
+                value: "{{ outputs.compute_rebuild_telemetry.vars.telemetry | toJson }}"
+
+              - id: alert_rebuild_complete_slack
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Post reindex completion notification to Slack.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: |
+                  {"text": "pgvector Reindex Complete: {{ fromJson(item.value).index }} on {{ fromJson(item.value).schema }}.{{ fromJson(item.value).table }} rebuilt in {{ outputs.compute_rebuild_telemetry.vars.duration_seconds }}s. Reclaimed: {{ outputs.compute_rebuild_telemetry.vars.reclaimed_mb }} MB ({{ outputs.compute_rebuild_telemetry.vars.reduction_pct }}% reduction). Bloat ratio: {{ fromJson(item.value).bloat_ratio }} to {{ outputs.compute_rebuild_telemetry.vars.post_ratio }}."}
+    else:
+      - id: log_nominal_posture
+        type: io.kestra.plugin.core.log.Log
+        message: "pgvector HNSW index posture nominal: all evaluated indexes sit below bloat and latency thresholds with recall >= {{ inputs.min_recall_threshold }}."
+
+errors:
+  - id: alert_maintenance_failure_slack
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Send alert to Slack when pgvector HNSW maintenance fails or encounters lock contention.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "CRITICAL: pgvector HNSW maintenance failed for {{ inputs.target_schema }}.{{ inputs.target_table }} on execution {{ execution.id }}. Inspect logs for details."}
+
+extend:
+  title: pgvector HNSW Index Bloat & Rebuild Maintenance Gate
+  metaTitle: pgvector HNSW Index Bloat & Rebuild Maintenance Gate | Kestra
+  shortDescription: Detect pgvector HNSW index bloat and ANN recall degradation from vector updates, execute non-blocking concurrent index rebuilds with lock timeout guards, and log telemetry to Kestra KV and Slack.
+  metaDescription: Audit pgvector HNSW index bloat and recall loss, execute non-blocking concurrent rebuilds with lock timeout guards, and track build metrics in Kestra KV.
+  tags:
+    - AI
+    - Data
+  subTags:
+    - Vector Stores & RAG
+    - Day 2 Operations
+  ee: false
+  demo: false
+  description: |
+    ## How it works
+    Hierarchical Navigable Small World (HNSW) indexes in pgvector construct multi-layer graphs to deliver low-latency approximate nearest neighbor (ANN) vector search. Under continuous updates and deletes in PostgreSQL, base table dead tuples accumulate through Multi-Version Concurrency Control (MVCC). While `VACUUM` cleans table heap pages, HNSW index graphs can suffer from unlinked edges, stale routing paths, and index bloat where index relation size outgrows table storage. This fragmentation forces vector similarity queries to traverse dead nodes, increasing disk I/O blocks read from disk (`pg_statio_user_indexes.idx_blks_read`) and degrading recall@k accuracy.
+
+    This workflow automates HNSW index health evaluation and concurrent remediation:
+    1. **Catalog Inspection**: Queries `pg_class`, `pg_index`, `pg_am`, `pg_namespace`, `pg_stat_user_tables`, and `pg_statio_user_indexes` (`io.kestra.plugin.jdbc.postgresql.Query`). It identifies all HNSW indexes (`amname = 'hnsw'`), extracts vector distance operators (`<=>`, `<#>`, `<->`), measures index size versus table size ratios, and calculates table dead tuple churn.
+    2. **ANN Performance & Recall Benchmark**: Executes a sample vector probe directly in PostgreSQL (`io.kestra.plugin.jdbc.postgresql.Query`). It compares top-k results from an exact sequential scan (`enable_indexscan = off`) against approximate HNSW index scans (`enable_indexscan = on`), computing actual recall@k and query execution latency in milliseconds.
+    3. **Maintenance Decision Gate**: Evaluates catalog statistics and benchmark metrics using Python (`io.kestra.plugin.scripts.python.Script`). An index is flagged for rebuild if its bloat ratio exceeds `bloat_ratio_threshold`, table dead tuple ratio exceeds `dead_tuple_ratio_threshold_pct`, ANN latency exceeds `ann_latency_threshold_ms`, or recall drops below `min_recall_threshold`.
+    4. **Slack Operational Alerting**: Dispatches degraded index summaries and recall metrics to Slack (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
+    5. **Concurrent Reindex with Lock Timeout Guard**: Executes `REINDEX INDEX CONCURRENTLY` in an isolated session configured with `lock_timeout` via JDBC URL options (`options=-c lock_timeout=...`). This acquires a weak `ShareUpdateExclusiveLock`, permitting concurrent reads and writes during the rebuild while aborting safely if lock contention occurs.
+    6. **KV Telemetry & Post-Build Validation**: Queries post-rebuild relation sizes, verifies index validity (`indisvalid`), calculates duration and storage reduction percentages, and writes atomic JSON telemetry to Kestra KV under `pgvector_hnsw_rebuild_{index_name}` (`io.kestra.plugin.core.kv.Set`).
+
+    ## What you get
+    - **Automated Bloat & Churn Detection**: Identifies bloated vector index graphs before query latency spikes breach production service level objectives (SLOs).
+    - **Recall Drift Detection**: Measures ground-truth recall@k degradation against exact vector scans to prevent stale retrieval in Retrieval-Augmented Generation (RAG) pipelines.
+    - **Non-Blocking Rebuilds**: Executes `REINDEX INDEX CONCURRENTLY` so production vector searches and application writes remain online.
+    - **Lock Timeout Protection**: Prevents maintenance tasks from queueing behind long-running analytical queries or blocking OLTP transactions.
+    - **Auditable KV Telemetry**: Tracks index build duration, reclaimed storage, and bloat reduction in Kestra KV for historical trend analysis.
+
+    ## Who it's for
+    - AI engineers maintaining pgvector backends for RAG pipelines and vector search APIs.
+    - Database administrators (DBAs) and Platform engineers managing PostgreSQL clusters with high vector ingestion churn.
+    - SRE and Data Ops teams establishing automated Day 2 database maintenance and health gates.
+
+    ## Why orchestrate this with Kestra
+    - **Hybrid SQL and Script Orchestration**: Seamlessly coordinate PostgreSQL catalog inspection, in-database recall benchmarking, and Python telemetry processing within a single unified pipeline.
+    - **Zero-Dependency Execution**: Perform vector recall audits directly inside PostgreSQL without exporting embeddings to external benchmark runners.
+    - **Built-in KV State Tracking**: Store per-index rebuild history, reclaimed megabytes, and durations directly in Kestra namespace KV without external databases.
+    - **Deterministic Scheduling and Webhooks**: Run maintenance during scheduled off-peak windows or trigger ad-hoc evaluations following batch embedding ingestion.
+
+    ## Prerequisites
+    - PostgreSQL 15+ cluster with the `pgvector` extension installed and enabled (`CREATE EXTENSION IF NOT EXISTS vector;`).
+    - Database user with permissions to query catalog tables (`pg_class`, `pg_index`, `pg_stat_user_tables`, `pg_statio_user_indexes`) and execute `REINDEX INDEX CONCURRENTLY`.
+    - Network connectivity from the Kestra worker to the PostgreSQL host.
+
+    ### Secrets
+    - `POSTGRES_PASSWORD`: Password for the PostgreSQL database user.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for alerting on index degradation and rebuild completions.
+    - `PGVECTOR_MAINTENANCE_WEBHOOK_KEY`: Secret authentication key for the inbound webhook trigger.
+
+    ## Quick start
+    1. Store your credentials in Kestra Secrets:
+       - Set `POSTGRES_PASSWORD` with your PostgreSQL password.
+       - Set `SLACK_WEBHOOK_URL` with your Slack incoming webhook endpoint.
+       - Set `PGVECTOR_MAINTENANCE_WEBHOOK_KEY` with a random secure token.
+    2. Configure the flow inputs:
+       - `postgres_url`: JDBC URL pointing to your PostgreSQL instance (e.g. `jdbc:postgresql://postgres.internal:5432/vectors`).
+       - `target_schema`: Target schema containing vector tables (default: `public`).
+       - `target_table`: Name of your vector embedding table (e.g. `documents`).
+       - `vector_column`: Name of your embedding column (e.g. `embedding`).
+    3. Run an initial test with `dry_run: true` to inspect index bloat and measure recall without executing rebuilds.
+    4. Enable the `off_peak_schedule` trigger to run weekly automated maintenance at 03:00 UTC.
+
+    ## How to extend
+    - **Dynamic HNSW Parameter Retuning**: Combine with `ALTER INDEX ... SET (ef_construction = ...)` to tune graph construction density during periodic off-peak rebuilds.
+    - **Multi-Table Sweeps**: Extend the scan query and loop to iterate over all vector tables across multiple microservice databases.
+    - **PagerDuty & Opsgenie Integration**: Replace or augment the Slack notification task with `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` for high-severity recall drops.
+    - **Grafana & Prometheus Metrics Export**: Export reclaimed gigabytes and ANN search latencies to Prometheus using `io.kestra.plugin.core.http.Request` to visualize vector index health over time.
+
+    ## Links
+    - [pgvector GitHub Repository](https://github.com/pgvector/pgvector)
+    - [PostgreSQL REINDEX Documentation](https://www.postgresql.org/docs/current/sql-reindex.html)
+    - [Kestra PostgreSQL Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-postgresql)
+    - [Kestra KV Store Documentation](https://kestra.io/docs/concepts/kv-store)

@@ -1,0 +1,242 @@
+id: sftp-postgres-commit-before-archive
+namespace: company.data
+
+inputs:
+  - id: feed
+    type: STRING
+    defaults: partner-inventory
+  - id: sftp_port
+    type: STRING
+    defaults: "22"
+  - id: inbox
+    type: STRING
+    defaults: /upload/inbox/
+  - id: archive
+    type: STRING
+    defaults: /upload/archive
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: initialize_tables
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: "{{ secret('POSTGRES_JDBC_URL') }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    transaction: true
+    sql: |
+      CREATE SCHEMA IF NOT EXISTS kestra_sftp_ingest;
+      CREATE TABLE IF NOT EXISTS kestra_sftp_ingest.batches (
+        feed TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+        source_name TEXT NOT NULL,
+        record_count INTEGER NOT NULL CHECK (record_count > 0),
+        first_execution TEXT NOT NULL,
+        committed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (feed, batch_id)
+      );
+      CREATE TABLE IF NOT EXISTS kestra_sftp_ingest.records (
+        feed TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL CHECK (quantity >= 0),
+        PRIMARY KEY (feed, batch_id, item_id),
+        FOREIGN KEY (feed, batch_id) REFERENCES kestra_sftp_ingest.batches(feed, batch_id)
+      );
+
+  - id: list_ready
+    type: io.kestra.plugin.fs.sftp.List
+    host: "{{ secret('SFTP_HOST') }}"
+    port: "{{ inputs.sftp_port }}"
+    username: "{{ secret('SFTP_USERNAME') }}"
+    password: "{{ secret('SFTP_PASSWORD') }}"
+    rootDir: false
+    from: "{{ inputs.inbox }}"
+    regExp: '.*\.ready\.json$'
+    recursive: false
+    sort: NAME_ASC
+    maxFiles: 10
+
+  - id: batches
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ outputs.list_ready.files }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: check_remote_size
+        type: io.kestra.plugin.core.execution.Assert
+        conditions:
+          - "{{ fromJson(item.value).fileType == 'FILE' and fromJson(item.value).size > 0 and fromJson(item.value).size <= 1048576 and not fromJson(item.value).symbolicLink }}"
+
+      - id: download
+        type: io.kestra.plugin.fs.sftp.Download
+        host: "{{ secret('SFTP_HOST') }}"
+        port: "{{ inputs.sftp_port }}"
+        username: "{{ secret('SFTP_USERNAME') }}"
+        password: "{{ secret('SFTP_PASSWORD') }}"
+        rootDir: false
+        from: "{{ fromJson(item.value).path }}"
+        checksumAlgorithm: SHA_256
+
+      - id: downloaded_size
+        type: io.kestra.plugin.core.storage.Size
+        uri: "{{ outputs.download.to }}"
+
+      - id: check_downloaded_size
+        type: io.kestra.plugin.core.execution.Assert
+        conditions:
+          - "{{ outputs.downloaded_size.size > 0 and outputs.downloaded_size.size <= 1048576 }}"
+
+      - id: commit_batch
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        description: Validate, claim and insert in one transaction. Any SQL failure rolls back the ledger too.
+        url: "{{ secret('POSTGRES_JDBC_URL') }}"
+        username: "{{ secret('POSTGRES_USERNAME') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        transaction: true
+        fetchType: FETCH
+        parameters:
+          feed: "{{ inputs.feed }}"
+          payload: "{{ read(outputs.download.to) }}"
+          sha256: "{{ outputs.download.checksum | lower }}"
+          source_name: "{{ fromJson(item.value).name }}"
+          execution_id: "{{ execution.id }}"
+        sql: |
+          CREATE TEMP TABLE batch_document (
+            payload JSONB NOT NULL CHECK ((
+              jsonb_typeof(payload) = 'object'
+              AND jsonb_typeof(payload->'batch_id') = 'string'
+              AND char_length(payload->>'batch_id') BETWEEN 1 AND 128
+              AND jsonb_typeof(payload->'records') = 'array'
+              AND jsonb_array_length(payload->'records') BETWEEN 1 AND 1000
+            ) IS TRUE)
+          ) ON COMMIT DROP;
+          INSERT INTO batch_document VALUES (CAST(:payload AS JSONB));
+
+          CREATE TEMP TABLE batch_records (
+            raw JSONB NOT NULL CHECK ((
+              jsonb_typeof(raw) = 'object'
+              AND jsonb_typeof(raw->'item_id') = 'string'
+              AND jsonb_typeof(raw->'quantity') = 'number'
+            ) IS TRUE),
+            item_id TEXT PRIMARY KEY CHECK (char_length(item_id) BETWEEN 1 AND 128),
+            quantity INTEGER NOT NULL CHECK (quantity >= 0)
+          ) ON COMMIT DROP;
+          INSERT INTO batch_records
+          SELECT entry, entry->>'item_id', CAST(entry->>'quantity' AS INTEGER)
+          FROM batch_document CROSS JOIN LATERAL jsonb_array_elements(payload->'records') AS entry;
+
+          CREATE TEMP TABLE claimed_batch ON COMMIT DROP AS
+          WITH claimed AS (
+            INSERT INTO kestra_sftp_ingest.batches
+              (feed, batch_id, sha256, source_name, record_count, first_execution)
+            SELECT :feed, payload->>'batch_id', :sha256, :source_name,
+                   jsonb_array_length(payload->'records'), :execution_id
+            FROM batch_document
+            ON CONFLICT (feed, batch_id) DO NOTHING
+            RETURNING batch_id
+          ) SELECT batch_id FROM claimed;
+
+          CREATE TEMP TABLE digest_guard (
+            expected TEXT NOT NULL,
+            actual TEXT NOT NULL,
+            CHECK (expected = actual)
+          ) ON COMMIT DROP;
+          INSERT INTO digest_guard
+          SELECT :sha256, b.sha256
+          FROM kestra_sftp_ingest.batches b CROSS JOIN batch_document d
+          WHERE b.feed = :feed AND b.batch_id = d.payload->>'batch_id';
+
+          INSERT INTO kestra_sftp_ingest.records (feed, batch_id, item_id, quantity)
+          SELECT :feed, c.batch_id, r.item_id, r.quantity
+          FROM batch_records r CROSS JOIN claimed_batch c;
+
+          SELECT payload->>'batch_id' AS batch_id, :sha256 AS sha256,
+                 (SELECT count(*) FROM batch_records) AS records,
+                 EXISTS (SELECT 1 FROM claimed_batch) AS newly_committed
+          FROM batch_document;
+
+      - id: recheck_source
+        type: io.kestra.plugin.fs.sftp.Download
+        description: Stop before acknowledgement if the producer changed the ready file during ingestion.
+        host: "{{ secret('SFTP_HOST') }}"
+        port: "{{ inputs.sftp_port }}"
+        username: "{{ secret('SFTP_USERNAME') }}"
+        password: "{{ secret('SFTP_PASSWORD') }}"
+        rootDir: false
+        from: "{{ fromJson(item.value).path }}"
+        checksumAlgorithm: SHA_256
+        validateChecksum: true
+        checksumExpected: "{{ outputs.download.checksum }}"
+
+      - id: archive_committed
+        type: io.kestra.plugin.fs.sftp.Move
+        description: This acknowledgement runs only after PostgreSQL commits successfully.
+        host: "{{ secret('SFTP_HOST') }}"
+        port: "{{ inputs.sftp_port }}"
+        username: "{{ secret('SFTP_USERNAME') }}"
+        password: "{{ secret('SFTP_PASSWORD') }}"
+        rootDir: false
+        from: "{{ fromJson(item.value).path }}"
+        to: "{{ inputs.archive }}/{{ execution.id }}/{{ fromJson(item.value).name }}"
+        overwrite: false
+
+triggers:
+  - id: poll_ready_batches
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    disabled: true
+
+extend:
+  title: Commit SFTP JSON Batches to PostgreSQL Before Archiving
+  metaTitle: Transactional SFTP to PostgreSQL Ingestion | Kestra
+  shortDescription: Load bounded JSON batches with a transactional PostgreSQL ledger, then archive the SFTP source. Retry an archive failure without inserting duplicate records.
+  metaDescription: Ingest SFTP JSON batches into PostgreSQL with a transactional ledger, reject conflicting replays, and archive source files only after commit.
+  description: |
+    Acknowledge partner deliveries only after their records and processing ledger commit together. Each feed/batch ID has one immutable SHA256; replaying identical bytes skips inserts, while changed content under the same ID fails.
+
+    ## How it works
+    1. Create sample tables, then list up to ten ready files in name order. Ignore producer `.part` uploads.
+    2. Download each file, enforce a 1 MiB bound, and obtain its SHA256 from the SFTP task.
+    3. Validate JSON and insert the ledger plus records in one PostgreSQL transaction. SQL errors roll back both.
+    4. Recheck the remote checksum, then move the source into an execution-specific archive directory.
+
+    ## What you get
+    - Durable batch history and immutable per-batch inventory rows.
+    - Retry after archive failure without duplicate inserts. SQL failure leaves the source in the inbox.
+    - A quiet successful run when no files are ready; failed batches remain for operator correction.
+
+    ## Who it's for
+    Data engineers consuming small partner inventory snapshots over SFTP.
+
+    ## Why orchestrate this with Kestra
+    Native file tasks surround a database transaction, making the commit/acknowledgement boundary and retry behavior visible in one execution. No custom ingestion script is needed.
+
+    ## Prerequisites
+    PostgreSQL with permission to create/use `kestra_sftp_ingest`, and writable SFTP inbox/archive directories. Producers must publish immutable, unique `*.ready.json` names by renaming completed uploads; this flow must be their sole archiver. Keep bytes unchanged until acknowledged. Use a trusted network or a host-key-pinned SSH tunnel: the FS SFTP tasks do not enforce server host-key checking. The checksum recheck is not a filesystem lock.
+
+    ### Secrets
+    - `POSTGRES_JDBC_URL`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`: database connection.
+    - `SFTP_HOST`, `SFTP_USERNAME`, `SFTP_PASSWORD`: the server and scoped partner account.
+
+    ## Quick start
+    1. Configure secrets and the feed, port and directory inputs. Import without catalog-only `extend`.
+    2. Publish `batch.ready.json` containing `{"batch_id":"delivery-001","records":[{"item_id":"sku-1","quantity":12}]}`. Use 1-1000 records, unique item IDs and nonnegative integer quantities.
+    3. Execute and inspect the ledger, rows and archive. Repair failed source batches before retrying; never reuse a committed ID for different bytes.
+    4. Set any non-default feed, port and directory inputs on the Schedule and enable it. Polling revisits unarchived files, including failed deliveries.
+
+    ## How to extend
+    Adapt the sample record schema, add failure notifications, or retain immutable raw snapshots with the ledger.
+
+    ## Links
+    - [SFTP tasks](https://kestra.io/plugins/plugin-fs/sftp)
+    - [PostgreSQL Queries](https://kestra.io/plugins/plugin-jdbc-postgres/io.kestra.plugin.jdbc.postgresql.queries)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - Testing & Quality
+  ee: false
+  demo: false

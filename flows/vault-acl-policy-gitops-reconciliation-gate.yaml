@@ -1,0 +1,688 @@
+id: vault-acl-policy-gitops-reconciliation-gate
+namespace: company.team
+
+description: |
+  Keep HashiCorp Vault or OpenBao ACL policies identical to the policy files in Git. Read every live
+  policy, diff it against Git, and plan creates, updates and optional deletes. A policy that keeps drifting
+  back is flagged as flapping across runs, the token's own policies are never touched, and nothing changes
+  until an operator confirms the exact number of changes. Each write re-checks the live policy, and the
+  result is read back and compared with Git.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: vault_addr
+    type: STRING
+    displayName: Vault or OpenBao address
+    description: Base URL such as http://host.docker.internal:8200, reachable from the Docker task runner.
+    defaults: "http://host.docker.internal:8200"
+
+  - id: vault_namespace
+    type: STRING
+    displayName: Namespace
+    description: Optional namespace sent as X-Vault-Namespace. Leave empty for the root namespace.
+    defaults: ""
+
+  - id: policy_repo_url
+    type: STRING
+    displayName: Policy repository URL
+    required: false
+    description: Git repository holding one lowercase name.hcl file per ACL policy. Set a default for webhook and scheduled runs. For a private repository add username and password to the clone_policy task.
+
+  - id: policy_branch
+    type: STRING
+    displayName: Policy branch
+    defaults: "main"
+
+  - id: policy_dir
+    type: STRING
+    displayName: Policy directory
+    description: Directory inside the repository that holds the .hcl files.
+    defaults: "policies"
+
+  - id: prune_unmanaged
+    type: BOOL
+    displayName: Delete policies that are not in Git
+    description: Off by default. When on, a policy missing from Git is deleted only after it stays unmanaged for the grace window. The default policy is never deleted.
+    defaults: false
+
+  - id: unmanaged_grace_hours
+    type: INT
+    displayName: Unmanaged grace window in hours
+    defaults: 72
+
+  - id: flap_window_days
+    type: INT
+    displayName: Flapping window in days
+    defaults: 7
+
+  - id: flap_threshold
+    type: INT
+    displayName: Flapping threshold
+    description: A policy already reconciled this many times inside the window is excluded, because something else keeps changing it.
+    defaults: 2
+
+  - id: include_flapping
+    type: BOOL
+    displayName: Reconcile flapping policies anyway
+    defaults: false
+
+  - id: max_changes_per_run
+    type: INT
+    displayName: Max policy changes per run
+    defaults: 10
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the plan is reported and tracked, but no approval is requested and no policy is written.
+    defaults: true
+
+variables:
+  state_key: "vault_policy_gitops_state_{{ (inputs.vault_addr ~ '-' ~ inputs.vault_namespace) | slugify }}"
+  audit_key: "vault_policy_gitops_audit_{{ (inputs.vault_addr ~ '-' ~ inputs.vault_namespace) | slugify }}"
+  lib_js: |
+    const crypto = require("crypto");
+
+    const NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
+
+    // Vault and OpenBao store the text as sent; compare ignoring line endings, trailing blanks and final newlines only.
+    const normalize = (text) => String(text).replace(/\r\n/g, "\n").split("\n").map((l) => l.replace(/[ \t]+$/, "")).join("\n").replace(/\n+$/, "");
+    const hashOf = (text) => crypto.createHash("sha256").update(normalize(text)).digest("hex");
+
+    function client({ addr, token, namespace }) {
+      const base = addr.replace(/\/+$/, "");
+      return async function call(method, path, body) {
+        const headers = { "X-Vault-Token": token, "Content-Type": "application/json" };
+        if (namespace) headers["X-Vault-Namespace"] = namespace;
+        const res = await fetch(`${base}/v1/${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+        const text = await res.text();
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (e) { /* non-JSON error body */ }
+        return { status: res.status, json, text };
+      };
+    }
+
+    async function lookupSelf(call) {
+      const r = await call("GET", "auth/token/lookup-self");
+      if (r.status !== 200 || !r.json || !r.json.data) throw new Error(`token lookup-self failed (HTTP ${r.status}): ${r.text.slice(0, 160)}`);
+      return r.json.data;
+    }
+
+    async function listPolicies(call) {
+      const r = await call("GET", "sys/policies/acl?list=true");
+      if (r.status === 404) return [];
+      if (r.status !== 200 || !r.json || !r.json.data || !Array.isArray(r.json.data.keys)) throw new Error(`listing ACL policies failed (HTTP ${r.status}): ${r.text.slice(0, 160)}`);
+      return r.json.data.keys;
+    }
+
+    async function readPolicy(call, name) {
+      const r = await call("GET", `sys/policies/acl/${encodeURIComponent(name)}`);
+      if (r.status === 404) return { exists: false };
+      if (r.status !== 200 || !r.json || !r.json.data || typeof r.json.data.policy !== "string") throw new Error(`reading policy ${name} failed (HTTP ${r.status}): ${r.text.slice(0, 160)}`);
+      const version = typeof r.json.data.version === "number" ? r.json.data.version : null;
+      return { exists: true, policy: r.json.data.policy, version };
+    }
+
+    // Best-effort summary of what a policy grants, used to tell the approver what a change does. Never used for decisions.
+    function grants(text) {
+      const out = new Map();
+      const re = /path\s+"([^"]+)"\s*\{([\s\S]*?)\}/g;
+      let m;
+      while ((m = re.exec(text))) {
+        const caps = /capabilities\s*=\s*\[([^\]]*)\]/.exec(m[2]);
+        out.set(m[1], new Set(caps ? caps[1].split(",").map((c) => c.replace(/["'\s]/g, "")).filter(Boolean) : []));
+      }
+      return out;
+    }
+
+    function delta(oldText, newText) {
+      const a = grants(oldText || "");
+      const b = grants(newText || "");
+      const added = [], removed = [], changed = [];
+      let sudoGained = false, wildcardWrite = false;
+      for (const [p, caps] of b) {
+        if (!a.has(p)) added.push(`${p} [${[...caps].join(",")}]`);
+        else {
+          const gained = [...caps].filter((c) => !a.get(p).has(c));
+          const lost = [...a.get(p)].filter((c) => !caps.has(c));
+          if (gained.length || lost.length) changed.push(`${p} ${gained.map((c) => "+" + c).join("")}${lost.map((c) => "-" + c).join("")}`);
+        }
+        const gainedCaps = [...caps].filter((c) => !(a.get(p) || new Set()).has(c));
+        if (gainedCaps.includes("sudo")) sudoGained = true;
+        if (/^(\*|\+\/\*|.*\/\*\*)$/.test(p) && gainedCaps.some((c) => ["create", "update", "delete", "sudo"].includes(c))) wildcardWrite = true;
+      }
+      for (const [p, caps] of a) if (!b.has(p)) removed.push(`${p} [${[...caps].join(",")}]`);
+      return { added, removed, changed, sudoGained, wildcardWrite };
+    }
+
+    function describe(op, delta_) {
+      const bits = [];
+      if (delta_.added.length) bits.push(`+paths ${delta_.added.join("; ")}`);
+      if (delta_.removed.length) bits.push(`-paths ${delta_.removed.join("; ")}`);
+      if (delta_.changed.length) bits.push(`caps ${delta_.changed.join("; ")}`);
+      const warn = [delta_.sudoGained ? "GAINS sudo" : "", delta_.wildcardWrite ? "WILDCARD WRITE" : ""].filter(Boolean).join(", ");
+      return `${op.op.toUpperCase()} ${op.name}${bits.length ? ": " + bits.join(" | ") : ""}${warn ? `  ⚠ ${warn}` : ""}`;
+    }
+
+    module.exports = { NAME_RE, normalize, hashOf, client, lookupSelf, listPolicies, readPolicy, delta, describe };
+
+triggers:
+  - id: policy_pushed_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call from a Git push webhook on the policy repository so merged changes reach Vault right away.
+    key: "{{ secret('VAULT_POLICY_WEBHOOK_KEY') }}"
+
+  - id: hourly_drift_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Catch policies edited directly in Vault between Git changes. Shipped disabled until policy_repo_url has a default.
+    cron: "5 * * * *"
+    disabled: true
+
+tasks:
+  - id: wdir
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone_policy
+        type: io.kestra.plugin.git.Clone
+        description: Fetch the policy repository, the source of truth for ACL policies.
+        url: "{{ inputs.policy_repo_url }}"
+        branch: "{{ inputs.policy_branch }}"
+        directory: policy_repo
+        # username: your-git-user-name # Needed only for private repositories
+        # password: "{{ secret('POLICY_REPO_TOKEN') }}" # Needed only for private repositories
+
+      - id: scan_policies
+        type: io.kestra.plugin.scripts.node.Script
+        description: Diff every live ACL policy against Git, protect the token's own policies, detect flapping from the KV history and describe what each change grants or removes.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: node:20-slim
+        inputFiles:
+          lib.js: "{{ vars.lib_js }}"
+          state.json: "{{ kv(key=render(vars.state_key), errorOnMissing=false) | default('{}') }}"
+        env:
+          VAULT_ADDR: "{{ inputs.vault_addr }}"
+          VAULT_TOKEN: "{{ secret('VAULT_TOKEN') }}"
+          VAULT_NAMESPACE: "{{ inputs.vault_namespace }}"
+          POLICY_DIR: "policy_repo/{{ inputs.policy_dir }}"
+          PRUNE_UNMANAGED: "{{ inputs.prune_unmanaged }}"
+          UNMANAGED_GRACE_HOURS: "{{ inputs.unmanaged_grace_hours }}"
+          FLAP_WINDOW_DAYS: "{{ inputs.flap_window_days }}"
+          FLAP_THRESHOLD: "{{ inputs.flap_threshold }}"
+          INCLUDE_FLAPPING: "{{ inputs.include_flapping }}"
+          MAX_CHANGES_PER_RUN: "{{ inputs.max_changes_per_run }}"
+        outputFiles:
+          - ops.json
+          - snapshot.json
+          - state.json
+          - findings.json
+        script: |
+          const fs = require("fs");
+          const path = require("path");
+          const lib = require("./lib.js");
+
+          const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+          const num = (key, fallback) => {
+            const value = Number(env(key, fallback));
+            if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid numeric setting ${key}`);
+            return value;
+          };
+          const cfg = {
+            policyDir: env("POLICY_DIR", "policy_repo/policies"),
+            prune: env("PRUNE_UNMANAGED", "false") === "true",
+            unmanagedGraceHours: num("UNMANAGED_GRACE_HOURS", "72"),
+            flapWindowDays: num("FLAP_WINDOW_DAYS", "7"),
+            flapThreshold: num("FLAP_THRESHOLD", "2"),
+            includeFlapping: env("INCLUDE_FLAPPING", "false") === "true",
+            maxChanges: num("MAX_CHANGES_PER_RUN", "10"),
+          };
+          if (!env("VAULT_ADDR", "") || !env("VAULT_TOKEN", "")) throw new Error("VAULT_ADDR and VAULT_TOKEN are required");
+          const call = lib.client({ addr: env("VAULT_ADDR", ""), token: env("VAULT_TOKEN", ""), namespace: env("VAULT_NAMESPACE", "") });
+
+          const readJson = (file, fallback) => {
+            const text = fs.readFileSync(file, "utf8").trim();
+            return text === "" || text === "null" ? fallback : JSON.parse(text);
+          };
+
+          function loadGit() {
+            if (!fs.existsSync(cfg.policyDir)) throw new Error(`Policy directory ${cfg.policyDir} does not exist in the cloned repository`);
+            const files = fs.readdirSync(cfg.policyDir).filter((f) => f.endsWith(".hcl")).sort();
+            if (!files.length) throw new Error(`No .hcl files in ${cfg.policyDir}; refusing to treat an empty directory as "delete everything"`);
+            const git = new Map();
+            for (const f of files) {
+              const name = f.slice(0, -4);
+              if (!lib.NAME_RE.test(name)) throw new Error(`Policy file ${f}: name must be lowercase [a-z0-9_.-] because Vault and OpenBao lowercase policy names`);
+              if (name === "root") throw new Error("A policy named root cannot be managed");
+              const text = fs.readFileSync(path.join(cfg.policyDir, f), "utf8");
+              if (!/\bpath\s+"[^"]+"\s*\{/.test(text)) throw new Error(`Policy file ${f} contains no path stanza; refusing to push an empty policy`);
+              if ((text.match(/\{/g) || []).length !== (text.match(/\}/g) || []).length) throw new Error(`Policy file ${f} has unbalanced braces`);
+              git.set(name, text);
+            }
+            return git;
+          }
+
+          (async () => {
+            const now = Date.now();
+            const nowIso = new Date(now).toISOString();
+            const git = loadGit();
+            const prevState = readJson("state.json", {}) || {};
+            const prevUnmanaged = prevState.unmanaged || {};
+            const history = prevState.history || {};
+
+            const self = await lib.lookupSelf(call);
+            const protectedNames = new Set([...(self.policies || []), ...(self.identity_policies || []), "root"]);
+            const findings = [];
+            if ((self.policies || []).includes("root")) findings.push({ kind: "ROOT_TOKEN_IN_USE", severity: "warning", detail: "Kestra is running with a root token; use a dedicated token whose policy allows only sys/policies/acl and token self-lookup" });
+
+            const liveNames = await lib.listPolicies(call);
+            const live = new Map();
+            for (const name of liveNames) {
+              if (name === "root") continue;
+              const p = await lib.readPolicy(call, name);
+              if (p.exists) live.set(name, p);
+            }
+
+            const ops = [];
+            const newUnmanaged = {};
+            const window = cfg.flapWindowDays * 864e5;
+            const flapping = (name) => (history[name] || []).filter((t) => now - Date.parse(t) <= window).length >= cfg.flapThreshold;
+
+            for (const [name, text] of git) {
+              const l = live.get(name);
+              const kind = !l ? "create" : lib.hashOf(l.policy) !== lib.hashOf(text) ? "update" : null;
+              if (!kind) continue;
+              if (protectedNames.has(name)) { findings.push({ kind: "PROTECTED_DRIFT", severity: "warning", name, detail: `${name} differs from Git but is attached to Kestra's own token, so it is never changed automatically` }); continue; }
+              if (flapping(name) && !cfg.includeFlapping) { findings.push({ kind: "FLAPPING", severity: "warning", name, detail: `${name} was already reconciled ${cfg.flapThreshold}+ times in ${cfg.flapWindowDays} days; something else keeps changing it (Terraform, a UI user, another controller). Fix the second writer or set include_flapping` }); continue; }
+              const d = lib.delta(l ? l.policy : "", text);
+              ops.push({ op: kind, name, policy: text, old_policy: l ? l.policy : null, expected_live_hash: l ? lib.hashOf(l.policy) : null, git_hash: lib.hashOf(text), cas: l && l.version !== null ? l.version : null, delta: d, description: lib.describe({ op: kind, name }, d) });
+            }
+            for (const [name, l] of live) {
+              if (git.has(name)) continue;
+              if (name === "default" || protectedNames.has(name)) continue; // default can never be deleted; token policies are lockout-protected
+              const firstSeen = prevUnmanaged[name] || nowIso;
+              newUnmanaged[name] = firstSeen;
+              if (!cfg.prune) continue;
+              if (now - Date.parse(firstSeen) < cfg.unmanagedGraceHours * 36e5) continue;
+              const d = lib.delta(l.policy, "");
+              ops.push({ op: "delete", name, policy: null, old_policy: l.policy, expected_live_hash: lib.hashOf(l.policy), git_hash: null, cas: null, delta: d, description: lib.describe({ op: "delete", name }, d) });
+            }
+
+            const order = { create: 0, update: 1, delete: 2 };
+            ops.sort((a, b) => order[a.op] - order[b.op] || a.name.localeCompare(b.name));
+            const capped = ops.slice(0, cfg.maxChanges);
+            const escalations = capped.filter((o) => o.delta.sudoGained || o.delta.wildcardWrite).length;
+            const unmanagedPending = Object.keys(newUnmanaged).filter((n) => !capped.some((o) => o.name === n)).length;
+
+            const snapshot = {};
+            for (const [name, l] of live) snapshot[name] = { hash: lib.hashOf(l.policy), policy: l.policy, version: l.version };
+
+            const summaryLines = [
+              ...capped.map((o) => `• ${o.description}`),
+              ...findings.map((f) => `• [${f.kind}] ${f.detail}`),
+              ...(ops.length > capped.length ? [`• ${ops.length - capped.length} more change(s) wait for the next run (max_changes_per_run)`] : []),
+            ];
+            fs.writeFileSync("ops.json", JSON.stringify(capped));
+            fs.writeFileSync("snapshot.json", JSON.stringify(snapshot));
+            fs.writeFileSync("state.json", JSON.stringify({ version: 1, unmanaged: newUnmanaged, history }));
+            fs.writeFileSync("findings.json", JSON.stringify(findings));
+
+            console.log("::" + JSON.stringify({ outputs: {
+              git_policies: git.size,
+              live_policies: live.size,
+              ops_count: capped.length,
+              creates: capped.filter((o) => o.op === "create").length,
+              updates: capped.filter((o) => o.op === "update").length,
+              deletes: capped.filter((o) => o.op === "delete").length,
+              escalations,
+              unmanaged_pending: unmanagedPending,
+              findings_count: findings.length,
+              has_ops: capped.length > 0,
+              names: capped.map((o) => o.name), // plain names for the Kestra Loop; policy text never passes through templating
+              has_attention: capped.length > 0 || findings.length > 0,
+              summary: summaryLines.join("\n"),
+            } }) + "::");
+          })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+  - id: gate_attention
+    type: io.kestra.plugin.core.flow.If
+    description: Only alert when policies need to change or a finding such as flapping or protected drift needs a human.
+    condition: "{{ outputs.scan_policies.vars.has_attention }}"
+    then:
+      - id: notify_plan
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the plan with what each change grants or removes, and every finding that needs a decision.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":lock: *Vault ACL policy drift* (execution `" ~ execution.id ~ "`, dry_run=" ~ inputs.dry_run ~ "): " ~ outputs.scan_policies.vars.creates ~ " create, " ~ outputs.scan_policies.vars.updates ~ " update, " ~ outputs.scan_policies.vars.deletes ~ " delete, " ~ outputs.scan_policies.vars.escalations ~ " with escalated access.",
+            "attachments": [ { "color": "#E2B93B", "text": outputs.scan_policies.vars.summary } ]
+          } | toJson }}
+
+      - id: gate_ops
+        type: io.kestra.plugin.core.flow.If
+        description: Findings without a change end here; only a concrete plan continues.
+        condition: "{{ outputs.scan_policies.vars.has_ops }}"
+        then:
+          - id: gate_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Dry runs stop after reporting so the plan can be reviewed before any policy is written.
+            condition: "{{ inputs.dry_run }}"
+            then:
+              - id: log_dry_run
+                type: io.kestra.plugin.core.log.Log
+                description: Record what a real run would change.
+                message: "Dry run: {{ outputs.scan_policies.vars.ops_count }} policy change(s) would be applied. Set dry_run to false to enable reconciliation."
+            else:
+              - id: pause_for_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Policy edits take effect on live tokens immediately. Unapproved plans fail after 12 hours and the state is not advanced.
+                pauseDuration: PT12H
+                behavior: FAIL
+                onResume:
+                  - id: confirm_count
+                    type: INT
+                    defaults: 0
+                    description: Type the number of policy changes listed in the Slack plan. A different number aborts the run.
+                  - id: approver_note
+                    type: STRING
+                    defaults: ""
+                    description: Change ticket or reason recorded in the audit entry.
+
+              - id: check_confirmation
+                type: io.kestra.plugin.core.flow.If
+                description: The operator must have read the plan well enough to repeat its size.
+                condition: "{{ (outputs.pause_for_approval.onResume.confirm_count ~ '') != (outputs.scan_policies.vars.ops_count ~ '') }}"
+                then:
+                  - id: fail_confirmation
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort before any policy is written.
+                    errorMessage: "Confirmation mismatch: the plan changes {{ outputs.scan_policies.vars.ops_count }} policy(ies) but {{ outputs.pause_for_approval.onResume.confirm_count }} was entered."
+
+              - id: apply_policy_changes
+                type: io.kestra.plugin.core.flow.Loop
+                description: Apply one policy at a time so a rejected write stops the rollout.
+                values: "{{ outputs.scan_policies.vars.names }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: apply_policy_change
+                    type: io.kestra.plugin.scripts.node.Script
+                    description: Re-read the live policy and only write if it is still what was approved, using check-and-set where the server supports it, then read it back.
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                    containerImage: node:20-slim
+                    inputFiles:
+                      lib.js: "{{ vars.lib_js }}"
+                      ops.json: "{{ outputs.scan_policies.outputFiles['ops.json'] }}"
+                    env:
+                      VAULT_ADDR: "{{ inputs.vault_addr }}"
+                      VAULT_TOKEN: "{{ secret('VAULT_TOKEN') }}"
+                      VAULT_NAMESPACE: "{{ inputs.vault_namespace }}"
+                      OP_NAME: "{{ item.value }}"
+                    script: |
+                      const fs = require("fs");
+                      const lib = require("./lib.js");
+
+                      const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+                      if (!env("VAULT_ADDR", "") || !env("VAULT_TOKEN", "") || !env("OP_NAME", "")) throw new Error("VAULT_ADDR, VAULT_TOKEN and OP_NAME are required");
+                      const call = lib.client({ addr: env("VAULT_ADDR", ""), token: env("VAULT_TOKEN", ""), namespace: env("VAULT_NAMESPACE", "") });
+                      const name = env("OP_NAME", "");
+
+                      (async () => {
+                        const op = JSON.parse(fs.readFileSync("ops.json", "utf8")).find((o) => o.name === name);
+                        if (!op) throw new Error(`No planned operation for policy ${name}`);
+                        if (name === "root" || !lib.NAME_RE.test(name)) throw new Error(`Refusing to touch policy ${name}`);
+
+                        // Time passed while the plan waited for approval: only act if the live policy is still what was approved.
+                        const now = await lib.readPolicy(call, name);
+                        const stale = op.op === "create" ? now.exists : !now.exists || lib.hashOf(now.policy) !== op.expected_live_hash;
+                        if (stale) {
+                          console.log("::" + JSON.stringify({ outputs: { result: "skipped_stale", name } }) + "::");
+                          return;
+                        }
+
+                        if (op.op === "delete") {
+                          const r = await call("DELETE", `sys/policies/acl/${encodeURIComponent(name)}`);
+                          if (![200, 204].includes(r.status)) throw new Error(`DELETE ${name} returned HTTP ${r.status}: ${r.text.slice(0, 200)}`);
+                          const after = await lib.readPolicy(call, name);
+                          if (after.exists) throw new Error(`${name} still exists after DELETE`);
+                        } else {
+                          const body = { policy: op.policy };
+                          if (op.op === "update" && op.cas !== null) body.cas = op.cas; // OpenBao: reject if the version moved since the scan
+                          const r = await call("PUT", `sys/policies/acl/${encodeURIComponent(name)}`, body);
+                          if (![200, 204].includes(r.status)) throw new Error(`PUT ${name} returned HTTP ${r.status}: ${r.text.slice(0, 200)}`);
+                          const after = await lib.readPolicy(call, name);
+                          if (!after.exists || lib.hashOf(after.policy) !== op.git_hash) throw new Error(`${name} does not match Git after PUT`);
+                        }
+                        console.log("::" + JSON.stringify({ outputs: { result: "applied", name, op: op.op } }) + "::");
+                      })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: verify_reconciliation
+                type: io.kestra.plugin.scripts.node.Script
+                description: Read every planned policy again, check nothing outside the plan changed, confirm the token still works, and record rollback text and flapping history.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: node:20-slim
+                inputFiles:
+                  lib.js: "{{ vars.lib_js }}"
+                  ops.json: "{{ outputs.scan_policies.outputFiles['ops.json'] }}"
+                  snapshot.json: "{{ outputs.scan_policies.outputFiles['snapshot.json'] }}"
+                  state.json: "{{ outputs.scan_policies.outputFiles['state.json'] }}"
+                env:
+                  VAULT_ADDR: "{{ inputs.vault_addr }}"
+                  VAULT_TOKEN: "{{ secret('VAULT_TOKEN') }}"
+                  VAULT_NAMESPACE: "{{ inputs.vault_namespace }}"
+                  EXECUTION_ID: "{{ execution.id }}"
+                  APPROVER_NOTE: "{{ outputs.pause_for_approval.onResume.approver_note }}"
+                outputFiles:
+                  - audit.json
+                  - state.json
+                script: |
+                  const fs = require("fs");
+                  const lib = require("./lib.js");
+
+                  const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+                  if (!env("VAULT_ADDR", "") || !env("VAULT_TOKEN", "")) throw new Error("VAULT_ADDR and VAULT_TOKEN are required");
+                  const call = lib.client({ addr: env("VAULT_ADDR", ""), token: env("VAULT_TOKEN", ""), namespace: env("VAULT_NAMESPACE", "") });
+
+                  (async () => {
+                    const ops = JSON.parse(fs.readFileSync("ops.json", "utf8"));
+                    const snapshot = JSON.parse(fs.readFileSync("snapshot.json", "utf8"));
+                    const state = JSON.parse(fs.readFileSync("state.json", "utf8"));
+                    const history = state.history || {};
+                    const unmanaged = state.unmanaged || {};
+                    const nowIso = new Date().toISOString();
+
+                    const mismatches = [];
+                    const staleSkipped = [];
+                    const confirmed = [];
+
+                    for (const op of ops) {
+                      const live = await lib.readPolicy(call, op.name);
+                      if (op.op === "delete") {
+                        if (!live.exists) { confirmed.push(op.name); delete unmanaged[op.name]; }
+                        else if (lib.hashOf(live.policy) === op.expected_live_hash) mismatches.push(`${op.name}: still present after the delete step`);
+                        else staleSkipped.push(op.name);
+                      } else if (live.exists && lib.hashOf(live.policy) === op.git_hash) {
+                        confirmed.push(op.name);
+                      } else if (op.op === "update" && live.exists && lib.hashOf(live.policy) === op.expected_live_hash) {
+                        mismatches.push(`${op.name}: still has the old content after the update step`);
+                      } else if (op.op === "create" && !live.exists) {
+                        mismatches.push(`${op.name}: still missing after the create step`);
+                      } else {
+                        staleSkipped.push(op.name);
+                      }
+                    }
+
+                    // Collateral check: nothing outside the plan may have changed or vanished.
+                    const planned = new Set(ops.map((o) => o.name));
+                    for (const [name, snap] of Object.entries(snapshot)) {
+                      if (planned.has(name)) continue;
+                      const live = await lib.readPolicy(call, name);
+                      if (!live.exists) mismatches.push(`${name}: disappeared although it was not in the plan`);
+                      else if (lib.hashOf(live.policy) !== snap.hash) mismatches.push(`${name}: changed although it was not in the plan`);
+                    }
+                    // Lockout check: the token must still be able to see itself.
+                    try { await lib.lookupSelf(call); } catch (e) { mismatches.push(`token self-lookup failed after the change: ${String(e.message).slice(0, 120)}`); }
+
+                    for (const name of confirmed) {
+                      if (!history[name]) history[name] = [];
+                      history[name].push(nowIso);
+                      history[name] = history[name].slice(-20);
+                    }
+                    const verified = mismatches.length === 0;
+                    const audit = {
+                      executed_at: nowIso,
+                      execution_id: process.env.EXECUTION_ID || "",
+                      verified,
+                      confirmed,
+                      stale_skipped: staleSkipped,
+                      approver_note: process.env.APPROVER_NOTE || "",
+                      mismatches,
+                      // Rollback material: the exact text that was live before each change.
+                      previous: Object.fromEntries(ops.filter((o) => o.old_policy !== null).map((o) => [o.name, o.old_policy])),
+                      changes: ops.map((o) => ({ op: o.op, name: o.name, description: o.description })),
+                    };
+                    fs.writeFileSync("audit.json", JSON.stringify(audit));
+                    fs.writeFileSync("state.json", JSON.stringify({ version: 1, unmanaged, history }));
+                    console.log("::" + JSON.stringify({ outputs: { verified, confirmed: confirmed.length, stale_skipped: staleSkipped.length, mismatch_summary: mismatches.slice(0, 10).join("; ") } }) + "::");
+                  })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: check_verification
+                type: io.kestra.plugin.core.flow.If
+                description: A Vault that does not match the plan is an incident, not a success.
+                condition: "{{ not outputs.verify_reconciliation.vars.verified }}"
+                then:
+                  - id: fail_verification
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Stop before the state is advanced.
+                    errorMessage: "Vault does not match the plan after reconciliation: {{ outputs.verify_reconciliation.vars.mismatch_summary }}"
+
+              - id: record_audit
+                type: io.kestra.plugin.core.kv.Set
+                description: Keep the last verified change set with the exact previous policy text for rollback.
+                key: "{{ render(vars.audit_key) }}"
+                kvType: JSON
+                value: "{{ read(outputs.verify_reconciliation.outputFiles['audit.json']) }}"
+
+              - id: persist_state_after_apply
+                type: io.kestra.plugin.core.kv.Set
+                description: Store the unmanaged-policy timers and the reconciliation history used to detect flapping.
+                key: "{{ render(vars.state_key) }}"
+                kvType: STRING
+                value: "{{ read(outputs.verify_reconciliation.outputFiles['state.json']) }}"
+
+              - id: notify_result
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Confirm the verified result.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: >-
+                  {{ {
+                    "text": ":white_check_mark: *Vault ACL policy drift* verified: " ~ outputs.verify_reconciliation.vars.confirmed ~ " policy change(s) confirmed, " ~ outputs.verify_reconciliation.vars.stale_skipped ~ " skipped because the live policy changed during approval (execution `" ~ execution.id ~ "`)."
+                  } | toJson }}
+        else:
+          - id: log_findings_only
+            type: io.kestra.plugin.core.log.Log
+            description: Findings such as flapping or protected drift need a human, not an automated write.
+            message: "No policy change planned. {{ outputs.scan_policies.vars.findings_count }} finding(s) reported."
+    else:
+      - id: log_in_sync
+        type: io.kestra.plugin.core.log.Log
+        description: Every managed policy matches Git.
+        message: "{{ outputs.scan_policies.vars.live_policies }} live policy(ies) checked against {{ outputs.scan_policies.vars.git_policies }} in Git: in sync."
+
+  - id: gate_persist
+    type: io.kestra.plugin.core.flow.If
+    description: Runs that wrote nothing store their state here; runs that applied changes stored it after verification.
+    condition: "{{ (not outputs.scan_policies.vars.has_ops) or inputs.dry_run }}"
+    then:
+      - id: persist_state
+        type: io.kestra.plugin.core.kv.Set
+        description: Advance the unmanaged timers and keep the flapping history only after the run finished cleanly.
+        key: "{{ render(vars.state_key) }}"
+        kvType: STRING
+        value: "{{ read(outputs.scan_policies.outputFiles['state.json']) }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Page the channel when the Git content is invalid, Vault rejects a write, approval times out, confirmation is wrong or verification finds a mismatch.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Vault ACL policy reconciliation failed* (execution `" ~ execution.id ~ "`). The state was not advanced; compare the live policies with Git before the next run."
+      } | toJson }}
+
+extend:
+  title: Vault ACL Policy GitOps Reconciliation Gate
+  metaTitle: Vault and OpenBao ACL Policy GitOps Reconciliation | Kestra
+  shortDescription: Reconciles Vault or OpenBao ACL policies with Git, shows what each change grants, detects flapping across runs, and applies changes after count-confirmed approval with read-back proof.
+  metaDescription: Reconcile Vault or OpenBao ACL policies with Git using count-confirmed approval, check-and-set writes, flapping detection and read-back verification.
+  description: |
+    ACL policies edited in the UI or by another tool drift from Git, and a policy write changes access for live tokens at once. This blueprint treats Git as the truth but makes every write explicit, concurrency-safe and verified.
+
+    ## How it works
+
+    1. A webhook (from a Git push on the policy repo) or an hourly schedule starts the flow; `concurrency` allows one run at a time.
+    2. `clone_policy` (`io.kestra.plugin.git.Clone`) fetches one lowercase `name.hcl` file per policy. An empty directory, an uppercase name, a file without a `path` stanza or unbalanced braces fails the run instead of being pushed.
+    3. `scan_policies` lists `sys/policies/acl`, reads each policy and diffs it with Git, ignoring line endings and trailing whitespace. It looks up the token's own policies with `auth/token/lookup-self` and never changes them.
+    4. A policy that was already reconciled `flap_threshold` times inside `flap_window_days`, recorded in KV, is reported as flapping instead of fought over. Unmanaged policies are only deleted after a grace window and never `default` or `root`.
+    5. The Slack plan describes per policy which paths and capabilities are added or removed and flags `sudo` or wildcard write gains.
+    6. `pause_for_approval` holds the plan; the operator types the number of changes.
+    7. `apply_policy_changes` loops over the policies. Each `apply_policy_change` re-reads the live policy, skips it if it changed while waiting, writes with OpenBao's `cas` version when available and reads it back.
+    8. `verify_reconciliation` re-reads every planned policy, checks nothing else changed, confirms the token still works and stores the previous text for rollback.
+
+    ## What you get
+
+    - Concurrency-safe policy writes with a rollback copy of every overwritten policy.
+    - Plans that show privilege changes instead of raw diffs.
+    - Protection from locking out the Kestra token or deleting everything after a Git mistake.
+
+    ## Who it's for
+
+    - Platform and security teams that run Vault or OpenBao and keep policies in Git.
+
+    ## Why orchestrate this with Kestra
+
+    Flapping detection needs memory across runs, writes need a human decision, and the proof needs an independent read. Git, KV, `Pause` and `Loop` express that in one flow.
+
+    ## Prerequisites
+
+    - Vault or OpenBao reachable from the worker, Docker on the worker and a Slack webhook.
+    - A token whose policy allows list, read, create, update and delete on `sys/policies/acl/*` and read on `auth/token/lookup-self`.
+
+    ### Secrets
+
+    - `VAULT_TOKEN`: token used for all policy reads and writes.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook.
+    - `VAULT_POLICY_WEBHOOK_KEY`: key protecting the webhook trigger.
+
+    ## Quick start
+
+    1. Run `docker run -d -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=dev-token -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 openbao/openbao server -dev` and create a non-root token.
+    2. Commit `policies/<name>.hcl` files to a Git repository and edit one policy in Vault to create drift.
+    3. Create the three secrets and execute with `dry_run: true`.
+    4. Execute with `dry_run: false`, resume the pause with the planned count and check the verified message.
+
+    ## How to extend
+
+    - The `default` policy is attached to almost every token, so it counts as the token's own policy and is reported, not changed, when it differs from Git.
+    - Add a Kubernetes or Terraform check that finds the second writer behind a flapping policy.
+    - Restore a policy from the `previous` map in the KV audit entry.
+
+    ## Links
+
+    - [OpenBao policy API](https://openbao.org/docs/api/system/policies/)
+    - [OpenBao policies concept](https://openbao.org/docs/concepts/policies/)
+    - [Kestra Git Clone](https://kestra.io/plugins/plugin-git/io.kestra.plugin.git.clone)
+    - [Kestra Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+  tags:
+    - Infrastructure
+  subTags:
+    - GitOps & Flow Sync
+    - Approval Gates
+  ee: false
+  demo: false

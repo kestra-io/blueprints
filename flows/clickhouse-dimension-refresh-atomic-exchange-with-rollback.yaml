@@ -1,0 +1,394 @@
+id: clickhouse-dimension-refresh-atomic-exchange-with-rollback
+namespace: company.analytics
+
+description: |
+  Rebuild a ClickHouse dimension table from its Postgres source of truth in a shadow table, prove the copy matches
+  the source, hold shrinking reloads for human approval, publish with an atomic EXCHANGE TABLES, re-audit the live
+  table and swap back automatically if the published data does not match what was audited.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: postgres_url
+    type: STRING
+    displayName: Postgres JDBC URL (as seen by the Kestra worker)
+    defaults: "jdbc:postgresql://localhost:5432/appdb"
+
+  - id: postgres_host_for_clickhouse
+    type: STRING
+    displayName: Postgres host:port (as seen by the ClickHouse server)
+    description: Used by the ClickHouse postgresql() table function. Often differs from the worker view, for example postgres:5432 inside a Docker network.
+    defaults: "postgres:5432"
+
+  - id: postgres_database
+    type: STRING
+    defaults: "appdb"
+
+  - id: source_schema
+    type: STRING
+    defaults: "public"
+
+  - id: source_table
+    type: STRING
+    defaults: "products"
+
+  - id: clickhouse_url
+    type: STRING
+    displayName: ClickHouse JDBC URL (HTTP port)
+    defaults: "jdbc:clickhouse://localhost:8123/"
+
+  - id: target_database
+    type: STRING
+    description: Must use the Atomic database engine, the default since ClickHouse 20.10. EXCHANGE TABLES is not supported on Ordinary databases.
+    defaults: "analytics"
+
+  - id: target_table
+    type: STRING
+    description: The live table readers query. It must already exist with the same column layout as the source.
+    defaults: "products"
+
+  - id: columns
+    type: STRING
+    description: Comma-separated column list copied from Postgres into ClickHouse, in a layout both tables share.
+    defaults: "id, sku, name, price_cents, updated_at"
+
+  - id: pk_column
+    type: STRING
+    defaults: "id"
+
+  - id: checksum_column
+    type: STRING
+    description: Integer column whose SUM is compared on both sides. Use an integer type, because numeric(12,2) and Decimal render differently.
+    defaults: "price_cents"
+
+  - id: updated_column
+    type: STRING
+    description: Timestamp column whose MAX is part of the source fingerprint used to skip no-op refreshes.
+    defaults: "updated_at"
+
+  - id: max_shrink_pct
+    type: INT
+    description: A reload that would shrink the live table by more than this percentage is held for approval.
+    defaults: 20
+
+  - id: always_require_approval
+    type: BOOL
+    description: Hold every publish for approval, not only shrinking reloads.
+    defaults: false
+
+  - id: allow_empty_source
+    type: BOOL
+    description: Permit publishing a zero-row table. Leave false so an emptied source cannot blank the dimension.
+    defaults: false
+
+  - id: approval_timeout
+    type: DURATION
+    defaults: PT12H
+
+triggers:
+  - id: refresh_every_two_hours
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Re-check the source on a schedule. Unchanged sources are skipped after a cheap fingerprint comparison.
+    cron: "10 */2 * * *"
+    disabled: true
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Fail
+    description: Every identifier is interpolated into SQL, so reject anything that is not a plain identifier or column list.
+    condition: "{{ not (inputs.source_table matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.source_schema matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.postgres_database matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.target_table matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.target_database matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.pk_column matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.checksum_column matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.updated_column matches '^[A-Za-z_][A-Za-z0-9_]*$') or not (inputs.columns matches '^[A-Za-z_][A-Za-z0-9_, ]*$') or inputs.max_shrink_pct < 0 or inputs.max_shrink_pct > 100 }}"
+    errorMessage: "Rejected inputs: identifiers must match [A-Za-z_][A-Za-z0-9_]*, columns must be a plain comma-separated list and max_shrink_pct must be between 0 and 100."
+
+  - id: check_database_engine
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: EXCHANGE TABLES only works inside an Atomic database, so read the engine before building anything.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "SELECT engine AS engine FROM system.databases WHERE name = '{{ inputs.target_database }}'"
+
+  - id: require_atomic_engine
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (outputs.check_database_engine.row.engine ?? '') != 'Atomic' }}"
+    errorMessage: "Database {{ inputs.target_database }} uses engine '{{ outputs.check_database_engine.row.engine ?? 'missing' }}', not Atomic. EXCHANGE TABLES cannot run there."
+
+  - id: read_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Fingerprints recorded by the last successful publish of this exact target table.
+    key: "clickhouse_dim_refresh_{{ inputs.target_database }}_{{ inputs.target_table }}"
+    errorOnMissing: false
+
+  - id: audit_source
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Row count, distinct primary keys, checksum and newest timestamp of the Postgres source.
+    url: "{{ inputs.postgres_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: >-
+      SELECT count(*)::text AS row_count,
+      count(DISTINCT {{ inputs.pk_column }})::text AS distinct_pk,
+      coalesce(sum({{ inputs.checksum_column }}), 0)::text AS sum_col,
+      coalesce(max({{ inputs.updated_column }})::text, '') AS max_ts
+      FROM {{ inputs.source_schema }}.{{ inputs.source_table }}
+
+  - id: audit_live
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Same audit on the live ClickHouse table, taken before anything is built.
+    url: "{{ inputs.clickhouse_url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: >-
+      SELECT toString(count()) AS row_count,
+      toString(uniqExact({{ inputs.pk_column }})) AS distinct_pk,
+      toString(sum({{ inputs.checksum_column }})) AS sum_col
+      FROM {{ inputs.target_database }}.{{ inputs.target_table }}
+
+  - id: fingerprints
+    type: io.kestra.plugin.core.output.OutputValues
+    description: A refresh is skipped only when the source is unchanged since the last publish and the live table still matches what that publish left behind.
+    values:
+      source_fp: "{{ outputs.audit_source.row.row_count }}|{{ outputs.audit_source.row.distinct_pk }}|{{ outputs.audit_source.row.sum_col }}|{{ outputs.audit_source.row.max_ts }}"
+      live_fp: "{{ outputs.audit_live.row.row_count }}|{{ outputs.audit_live.row.distinct_pk }}|{{ outputs.audit_live.row.sum_col }}"
+      state_source_fp: "{{ fromJson(outputs.read_state.value ?? '{}').source_fingerprint ?? '' }}"
+      state_live_fp: "{{ fromJson(outputs.read_state.value ?? '{}').live_fingerprint ?? '' }}"
+
+  - id: refresh_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Nothing to do when the source is unchanged and the live table still matches the last publish. Otherwise build, audit, approve if needed, swap and verify.
+    condition: "{{ outputs.fingerprints.values.source_fp == outputs.fingerprints.values.state_source_fp and outputs.fingerprints.values.live_fp == outputs.fingerprints.values.state_live_fp }}"
+    then:
+      - id: log_unchanged
+        type: io.kestra.plugin.core.log.Log
+        message: "Source {{ inputs.source_schema }}.{{ inputs.source_table }} is unchanged since the last publish and {{ inputs.target_database }}.{{ inputs.target_table }} still matches it. Fingerprint {{ outputs.fingerprints.values.live_fp }}. Skipping."
+    else:
+      - id: drop_stale_shadow
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: Remove the previous run's shadow table, which also held the pre-swap data of the last publish. SYNC releases the name immediately.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+        password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+        sql: "DROP TABLE IF EXISTS {{ inputs.target_database }}.{{ inputs.target_table }}__refresh SYNC"
+
+      - id: create_shadow
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: Clone the live table's structure and engine so the swap is a pure name exchange.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+        password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+        sql: "CREATE TABLE {{ inputs.target_database }}.{{ inputs.target_table }}__refresh AS {{ inputs.target_database }}.{{ inputs.target_table }}"
+
+      - id: load_shadow
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: Pull the full source straight from Postgres into the shadow table with the ClickHouse postgresql() table function. Readers keep hitting the untouched live table.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+        password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+        sql: >-
+          INSERT INTO {{ inputs.target_database }}.{{ inputs.target_table }}__refresh ({{ inputs.columns }})
+          SELECT {{ inputs.columns }}
+          FROM postgresql('{{ inputs.postgres_host_for_clickhouse }}', '{{ inputs.postgres_database }}', '{{ inputs.source_table }}', '{{ secret('POSTGRES_USERNAME') }}', '{{ secret('POSTGRES_PASSWORD') }}', '{{ inputs.source_schema }}')
+
+      - id: audit_shadow
+        type: io.kestra.plugin.jdbc.clickhouse.Query
+        description: Audit the shadow table with the same three aggregates computed on the source.
+        url: "{{ inputs.clickhouse_url }}"
+        username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+        password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        sql: >-
+          SELECT toString(count()) AS row_count,
+          toString(uniqExact({{ inputs.pk_column }})) AS distinct_pk,
+          toString(sum({{ inputs.checksum_column }})) AS sum_col
+          FROM {{ inputs.target_database }}.{{ inputs.target_table }}__refresh
+
+      - id: verdict
+        type: io.kestra.plugin.core.output.OutputValues
+        description: Compare shadow with source, size the change against the live table and decide whether a human must approve it.
+        values:
+          shadow_fp: "{{ outputs.audit_shadow.row.row_count }}|{{ outputs.audit_shadow.row.distinct_pk }}|{{ outputs.audit_shadow.row.sum_col }}"
+          source_triple: "{{ outputs.audit_source.row.row_count }}|{{ outputs.audit_source.row.distinct_pk }}|{{ outputs.audit_source.row.sum_col }}"
+          parity: "{{ (outputs.audit_shadow.row.row_count ~ '|' ~ outputs.audit_shadow.row.distinct_pk ~ '|' ~ outputs.audit_shadow.row.sum_col) == (outputs.audit_source.row.row_count ~ '|' ~ outputs.audit_source.row.distinct_pk ~ '|' ~ outputs.audit_source.row.sum_col) }}"
+          empty: "{{ (outputs.audit_shadow.row.row_count | number) == 0 }}"
+          shrink: "{{ (outputs.audit_live.row.row_count | number) > 0 and ((outputs.audit_shadow.row.row_count | number) * 100) < ((outputs.audit_live.row.row_count | number) * (100 - inputs.max_shrink_pct)) }}"
+          needs_approval: "{{ inputs.always_require_approval or ((outputs.audit_live.row.row_count | number) > 0 and ((outputs.audit_shadow.row.row_count | number) * 100) < ((outputs.audit_live.row.row_count | number) * (100 - inputs.max_shrink_pct))) }}"
+
+      - id: fail_on_parity_mismatch
+        type: io.kestra.plugin.core.execution.Fail
+        description: A shadow that differs from the source means rows changed mid-load or the copy was partial. Nothing is published and the shadow is kept for inspection.
+        condition: "{{ (outputs.verdict.values.parity ~ '') != 'true' }}"
+        errorMessage: "Shadow table does not match Postgres. source={{ outputs.verdict.values.source_triple }} shadow={{ outputs.verdict.values.shadow_fp }} (count|distinct pk|checksum). Live table untouched."
+
+      - id: fail_on_empty_source
+        type: io.kestra.plugin.core.execution.Fail
+        condition: "{{ ((outputs.verdict.values.empty ~ '') == 'true') and not inputs.allow_empty_source }}"
+        errorMessage: "Source {{ inputs.source_schema }}.{{ inputs.source_table }} returned zero rows. Refusing to blank {{ inputs.target_database }}.{{ inputs.target_table }}. Set allow_empty_source to publish an empty table on purpose."
+
+      - id: approval_gate
+        type: io.kestra.plugin.core.flow.If
+        description: Shrinking reloads, and every reload when always_require_approval is set, wait for an operator.
+        condition: "{{ (outputs.verdict.values.needs_approval ~ '') == 'true' }}"
+        then:
+          - id: request_approval
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {"text": "ClickHouse dimension refresh waiting for approval: {{ inputs.target_database }}.{{ inputs.target_table }} would go from {{ outputs.audit_live.row.row_count }} to {{ outputs.audit_shadow.row.row_count }} rows (max allowed shrink {{ inputs.max_shrink_pct }}%). The shadow table matches Postgres. Resume or reject execution {{ execution.id }} within {{ inputs.approval_timeout }}."}
+
+          - id: approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Hold the swap. FAIL on timeout means an ignored request never publishes.
+            pauseDuration: "{{ inputs.approval_timeout }}"
+            behavior: FAIL
+            onResume:
+              - id: approved
+                type: BOOL
+                description: Publish the shadow table to the live name.
+                defaults: false
+              - id: reason
+                type: STRING
+                description: Why the shrink is expected or why it is rejected.
+                defaults: ""
+
+      - id: decide_publish
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          go: "{{ ((outputs.verdict.values.needs_approval ~ '') == 'false') or (outputs.approval is defined and ((outputs.approval.onResume.approved ~ '') == 'true')) }}"
+
+      - id: publish_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.decide_publish.values.go ~ '') == 'true' }}"
+        then:
+          - id: swap_tables
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: Atomic name exchange. Readers see either the old table or the new one, never a partial load. The old data now lives under the shadow name.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+            password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+            sql: "EXCHANGE TABLES {{ inputs.target_database }}.{{ inputs.target_table }} AND {{ inputs.target_database }}.{{ inputs.target_table }}__refresh"
+
+          - id: audit_published
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            description: Re-read the live name after the swap instead of assuming it took.
+            url: "{{ inputs.clickhouse_url }}"
+            username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+            password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: >-
+              SELECT toString(count()) AS row_count,
+              toString(uniqExact({{ inputs.pk_column }})) AS distinct_pk,
+              toString(sum({{ inputs.checksum_column }})) AS sum_col
+              FROM {{ inputs.target_database }}.{{ inputs.target_table }}
+
+          - id: rollback_gate
+            type: io.kestra.plugin.core.flow.If
+            description: If the live name does not carry exactly the audited data, swap the old table back and fail the run.
+            condition: "{{ (outputs.audit_published.row.row_count ~ '|' ~ outputs.audit_published.row.distinct_pk ~ '|' ~ outputs.audit_published.row.sum_col) != outputs.verdict.values.shadow_fp }}"
+            then:
+              - id: rollback_swap
+                type: io.kestra.plugin.jdbc.clickhouse.Query
+                url: "{{ inputs.clickhouse_url }}"
+                username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+                password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+                sql: "EXCHANGE TABLES {{ inputs.target_database }}.{{ inputs.target_table }} AND {{ inputs.target_database }}.{{ inputs.target_table }}__refresh"
+
+              - id: fail_after_rollback
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Post-swap audit of {{ inputs.target_database }}.{{ inputs.target_table }} returned {{ outputs.audit_published.row.row_count }}|{{ outputs.audit_published.row.distinct_pk }}|{{ outputs.audit_published.row.sum_col }} but {{ outputs.verdict.values.shadow_fp }} was audited. The previous table was swapped back."
+
+          - id: save_state
+            type: io.kestra.plugin.core.kv.Set
+            description: Record what was published only after the post-swap audit passed.
+            key: "clickhouse_dim_refresh_{{ inputs.target_database }}_{{ inputs.target_table }}"
+            kvType: STRING
+            value: "{{ { 'source_fingerprint': outputs.fingerprints.values.source_fp, 'live_fingerprint': outputs.verdict.values.shadow_fp, 'rows': outputs.audit_published.row.row_count, 'execution': execution.id } | toJson }}"
+
+          - id: notify_published
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {"text": "ClickHouse dimension refresh published: {{ inputs.target_database }}.{{ inputs.target_table }} went from {{ outputs.audit_live.row.row_count }} to {{ outputs.audit_published.row.row_count }} rows, verified after the swap. The previous data stays in {{ inputs.target_table }}__refresh until the next run. Execution {{ execution.id }}."}
+        else:
+          - id: notify_rejected
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |
+              {"text": "ClickHouse dimension refresh rejected for {{ inputs.target_database }}.{{ inputs.target_table }}. Live table untouched, shadow kept in {{ inputs.target_table }}__refresh. Reason: {{ outputs.approval.onResume.reason ?? 'none given' }}. Execution {{ execution.id }}."}
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "ClickHouse dimension refresh failed for {{ inputs.target_database }}.{{ inputs.target_table }} (execution {{ execution.id }}). Check whether the live table is intact, then inspect {{ inputs.target_table }}__refresh before the next run drops it."}
+
+extend:
+  title: Reload a ClickHouse dimension table from Postgres with an atomic swap and automatic rollback
+  metaTitle: ClickHouse Atomic EXCHANGE TABLES Refresh from Postgres | Kestra
+  shortDescription: Rebuild a ClickHouse dimension in a shadow table, prove it matches Postgres, hold shrinking reloads for approval, swap atomically and roll back if the live audit fails.
+  metaDescription: Refresh a ClickHouse table from Postgres via a shadow copy, audit parity, require approval on big shrinks, EXCHANGE TABLES atomically and auto-rollback.
+  description: |
+    A full reload of a ClickHouse dimension usually means TRUNCATE plus INSERT, so dashboards querying it in that window see an empty or half-filled table. This blueprint loads a shadow table next to the live one, proves it matches Postgres, then swaps the two names with one atomic EXCHANGE TABLES.
+
+    ## How it works
+
+    1. `validate_inputs` rejects non-identifier input (everything is interpolated into SQL) and `require_atomic_engine` stops unless the target database uses the Atomic engine.
+    2. `read_state` loads the fingerprints of the last publish. `audit_source` (Postgres) and `audit_live` (ClickHouse) compute row count, distinct keys and a checksum. `refresh_gate` skips unchanged sources, but still repairs a live table that drifted from the last publish.
+    3. `create_shadow` and `load_shadow` build `<table>__refresh` with the ClickHouse `postgresql()` table function while readers keep using the live table. `verdict` compares the audited shadow with the source, and `fail_on_parity_mismatch` and `fail_on_empty_source` stop the run before anything is published.
+    4. A reload shrinking the table by more than `max_shrink_pct` waits in the `approval` Pause. Timeout fails the run, so an ignored request never publishes.
+    5. `swap_tables` runs EXCHANGE TABLES, `audit_published` re-reads the live name, and `rollback_gate` swaps back and fails the run if it differs from the audited shadow. Only a verified publish reaches `save_state`.
+
+    ## What you get
+
+    - Readers never see an empty or partial dimension.
+    - Parity proof between Postgres and the shadow before any swap.
+    - An approval gate on suspicious shrinks, automatic rollback, and the previous data kept under the shadow name until the next run.
+
+    ## Who it's for
+
+    - Analytics and platform engineers serving dashboards from ClickHouse dimensions copied out of Postgres.
+
+    ## Why orchestrate this with Kestra
+
+    The safety is ordering and state: audit, branch, pause for a person, mutate, verify, undo. Kestra keeps fingerprints in KV between runs, holds the approval without a worker, and runs the failure handler on any step.
+
+    ## Prerequisites
+
+    - ClickHouse with an Atomic database and an existing live table matching the source columns.
+    - A Postgres read user reachable from both the worker and the ClickHouse server.
+    - Locally, the `clickhouse/clickhouse-server` and `postgres` Docker images on one network.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` and `POSTGRES_PASSWORD`: read-only Postgres user, also passed to `postgresql()`.
+    - `CLICKHOUSE_USERNAME` and `CLICKHOUSE_PASSWORD`: user allowed to create, drop and exchange tables.
+    - `SLACK_WEBHOOK_URL`: approval requests and results.
+
+    ## Quick start
+
+    1. Create the secrets and the live ClickHouse table.
+    2. Execute once with inputs adjusted to your table.
+    3. Delete rows in Postgres to hit the shrink approval path, then resume or reject.
+    4. Remove `disabled: true` from the trigger.
+
+    ## How to extend
+
+    - Reload dictionaries sourced from this table after `swap_tables`.
+    - Loop over several dimension tables with `io.kestra.plugin.core.flow.Loop`.
+
+    ## Links
+
+    - [ClickHouse EXCHANGE TABLES](https://clickhouse.com/docs/sql-reference/statements/exchange)
+    - [ClickHouse postgresql() table function](https://clickhouse.com/docs/sql-reference/table-functions/postgresql)
+    - [Kestra ClickHouse plugin](https://kestra.io/plugins/plugin-jdbc-clickhouse)
+  tags:
+    - Data
+  subTags:
+    - ELT & Warehouse Loading
+    - Data Warehouses
+  ee: false
+  demo: false

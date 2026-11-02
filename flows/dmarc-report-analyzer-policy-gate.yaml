@@ -1,0 +1,669 @@
+id: dmarc-report-analyzer-policy-gate
+namespace: company.security
+description: |
+  Read the DMARC aggregate reports that mailbox providers send for your domain,
+  keep every reported sender in Postgres, alert on spoofing waves, and once a
+  week show who sends mail as your domain and whether it passes. When every
+  authorized sender has passed long enough, propose the next DMARC policy step
+  and, after approval, open a pull request to your DNS-as-code repository.
+
+labels:
+  team: security
+  use-case: email-authentication
+
+inputs:
+  - id: mode
+    type: SELECT
+    displayName: Action
+    description: "`ingest` stores reports (the mailbox trigger does this). `review` analyzes them and may propose a policy step (weekly)."
+    values:
+      - ingest
+      - review
+    defaults: ingest
+  - id: report_file
+    type: FILE
+    displayName: Report file (ingest)
+    description: A DMARC aggregate report as .xml, .xml.gz or .zip, or a .zip with many reports, to backfill or test.
+    required: false
+  - id: days
+    type: INT
+    displayName: Review window in days
+    defaults: 30
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run (review)
+    description: Show the proposed DNS change without asking for approval or opening a pull request.
+    defaults: false
+
+variables:
+  domain: example-shop.test
+  # Who may send mail as the domain, matched on reverse DNS (suffix) or IP range.
+  authorized_senders:
+    - name: Google Workspace
+      ptr_suffixes: [".google.com"]
+    - name: SendGrid
+      ptr_suffixes: [".sendgrid.net"]
+    - name: Mailchimp
+      ptr_suffixes: [".mandrillapp.com", ".mcsv.net", ".rsgsv.net"]
+  # Every authorized sender must pass DMARC at this rate over the window before a stricter policy is proposed.
+  pass_threshold: 0.98
+  # Reports must cover at least this many days, and policy steps are at least this far apart.
+  min_days_clean: 14
+  # Policy ladder, one step per approval.
+  ladder:
+    - {p: none, pct: 100}
+    - {p: quarantine, pct: 25}
+    - {p: quarantine, pct: 100}
+    - {p: reject, pct: 100}
+  # Failing messages per report from one unknown source that trigger an immediate alert.
+  alert_spoof_volume: 100
+  imap_host: imap.example.com
+  imap_port: 993
+  dns_repo: your-org/dns
+  dns_branch: main
+  dns_file: zones/example-shop.test.zone
+
+triggers:
+  - id: reports_mailbox
+    type: io.kestra.plugin.email.RealTimeTrigger
+    description: One run per email arriving in the mailbox your DMARC record's rua= address delivers to.
+    protocol: IMAP
+    host: "{{ vars.imap_host }}"
+    port: "{{ vars.imap_port }}"
+    username: "{{ secret('DMARC_IMAP_USERNAME') }}"
+    password: "{{ secret('DMARC_IMAP_PASSWORD') }}"
+    folder: INBOX
+    maxAttachmentSize: 25000000
+
+  - id: weekly_review
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8 * * 1"
+    inputs:
+      mode: review
+
+tasks:
+  - id: ensure_schema
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Create the report tables on first use. Safe to run every time.
+    url: "{{ secret('DMARC_DB_URL') }}"
+    username: "{{ secret('DMARC_DB_USERNAME') }}"
+    password: "{{ secret('DMARC_DB_PASSWORD') }}"
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT2M
+      maxAttempts: 3
+    sql: |
+      CREATE TABLE IF NOT EXISTS dmarc_reports (
+        report_id text PRIMARY KEY, org_name text, date_begin timestamptz, date_end timestamptz,
+        domain text, policy_p text, policy_pct int, ingested_at timestamptz DEFAULT now());
+      CREATE TABLE IF NOT EXISTS dmarc_records (
+        report_id text REFERENCES dmarc_reports ON DELETE CASCADE, row_no int, source_ip text, ptr text,
+        sender text, authorized boolean, msg_count int, disposition text, dkim_aligned boolean,
+        spf_aligned boolean, dmarc_pass boolean, header_from text, dkim_domains text, spf_domain text,
+        date_end timestamptz, PRIMARY KEY (report_id, row_no));
+
+  - id: by_mode
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ inputs.mode ?? 'ingest' }}"
+    cases:
+      ingest:
+        - id: parse_reports
+          type: io.kestra.plugin.scripts.python.Script
+          description: Unpack .zip and .gz attachments, parse each aggregate report with defusedxml (reports are untrusted XML), look up reverse DNS for every source IP and match it to the authorized senders.
+          dependencies:
+            - defusedxml
+            - kestra
+          inputFiles: |
+            {
+              "settings.json": {{ {'domain': vars.domain, 'senders': vars.authorized_senders, 'alert': vars.alert_spoof_volume, 'from': trigger.from ?? 'manual upload', 'subject': trigger.subject ?? ''} | toJson | toJson }},
+              "in/upload.bin": "{{ inputs.report_file ?? '' }}"
+              {%- for a in (trigger.attachments ?? []) %},
+              "in/att_{{ loop.index }}.bin": "{{ a.uri }}"
+              {%- endfor %}
+            }
+          outputFiles:
+            - reports.json
+            - records.json
+          script: |
+            import gzip, io, json, socket, zipfile
+            from datetime import datetime, timezone
+            from ipaddress import ip_address, ip_network
+            from pathlib import Path
+            from defusedxml import ElementTree
+            from kestra import Kestra
+
+            settings = json.load(open("settings.json"))
+            domain = settings["domain"].lower()
+            socket.setdefaulttimeout(3)
+
+            def documents(data):
+                if data[:2] == b"PK":
+                    with zipfile.ZipFile(io.BytesIO(data)) as z:
+                        for name in z.namelist():
+                            yield from documents(z.read(name))
+                elif data[:2] == b"\x1f\x8b":
+                    yield from documents(gzip.decompress(data))
+                elif data.lstrip()[:1] == b"<":
+                    yield data
+
+            def text(node, path, default=""):
+                found = node.find(path)
+                return (found.text or "").strip() if found is not None and found.text else default
+
+            ptr_cache = {}
+            def ptr(ip):
+                if ip not in ptr_cache:
+                    try:
+                        ptr_cache[ip] = socket.gethostbyaddr(ip)[0].lower()
+                    except OSError:
+                        ptr_cache[ip] = ""
+                return ptr_cache[ip]
+
+            def sender(ip, host):
+                for s in settings["senders"]:
+                    if host and any(host.endswith(sfx.lower()) for sfx in s.get("ptr_suffixes", [])):
+                        return s["name"], True
+                    if any(ip_address(ip) in ip_network(c) for c in s.get("ip_ranges", [])):
+                        return s["name"], True
+                return f"Unknown {ip}" + (f" ({host})" if host else " (no reverse DNS)"), False
+
+            def aligned(d):
+                d = (d or "").lower().rstrip(".")
+                return d == domain or d.endswith("." + domain)
+
+            reports, records, skipped = [], [], []
+            for path in sorted(Path("in").glob("*.bin")):
+                data = path.read_bytes()
+                for doc in documents(data):
+                    try:
+                        root = ElementTree.fromstring(doc)
+                    except Exception as e:
+                        skipped.append(f"{path.name}: not valid XML ({e})")
+                        continue
+                    if root.tag != "feedback" or root.find("report_metadata") is None:
+                        skipped.append(f"{path.name}: not a DMARC aggregate report")
+                        continue
+                    meta, policy = root.find("report_metadata"), root.find("policy_published")
+                    if text(policy, "domain").lower() != domain:
+                        skipped.append(f"{path.name}: report for {text(policy, 'domain')}, not {domain}")
+                        continue
+                    stamp = lambda s: datetime.fromtimestamp(int(s), timezone.utc).isoformat()
+                    org = text(meta, "org_name")
+                    report_id = f"{org}:{text(meta, 'report_id')}"
+                    end = stamp(text(meta, "date_range/end"))
+                    reports.append([report_id, org, stamp(text(meta, "date_range/begin")), end, domain,
+                                    text(policy, "p", "none"), int(text(policy, "pct", "100"))])
+                    for n, rec in enumerate(root.findall("record")):
+                        ip = text(rec, "row/source_ip")
+                        host = ptr(ip)
+                        name, authorized = sender(ip, host)
+                        dkim_ok = text(rec, "row/policy_evaluated/dkim") == "pass"
+                        spf_ok = text(rec, "row/policy_evaluated/spf") == "pass"
+                        dkim_domains = ",".join(sorted({text(d, "domain") for d in rec.findall("auth_results/dkim")}))
+                        records.append([report_id, n, ip, host, name, authorized, int(text(rec, "row/count", "0")),
+                                        text(rec, "row/policy_evaluated/disposition", "none"), dkim_ok, spf_ok,
+                                        dkim_ok or spf_ok, text(rec, "identifiers/header_from").lower(), dkim_domains,
+                                        text(rec, "auth_results/spf/domain"), end])
+
+            per_report = {}
+            for r in records:
+                if not r[5] and not r[10]:
+                    per_report[(r[0], r[4])] = per_report.get((r[0], r[4]), 0) + r[6]
+            worst = {}
+            for (report, name), count in per_report.items():
+                if count >= settings["alert"]:
+                    worst[name] = max(worst.get(name, 0), count)
+            alerts = [f"{count:,} messages in one report from {name}" for name, count in worst.items()]
+            json.dump(reports, open("reports.json", "w"))
+            json.dump(records, open("records.json", "w"))
+            for s in skipped:
+                print("Skipped", s)
+            print(f"{len(reports)} report(s), {len(records)} record(s) from {settings['from']}")
+            Kestra.outputs({"reports": len(reports), "records": len(records), "skipped": skipped,
+                            "spoof_alerts": alerts, "source": settings["from"],
+                            "messages": sum(r[6] for r in records)})
+
+        - id: anything_to_store
+          type: io.kestra.plugin.core.flow.If
+          description: An email that holds no report for this domain ends with a warning instead of failing, since report mailboxes also receive other mail.
+          condition: "{{ outputs.parse_reports.vars.reports == 0 }}"
+          then:
+            - id: no_report
+              type: io.kestra.plugin.core.execution.Exit
+              state: WARNING
+
+        - id: reports_ion
+          type: io.kestra.plugin.serdes.json.JsonToIon
+          from: "{{ outputs.parse_reports.outputFiles['reports.json'] }}"
+          newLine: false
+
+        - id: records_ion
+          type: io.kestra.plugin.serdes.json.JsonToIon
+          from: "{{ outputs.parse_reports.outputFiles['records.json'] }}"
+          newLine: false
+
+        - id: store_reports
+          type: io.kestra.plugin.jdbc.postgresql.Batch
+          description: Insert the reports. A report delivered twice is skipped by its ID.
+          url: "{{ secret('DMARC_DB_URL') }}"
+          username: "{{ secret('DMARC_DB_USERNAME') }}"
+          password: "{{ secret('DMARC_DB_PASSWORD') }}"
+          from: "{{ outputs.reports_ion.uri }}"
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT2M
+            maxAttempts: 3
+          sql: |
+            INSERT INTO dmarc_reports (report_id, org_name, date_begin, date_end, domain, policy_p, policy_pct)
+            VALUES (?, ?, CAST(? AS timestamptz), CAST(? AS timestamptz), ?, ?, ?)
+            ON CONFLICT (report_id) DO NOTHING
+
+        - id: store_records
+          type: io.kestra.plugin.jdbc.postgresql.Batch
+          description: Insert one row per reported source. Rows of a report stored before are skipped.
+          url: "{{ secret('DMARC_DB_URL') }}"
+          username: "{{ secret('DMARC_DB_USERNAME') }}"
+          password: "{{ secret('DMARC_DB_PASSWORD') }}"
+          from: "{{ outputs.records_ion.uri }}"
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT2M
+            maxAttempts: 3
+          sql: |
+            INSERT INTO dmarc_records (report_id, row_no, source_ip, ptr, sender, authorized, msg_count, disposition,
+              dkim_aligned, spf_aligned, dmarc_pass, header_from, dkim_domains, spf_domain, date_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS timestamptz))
+            ON CONFLICT (report_id, row_no) DO NOTHING
+
+        - id: spoofing_wave
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          description: Alert right away when an unknown source sends a large volume of failing mail as the domain. Reports already stored before don't alert again.
+          runIf: "{{ (outputs.parse_reports.vars.spoof_alerts | length > 0) and outputs.store_records.updatedCount > 0 }}"
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: |
+            🚨 *Possible spoofing of {{ vars.domain }}* in a report from {{ outputs.parse_reports.vars.source }}: {{ outputs.parse_reports.vars.spoof_alerts | join('; ') }} failed DMARC.
+            {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+      review:
+        - id: sender_summary
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Volume and DMARC pass rate per sender over the window.
+          url: "{{ secret('DMARC_DB_URL') }}"
+          username: "{{ secret('DMARC_DB_USERNAME') }}"
+          password: "{{ secret('DMARC_DB_PASSWORD') }}"
+          fetchType: FETCH
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT2M
+            maxAttempts: 3
+          sql: |
+            SELECT sender, bool_or(authorized) AS authorized, sum(msg_count)::int AS messages,
+                   sum(CASE WHEN dmarc_pass THEN msg_count ELSE 0 END)::int AS passed,
+                   sum(CASE WHEN dkim_aligned THEN msg_count ELSE 0 END)::int AS dkim_aligned,
+                   min(date_end)::date::text AS first_seen, max(date_end)::date::text AS last_seen,
+                   max(CASE WHEN NOT dmarc_pass THEN date_end END)::date::text AS last_failure,
+                   string_agg(DISTINCT dkim_domains, ' ') AS dkim_domains
+            FROM dmarc_records
+            WHERE header_from = '{{ vars.domain }}' AND date_end > now() - make_interval(days => {{ inputs.days ?? 30 }})
+            GROUP BY sender ORDER BY messages DESC
+
+        - id: published_policy
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: The policy the most recent report saw, and how many days of reports there are.
+          url: "{{ secret('DMARC_DB_URL') }}"
+          username: "{{ secret('DMARC_DB_USERNAME') }}"
+          password: "{{ secret('DMARC_DB_PASSWORD') }}"
+          fetchType: FETCH_ONE
+          retry:
+            type: exponential
+            interval: PT10S
+            maxInterval: PT2M
+            maxAttempts: 3
+          sql: |
+            SELECT (SELECT policy_p FROM dmarc_reports WHERE domain = '{{ vars.domain }}' ORDER BY date_end DESC LIMIT 1) AS policy_p,
+                   (SELECT policy_pct FROM dmarc_reports WHERE domain = '{{ vars.domain }}' ORDER BY date_end DESC LIMIT 1) AS policy_pct,
+                   (SELECT count(DISTINCT date_end::date) FROM dmarc_reports
+                     WHERE domain = '{{ vars.domain }}' AND date_end > now() - make_interval(days => {{ inputs.days ?? 30 }}))::int AS days_covered,
+                   (SELECT count(*) FROM dmarc_reports WHERE domain = '{{ vars.domain }}'
+                     AND date_end > now() - make_interval(days => {{ inputs.days ?? 30 }}))::int AS reports
+
+        - id: assess
+          type: io.kestra.plugin.scripts.python.Script
+          description: Group senders into authorized-and-passing, authorized-but-failing (blockers) and unknown-and-failing (likely spoofing), check the live DMARC record, and decide whether the next policy step is safe.
+          dependencies:
+            - dnspython
+            - kestra
+          inputFiles:
+            data.json: |
+              {"rows": {{ outputs.sender_summary.rows | toJson }}, "policy": {{ outputs.published_policy.row | toJson }},
+               "domain": {{ vars.domain | toJson }}, "ladder": {{ vars.ladder | toJson }},
+               "threshold": {{ vars.pass_threshold }}, "min_days": {{ vars.min_days_clean }}, "days": {{ inputs.days ?? 30 }},
+               "last_change": {{ kv('dmarc-policy-change-' ~ (vars.domain | slugify), errorOnMissing=false) | toJson }}}
+          outputFiles:
+            - senders.csv
+          script: |
+            import csv, json
+            from datetime import date, timedelta
+            import dns.resolver
+            from kestra import Kestra
+
+            d = json.load(open("data.json"))
+            rows, policy, ladder = d["rows"], d["policy"] or {}, d["ladder"]
+            if not rows:
+                raise SystemExit(f"No DMARC reports for {d['domain']} in the last {d['days']} days. Check that rua= points at the monitored mailbox.")
+
+            live = None
+            try:
+                answers = dns.resolver.resolve(f"_dmarc.{d['domain']}", "TXT", lifetime=5)
+                live = " ".join(b"".join(a.strings).decode() for a in answers)
+            except Exception as e:
+                live_note = f"no live record found ({type(e).__name__}), using the policy from the latest report"
+            if live:
+                tags = dict(t.strip().split("=", 1) for t in live.split(";") if "=" in t)
+                current = {"p": tags.get("p", "none").strip(), "pct": int(tags.get("pct", "100"))}
+                live_note = f"live record: {live}"
+            else:
+                current = {"p": policy.get("policy_p") or "none", "pct": int(policy.get("policy_pct") or 100)}
+
+            step = next((i for i, s in enumerate(ladder) if s["p"] == current["p"] and int(s["pct"]) == current["pct"]),
+                        max((i for i, s in enumerate(ladder) if s["p"] == current["p"]), default=0))
+            rate = lambda r: r["passed"] / r["messages"] if r["messages"] else 1
+            authorized = [r for r in rows if r["authorized"]]
+            blockers = [r for r in authorized if rate(r) < d["threshold"]]
+            unknown_failing = [r for r in rows if not r["authorized"] and r["passed"] < r["messages"]]
+            total_auth = sum(r["messages"] for r in authorized)
+            auth_rate = sum(r["passed"] for r in authorized) / total_auth if total_auth else 0
+
+            reasons = []
+            if step >= len(ladder) - 1:
+                reasons.append(f"already at the final step (p={current['p']})")
+            if policy.get("days_covered", 0) < d["min_days"]:
+                reasons.append(f"only {policy.get('days_covered', 0)} day(s) of reports, {d['min_days']} needed")
+            if not authorized:
+                reasons.append("no authorized sender seen in the reports; check authorized_senders")
+            for r in blockers:
+                fix = "DKIM is not aligned with your domain" if r["dkim_aligned"] < r["messages"] else "SPF and DKIM fail"
+                reasons.append(f"{r['sender']}: {r['messages'] - r['passed']:,} of {r['messages']:,} messages fail DMARC ({fix}; signing domains: {r.get('dkim_domains') or 'none'})")
+            if d["last_change"]:
+                since = (date.today() - date.fromisoformat(d["last_change"]["date"])).days
+                if since < d["min_days"]:
+                    reasons.append(f"the policy was changed {since} day(s) ago; wait {d['min_days']} days between steps")
+            target = ladder[step + 1] if step < len(ladder) - 1 else None
+            last = d["last_change"] or {}
+            if target and last.get("p") == target["p"] and int(last.get("pct", 100)) == int(target["pct"]):
+                reasons.append(f"the pull request for p={target['p']} pct={target['pct']} is not live yet: {last.get('pull_request', 'see the previous review')}")
+            ready = not reasons and target is not None
+
+            def line(r):
+                icon = "✅" if r["authorized"] and rate(r) >= d["threshold"] else ("⚠️" if r["authorized"] else "🚫")
+                return f"{icon} {r['sender']}: {r['messages']:,} messages, {rate(r):.1%} pass (last seen {r.get('last_seen')})"
+            evidence = "\n".join(
+                [f"| Sender | Authorized | Messages | DMARC pass | Last failure |", "|---|---|---|---|---|"] +
+                [f"| {r['sender']} | {'yes' if r['authorized'] else 'no'} | {r['messages']:,} | {rate(r):.1%} | {r.get('last_failure') or '-'} |" for r in rows])
+            with open("senders.csv", "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["sender", "authorized", "messages", "passed", "dkim_aligned", "first_seen", "last_seen", "last_failure", "dkim_domains"])
+                w.writeheader(); w.writerows(rows)
+
+            digest = "\n".join([line(r) for r in rows[:15]] + [
+                f"Authorized senders: {auth_rate:.1%} pass. Unknown sources failing: {len(unknown_failing)} ({sum(r['messages'] - r['passed'] for r in unknown_failing):,} messages).",
+                f"Policy: p={current['p']} pct={current['pct']} ({live_note})."])
+            Kestra.outputs({"ready": ready, "reasons": reasons, "digest": digest, "evidence": evidence,
+                            "current": current, "target": target or {}, "auth_rate_pct": f"{auth_rate:.1%}",
+                            "blockers": len(blockers), "unknown_failing": len(unknown_failing)})
+
+        - id: post_review
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          retry:
+            type: constant
+            interval: PT10S
+            maxAttempts: 3
+          messageText: |
+            📬 *DMARC review for {{ vars.domain }}* (last {{ inputs.days ?? 30 }} days)
+            {{ outputs.assess.vars.digest }}
+            {% if outputs.assess.vars.ready %}➡️ *Ready for the next step:* p={{ outputs.assess.vars.target.p }}{% if outputs.assess.vars.target.pct < 100 %} pct={{ outputs.assess.vars.target.pct }}{% endif %}.{% if inputs.dry_run ?? false %} Dry run: no pull request will be opened.{% else %} Approve in Kestra: {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}{% endif %}{% else %}⏸️ *Hold:* {{ outputs.assess.vars.reasons | join('; ') }}{% endif %}
+
+        - id: propose_step
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.assess.vars.ready and not (inputs.dry_run ?? false) }}"
+          then:
+            - id: approve
+              type: io.kestra.plugin.core.flow.Pause
+              description: A person decides whether to propose the stricter policy. The DNS change itself still goes through the repository's review.
+              pauseDuration: P3D
+              behavior: CANCEL
+              onResume:
+                - id: decision
+                  type: SELECT
+                  displayName: Next DMARC policy step
+                  values:
+                    - Open the DNS pull request
+                    - Hold
+                  defaults: Hold
+                - id: note
+                  type: STRING
+                  displayName: Note for the pull request (optional)
+                  required: false
+
+            - id: open_pull_request
+              type: io.kestra.plugin.core.flow.If
+              condition: "{{ outputs.approve.onResume.decision == 'Open the DNS pull request' }}"
+              then:
+                - id: edit_zone
+                  type: io.kestra.plugin.core.flow.WorkingDirectory
+                  tasks:
+                    - id: clone_dns
+                      type: io.kestra.plugin.git.Clone
+                      url: "https://github.com/{{ vars.dns_repo }}.git"
+                      username: "{{ secret('GITHUB_TOKEN') }}"
+                      password: "{{ secret('GITHUB_TOKEN') }}"
+                      branch: "{{ vars.dns_branch }}"
+                      directory: repo
+                      retry:
+                        type: exponential
+                        interval: PT10S
+                        maxInterval: PT2M
+                        maxAttempts: 3
+
+                    - id: set_policy
+                      type: io.kestra.plugin.scripts.python.Script
+                      description: Change only the p= and pct= tags of the one DMARC record in the DNS file. Any other count of DMARC records stops the run.
+                      dependencies:
+                        - kestra
+                      inputFiles:
+                        change.json: |
+                          {"file": {{ vars.dns_file | toJson }}, "target": {{ outputs.assess.vars.target | toJson }}}
+                      outputFiles:
+                        - edited/**
+                      script: |
+                        import json, re
+                        from pathlib import Path
+                        from kestra import Kestra
+
+                        c = json.load(open("change.json"))
+                        path = Path("repo", c["file"])
+                        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+                        hits = [i for i, l in enumerate(lines) if "v=DMARC1" in l]
+                        if len(hits) != 1:
+                            raise SystemExit(f"Expected exactly one DMARC record in {c['file']}, found {len(hits)}.")
+                        old = lines[hits[0]]
+                        new = re.sub(r"(;\s*)p=\w+", rf"\1p={c['target']['p']}", old, count=1)
+                        new = re.sub(r";\s*pct=\d+", "", new)
+                        if int(c["target"]["pct"]) < 100:
+                            new = re.sub(r"(p=\w+)", rf"\1; pct={c['target']['pct']}", new, count=1)
+                        if new == old:
+                            raise SystemExit("The DMARC record already has the proposed policy.")
+                        lines[hits[0]] = new
+                        out = Path("edited", c["file"])
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        out.write_text("".join(lines), encoding="utf-8")
+                        Kestra.outputs({"before": old.strip(), "after": new.strip()})
+
+                - id: push_branch
+                  type: io.kestra.plugin.git.PushExecutionFiles
+                  description: Commit only the DNS file to a new branch. delete is off, so nothing else in the repository changes.
+                  url: "https://github.com/{{ vars.dns_repo }}.git"
+                  username: "{{ secret('GITHUB_TOKEN') }}"
+                  password: "{{ secret('GITHUB_TOKEN') }}"
+                  branch: "dmarc/{{ vars.domain | replace({'.': '-'}) | slugify }}-p-{{ outputs.assess.vars.target.p }}-{{ outputs.assess.vars.target.pct }}-{{ execution.startDate | date('yyyyMMdd') }}"
+                  gitDirectory: .
+                  delete: false
+                  authorName: Kestra DMARC policy gate
+                  commitMessage: "dmarc: {{ vars.domain }} p={{ outputs.assess.vars.target.p }} pct={{ outputs.assess.vars.target.pct }}"
+                  filesMap: "{ {% for file in outputs.set_policy.outputFiles %}{{ file.key | replace({'edited/': ''}) | toJson }}: {{ file.value | toJson }}{% if not loop.last %}, {% endif %}{% endfor %} }"
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT2M
+                    maxAttempts: 3
+
+                - id: create_pr
+                  type: io.kestra.plugin.github.pulls.Create
+                  oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+                  repository: "{{ vars.dns_repo }}"
+                  sourceBranch: "dmarc/{{ vars.domain | replace({'.': '-'}) | slugify }}-p-{{ outputs.assess.vars.target.p }}-{{ outputs.assess.vars.target.pct }}-{{ execution.startDate | date('yyyyMMdd') }}"
+                  targetBranch: "{{ vars.dns_branch }}"
+                  title: "DMARC: move {{ vars.domain }} to p={{ outputs.assess.vars.target.p }}{% if outputs.assess.vars.target.pct < 100 %} pct={{ outputs.assess.vars.target.pct }}{% endif %}"
+                  body: |
+                    Authorized senders passed DMARC for {{ outputs.assess.vars.auth_rate_pct }} of their mail over the last {{ inputs.days ?? 30 }} days, according to {{ outputs.published_policy.row.reports }} aggregate reports.
+
+                    ```diff
+                    - {{ outputs.set_policy.vars.before }}
+                    + {{ outputs.set_policy.vars.after }}
+                    ```
+
+                    {{ outputs.assess.vars.evidence }}
+
+                    Sources marked "no" are not in the authorized sender list; after this change their mail is {% if outputs.assess.vars.target.p == 'reject' %}rejected{% else %}sent to spam{% endif %}{% if outputs.assess.vars.target.pct < 100 %} for {{ outputs.assess.vars.target.pct }}% of messages{% endif %}.
+                    {% if (outputs.approve.onResume.note ?? '') != '' %}
+                    Note: {{ outputs.approve.onResume.note }}{% endif %}
+
+                    Opened by Kestra execution {{ execution.id }}.
+                  retry:
+                    type: exponential
+                    interval: PT10S
+                    maxInterval: PT2M
+                    maxAttempts: 3
+
+                - id: remember_change
+                  type: io.kestra.plugin.core.kv.Set
+                  description: Start the waiting period before the next step.
+                  key: "{{ 'dmarc-policy-change-' ~ (vars.domain | slugify) }}"
+                  kvType: JSON
+                  value: |
+                    {"date": "{{ now() | date('yyyy-MM-dd') }}", "p": "{{ outputs.assess.vars.target.p }}", "pct": {{ outputs.assess.vars.target.pct }}, "pull_request": "{{ outputs.create_pr.pullRequestUrl }}"}
+
+                - id: post_pr
+                  type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                  url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                  retry:
+                    type: constant
+                    interval: PT10S
+                    maxAttempts: 3
+                  messageText: "📝 DNS pull request for *{{ vars.domain }}* p={{ outputs.assess.vars.target.p }}{% if outputs.assess.vars.target.pct < 100 %} pct={{ outputs.assess.vars.target.pct }}{% endif %}: {{ outputs.create_pr.pullRequestUrl }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert with the failed task, the error and a link. A failed ingest stores nothing for that email, so it can be replayed.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    messageText: |
+      ❌ *DMARC report analyzer FAILED* ({{ inputs.mode ?? 'ingest' }}; flow {{ flow.namespace }}.{{ flow.id }}, execution {{ execution.id }}).
+      Failed task: {{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}. Error: {{ ((errorLogs() | length) > 0 and (errorLogs()[0].message ?? 'null') != 'null') ? errorLogs()[0].message : 'see the execution logs' }}
+      {{ kestra.url ?? '' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: reports_stored
+    type: INT
+    displayName: Reports in this run
+    value: "{{ outputs.parse_reports.vars.reports ?? 0 }}"
+  - id: ready_for_next_step
+    type: BOOL
+    displayName: Ready for a stricter policy
+    value: "{{ outputs.assess.vars.ready ?? false }}"
+  - id: pull_request
+    type: STRING
+    displayName: DNS pull request
+    value: "{{ outputs.create_pr.pullRequestUrl ?? '' }}"
+
+extend:
+  title: DMARC Aggregate Report Analyzer with Sender Inventory and Evidence-Based Policy Tightening
+  metaTitle: DMARC Report Analyzer and Policy Tightening Gate
+  shortDescription: Read DMARC aggregate reports from your rua mailbox into Postgres, see every sender using your domain and whether it passes, alert on spoofing, and open a DNS pull request for a stricter policy once the evidence supports it.
+  metaDescription: Parse DMARC aggregate reports with Kestra, inventory every sender, alert on spoofing, and tighten DMARC from none to reject through approved DNS pull requests.
+  description: |
+    Most domains stay on DMARC `p=none` because nobody reads the daily XML reports. Tightening blindly drops mail from a forgotten SaaS sender; staying on `none` leaves the domain open to spoofing. This flow reads the reports and proposes the next policy step only when every authorized sender is ready.
+
+    ## How it works
+
+    1. `reports_mailbox` (`email.RealTimeTrigger`) starts a run for each report email; a `report_file` upload backfills older reports.
+    2. `parse_reports` unpacks `.zip` and `.gz` files, parses them with `defusedxml` and matches each source's reverse DNS to `authorized_senders`. `jdbc.postgresql.Batch` stores them, skipping known reports, and `spoofing_wave` alerts on large failing volumes from unknown sources.
+    3. `weekly_review` (`Schedule`) computes each sender's pass rate and the current policy, and picks the next `ladder` step only if every authorized sender passes `pass_threshold` over `min_days_clean` days and the previous step is live.
+    4. `approve` (`Pause`) asks a person. On approval the flow clones the DNS repository (`git.Clone`), changes only the `p=` and `pct=` tags of the DMARC record, pushes a branch (`git.PushExecutionFiles`) and opens a pull request with the evidence (`github.pulls.Create`).
+
+    ## What you get
+
+    - A Postgres inventory of every source sending as your domain, with SPF, DKIM and DMARC results.
+    - Spoofing alerts, and a weekly digest naming each blocker, such as a sender whose DKIM isn't aligned.
+    - One-line DNS pull requests with the evidence table, one ladder step at a time.
+
+    ## Who it's for
+
+    - Security, IT and email deliverability teams who own a domain's DMARC policy.
+
+    ## Why orchestrate this with Kestra
+
+    Trigger, database, approval and Git change run as one audited flow with retries; DNS changes still get your repository's review.
+
+    ## Prerequisites
+
+    - A mailbox your DMARC `rua=` address delivers to, a PostgreSQL database, and a DNS-as-code repository on GitHub (BIND, octoDNS, Terraform or dnscontrol file with one DMARC record).
+    - Set `domain`, `authorized_senders`, `imap_host`, `dns_repo` and `dns_file` in `variables`.
+
+    ### Secrets
+
+    - `DMARC_IMAP_USERNAME`, `DMARC_IMAP_PASSWORD`: read the report mailbox.
+    - `DMARC_DB_URL`, `DMARC_DB_USERNAME`, `DMARC_DB_PASSWORD`: JDBC URL and login for Postgres.
+    - `GITHUB_TOKEN`: clone the DNS repository, push the branch and open the pull request.
+    - `SLACK_WEBHOOK_URL`: spoofing alerts, digests and failures.
+
+    ## Quick start
+
+    1. Add the secrets and set `variables`.
+    2. Execute with `mode: ingest` and a `.zip` of past reports to backfill.
+    3. Execute with `mode: review` and `dry_run: true` to read the digest without opening a pull request.
+    4. Enable `reports_mailbox` and `weekly_review`.
+
+    Outputs: `{{ outputs.ready_for_next_step }}`, `{{ outputs.pull_request }}` and `{{ outputs.assess.outputFiles['senders.csv'] }}`.
+
+    ## How to extend
+
+    - Add `ip_ranges` to `authorized_senders` for your own mail servers.
+    - Point Grafana or Metabase at the `dmarc_records` table.
+
+    ## Links
+
+    - [Email trigger](https://kestra.io/plugins/plugin-email)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [GitHub plugin](https://kestra.io/plugins/plugin-github)
+    - [RFC 7489 (DMARC)](https://datatracker.ietf.org/doc/html/rfc7489)
+    - This blueprint has been created by [Biplab Bera](https://github.com/bishalbera)
+  tags:
+    - Infrastructure
+  subTags:
+    - Approval Gates
+    - Monitoring & Alerting
+  ee: false
+  demo: false

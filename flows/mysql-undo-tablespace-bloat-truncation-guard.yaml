@@ -1,0 +1,509 @@
+id: mysql-undo-tablespace-bloat-truncation-guard
+namespace: company.team
+
+inputs:
+  - id: mysql_url
+    type: STRING
+    defaults: jdbc:mysql://localhost:3306/
+    description: JDBC URL of the MySQL server to guard. The connecting user needs PROCESS to read information_schema.FILES plus the INNODB_TABLESPACES view.
+
+  - id: use_secret_auth
+    type: BOOL
+    defaults: true
+    description: Leave true in production so the connection reads MYSQL_USERNAME and MYSQL_PASSWORD from secrets. Set false only to pass credentials inline in a disposable test environment.
+
+  - id: mysql_username
+    type: STRING
+    defaults: root
+    description: Username used only when use_secret_auth is false. Ignored in production.
+
+  - id: mysql_password
+    type: STRING
+    defaults: ""
+    description: Password used only when use_secret_auth is false. Ignored in production.
+
+  - id: max_size_mb
+    type: INT
+    defaults: 64
+    description: >-
+      Size limit in MiB. An active undo tablespace larger than this is reported as bloated. A fresh
+      undo tablespace is 16 MiB, so anything well above that has been inflated by a long transaction
+      that held back purge. Raise the limit on a server that routinely carries large undo.
+
+  - id: max_truncate_per_run
+    type: INT
+    defaults: 1
+    description: >-
+      How many undo tablespaces to cycle in one run. Each cycle takes one tablespace out of service
+      for a few seconds, so one per run is the cautious default on a busy server.
+
+  - id: truncate_timeout
+    type: DURATION
+    defaults: PT2M
+    description: >-
+      How long to wait for InnoDB to empty an inactive undo tablespace before putting it back in
+      service. Truncation only completes once purge has advanced past every undo record in the file,
+      so an open read view can hold it off for the whole window. The wait never fails the run on its
+      own. The re-read decides.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, report the bloated undo tablespaces without issuing any ALTER UNDO TABLESPACE statement.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true and dry_run is false, cycle each targeted tablespace inactive then active behind an approval gate, then re-read the file size.
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "17 4 * * *"
+    description: Check undo tablespace sizes once a day. Disabled by default and pinned to safe mode so it reports without cycling anything until an operator enables it.
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.jdbc.mysql.Query
+    description: >-
+      Read every undo tablespace with its file on disk, its current size, its state, the server wide
+      count of active undo tablespaces, whether automatic truncation is on, plus the age of the
+      oldest open transaction. The join to information_schema.FILES is what supplies the real file
+      path, which is the thing an operator checks with ls.
+    url: "{{ inputs.mysql_url }}"
+    username: "{{ inputs.use_secret_auth ? secret('MYSQL_USERNAME') : inputs.mysql_username }}"
+    password: "{{ inputs.use_secret_auth ? secret('MYSQL_PASSWORD') : inputs.mysql_password }}"
+    fetchType: FETCH
+    sql: |
+      SELECT t.NAME                              AS ts_name,
+             f.FILE_NAME                         AS ts_file,
+             t.FILE_SIZE                         AS size_bytes,
+             t.FILE_SIZE DIV 1048576             AS size_mb,
+             t.ALLOCATED_SIZE                    AS allocated_bytes,
+             (f.TOTAL_EXTENTS * f.EXTENT_SIZE)   AS extent_bytes,
+             t.STATE                             AS ts_state,
+             s.active_count                      AS active_count,
+             s.truncate_enabled                  AS truncate_enabled,
+             s.oldest_trx_seconds                AS oldest_trx_seconds
+        FROM information_schema.INNODB_TABLESPACES t
+        JOIN information_schema.FILES f
+          ON f.TABLESPACE_NAME = t.NAME
+         AND f.FILE_TYPE = 'UNDO LOG'
+        CROSS JOIN (
+              SELECT (SELECT COUNT(*)
+                        FROM information_schema.INNODB_TABLESPACES
+                       WHERE SPACE_TYPE = 'Undo'
+                         AND STATE = 'active')                       AS active_count,
+                     @@innodb_undo_log_truncate                      AS truncate_enabled,
+                     COALESCE((SELECT MAX(TIMESTAMPDIFF(SECOND, trx_started, NOW()))
+                                 FROM information_schema.INNODB_TRX), 0) AS oldest_trx_seconds
+             ) s
+       WHERE t.SPACE_TYPE = 'Undo'
+       ORDER BY t.FILE_SIZE DESC, t.NAME
+
+  - id: plan
+    type: io.kestra.plugin.core.output.OutputValues
+    description: >-
+      Build the target list. A tablespace is a target only when it is active, larger than the limit
+      plus its name is a plain identifier. The whole batch is refused unless three or more undo
+      tablespaces are active, because MySQL keeps a hard floor of two active ones. It is also
+      refused while any undo tablespace is already not active, since a tablespace somebody else is
+      holding inactive makes the truncation wait unreadable.
+    values:
+      summary: >-
+        {{ {'rows': (outputs.detect.rows ?? []), 'limit_mb': inputs.max_size_mb, 'cap': inputs.max_truncate_per_run} | toJson | jq('. as $in | ($in.rows // []) as $rows | (($in.limit_mb | tonumber) * 1048576) as $limit | ($in.cap | tonumber) as $cap | (($rows[0].active_count // 0) | tonumber) as $active | ($rows | map(select(.ts_state != "active")) | length) as $held | ($rows | map(select((.size_bytes | tonumber) > $limit and .ts_state == "active"))) as $over | ($over | map(select(.ts_name | test("^[A-Za-z0-9_]+$")))) as $named | (($over | length) - ($named | length)) as $unsafe | (if $active >= 3 and $held == 0 and $unsafe == 0 then 1 else 0 end) as $ok | {undo_count: ($rows | length), active_count: $active, held_count: $held, unsafe_name_count: $unsafe, truncate_enabled: (($rows[0].truncate_enabled // 0) | tostring), oldest_trx_seconds: (($rows[0].oldest_trx_seconds // 0) | tonumber), limit_mb: ($in.limit_mb | tonumber), largest_mb: (($rows | map(.size_mb | tonumber) | max) // 0), oversized_count: ($over | length), safe_to_cycle: $ok, spare_above_floor: (if $active >= 3 then ($active - 2) else 0 end), target_count: (if $ok == 1 then ($named[0:$cap] | length) else 0 end), targets: (if $ok == 1 then ($named[0:$cap] | map({ts_name: .ts_name, ts_file: .ts_file, size_bytes: (.size_bytes | tonumber), size_mb: (.size_mb | tonumber)})) else [] end), inventory: ($rows | map({ts_name: .ts_name, size_mb: (.size_mb | tonumber), ts_state: .ts_state}))}') | first | toJson }}
+
+  - id: log_status
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      MySQL undo tablespace guard on {{ inputs.mysql_url }}.
+      {{ fromJson(outputs.plan.values.summary).undo_count }} undo tablespace(s), {{ fromJson(outputs.plan.values.summary).active_count }} active, largest {{ fromJson(outputs.plan.values.summary).largest_mb }} MiB against a limit of {{ fromJson(outputs.plan.values.summary).limit_mb }} MiB.
+      Bloated: {{ fromJson(outputs.plan.values.summary).oversized_count }}. Targeted this run: {{ fromJson(outputs.plan.values.summary).target_count }}.
+      innodb_undo_log_truncate={{ fromJson(outputs.plan.values.summary).truncate_enabled }} (0 means MySQL will never shrink these files on its own). Oldest open transaction {{ fromJson(outputs.plan.values.summary).oldest_trx_seconds }}s.
+      Mode dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}. Spare tablespaces above the floor of two: {{ fromJson(outputs.plan.values.summary).spare_above_floor }}.
+      Inventory: {{ fromJson(outputs.plan.values.summary).inventory | toJson }}
+      Targets: {{ fromJson(outputs.plan.values.summary).targets | toJson }}
+
+  - id: have_bloat
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ fromJson(outputs.plan.values.summary).oversized_count > 0 }}"
+    then:
+      - id: alert_bloat
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert that undo tablespaces are holding space, in report mode as well as in remediate mode, so the disk cost is visible even when nothing is cycled.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "MySQL undo guard: {{ fromJson(outputs.plan.values.summary).oversized_count }} undo tablespace(s) on {{ inputs.mysql_url }} above {{ fromJson(outputs.plan.values.summary).limit_mb }} MiB, largest {{ fromJson(outputs.plan.values.summary).largest_mb }} MiB. innodb_undo_log_truncate={{ fromJson(outputs.plan.values.summary).truncate_enabled }}. dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}. Execution {{ execution.id }}."}
+
+      - id: floor_gate
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          Refuse the whole batch unless the server can spare a tablespace. MySQL rejects SET INACTIVE
+          with ERROR 3655 when it would leave fewer than two active, so a two tablespace server
+          cannot be truncated this way at all until a third one is created.
+          Also refuse while a tablespace is already held inactive or a name is not a plain identifier.
+        condition: "{{ fromJson(outputs.plan.values.summary).safe_to_cycle == 1 }}"
+        then:
+          - id: mode
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+            then:
+              - id: approval_gate
+                type: io.kestra.plugin.core.flow.Pause
+                description: Hold the run until a human approves. Taking an undo tablespace out of service is never automatic.
+                pauseDuration: PT1H
+                behavior: FAIL
+                onResume:
+                  - id: approved
+                    type: BOOL
+                    required: false
+                    description: Set true to cycle the targeted undo tablespaces. Anything else leaves them alone.
+
+              - id: apply
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.approval_gate.onResume.approved ?? false }}"
+                then:
+                  - id: remediate_truncate
+                    type: io.kestra.plugin.core.flow.Loop
+                    description: >-
+                      Cycle one targeted undo tablespace at a time. concurrencyLimit 1 because each
+                      cycle drops the server wide active count by one while it runs, so two parallel
+                      cycles on a three tablespace server would collide with the floor of two.
+                    concurrencyLimit: 1
+                    values: "{{ fromJson(outputs.plan.values.summary).targets | toJson }}"
+                    tasks:
+                      - id: set_inactive
+                        type: io.kestra.plugin.jdbc.mysql.Query
+                        description: >-
+                          Take the tablespace out of service. New transactions stop being assigned to
+                          it so purge can empty it. allowFailure because MySQL refuses this with
+                          ERROR 3655 if a concurrent change already pushed the server to the floor,
+                          in which case the re-read is what reports the miss.
+                        allowFailure: true
+                        url: "{{ inputs.mysql_url }}"
+                        username: "{{ inputs.use_secret_auth ? secret('MYSQL_USERNAME') : inputs.mysql_username }}"
+                        password: "{{ inputs.use_secret_auth ? secret('MYSQL_PASSWORD') : inputs.mysql_password }}"
+                        fetchType: NONE
+                        sql: "ALTER UNDO TABLESPACE {{ fromJson(item.value).ts_name }} SET INACTIVE"
+
+                      - id: wait_empty
+                        type: io.kestra.plugin.core.flow.LoopUntil
+                        description: >-
+                          Wait for InnoDB to finish emptying the file. A tablespace sits in state
+                          inactive until purge has passed every undo record in it, then flips to
+                          empty, which is the moment the file is truncated back to its initial size.
+                          failOnMaxReached false so a stuck purge does not leave the tablespace out
+                          of service. The re-read is the gate instead.
+                        condition: "{{ (outputs.poll_state.row.pending ?? 1) == 0 }}"
+                        checkFrequency:
+                          interval: PT3S
+                          maxDuration: "{{ inputs.truncate_timeout }}"
+                        failOnMaxReached: false
+                        tasks:
+                          - id: poll_state
+                            type: io.kestra.plugin.jdbc.mysql.Query
+                            description: Count undo tablespaces still in state inactive. The plan refused to start while any was already held, so during this iteration that count is the targeted tablespace alone.
+                            url: "{{ inputs.mysql_url }}"
+                            username: "{{ inputs.use_secret_auth ? secret('MYSQL_USERNAME') : inputs.mysql_username }}"
+                            password: "{{ inputs.use_secret_auth ? secret('MYSQL_PASSWORD') : inputs.mysql_password }}"
+                            fetchType: FETCH_ONE
+                            sql: SELECT COUNT(*) AS pending FROM information_schema.INNODB_TABLESPACES WHERE SPACE_TYPE = 'Undo' AND STATE = 'inactive'
+
+                      - id: set_active
+                        type: io.kestra.plugin.jdbc.mysql.Query
+                        description: >-
+                          Put the tablespace back in service whatever happened above. An undo
+                          tablespace left inactive permanently reduces the undo capacity of the
+                          server, so this runs even when the truncation did not complete.
+                        allowFailure: true
+                        url: "{{ inputs.mysql_url }}"
+                        username: "{{ inputs.use_secret_auth ? secret('MYSQL_USERNAME') : inputs.mysql_username }}"
+                        password: "{{ inputs.use_secret_auth ? secret('MYSQL_PASSWORD') : inputs.mysql_password }}"
+                        fetchType: NONE
+                        sql: "ALTER UNDO TABLESPACE {{ fromJson(item.value).ts_name }} SET ACTIVE"
+
+                  - id: reverify
+                    type: io.kestra.plugin.jdbc.mysql.Query
+                    description: Read every undo tablespace again. This read decides whether the run succeeded, not the ALTER statements above.
+                    url: "{{ inputs.mysql_url }}"
+                    username: "{{ inputs.use_secret_auth ? secret('MYSQL_USERNAME') : inputs.mysql_username }}"
+                    password: "{{ inputs.use_secret_auth ? secret('MYSQL_PASSWORD') : inputs.mysql_password }}"
+                    fetchType: FETCH
+                    sql: |
+                      SELECT t.NAME                              AS ts_name,
+                             f.FILE_NAME                         AS ts_file,
+                             t.FILE_SIZE                         AS size_bytes,
+                             t.FILE_SIZE DIV 1048576             AS size_mb,
+                             t.STATE                             AS ts_state
+                        FROM information_schema.INNODB_TABLESPACES t
+                        JOIN information_schema.FILES f
+                          ON f.TABLESPACE_NAME = t.NAME
+                         AND f.FILE_TYPE = 'UNDO LOG'
+                       WHERE t.SPACE_TYPE = 'Undo'
+                       ORDER BY t.NAME
+
+                  - id: verify_values
+                    type: io.kestra.plugin.core.output.OutputValues
+                    description: Pair each target with its size after the cycle. checked must equal the number of targets, so a broken parse cannot pass as a clean result.
+                    values:
+                      summary: >-
+                        {{ {'t': fromJson(outputs.plan.values.summary).targets, 'r': (outputs.reverify.rows ?? [])} | toJson | jq('. as $x | ($x.t // []) as $t | ($x.r // []) as $r | [$t[] | . as $b | (($r | map(select(.ts_name == $b.ts_name)) | first) // {}) as $a | {name: $b.ts_name, before_bytes: ($b.size_bytes | tonumber), after_bytes: (($a.size_bytes // 0) | tonumber), state: (($a.ts_state // "missing") | tostring)}] as $p | {checked: ($p | length), not_shrunk: ($p | map(select(.after_bytes >= .before_bytes)) | length), not_active: ($p | map(select(.state != "active")) | length), freed_bytes: (($p | map(.before_bytes - .after_bytes) | add) // 0), pairs: $p}') | first | toJson }}
+
+                  - id: verify_result
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ fromJson(outputs.verify_values.values.summary).checked == fromJson(outputs.plan.values.summary).target_count and fromJson(outputs.verify_values.values.summary).not_shrunk == 0 and fromJson(outputs.verify_values.values.summary).not_active == 0 }}"
+                    then:
+                      - id: truncated
+                        type: io.kestra.plugin.core.log.Log
+                        message: |
+                          Truncation confirmed on {{ inputs.mysql_url }}. {{ fromJson(outputs.verify_values.values.summary).checked }} tablespace(s) cycled, {{ fromJson(outputs.verify_values.values.summary).freed_bytes }} bytes handed back to the filesystem, every one back in state active.
+                          Before and after: {{ fromJson(outputs.verify_values.values.summary).pairs | toJson }}
+                    else:
+                      - id: remediation_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          Undo truncation did not land on {{ inputs.mysql_url }}.
+                          {{ fromJson(outputs.verify_values.values.summary).not_shrunk }} of
+                          {{ fromJson(outputs.verify_values.values.summary).checked }} targeted tablespace(s) are the same size or larger,
+                          {{ fromJson(outputs.verify_values.values.summary).not_active }} are not back in state active.
+                          Before and after: {{ fromJson(outputs.verify_values.values.summary).pairs | toJson }}.
+                          The usual cause is a transaction that held a read view through the whole wait, which stops purge advancing so InnoDB never empties the file. Oldest open transaction at the start of this run was {{ fromJson(outputs.plan.values.summary).oldest_trx_seconds }}s. End that transaction, then run again.
+                else:
+                  - id: not_approved
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Approval not granted, so no ALTER UNDO TABLESPACE ran. {{ fromJson(outputs.plan.values.summary).target_count }} bloated tablespace(s) on {{ inputs.mysql_url }} are untouched."
+            else:
+              - id: report_only
+                type: io.kestra.plugin.core.log.Log
+                message: |
+                  Report only (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}). No statement issued.
+                  {{ fromJson(outputs.plan.values.summary).target_count }} of {{ fromJson(outputs.plan.values.summary).oversized_count }} bloated tablespace(s) on {{ inputs.mysql_url }} would be cycled inactive then active: {{ fromJson(outputs.plan.values.summary).targets | toJson }}
+        else:
+          - id: cycle_refused
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: |
+              Refusing to cycle any undo tablespace on {{ inputs.mysql_url }}. Bloated: {{ fromJson(outputs.plan.values.summary).oversized_count }}. None is safe to touch right now.
+              Active undo tablespaces: {{ fromJson(outputs.plan.values.summary).active_count }}. MySQL keeps a floor of two, so cycling needs three or more. Spare above the floor: {{ fromJson(outputs.plan.values.summary).spare_above_floor }}.
+              Already held out of service: {{ fromJson(outputs.plan.values.summary).held_count }}. Names rejected as unsafe identifiers: {{ fromJson(outputs.plan.values.summary).unsafe_name_count }}.
+              On a two tablespace server, run CREATE UNDO TABLESPACE to add a third, then run this flow again. Nothing was changed.
+    else:
+      - id: clean_log
+        type: io.kestra.plugin.core.log.Log
+        message: "No action. {{ fromJson(outputs.plan.values.summary).undo_count }} undo tablespace(s) on {{ inputs.mysql_url }}, largest {{ fromJson(outputs.plan.values.summary).largest_mb }} MiB, all within the {{ fromJson(outputs.plan.values.summary).limit_mb }} MiB limit."
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Post to Slack on any failure, including a connection error or a cycle that did not shrink the file.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "MySQL undo guard FAILED for {{ inputs.mysql_url }} (execution {{ execution.id }}). Either the server was unreachable or a cycled undo tablespace did not shrink. Check the run."}
+
+extend:
+  title: Truncate bloated MySQL InnoDB undo tablespaces with a re-read gate
+  description: >-
+    ## Findings
+
+    Measured on MySQL 8.0.46 with `innodb_undo_log_truncate=OFF`. Four undo tablespaces started at
+    16777216 bytes each. Twelve bulk UPDATE passes over a 30000 row table, run while one REPEATABLE
+    READ transaction held a consistent snapshot, took every one of them to 117440512 bytes. They
+    stayed there. MySQL will not shrink an undo tablespace while automatic truncation is off, so the
+    bytes are gone until somebody cycles the file by hand.
+
+    One `SET INACTIVE` plus `SET ACTIVE` cycle took a file from 117440512 bytes back to 16777216
+    bytes in under three seconds, once purge was free to advance. With the snapshot still open the
+    same cycle left the file at 117440512 bytes in state `inactive` for more than thirty seconds,
+    because purge could not pass the undo records the read view still needed. That is why this flow
+    re-reads the size and fails the run on no change, instead of trusting the `ALTER` statement.
+
+    ## Safety
+
+    MySQL keeps a hard floor of two active undo tablespaces.
+    `ALTER UNDO TABLESPACE innodb_undo_001 SET INACTIVE` on a server with exactly two is refused with
+    `ERROR 3655 (HY000): Cannot set innodb_undo_001 inactive since there would be less than 2 undo
+    tablespaces left active.` The plan refuses the batch unless three or more are active, so the
+    statement never reaches a server that cannot take it. The refusal path is a normal outcome here,
+    not an error: a stock MySQL ships two undo tablespaces, which means a stock MySQL cannot be
+    truncated this way until an operator adds a third.
+
+    Every cycle ends with `SET ACTIVE` even when the truncation did not finish. A tablespace left
+    inactive permanently cuts the undo capacity of the server, which is a worse outcome than the
+    bloat.
+
+    ## How it works
+
+    1. `detect` joins `information_schema.INNODB_TABLESPACES` to `information_schema.FILES` on
+    `FILE_TYPE = 'UNDO LOG'` to list every undo tablespace with its file on disk, its current
+    `FILE_SIZE`, its state, the count of active undo tablespaces, the live value of
+    `innodb_undo_log_truncate` plus the age of the oldest open transaction.
+
+    2. `plan` marks an active tablespace above `max_size_mb` as bloated. It targets at most
+    `max_truncate_per_run` of them. It refuses the whole batch on any of three conditions: fewer
+    than three undo tablespaces active, one already held out of service, a name that is not a plain
+    identifier.
+
+    3. `log_status` prints the inventory, the targets plus the mode so a report run is readable on
+    its own.
+
+    4. Bloat found posts to Slack in every mode. A disk cost an operator cannot see is a disk cost
+    nobody reclaims.
+
+    5. With `auto_remediate` true, `dry_run` false plus an approval typed into the `Pause`, a
+    `Loop` with `concurrencyLimit: 1` cycles one tablespace at a time: `SET INACTIVE`, then a
+    `LoopUntil` that waits for InnoDB to empty the file, then `SET ACTIVE`.
+
+    6. `reverify` reads every undo tablespace again. The run fails unless every targeted file is
+    smaller than before and back in state `active`. The failure message names the open read view as
+    the usual cause.
+
+    ## What you get
+
+    - A size inventory of every undo tablespace with the file path an operator can check with `ls`.
+
+    - The two facts that explain the bloat in the same report: whether automatic truncation is off
+    plus how long the oldest transaction has been open.
+
+    - Space handed back to the filesystem in bytes, measured rather than claimed.
+
+    - A refusal that protects the two tablespace floor before MySQL has to reject the statement.
+
+    - A failed run whenever a cycle did not shrink the file, with the cause named.
+
+    ## Who it's for
+
+    DBAs plus platform engineers running MySQL 8 where a batch job, a stuck replica or an idle
+    session in a transaction has inflated the undo tablespaces while the disk never came back.
+    Anyone who has found a 40 GB `undo_002` on a 100 GB volume knows the shape of this.
+
+    ## Why orchestrate this with Kestra
+
+    Reclaiming undo is a sequence, not a statement. Take a file out of service, wait for purge to
+    drain it, put it back, then prove the bytes returned. Each step can stall for reasons outside
+    the database, so the wait needs a bound plus the result needs a check. Kestra carries the
+    approval gate, the bounded wait, the serialised loop plus the re-read in one versioned flow. The
+    same file runs from a schedule in report mode or by hand in remediate mode.
+
+    The gate matters because the write here carries no information. `ALTER UNDO TABLESPACE` returns
+    success the moment it marks the file inactive, long before anything has been truncated. The
+    truncation may never happen at all. Only the second read knows.
+
+    ## Tested end to end
+
+    Run on Kestra 2.0.5 against MySQL 8.0.46 with `innodb_undo_log_truncate=OFF` and four undo
+    tablespaces.
+
+    - Healthy: all four undo tablespaces at 16777216 bytes, limit 64 MiB. 0 bloated, no Slack, no
+    statement issued.
+
+    - Bloated: twelve bulk UPDATE passes under an open snapshot took all four to 117440512 bytes.
+    Detection reported 4 bloated with the largest at 112 MiB.
+
+    - `dry_run=true`: reported the target and the statement it would run. MySQL's own CLI showed the
+    file unchanged at 117440512 bytes.
+
+    - `auto_remediate=true`, `dry_run=false`, approval `true`: the target went from 117440512 bytes
+    to 16777216 bytes, 100663296 bytes handed back, state `active`, re-read confirmed.
+
+    - Approval declined: no statement ran, the file stayed at 117440512 bytes.
+
+    - Floor refusal: with only two active undo tablespaces the run refused the batch, logged the
+    `CREATE UNDO TABLESPACE` next step plus issued nothing.
+
+    - Re-verify failure: with a transaction holding a read view through the whole wait, the cycle
+    could not empty the file. The tablespace was put back in service at its old size, the re-read
+    caught it plus the run failed.
+
+    - Failure path: an unreachable JDBC URL failed `detect` and fired the `errors` Slack task.
+
+    ## Prerequisites
+
+    MySQL 8.0.14 or later, which is where `ALTER UNDO TABLESPACE` arrived. Three or more undo
+    tablespaces if you want the remediation to be able to run at all. Reporting works on any server.
+
+    ### Secrets
+
+    - `MYSQL_USERNAME` plus `MYSQL_PASSWORD`: a user with `PROCESS` to read the undo inventory plus
+    the privileges `ALTER UNDO TABLESPACE` needs to cycle one.
+
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the bloat alert plus the failure alert.
+
+    ### Inputs
+
+    - `mysql_url`: JDBC URL of the server to guard.
+
+    - `use_secret_auth`: true in production. False only for a disposable test server with inline
+    credentials.
+
+    - `max_size_mb`: size limit in MiB above which an active undo tablespace is reported. Default 64
+    against a 16 MiB fresh file.
+
+    - `max_truncate_per_run`: how many to cycle in one run. Default 1.
+
+    - `truncate_timeout`: bound on the wait for InnoDB to empty the file. Default PT2M.
+
+    - `dry_run`: true by default, reports without issuing anything.
+
+    - `auto_remediate`: false by default. Both flags plus a typed approval are needed before any
+    statement runs.
+
+    ## Quick start
+
+    1. Add `MYSQL_USERNAME`, `MYSQL_PASSWORD` plus `SLACK_WEBHOOK_URL` as secrets.
+
+    2. Run with the defaults. You get the inventory, the bloated count plus nothing changed.
+
+    3. Check `innodb_undo_log_truncate` in the log. A `0` means MySQL will never shrink these files
+    on its own, which is the setting that created the problem.
+
+    4. If the count of active undo tablespaces is two, add a third with
+    `CREATE UNDO TABLESPACE extra_undo ADD DATAFILE 'extra_undo.ibu'`, then run again.
+
+    5. To reclaim, run with `auto_remediate=true` plus `dry_run=false`, then type `true` into the
+    paused task. Read the before and after bytes in the log.
+
+    6. Enable the Schedule trigger once the report looks right. It stays pinned to report mode.
+
+    ## How to extend
+
+    - Swap the Slack task for PagerDuty, Discord or an HTTP call to your own endpoint.
+
+    - Raise `max_truncate_per_run` on a server with many undo tablespaces, keeping
+    `concurrencyLimit: 1` so the floor is never at risk.
+
+    - Add a task that sets `innodb_undo_log_truncate=ON` plus a sane `innodb_max_undo_log_size`,
+    so MySQL recycles the files without a flow. Keep this guard for the servers where that is not
+    allowed.
+
+    - Add a kill step for the transaction named by `oldest_trx_seconds`, behind its own approval, for
+    the case where an idle session is the thing holding purge back.
+
+    - Point the detect query at several servers with a `Loop` over a list of JDBC URLs.
+
+    ## Links
+
+    - [MySQL undo tablespaces](https://dev.mysql.com/doc/refman/8.0/en/innodb-undo-tablespaces.html)
+
+    - [ALTER UNDO TABLESPACE](https://dev.mysql.com/doc/refman/8.0/en/alter-undo-tablespace.html)
+
+    - [innodb_undo_log_truncate](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_undo_log_truncate)
+
+    - [Kestra MySQL Query task](https://kestra.io/plugins/plugin-jdbc-mysql/io.kestra.plugin.jdbc.mysql.query)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+  ee: false
+  demo: false
+  metaTitle: MySQL undo tablespace bloat truncation guard for Kestra
+  metaDescription: Find MySQL undo tablespaces that grew past a size limit, cycle them inactive then active behind an approval gate, then confirm the file really shrank.
+  shortDescription: Detect bloated InnoDB undo tablespaces, truncate them behind an approval gate, then re-read the file size to prove the space came back.
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+    - Monitoring & Alerting

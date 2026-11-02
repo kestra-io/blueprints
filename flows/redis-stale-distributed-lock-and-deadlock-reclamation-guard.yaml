@@ -1,0 +1,515 @@
+id: redis-stale-distributed-lock-and-deadlock-reclamation-guard
+namespace: company.team
+
+description: |
+  Audit Redis distributed lock keys, detect infinite TTLs and stale leases across runs,
+  quarantine deadlocks, pause for operator approval, reclaim stuck locks, and notify Slack.
+
+inputs:
+  - id: redis_host
+    type: STRING
+    defaults: "localhost"
+    description: Redis server hostname or IP address. The single source of truth for connecting -- used to build the connection URL for both the native Redis tasks and the Python audit scripts. Password, if any, is read directly from the REDIS_PASSWORD secret, never exposed as an input.
+
+  - id: redis_port
+    type: INT
+    defaults: 6379
+    description: Redis server port.
+
+  - id: lock_key_pattern
+    type: STRING
+    defaults: "lock:*"
+    description: Key pattern or wildcard prefix used to discover active distributed locks (e.g. lock:*, mutex:*, shedlock:*).
+
+  - id: stale_lock_threshold_seconds
+    type: INT
+    defaults: 900
+    description: Maximum permitted holding time (in seconds) for a lock key before it is classified as a deadlocked or stale lease.
+
+  - id: flag_infinite_ttl
+    type: BOOL
+    defaults: true
+    description: When true, locks with no expiration (TTL = -1) are immediately flagged as critical deadlocks regardless of observed age.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: true
+    description: When true, prompts approval and releases confirmed deadlocked locks.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true, audits locks and flags deadlocks without mutating or deleting Redis keys.
+
+  - id: publish_release_event
+    type: BOOL
+    defaults: true
+    description: When true, broadcasts lock reclamation events to a Redis Pub/Sub channel to immediately unblock waiting worker subscribers.
+
+  - id: release_channel
+    type: STRING
+    defaults: "locks:reclaimed"
+    description: Redis Pub/Sub channel where lock release events are broadcasted.
+
+triggers:
+  - id: scheduled_lock_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Automated scheduled audit running every 15 minutes to detect and reclaim deadlocked Redis locks. Shipped disabled so connection settings and thresholds can be verified first.
+    cron: "*/15 * * * *"
+    disabled: true
+
+  - id: on_demand_deadlock_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated HTTP endpoint invoked by worker monitoring alarms, Celery or BullMQ deadlock detectors, or incident runbooks.
+    key: "{{ secret('REDIS_LOCK_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy threshold and sanity constraints.
+    conditions:
+      - "{{ inputs.redis_host | length > 0 }}"
+      - "{{ inputs.redis_port > 0 }}"
+      - "{{ inputs.stale_lock_threshold_seconds >= 30 }}"
+    errorMessage: "Invalid inputs. Provide a valid redis_host, redis_port > 0, and stale_lock_threshold_seconds >= 30."
+
+  - id: fetch_historical_locks
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieves previous run active lock telemetry from Kestra KV store to track multi-run lease duration.
+    key: redis_active_locks_state
+    errorOnMissing: false
+
+  - id: triage_distributed_locks
+    type: io.kestra.plugin.scripts.python.Script
+    description: Connects to Redis, scans active lock keys, calculates holding durations against KV history, and detects deadlocked leases.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install redis kestra
+    env:
+      REDIS_HOST: "{{ inputs.redis_host }}"
+      REDIS_PORT: "{{ inputs.redis_port }}"
+      REDIS_PASSWORD: "{{ secret('REDIS_PASSWORD') }}"
+      LOCK_KEY_PATTERN: "{{ inputs.lock_key_pattern }}"
+      STALE_THRESHOLD: "{{ inputs.stale_lock_threshold_seconds }}"
+      FLAG_INFINITE_TTL: "{{ inputs.flag_infinite_ttl }}"
+      HISTORICAL_STATE: "{{ (outputs.fetch_historical_locks.value ?? {}) | toJson }}"
+    script: |
+      import json
+      import os
+      import time
+      import redis
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      host = os.environ.get("REDIS_HOST", "localhost")
+      port = int(os.environ.get("REDIS_PORT", "6379"))
+      password = os.environ.get("REDIS_PASSWORD") or None
+      pattern = os.environ.get("LOCK_KEY_PATTERN", "lock:*")
+      stale_threshold = int(os.environ.get("STALE_THRESHOLD", "900"))
+      flag_infinite = os.environ.get("FLAG_INFINITE_TTL", "true").lower() == "true"
+
+      try:
+          hist_raw = os.environ.get("HISTORICAL_STATE", "{}")
+          historical = json.loads(hist_raw) if hist_raw else {}
+      except Exception:
+          historical = {}
+
+      r = redis.Redis(
+          host=host,
+          port=port,
+          password=password,
+          socket_timeout=10,
+          decode_responses=True
+      )
+
+      now_epoch = time.time()
+      deadlocked = []
+      new_active_state = {}
+      scanned_count = 0
+
+      for key in r.scan_iter(match=pattern, count=100):
+          scanned_count += 1
+          token = r.get(key) or "unknown"
+          ttl = r.ttl(key)
+          try:
+              idle_seconds = int(r.object("idletime", key) or 0)
+          except Exception:
+              idle_seconds = 0
+
+          hist_entry = historical.get(key, {})
+          if isinstance(hist_entry, dict) and hist_entry.get("token") == token:
+              first_seen = float(hist_entry.get("first_seen", now_epoch))
+          else:
+              first_seen = now_epoch
+
+          held_duration = int(now_epoch - first_seen)
+          new_active_state[key] = {
+              "token": str(token),
+              "first_seen": first_seen,
+              "ttl": ttl,
+              "idle_seconds": idle_seconds
+          }
+
+          if ttl == -1 and flag_infinite:
+              deadlocked.append({
+                  "key": key,
+                  "token": str(token),
+                  "ttl": ttl,
+                  "idle_seconds": idle_seconds,
+                  "held_duration_seconds": held_duration,
+                  "reason": "INFINITE_TTL_DEADLOCK"
+              })
+          elif held_duration >= stale_threshold:
+              deadlocked.append({
+                  "key": key,
+                  "token": str(token),
+                  "ttl": ttl,
+                  "idle_seconds": idle_seconds,
+                  "held_duration_seconds": held_duration,
+                  "reason": "STALE_LEASE_EXCEEDED"
+              })
+
+      deadlocked_keys = [item["key"] for item in deadlocked]
+      print(f"Scanned {scanned_count} locks matching '{pattern}'. Identified {len(deadlocked)} deadlocked locks.")
+
+      output_data = {
+          "total_scanned": scanned_count,
+          "deadlocked_count": len(deadlocked),
+          "deadlocked_locks": deadlocked,
+          "deadlocked_keys": deadlocked_keys,
+          "active_locks_state": new_active_state
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print(f"::{json.dumps({'outputs': output_data})}::")
+
+  - id: persist_active_locks_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Saves current active locks telemetry into Kestra KV store for cross-run lease tracking on subsequent runs.
+    key: redis_active_locks_state
+    kvType: JSON
+    value: "{{ outputs.triage_distributed_locks.vars.active_locks_state | toJson }}"
+
+  - id: branch_on_deadlocks
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether deadlocked or unexpiring lock keys were detected.
+    condition: "{{ outputs.triage_distributed_locks.vars.deadlocked_count > 0 }}"
+    then:
+      - id: quarantine_deadlocked_manifest
+        type: io.kestra.plugin.core.kv.Set
+        description: Archives quarantined deadlocked locks audit certificate into Kestra KV for compliance auditing.
+        key: redis_deadlock_quarantine_manifest
+        kvType: JSON
+        value: "{{ outputs.triage_distributed_locks.vars.deadlocked_locks | toJson }}"
+
+      - id: notify_deadlocks_detected
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-priority incident triage notification to Slack detailing deadlocked keys and token holders.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":warning: *Redis Distributed Lock Deadlock Detected*\n*Endpoint:* `" ~ inputs.redis_host ~ ":" ~ inputs.redis_port ~ "`\n*Deadlocked Locks Identified:* *" ~ outputs.triage_distributed_locks.vars.deadlocked_count ~ "*\n*Target Keys:* `" ~ (outputs.triage_distributed_locks.vars.deadlocked_keys | join(', ')) ~ "`\n*Auto-Remediate:* `" ~ inputs.auto_remediate ~ "` (Dry Run: `" ~ inputs.dry_run ~ "`)\nReview quarantined lock leases in execution `" ~ execution.id ~ "` before approving deletion."
+          } | toJson }}
+
+      - id: evaluate_remediation
+        type: io.kestra.plugin.core.flow.If
+        description: Checks if automated remediation is permitted by input parameters.
+        condition: "{{ inputs.auto_remediate == true }}"
+        then:
+          - id: check_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Dispatches remediation actions when dry-run mode is disabled.
+            condition: "{{ inputs.dry_run == false }}"
+            then:
+              - id: pause_for_reclamation_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Interactive human approval gate before deleting deadlocked keys from Redis. Resume to delete deadlocked locks or cancel execution to abort.
+
+              - id: delete_deadlocked_keys
+                type: io.kestra.plugin.scripts.python.Script
+                description: >-
+                  Safely releases confirmed deadlocked locks via a token-checked compare-and-delete (the
+                  standard Redlock-safe release pattern), instead of blindly deleting by key name. Between
+                  detection and this operator-approved release, the pause gate may stay open for an
+                  unbounded time; a key's holder token could legitimately change in that window if the
+                  lock's own TTL expired and a different, active worker re-acquired it. Deleting by name
+                  alone would silently steal that worker's live lock. Only keys whose current token still
+                  matches the token observed at detection time are deleted.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install redis kestra
+                env:
+                  REDIS_HOST: "{{ inputs.redis_host }}"
+                  REDIS_PORT: "{{ inputs.redis_port }}"
+                  REDIS_PASSWORD: "{{ secret('REDIS_PASSWORD') }}"
+                  DEADLOCKED_LOCKS_JSON: "{{ outputs.triage_distributed_locks.vars.deadlocked_locks | toJson }}"
+                script: |
+                  import json
+                  import os
+                  import redis
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  host = os.environ.get("REDIS_HOST", "localhost")
+                  port = int(os.environ.get("REDIS_PORT", "6379"))
+                  password = os.environ.get("REDIS_PASSWORD") or None
+
+                  deadlocked_locks = json.loads(os.environ.get("DEADLOCKED_LOCKS_JSON", "[]"))
+
+                  r = redis.Redis(
+                      host=host,
+                      port=port,
+                      password=password,
+                      socket_timeout=10,
+                      decode_responses=True
+                  )
+
+                  # Classic Redlock-safe release: only delete if the current value still matches the
+                  # token we observed at detection time. Atomic via EVAL so there is no race between
+                  # the GET check and the DEL.
+                  RELEASE_SCRIPT = """
+                  if redis.call("get", KEYS[1]) == ARGV[1] then
+                      return redis.call("del", KEYS[1])
+                  else
+                      return 0
+                  end
+                  """
+
+                  released = []
+                  skipped_reacquired = []
+
+                  for lock in deadlocked_locks:
+                      key = lock["key"]
+                      token = lock["token"]
+                      try:
+                          result = r.eval(RELEASE_SCRIPT, 1, key, token)
+                      except Exception as e:
+                          print(f"Error releasing lock '{key}': {e}")
+                          skipped_reacquired.append(key)
+                          continue
+
+                      if result == 1:
+                          released.append(lock)
+                      else:
+                          skipped_reacquired.append(key)
+
+                  print(
+                      f"Released {len(released)} deadlocked lock(s). "
+                      f"Skipped {len(skipped_reacquired)} key(s) whose token no longer matched "
+                      f"(reacquired by a new legitimate holder since detection)."
+                  )
+
+                  output_data = {
+                      "released_locks": released,
+                      "released_keys": [l["key"] for l in released],
+                      "released_count": len(released),
+                      "skipped_reacquired_keys": skipped_reacquired,
+                      "skipped_reacquired_count": len(skipped_reacquired)
+                  }
+
+                  if Kestra:
+                      Kestra.outputs(output_data)
+                  else:
+                      print(f"::{json.dumps({'outputs': output_data})}::")
+
+              - id: branch_on_pubsub_broadcast
+                type: io.kestra.plugin.core.flow.If
+                description: Broadcasts release notification to Redis Pub/Sub when enabled.
+                condition: "{{ inputs.publish_release_event == true }}"
+                then:
+                  - id: broadcast_lock_release
+                    type: io.kestra.plugin.redis.pubsub.Publish
+                    description: Broadcasts structured JSON lock reclamation events to Redis Pub/Sub channel so waiting worker subscribers re-attempt acquisition immediately. Only announces locks that were actually released, not ones skipped because a new legitimate holder re-acquired them.
+                    url: "{{ secret('REDIS_PASSWORD') != '' ? ('redis://:' ~ secret('REDIS_PASSWORD') ~ '@' ~ inputs.redis_host ~ ':' ~ inputs.redis_port ~ '/0') : ('redis://' ~ inputs.redis_host ~ ':' ~ inputs.redis_port ~ '/0') }}"
+                    channel: "{{ inputs.release_channel }}"
+                    from: "{{ outputs.delete_deadlocked_keys.vars.released_locks }}"
+                    serdeType: JSON
+
+              - id: verify_locks_reclaimed
+                type: io.kestra.plugin.scripts.python.Script
+                description: Queries Redis directly to verify that every actually-released lock key has ceased to exist, asserting post-remediation correctness.
+                containerImage: python:3.11-slim
+                beforeCommands:
+                  - pip install redis kestra
+                env:
+                  REDIS_HOST: "{{ inputs.redis_host }}"
+                  REDIS_PORT: "{{ inputs.redis_port }}"
+                  REDIS_PASSWORD: "{{ secret('REDIS_PASSWORD') }}"
+                  DELETED_KEYS_JSON: "{{ outputs.delete_deadlocked_keys.vars.released_keys | toJson }}"
+                script: |
+                  import json
+                  import os
+                  import redis
+
+                  try:
+                      from kestra import Kestra
+                  except ImportError:
+                      Kestra = None
+
+                  host = os.environ.get("REDIS_HOST", "localhost")
+                  port = int(os.environ.get("REDIS_PORT", "6379"))
+                  password = os.environ.get("REDIS_PASSWORD") or None
+
+                  deleted_keys = json.loads(os.environ.get("DELETED_KEYS_JSON", "[]"))
+
+                  r = redis.Redis(
+                      host=host,
+                      port=port,
+                      password=password,
+                      socket_timeout=10,
+                      decode_responses=True
+                  )
+
+                  lingering_keys = []
+                  for key in deleted_keys:
+                      if r.exists(key):
+                          lingering_keys.append(key)
+
+                  if lingering_keys:
+                      raise RuntimeError(f"Post-remediation verification failed! The following lock keys still exist in Redis: {lingering_keys}")
+
+                  print(f"Post-remediation verification passed: All {len(deleted_keys)} deadlocked lock keys verified absent from Redis.")
+
+                  output_data = {
+                      "verified_released_count": len(deleted_keys),
+                      "lingering_count": len(lingering_keys),
+                      "verification_status": "SUCCESS"
+                  }
+
+                  if Kestra:
+                      Kestra.outputs(output_data)
+                  else:
+                      print(f"::{json.dumps({'outputs': output_data})}::")
+
+              - id: notify_remediation_success
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Dispatches recovery alert to Slack confirming deadlocked keys were cleanly released and verified absent.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: >-
+                  {{ {
+                    "text": ":white_check_mark: *Redis Distributed Lock Reclamation Succeeded*\n*Endpoint:* `" ~ inputs.redis_host ~ ":" ~ inputs.redis_port ~ "`\n*Detected Deadlocks:* `" ~ outputs.triage_distributed_locks.vars.deadlocked_count ~ "`\n*Released:* `" ~ outputs.delete_deadlocked_keys.vars.released_count ~ "`\n*Skipped (reacquired by a new holder since detection):* `" ~ outputs.delete_deadlocked_keys.vars.skipped_reacquired_count ~ "`\n*Verified Absent:* `" ~ outputs.verify_locks_reclaimed.vars.verified_released_count ~ "`\n*Pub/Sub Broadcast:* `" ~ inputs.publish_release_event ~ "` (`" ~ inputs.release_channel ~ "`)\nAll released locks' worker queues unblocked successfully."
+                  } | toJson }}
+
+            else:
+              - id: log_dry_run_mode
+                type: io.kestra.plugin.core.log.Log
+                description: Logs dry-run diagnostics without performing key deletion.
+                message: "Dry-run mode active. Identified {{ outputs.triage_distributed_locks.vars.deadlocked_count }} deadlocked lock keys: {{ outputs.triage_distributed_locks.vars.deadlocked_keys }}. Skipping deletion."
+
+    else:
+      - id: log_locks_healthy
+        type: io.kestra.plugin.core.log.Log
+        description: Logs nominal status when all inspected locks have healthy leases and valid TTLs.
+        message: "All {{ outputs.triage_distributed_locks.vars.total_scanned }} inspected Redis distributed locks are healthy with active leases and valid expirations."
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Emergency alert dispatched to Slack if the lock audit or reclamation flow fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Flow Execution Failed*: `redis-stale-distributed-lock-and-deadlock-reclamation-guard` (Execution: `" ~ execution.id ~ "`). Failed to complete Redis lock audit or reclamation pass. Check Redis connectivity and authentication."
+      } | toJson }}
+
+extend:
+  title: Redis Stale Distributed Lock and Deadlock Lease Reclamation Guard
+  metaTitle: Redis Distributed Lock Deadlock Reclamation Guard | Kestra
+  shortDescription: Audit Redis distributed lock keys, detect infinite TTLs and stale leases across runs, pause for operator approval, reclaim deadlocked locks, and notify Slack.
+  metaDescription: Audit Redis distributed locks, detect infinite TTLs and deadlocks, pause for approval, delete stale locks, verify reclamation, and alert on Slack.
+  description: |
+    Distributed locking patterns in Redis (including Redlock algorithms, Celery worker locks, BullMQ mutexes, and Spring ShedLock) coordinate critical mutual exclusion across distributed microservices. However, worker process crashes, out-of-memory container terminations, and unhandled runtime exceptions frequently orphan lock keys. When a client sets a lock key without an expiration (TTL = -1) or crashes before releasing a long-duration lease, subsequent pipeline jobs stall indefinitely, creating severe distributed task gridlock.
+
+    This blueprint implements an automated Redis distributed lock sentinel and reclamation guard. It tracks active lock keys across execution runs via Kestra Key-Value store, detects infinite TTLs and abandoned leases, isolates deadlocks into an audit quarantine certificate, pauses for operator approval, safely deletes stuck lock keys, broadcasts release events to Redis Pub/Sub, verifies absence in the cluster, and alerts Slack.
+
+    ## How it works
+
+    1. The `scheduled_lock_guard` schedule trigger executes the audit every 15 minutes, while `on_demand_deadlock_webhook` provides an on-demand webhook entry point for external worker monitoring alarms or on-call runbooks.
+    2. The `validate_inputs` task (`io.kestra.plugin.core.execution.Assert`) verifies that connection properties and threshold constraints are positive and well-formed.
+    3. The `fetch_historical_locks` task (`io.kestra.plugin.core.kv.Get`) retrieves the previous scan snapshot from Kestra KV store under key `redis_active_locks_state` to track multi-run lease continuity.
+    4. The `triage_distributed_locks` task (`io.kestra.plugin.scripts.python.Script`) connects to Redis, scans keys matching `lock_key_pattern`, extracts holder tokens, inspects remaining TTLs, measures idle times, and compares against historical snapshots:
+       - `INFINITE_TTL_DEADLOCK`: Flagged when a lock has no expiration (`TTL == -1`), posing immediate risk of permanent worker starvation.
+       - `STALE_LEASE_EXCEEDED`: Flagged when a lock with identical holder token has persisted across consecutive runs exceeding `stale_lock_threshold_seconds`.
+       - `HEALTHY_ACTIVE`: In-flight lock within operational lease parameters.
+    5. The `persist_active_locks_state` task (`io.kestra.plugin.core.kv.Set`) updates Kestra KV store with current active lock telemetry for trend tracking on subsequent runs.
+    6. The `branch_on_deadlocks` task (`io.kestra.plugin.core.flow.If`) evaluates whether deadlocked locks were identified:
+       - Archives diagnosed deadlock records to `redis_deadlock_quarantine_manifest` in Kestra KV.
+       - Dispatches an incident alert to Slack detailing key names, holder tokens, and detected hold durations.
+       - When `auto_remediate` is enabled and `dry_run` is false, triggers the interactive `pause_for_reclamation_approval` gate (`io.kestra.plugin.core.flow.Pause`) requiring operator confirmation.
+       - Upon approval, `delete_deadlocked_keys` (`io.kestra.plugin.scripts.python.Script`) releases each deadlocked key only if its current value still matches the holder token observed at detection time (a Redlock-safe compare-and-delete via Lua `EVAL`), skipping any key that a new legitimate worker re-acquired while the approval gate was open.
+       - If `publish_release_event` is enabled, `broadcast_lock_release` (`io.kestra.plugin.redis.pubsub.Publish`) publishes structured JSON events to `release_channel` to notify waiting worker subscribers.
+       - The `verify_locks_reclaimed` task (`io.kestra.plugin.scripts.python.Script`) re-queries Redis to assert every target key is absent, raising an error if any lock lingers.
+       - Posts a confirmation alert to Slack upon successful verification.
+    7. An `errors` handler catches unexpected execution errors and pages on-call engineers via Slack.
+
+    ## What you get
+
+    - Automated discovery and categorization of Redis distributed locks trapped in infinite TTL or stale lease states.
+    - Historical multi-run trend detection distinguishing normal long-running tasks from abandoned crashed worker locks.
+    - Interactive human-in-the-loop approval gate before executing any destructive key deletions.
+    - Native Redis string deletion combined with Pub/Sub release broadcasts to immediately awaken blocked workers.
+    - Post-remediation verification asserting that released lock keys have ceased to exist in Redis.
+    - Quarantined audit trail preserved in Kestra KV for compliance and post-mortem incident analysis.
+    - Context-rich Slack notifications with token identifiers, hold times, and cluster endpoints.
+
+    ## Who it's for
+
+    - Platform Engineers and Site Reliability Engineers managing Redis infrastructure and distributed worker fleets.
+    - Backend and Distributed Systems Engineers maintaining Celery, BullMQ, Sidekiq, or Spring ShedLock task pipelines.
+    - Data Engineers orchestrating distributed extract-transform-load (ETL) jobs requiring mutex coordination.
+
+    ## Why orchestrate this with Kestra
+
+    Distributed locks are inherently stateful and hazardous to clear blindly. A naive cron job running `redis-cli del` risks evicting active jobs that are simply taking longer than average. Kestra solves this by persisting lock observation history across runs in atomic namespace KV storage, gating destructive operations behind interactive Pause approval gates, broadcasting recovery events to Pub/Sub, and asserting post-action cleanliness with verified verification queries.
+
+    ## Prerequisites
+
+    - Reachable Redis instance (version 6.x, 7.x, or compatible KeyDB/Valkey).
+    - Network connectivity from Kestra workers to the Redis port.
+    - Slack Incoming Webhook URL configured for incident triage notifications.
+
+    ### Secrets
+
+    - `REDIS_PASSWORD`: Password for authenticating to the target Redis instance (leave empty if unauthenticated).
+    - `REDIS_LOCK_GUARD_WEBHOOK_KEY`: Secret authentication key for the on-demand webhook trigger.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for operational notifications and alerts.
+
+    ## Quick start
+
+    1. Configure `REDIS_PASSWORD`, `REDIS_LOCK_GUARD_WEBHOOK_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Run an initial manual execution with default parameters (`dry_run: true`) to audit current lock keys and inspect detected TTLs without deleting keys.
+    3. Review the execution logs, Slack triage notification, and Kestra KV store entries under `redis_active_locks_state`.
+    4. Run with `auto_remediate: true` and `dry_run: false`. When deadlocks are identified, approve the `pause_for_reclamation_approval` gate in the Kestra UI to release the stuck locks.
+    5. Enable the `scheduled_lock_guard` schedule trigger to maintain continuous automated deadlock protection.
+
+    ## How to extend
+
+    - Customize `lock_key_pattern` to isolate specific service prefixes (e.g., `celery-task-meta:*` or `shedlock:*`).
+    - Add a downstream webhook task to trigger an automated pod restart for the deadlocked worker service.
+    - Connect PagerDuty or Opsgenie notifications for automated escalation when `deadlocked_count` exceeds a critical threshold.
+    - Route quarantined lock manifests to Amazon S3 or Google Cloud Storage for permanent regulatory audit retention.
+
+    ## Links
+
+    - [Redis Distributed Locks (Redlock) Specification](https://redis.io/docs/latest/develop/use/patterns/distributed-locks/)
+    - [Redis Key Expiration and TTL Documentation](https://redis.io/commands/ttl/)
+    - [Kestra Redis Plugin Documentation](https://kestra.io/plugins/plugin-redis)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+    - [Kestra Pause Flow Documentation](https://kestra.io/plugins/core/flow/pause)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
