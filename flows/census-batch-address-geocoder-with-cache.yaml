@@ -1,0 +1,350 @@
+id: census-batch-address-geocoder-with-cache
+namespace: company.team
+
+description: |
+  Geocode a CSV of US addresses to coordinates and Census geographies (state, county, tract,
+  block) with the free Census Geocoder batch endpoint, and keep every answer in a Parquet cache
+  in Kestra's internal storage so re-running on a grown or re-ordered file sends only the
+  addresses the Census has not seen yet. No API key, no per-request loop: one multipart POST
+  of up to 10,000 addresses per run, parsed and merged with DuckDB.
+
+inputs:
+  - id: addresses_csv
+    type: STRING
+    description: Inline CSV with a header row `id,street,city,state,zip`. Ignored when `addresses_file` is uploaded. The default has one duplicate written differently and one address that cannot match.
+    defaults: |
+      id,street,city,state,zip
+      1,1600 Pennsylvania Ave NW,Washington,DC,20500
+      2,350 Fifth Ave,New York,NY,10118
+      3,233 S Wacker Dr,Chicago,IL,60606
+      4,400 Broad St,Seattle,WA,98109
+      5,  1600 pennsylvania ave nw ,washington,dc,20500
+      6,999 Nowhere Street,Faketown,ZZ,00000
+
+  - id: addresses_file
+    type: FILE
+    required: false
+    description: Optional CSV upload with the same columns, for real address lists.
+
+  - id: benchmark
+    type: STRING
+    defaults: Public_AR_Current
+    description: Census address benchmark. `Public_AR_Current` is the latest; a dated one such as `Public_AR_Census2020` reproduces an older vintage.
+
+  - id: vintage
+    type: STRING
+    defaults: Current_Current
+    description: Census geography vintage paired with the benchmark (`Census2020_Census2020` with the 2020 benchmark).
+
+  - id: cache_key
+    type: STRING
+    defaults: census_geocode_cache
+    description: KV key holding the cache URI. Use a different key per address list or per benchmark.
+
+  - id: recheck_no_match
+    type: BOOL
+    defaults: false
+    description: Send cached No_Match and Tie addresses again (useful after the Census publishes a new benchmark).
+
+tasks:
+  - id: inline_addresses
+    type: io.kestra.plugin.core.storage.Write
+    description: Puts the inline CSV in internal storage so DuckDB reads the inline text and an uploaded file the same way.
+    content: "{{ inputs.addresses_csv }}"
+    extension: .csv
+
+  - id: previous_cache
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.cache_key }}"
+    errorOnMissing: false
+    description: URI of the Parquet cache written by the last run; missing on the first run.
+
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Writes an empty cache with the right schema so every later task has one code path.
+    condition: "{{ outputs.previous_cache.value is not defined or outputs.previous_cache.value is empty }}"
+    then:
+      - id: empty_cache
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        fetchType: NONE
+        outputFiles:
+          - cache_parquet
+        sql: |
+          CREATE TABLE cache (
+            address_key VARCHAR, match_status VARCHAR, match_type VARCHAR, matched_address VARCHAR,
+            longitude DOUBLE, latitude DOUBLE, tigerline_id VARCHAR, side VARCHAR,
+            state_fips VARCHAR, county_fips VARCHAR, tract VARCHAR, block VARCHAR,
+            benchmark VARCHAR, geocoded_at TIMESTAMP
+          );
+          COPY cache TO '{{ outputFiles.cache_parquet }}' (FORMAT PARQUET);
+
+  - id: build_batch
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Normalises each address into a key (upper case, trimmed, single spaces), drops duplicates, removes the keys
+      already in the cache and writes the Census batch file (no header, `id,street,city,state,zip`, at most 10,000 rows)
+      plus a key map so the response can be joined back without trusting the echoed address text.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      addresses.csv: "{{ inputs.addresses_file ?? outputs.inline_addresses.uri }}"
+      cache.parquet: "{{ outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+    outputFiles:
+      - batch_csv
+      - keys_csv
+    parameters:
+      recheck_no_match: "{{ inputs.recheck_no_match }}"
+    sql: |
+      CREATE TABLE addresses AS
+      SELECT *, upper(regexp_replace(trim(street) || '|' || trim(city) || '|' || trim(state) || '|' || trim(zip), '\s+', ' ', 'g')) AS address_key
+      FROM read_csv('addresses.csv', header = true, all_varchar = true);
+
+      CREATE TABLE cache AS SELECT * FROM read_parquet('cache.parquet');
+
+      CREATE TABLE pending AS
+      SELECT address_key, any_value(trim(street)) AS street, any_value(trim(city)) AS city, any_value(trim(state)) AS state, any_value(trim(zip)) AS zip
+      FROM addresses a
+      WHERE NOT EXISTS (
+        SELECT 1 FROM cache c
+        WHERE c.address_key = a.address_key
+          AND NOT (:recheck_no_match AND c.match_status <> 'Match')
+      )
+      GROUP BY address_key
+      ORDER BY address_key;
+
+      CREATE TABLE batch AS
+      SELECT CAST(row_number() OVER (ORDER BY address_key) AS VARCHAR) AS batch_id, * FROM pending LIMIT 10000;
+
+      COPY (SELECT batch_id, street, city, state, zip FROM batch ORDER BY CAST(batch_id AS INTEGER)) TO '{{ outputFiles.batch_csv }}' (HEADER false, DELIMITER ',');
+      COPY (SELECT batch_id, address_key FROM batch) TO '{{ outputFiles.keys_csv }}' (HEADER true, DELIMITER ',');
+
+      SELECT
+        (SELECT count(*) FROM addresses) AS input_rows,
+        (SELECT count(DISTINCT address_key) FROM addresses) AS unique_addresses,
+        (SELECT count(DISTINCT address_key) FROM addresses) - (SELECT count(*) FROM pending) AS from_cache,
+        (SELECT count(*) FROM batch) AS to_geocode,
+        (SELECT count(*) FROM pending) - (SELECT count(*) FROM batch) AS deferred,
+        (SELECT count(*) FROM cache) AS cache_size_before;
+
+  - id: geocode_new
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.build_batch.outputs[0].row.to_geocode > 0 }}"
+    then:
+      - id: geocode
+        type: io.kestra.plugin.core.http.Download
+        description: |
+          One multipart POST with the batch file; the Census returns a CSV (`GeocodeResults.csv`) with the match status,
+          standardised address, longitude,latitude and the state, county, tract and block FIPS codes. A 10,000-row batch
+          can take several minutes, hence the long read timeout.
+        uri: https://geocoding.geo.census.gov/geocoder/geographies/addressbatch
+        method: POST
+        contentType: multipart/form-data
+        formData:
+          addressFile:
+            name: addresses.csv
+            content: "{{ outputs.build_batch.outputFiles.batch_csv }}"
+          benchmark: "{{ inputs.benchmark }}"
+          vintage: "{{ inputs.vintage }}"
+        options:
+          timeout:
+            readIdleTimeout: PT10M
+
+      - id: merge_cache
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: Parses the Census CSV (No_Match and Tie rows have only three columns), joins the batch ids back to the address keys and writes the new cache as Parquet.
+        url: "jdbc:duckdb:"
+        fetchType: FETCH_ONE
+        inputFiles:
+          response.csv: "{{ outputs.geocode.uri }}"
+          keys.csv: "{{ outputs.build_batch.outputFiles.keys_csv }}"
+          cache.parquet: "{{ outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+        outputFiles:
+          - cache_parquet
+        parameters:
+          benchmark: "{{ inputs.benchmark }}"
+          run_started: "{{ execution.startDate }}"
+        sql: |
+          CREATE TABLE response AS
+          SELECT * FROM read_csv('response.csv', header = false, delim = ',', quote = '"', escape = '"', null_padding = true, auto_detect = false, all_varchar = true,
+            columns = {'batch_id': 'VARCHAR', 'input_address': 'VARCHAR', 'match_status': 'VARCHAR', 'match_type': 'VARCHAR',
+                       'matched_address': 'VARCHAR', 'coordinates': 'VARCHAR', 'tigerline_id': 'VARCHAR', 'side': 'VARCHAR',
+                       'state_fips': 'VARCHAR', 'county_fips': 'VARCHAR', 'tract': 'VARCHAR', 'block': 'VARCHAR'});
+
+          CREATE TABLE fresh AS
+          SELECT k.address_key, r.match_status, r.match_type, r.matched_address,
+                 CAST(split_part(r.coordinates, ',', 1) AS DOUBLE) AS longitude,
+                 CAST(split_part(r.coordinates, ',', 2) AS DOUBLE) AS latitude,
+                 r.tigerline_id, r.side, r.state_fips, r.county_fips, r.tract, r.block,
+                 :benchmark AS benchmark, CAST(:run_started AS TIMESTAMP) AS geocoded_at
+          FROM response r JOIN read_csv('keys.csv', header = true, all_varchar = true) k ON k.batch_id = r.batch_id;
+
+          CREATE TABLE cache AS
+          SELECT * FROM read_parquet('cache.parquet') c WHERE NOT EXISTS (SELECT 1 FROM fresh f WHERE f.address_key = c.address_key)
+          UNION ALL
+          SELECT * FROM fresh;
+
+          COPY cache TO '{{ outputFiles.cache_parquet }}' (FORMAT PARQUET);
+
+          SELECT
+            (SELECT count(*) FROM fresh) AS geocoded,
+            (SELECT count(*) FILTER (WHERE match_status = 'Match') FROM fresh) AS matched,
+            (SELECT count(*) FILTER (WHERE match_type = 'Exact') FROM fresh) AS exact,
+            (SELECT count(*) FILTER (WHERE match_type = 'Non_Exact') FROM fresh) AS non_exact,
+            (SELECT count(*) FILTER (WHERE match_status = 'No_Match') FROM fresh) AS no_match,
+            (SELECT count(*) FILTER (WHERE match_status = 'Tie') FROM fresh) AS tie,
+            (SELECT count(*) FROM cache) AS cache_size;
+
+      - id: save_cache
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ inputs.cache_key }}"
+        value: "{{ outputs.merge_cache.outputFiles.cache_parquet }}"
+        description: Points the KV key at the new cache. Old cache files stay with their executions until purged.
+
+  - id: join_output
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Joins every input row (duplicates included, original order kept) to the cache and writes the geocoded CSV with coordinates, FIPS codes and a 15-digit block GEOID.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      addresses.csv: "{{ inputs.addresses_file ?? outputs.inline_addresses.uri }}"
+      cache.parquet: "{{ outputs.merge_cache.outputFiles.cache_parquet ?? outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+    outputFiles:
+      - geocoded_csv
+    parameters:
+      run_started: "{{ execution.startDate }}"
+    sql: |
+      CREATE TABLE addresses AS
+      SELECT *, upper(regexp_replace(trim(street) || '|' || trim(city) || '|' || trim(state) || '|' || trim(zip), '\s+', ' ', 'g')) AS address_key,
+             row_number() OVER () AS input_order
+      FROM read_csv('addresses.csv', header = true, all_varchar = true);
+
+      CREATE TABLE result AS
+      SELECT a.id, a.street, a.city, a.state, a.zip,
+             coalesce(c.match_status, 'PENDING') AS match_status, c.match_type, c.matched_address,
+             c.longitude, c.latitude, c.state_fips, c.county_fips, c.tract, c.block,
+             CASE WHEN c.block IS NOT NULL THEN c.state_fips || c.county_fips || c.tract || c.block END AS block_geoid,
+             c.benchmark, c.geocoded_at,
+             c.geocoded_at < CAST(:run_started AS TIMESTAMP) AS from_cache
+      FROM addresses a
+      LEFT JOIN read_parquet('cache.parquet') c ON c.address_key = a.address_key
+      ORDER BY a.input_order;
+
+      COPY result TO '{{ outputFiles.geocoded_csv }}' (HEADER true, DELIMITER ',');
+
+      SELECT
+        count(*) AS rows,
+        count(*) FILTER (WHERE match_status = 'Match') AS matched,
+        count(*) FILTER (WHERE match_type = 'Exact') AS exact,
+        count(*) FILTER (WHERE match_type = 'Non_Exact') AS non_exact,
+        count(*) FILTER (WHERE match_status = 'No_Match') AS no_match,
+        count(*) FILTER (WHERE match_status = 'Tie') AS tie,
+        count(*) FILTER (WHERE match_status = 'PENDING') AS pending,
+        count(*) FILTER (WHERE from_cache) AS from_cache,
+        round(100.0 * count(*) FILTER (WHERE match_status = 'Match') / count(*), 1) AS match_rate_pct
+      FROM result;
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.build_batch.outputs[0].row.input_rows }} input rows, {{ outputs.build_batch.outputs[0].row.unique_addresses }} unique addresses: {{ outputs.build_batch.outputs[0].row.from_cache }} already cached, {{ outputs.build_batch.outputs[0].row.to_geocode }} sent to the Census Geocoder, {{ outputs.build_batch.outputs[0].row.deferred }} deferred to the next run.
+      Result: {{ outputs.join_output.outputs[0].row.matched }} matched ({{ outputs.join_output.outputs[0].row.exact }} exact, {{ outputs.join_output.outputs[0].row.non_exact }} non-exact), {{ outputs.join_output.outputs[0].row.no_match }} no match, {{ outputs.join_output.outputs[0].row.tie }} tie, {{ outputs.join_output.outputs[0].row.pending }} pending; match rate {{ outputs.join_output.outputs[0].row.match_rate_pct }} percent.
+      Geocoded CSV: {{ outputs.join_output.outputFiles.geocoded_csv }}
+
+outputs:
+  - id: geocoded_csv
+    type: FILE
+    value: "{{ outputs.join_output.outputFiles.geocoded_csv }}"
+  - id: batch_summary
+    type: JSON
+    value: "{{ outputs.build_batch.outputs[0].row }}"
+  - id: result_summary
+    type: JSON
+    value: "{{ outputs.join_output.outputs[0].row }}"
+  - id: cache_parquet
+    type: FILE
+    value: "{{ outputs.merge_cache.outputFiles.cache_parquet ?? outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+
+extend:
+  title: Batch Geocode US Addresses to Coordinates and Census Tracts with the Census Geocoder and a DuckDB Cache
+  metaTitle: Census Geocoder Batch Address Geocoding with DuckDB Cache | Kestra
+  shortDescription: Geocode a CSV of US addresses to longitude, latitude and state, county, tract and block FIPS codes with the free Census Geocoder batch endpoint, one multipart POST per run, and keep every answer in a Parquet cache so re-runs only send the addresses not seen before.
+  metaDescription: Batch geocode US addresses with the free Census Geocoder, parse the CSV reply in DuckDB and cache results in Parquet so re-runs only send new addresses.
+  description: |
+    Address lists are geocoded again and again: the customer file grows by a few hundred rows a week and the whole thing goes through a paid geocoder every time. The US Census Bureau runs a free geocoder with a batch endpoint that takes a CSV of up to 10,000 addresses per request and returns coordinates plus the state, county, tract and block codes that join directly to Census and ACS tables. This flow wraps it with a cache: DuckDB normalises the addresses into keys, removes the ones already answered, sends only the rest in a single multipart POST, parses the CSV reply and merges it into a Parquet cache kept in Kestra's internal storage. Every input row, duplicates included, comes back with its coordinates and a 15-digit block GEOID.
+
+    ## How it works
+
+    1. The address list comes either from the `addresses_csv` input (inline CSV with a header row `id,street,city,state,zip`) or from an uploaded `addresses_file`. `inline_addresses` (Storage Write) puts the inline text in internal storage so both paths are read the same way.
+    2. `previous_cache` (KV Get, `errorOnMissing: false`) reads the URI of the Parquet cache written by the last run; `bootstrap` (If) runs `empty_cache` (DuckDB Queries) on the first run only, writing an empty Parquet file with the cache schema so every later task has one code path.
+    3. `build_batch` (DuckDB Queries) builds an `address_key` per row (upper case, trimmed, single spaces), keeps one row per key, drops the keys already in the cache and writes two files through `outputFiles`: the Census batch CSV (no header, batch id plus the four address fields, at most 10,000 rows) and a key map from batch id to address key. With `recheck_no_match` the cached `No_Match` and `Tie` rows are sent again. The result row counts input rows, unique addresses, cache hits, rows sent and rows deferred.
+    4. `geocode_new` (If) runs only when there is something to send. `geocode` (HTTP Download) POSTs the batch file as `multipart/form-data` to `geocoding.geo.census.gov/geocoder/geographies/addressbatch` with the chosen `benchmark` and `vintage`; the reply, a CSV named `GeocodeResults.csv`, lands in internal storage. A long `readIdleTimeout` covers a full 10,000-row batch.
+    5. `merge_cache` (DuckDB Queries) reads the reply with an explicit column list (`No_Match` and `Tie` rows carry only three fields), splits the `longitude,latitude` pair, joins the batch ids back to the address keys, replaces those keys in the cache and writes the new Parquet file. `save_cache` (KV Set) points the KV key at it.
+    6. `join_output` (DuckDB Queries) left-joins every input row to the cache, in the original order, and writes the geocoded CSV: match status and type, standardised address, longitude, latitude, FIPS codes, block GEOID, benchmark, when the address was geocoded and whether it came from the cache. Rows beyond the 10,000 cap show as `PENDING` until the next run.
+    7. `summary` logs the counts; the flow exposes the geocoded CSV, the two summary rows and the cache Parquet as outputs.
+
+    ## What you get
+
+    - A geocoded CSV with coordinates and state, county, tract and block FIPS codes for every input row, ready to join to Census or ACS data.
+    - A Parquet cache that makes the second run of the same list free and the run on a grown list cost only the new rows.
+    - Duplicate and differently formatted spellings of the same address resolved once and answered for every row.
+    - `No_Match`, `Tie` and `PENDING` statuses in the output instead of silently dropped rows.
+    - No API key, no per-address loop, no database.
+
+    ## Who it's for
+
+    - Analytics and data engineering teams enriching customer, store or facility addresses with Census geography for demographic joins.
+    - Public health, housing and civic tech teams who map addresses to tracts and need reproducible vintages.
+    - Anyone paying a commercial geocoder for US addresses that the Census Geocoder would resolve for free.
+
+    ## Why orchestrate this with Kestra
+
+    - `Download` with `formData` uploads a file straight from internal storage as `multipart/form-data`; no script, no container.
+    - DuckDB `inputFiles` and `outputFiles` carry the batch, the reply and the Parquet cache between tasks declaratively.
+    - The KV store holds one URI per address list, so several lists or benchmarks share the flow under different `cache_key` values.
+    - `If` conditions skip the bootstrap after the first run and the HTTP call when everything is cached.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB plugin.
+    - Outbound HTTPS to `geocoding.geo.census.gov`; the Census Geocoder needs no key or account.
+    - US addresses only (50 states, DC and Puerto Rico); the Census standardises them, so mixed case and extra spaces are fine.
+    - The cache Parquet lives in the execution folder of the run that wrote it; if you purge executions, keep the latest successful one of this flow or copy the file first.
+
+    ### Secrets
+
+    - None. The Census Geocoder is public and keyless.
+
+    ## Quick start
+
+    1. Import the flow and click **Execute** with the defaults: six rows, five unique addresses (one is the White House written twice, once in lower case with stray spaces) and one street that does not exist. The first run bootstraps the cache, sends 5 addresses and returns 5 `Match` rows (the duplicate answered from the same lookup) and 1 `No_Match`.
+    2. Execute again: 5 already cached, 0 sent, the HTTP call is skipped and the output CSV is rebuilt from the cache with `from_cache = true`.
+    3. Add two addresses to `addresses_csv` and run: 5 cached, 2 sent.
+    4. Run with `recheck_no_match: true`: only the `No_Match` address is sent again.
+    5. Upload your own CSV as `addresses_file` (same header) for real lists; up to 10,000 new addresses go in one run, the rest show as `PENDING` and go in the next.
+
+    ## How to extend
+
+    - Trigger on a new file in S3, GCS or SFTP with the matching trigger and pass it as `addresses_file`.
+    - Load the geocoded CSV into Postgres, Snowflake or BigQuery with the corresponding plugin, or read the cache Parquet directly in DuckDB.
+    - Join `block_geoid` or the tract code to ACS tables from `api.census.gov` for population and income enrichment.
+    - Switch `benchmark` and `vintage` to `Public_AR_Census2020` and `Census2020_Census2020` under a separate `cache_key` to geocode against 2020 geography.
+    - Add a Slack or email summary task after `summary` when `no_match` exceeds a threshold.
+
+    ## Links
+
+    - [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download)
+    - [Storage Write](https://kestra.io/plugins/core/storage/io.kestra.plugin.core.storage.write)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if)
+    - [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [Census Geocoder](https://geocoding.geo.census.gov/geocoder/) and [technical documentation](https://www.census.gov/programs-surveys/geography/technical-documentation/complete-technical-documentation/census-geocoder.html)
+    - [Census geocoding services overview](https://www.census.gov/data/developers/data-sets/Geocoding-services.html)
+  tags:
+    - Data
+  subTags:
+    - ELT & Data Landing
+    - File & Data Processing Basics
+  ee: false
+  demo: false

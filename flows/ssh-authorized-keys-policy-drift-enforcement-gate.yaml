@@ -1,0 +1,827 @@
+id: ssh-authorized-keys-policy-drift-enforcement-gate
+namespace: company.team
+
+description: |
+  Enforce an SSH access policy that lives in Git on a fleet of Linux hosts. Read every authorized_keys
+  file over SSH, compare the exact key fingerprints with the policy, track how long each out-of-policy
+  key has been present in Kestra KV, and after approval remove the keys that are expired or stayed
+  unauthorized past the grace window. A backup is taken first and a second SSH read proves the result.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: policy_repo_url
+    type: STRING
+    displayName: Policy repository URL
+    required: false
+    description: Git repository that holds the access policy. Set a default for webhook and scheduled runs. For a private repository add username and password to the clone_policy and clone_policy_again tasks.
+
+  - id: policy_branch
+    type: STRING
+    displayName: Policy branch
+    defaults: "main"
+
+  - id: policy_path
+    type: STRING
+    displayName: Policy file path
+    description: JSON policy file inside the repository, with groups, hosts, users and allowed key fingerprints.
+    defaults: "access-policy.json"
+
+  - id: ssh_user
+    type: STRING
+    displayName: SSH user
+    description: Account Kestra connects with. It needs read and write access to the audited authorized_keys files, normally through passwordless sudo.
+    defaults: "kestra"
+
+  - id: ssh_port
+    type: INT
+    displayName: SSH port
+    defaults: 22
+
+  - id: use_sudo
+    type: BOOL
+    displayName: Use sudo
+    description: Run the remote read and edit scripts through sudo -n.
+    defaults: true
+
+  - id: authorized_keys_file
+    type: STRING
+    displayName: authorized_keys path relative to the home directory
+    defaults: ".ssh/authorized_keys"
+
+  - id: grace_hours
+    type: INT
+    displayName: Grace window in hours
+    description: A key that is not in the policy must be seen for this long before removal. Expired keys are removed without waiting.
+    defaults: 24
+
+  - id: max_removals_per_run
+    type: INT
+    displayName: Max keys removed per run
+    defaults: 20
+
+  - id: max_host_removal_pct
+    type: INT
+    displayName: Max share of a host's keys that may be removed
+    description: Above this share the host is blocked, because a policy mistake looks like mass drift.
+    defaults: 50
+
+  - id: min_rsa_bits
+    type: INT
+    displayName: Minimum RSA key size
+    description: Allowed RSA keys below this size are reported but never removed.
+    defaults: 2048
+
+  - id: allow_unpinned_hosts
+    type: BOOL
+    displayName: Allow hosts without a pinned host key
+    description: By default every policy host must have its SHA256 host key fingerprint in host_keys, so the audit cannot be fed by an impostor. Set true only for a throwaway test.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true the plan is reported and tracked, but no approval is requested and no file is edited.
+    defaults: true
+
+variables:
+  ledger_key: "ssh_key_drift_ledger_{{ inputs.policy_repo_url | slugify }}"
+  audit_key: "ssh_key_drift_audit_{{ inputs.policy_repo_url | slugify }}"
+  lib_js: |
+    const crypto = require("crypto");
+    const { Client, utils } = require("ssh2");
+
+    const KEY_TYPE = /^(ssh-rsa|ssh-dss|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/;
+    const USER_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,31}$/;
+    const AK_FILE_RE = /^(?!\/)(?!.*\.\.)[A-Za-z0-9._\/-]+$/;
+
+    // authorized_keys options may contain spaces inside double quotes, so split on whitespace outside quotes only.
+    function tokenize(line) {
+      const tokens = [];
+      let cur = "";
+      let quoted = false;
+      for (const ch of line) {
+        if (ch === '"') { quoted = !quoted; cur += ch; }
+        else if (!quoted && /\s/.test(ch)) { if (cur) { tokens.push(cur); cur = ""; } }
+        else cur += ch;
+      }
+      if (cur) tokens.push(cur);
+      return tokens;
+    }
+
+    const fingerprint = (blob) => "SHA256:" + crypto.createHash("sha256").update(blob).digest("base64").replace(/=+$/, "");
+
+    function readString(buf, offset) {
+      const len = buf.readUInt32BE(offset);
+      return [buf.subarray(offset + 4, offset + 4 + len), offset + 4 + len];
+    }
+
+    function rsaBits(blob) {
+      let [, off] = readString(blob, 0);
+      [, off] = readString(blob, off);
+      let [n] = readString(blob, off);
+      let i = 0;
+      while (i < n.length && n[i] === 0) i++;
+      n = n.subarray(i);
+      return n.length ? (n.length - 1) * 8 + (32 - Math.clz32(n[0])) : 0;
+    }
+
+    // Returns null for blank/comment lines, {invalid:true} for lines that are not a key, otherwise the parsed key.
+    function parseKeyLine(raw) {
+      const line = raw.replace(/\r$/, "");
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return null;
+      const tokens = tokenize(trimmed);
+      const idx = tokens.findIndex((t) => KEY_TYPE.test(t));
+      if (idx < 0 || idx + 1 >= tokens.length) return { invalid: true, line };
+      const type = tokens[idx];
+      let blob;
+      try {
+        blob = Buffer.from(tokens[idx + 1], "base64");
+        const [declared] = readString(blob, 0);
+        if (declared.toString("latin1") !== type) return { invalid: true, line };
+      } catch (e) {
+        return { invalid: true, line };
+      }
+      return {
+        line,
+        type,
+        fp: fingerprint(blob),
+        bits: type === "ssh-rsa" ? rsaBits(blob) : null,
+        options: tokens.slice(0, idx).join(" "),
+        comment: tokens.slice(idx + 2).join(" "),
+      };
+    }
+
+    function ownFingerprint(privateKey, passphrase) {
+      const parsed = utils.parseKey(privateKey, passphrase || undefined);
+      const key = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (key instanceof Error) throw new Error(`Cannot parse SSH_PRIVATE_KEY: ${key.message}`);
+      return fingerprint(key.getPublicSSH());
+    }
+
+    function sshExec({ host, port, username, privateKey, passphrase, command, stdin, hostFingerprint, timeoutMs = 30000 }) {
+      return new Promise((resolve, reject) => {
+        const conn = new Client();
+        let settled = false;
+        const done = (fn, v) => { if (!settled) { settled = true; conn.end(); fn(v); } };
+        conn.on("ready", () => {
+          conn.exec(command, (err, stream) => {
+            if (err) return done(reject, err);
+            let stdout = "", stderr = "";
+            stream.on("data", (d) => (stdout += d));
+            stream.stderr.on("data", (d) => (stderr += d));
+            stream.on("close", (code) => done(resolve, { code, stdout, stderr }));
+            stream.end(stdin || "");
+          });
+        });
+        conn.on("error", (e) => done(reject, e));
+        conn.connect({
+          host, port: Number(port), username, privateKey, passphrase: passphrase || undefined,
+          readyTimeout: timeoutMs,
+          hostVerifier: (key) => (hostFingerprint ? fingerprint(key) === hostFingerprint : true),
+        });
+      });
+    }
+
+    function readScript(users, akFile, backupSuffix) {
+      if (!AK_FILE_RE.test(akFile)) throw new Error(`Unsafe authorized_keys path: ${akFile}`);
+      for (const u of users) if (!USER_RE.test(u)) throw new Error(`Unsafe user name in policy: ${u}`);
+      return `set -u
+    for u in ${users.join(" ")}; do
+      home=$(getent passwd "$u" | cut -d: -f6)
+      if [ -z "$home" ]; then printf '@@USER\\t%s\\tNOUSER\\n' "$u"; continue; fi
+      f="$home/${akFile}"
+      if [ ! -f "$f" ]; then printf '@@USER\\t%s\\tNOFILE\\n' "$u"; continue; fi
+      printf '@@USER\\t%s\\tOK\\n' "$u"
+    ${backupSuffix ? `  if [ -f "$f.kestra-bak-${backupSuffix}" ]; then printf '@@BAK\\t%s\\tpresent\\n' "$u"; else printf '@@BAK\\t%s\\tmissing\\n' "$u"; fi\n` : ""}  while IFS= read -r line || [ -n "$line" ]; do
+        printf '@@LINE\\t%s\\n' "$(printf '%s' "$line" | base64 | tr -d '\\n')"
+      done < "$f"
+    done
+    `;
+    }
+
+    // -> { users: { name: { status, keys:[parsed], invalid:[line] } }, backups: { name: bool } }
+    function parseReadOutput(stdout) {
+      const users = {};
+      const backups = {};
+      let current = null;
+      for (const row of stdout.split("\n")) {
+        const parts = row.replace(/\r$/, "").split("\t");
+        if (parts[0] === "@@USER") { current = parts[1]; users[current] = { status: parts[2], keys: [], invalid: [] }; }
+        else if (parts[0] === "@@BAK") backups[parts[1]] = parts[2] === "present";
+        else if (parts[0] === "@@LINE" && current) {
+          const line = Buffer.from(parts[1] || "", "base64").toString("utf8");
+          const key = parseKeyLine(line);
+          if (key === null) continue;
+          if (key.invalid) users[current].invalid.push(line); else users[current].keys.push(key);
+        }
+      }
+      return { users, backups };
+    }
+
+    async function readHost(conn, users, akFile, useSudo, backupSuffix) {
+      const res = await sshExec({ ...conn, command: useSudo ? "sudo -n sh -s" : "sh -s", stdin: readScript(users, akFile, backupSuffix) });
+      if (res.code !== 0) throw new Error(`remote read exited ${res.code}: ${res.stderr.trim().slice(0, 200)}`);
+      return parseReadOutput(res.stdout);
+    }
+
+    // Remove exact lines (recorded at scan time) from each user's file after taking a backup next to it.
+    function applyScript(removals, akFile, execId) {
+      if (!AK_FILE_RE.test(akFile)) throw new Error(`Unsafe authorized_keys path: ${akFile}`);
+      if (!/^[A-Za-z0-9_-]+$/.test(execId)) throw new Error("Unsafe execution id");
+      const blocks = removals.map((r) => {
+        if (!USER_RE.test(r.user)) throw new Error(`Unsafe user name: ${r.user}`);
+        const patterns = Buffer.from(r.lines.join("\n") + "\n").toString("base64");
+        return `remove_lines '${r.user}' '${patterns}'`;
+      });
+      return `set -eu
+    remove_lines() {
+      home=$(getent passwd "$1" | cut -d: -f6)
+      f="$home/${akFile}"
+      [ -n "$home" ] && [ -f "$f" ] || { echo "authorized_keys for $1 not found" >&2; return 1; }
+      cp -p "$f" "$f.kestra-bak-${execId}"
+      pat=$(mktemp); tmp=$(mktemp)
+      printf '%s' "$2" | base64 -d > "$pat"
+      grep -vxF -f "$pat" "$f" > "$tmp" || [ $? -eq 1 ]
+      cat "$tmp" > "$f"
+      rm -f "$pat" "$tmp"
+      echo "cleaned $1"
+    }
+    ${blocks.join("\n")}
+    `;
+    }
+
+    module.exports = { fingerprint, parseKeyLine, ownFingerprint, sshExec, readHost, readScript, parseReadOutput, applyScript, USER_RE };
+
+triggers:
+  - id: policy_pushed_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call from a Git push webhook on the policy repository so access changes are enforced right after they merge.
+    key: "{{ secret('SSH_DRIFT_WEBHOOK_KEY') }}"
+
+  - id: periodic_drift_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Catch keys added directly on a host between policy changes. Shipped disabled until policy_repo_url has a default.
+    cron: "10 */4 * * *"
+    disabled: true
+
+tasks:
+  - id: wdir
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone_policy
+        type: io.kestra.plugin.git.Clone
+        description: Fetch the access policy, the source of truth for which keys may exist.
+        url: "{{ inputs.policy_repo_url }}"
+        branch: "{{ inputs.policy_branch }}"
+        directory: policy_repo
+        # username: your-git-user-name # Needed only for private repositories
+        # password: "{{ secret('POLICY_REPO_TOKEN') }}" # Needed only for private repositories
+
+      - id: scan_hosts
+        type: io.kestra.plugin.scripts.node.Script
+        description: Read every authorized_keys over SSH, fingerprint each key, compare with the policy, age out-of-policy keys in the KV ledger and plan the removals.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: node:20-slim
+        beforeCommands:
+          - npm install --no-save --no-audit --no-fund ssh2@1.17.0
+        inputFiles:
+          lib.js: "{{ vars.lib_js }}"
+          ledger.json: "{{ kv(key=render(vars.ledger_key), errorOnMissing=false) | default('{}') }}"
+        env:
+          POLICY_FILE: "policy_repo/{{ inputs.policy_path }}"
+          SSH_USER: "{{ inputs.ssh_user }}"
+          SSH_PORT: "{{ inputs.ssh_port }}"
+          SSH_PRIVATE_KEY: "{{ secret('SSH_PRIVATE_KEY') }}"
+          USE_SUDO: "{{ inputs.use_sudo }}"
+          AUTHORIZED_KEYS_FILE: "{{ inputs.authorized_keys_file }}"
+          GRACE_HOURS: "{{ inputs.grace_hours }}"
+          MAX_REMOVALS_PER_RUN: "{{ inputs.max_removals_per_run }}"
+          MAX_HOST_REMOVAL_PCT: "{{ inputs.max_host_removal_pct }}"
+          MIN_RSA_BITS: "{{ inputs.min_rsa_bits }}"
+          EXECUTION_ID: "{{ execution.id }}"
+          ALLOW_UNPINNED_HOSTS: "{{ inputs.allow_unpinned_hosts }}"
+        outputFiles:
+          - ledger.json
+          - plan.json
+          - expected.json
+          - findings.json
+        script: |
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const lib = require("./lib.js");
+
+          const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+          const num = (key, fallback) => {
+            const value = Number(env(key, fallback));
+            if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid numeric setting ${key}`);
+            return value;
+          };
+          const cfg = {
+            policyFile: env("POLICY_FILE", "policy/access-policy.json"),
+            akFile: env("AUTHORIZED_KEYS_FILE", ".ssh/authorized_keys"),
+            useSudo: env("USE_SUDO", "true") === "true",
+            sshUser: env("SSH_USER", ""),
+            sshPort: num("SSH_PORT", "22"),
+            graceHours: num("GRACE_HOURS", "24"),
+            maxRemovals: num("MAX_REMOVALS_PER_RUN", "20"),
+            maxHostPct: num("MAX_HOST_REMOVAL_PCT", "50"),
+            minRsaBits: num("MIN_RSA_BITS", "2048"),
+            execId: env("EXECUTION_ID", "local").replace(/[^A-Za-z0-9_-]/g, ""),
+            allowUnpinned: env("ALLOW_UNPINNED_HOSTS", "false") === "true",
+          };
+          const privateKey = env("SSH_PRIVATE_KEY", "");
+          const passphrase = env("SSH_PASSPHRASE", "");
+          if (!cfg.sshUser || !privateKey) throw new Error("SSH_USER and SSH_PRIVATE_KEY are required");
+
+          const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
+          function loadPolicy() {
+            const policy = JSON.parse(fs.readFileSync(cfg.policyFile, "utf8"));
+            if (!policy.groups || typeof policy.groups !== "object" || !Object.keys(policy.groups).length) throw new Error("Policy has no groups");
+            const hosts = new Map(); // host -> { users: Map<user, Map<fp, meta>> }
+            let allowedTotal = 0;
+            for (const [name, group] of Object.entries(policy.groups)) {
+              if (!Array.isArray(group.hosts) || !group.hosts.length) throw new Error(`Policy group ${name} has no hosts`);
+              if (!group.users || typeof group.users !== "object" || !Object.keys(group.users).length) throw new Error(`Policy group ${name} has no users`);
+              for (const [user, entries] of Object.entries(group.users)) {
+                if (!lib.USER_RE.test(user)) throw new Error(`Policy group ${name}: unsafe user name ${user}`);
+                if (!Array.isArray(entries)) throw new Error(`Policy group ${name}: user ${user} must list key entries`);
+                if (entries.length === 0 && !(group.allow_no_keys || []).includes(user)) {
+                  throw new Error(`Policy group ${name}: user ${user} lists no keys and is not in allow_no_keys; refusing to treat an empty list as intent`);
+                }
+                for (const e of entries) {
+                  if (!FP_RE.test(e.fingerprint || "")) throw new Error(`Policy group ${name}: invalid fingerprint for ${user}`);
+                  if (e.expires && Number.isNaN(Date.parse(e.expires))) throw new Error(`Policy group ${name}: invalid expires for ${user}`);
+                  allowedTotal++;
+                }
+              }
+              for (const host of group.hosts) {
+                if (!hosts.has(host)) hosts.set(host, { users: new Map() });
+                const h = hosts.get(host);
+                for (const [user, entries] of Object.entries(group.users)) {
+                  if (!h.users.has(user)) h.users.set(user, new Map());
+                  for (const e of entries) h.users.get(user).set(e.fingerprint, { owner: e.owner || "", expires: e.expires || "" });
+                }
+              }
+            }
+            if (allowedTotal === 0) throw new Error("Policy lists no allowed keys at all; refusing to run");
+            const hostKeys = policy.host_keys || {};
+            for (const [host, fp] of Object.entries(hostKeys)) if (!FP_RE.test(fp)) throw new Error(`host_keys: invalid SHA256 fingerprint for ${host}`);
+            const unpinned = [...hosts.keys()].filter((h) => !hostKeys[h]);
+            if (unpinned.length && !cfg.allowUnpinned) throw new Error(`Hosts without a pinned host key in host_keys: ${unpinned.join(", ")}. Add their SHA256 fingerprints (ssh-keyscan -t ed25519 HOST | ssh-keygen -lf -), or set allow_unpinned_hosts for a test.`);
+            return { hosts, hostKeys };
+          }
+
+          const readJson = (file, fallback) => {
+            const text = fs.readFileSync(file, "utf8").trim();
+            return text === "" || text === "null" ? fallback : JSON.parse(text);
+          };
+
+          (async () => {
+            const now = Date.now();
+            const nowIso = new Date(now).toISOString();
+            const policySha = crypto.createHash("sha256").update(fs.readFileSync(cfg.policyFile)).digest("hex");
+            const { hosts, hostKeys } = loadPolicy();
+            const ledger = (readJson("ledger.json", {}) || {}).findings || {};
+            const ownFp = lib.ownFingerprint(privateKey, passphrase);
+
+            const newLedger = {};
+            const findings = [];
+            const unreachable = [];
+            const blockedHosts = [];
+            const planHosts = [];
+            const expected = [];
+            let keysTotal = 0;
+            let unauthorizedTotal = 0;
+            let pendingGrace = 0;
+            const candidates = [];
+            const hostResults = new Map();
+
+            for (const [host, hp] of [...hosts.entries()].sort()) {
+              let result;
+              try {
+                result = await lib.readHost({ host, port: cfg.sshPort, username: cfg.sshUser, privateKey, passphrase, hostFingerprint: hostKeys[host] }, [...hp.users.keys()], cfg.akFile, cfg.useSudo, "");
+              } catch (err) {
+                unreachable.push({ host, error: String(err.message || err).slice(0, 160) });
+                continue;
+              }
+              hostResults.set(host, result);
+              const hostKeysFound = [];
+              for (const [user, allowed] of hp.users) {
+                const info = result.users[user];
+                if (!info || info.status !== "OK") { findings.push({ host, user, kind: "NO_AUTHORIZED_KEYS_FILE", severity: "info", detail: `${user}: ${info ? info.status : "not reported"}` }); continue; }
+                for (const l of info.invalid) findings.push({ host, user, kind: "MALFORMED_LINE", severity: "info", detail: `${user}: unparseable line left untouched` });
+                for (const k of info.keys) {
+                  hostKeysFound.push({ user, key: k });
+                  const meta = allowed.get(k.fp);
+                  const weak = k.type === "ssh-dss" || (k.type === "ssh-rsa" && k.bits < cfg.minRsaBits);
+                  const expired = meta && meta.expires && Date.parse(meta.expires) < now;
+                  if (!meta || expired) {
+                    if (k.fp === ownFp) {
+                      // The connecting key is never a removal candidate, and this is reported even when the host is later blocked.
+                      if (!findings.some((f) => f.kind === "SELF_KEY_NOT_IN_POLICY" && f.host === host && f.user === user)) findings.push({ host, user, kind: "SELF_KEY_NOT_IN_POLICY", severity: "critical", fp: k.fp, detail: `${user}@${host}: the key Kestra connects with is ${meta ? "expired in" : "not in"} the policy; it is protected from removal, fix the policy` });
+                    } else candidates.push({ host, user, key: k, kind: meta ? "EXPIRED_KEY" : "UNAUTHORIZED_KEY", owner: meta ? meta.owner : "" });
+                    continue;
+                  }
+                  if (weak) findings.push({ host, user, kind: "WEAK_KEY", severity: "warning", fp: k.fp, detail: `${user}: allowed key ${k.fp.slice(0, 19)}… (${k.type}${k.bits ? " " + k.bits + " bits" : ""}) is below policy strength; replace it, the guard will not remove an allowed key` });
+                }
+              }
+              keysTotal += hostKeysFound.length;
+              const hostCandidates = candidates.filter((c) => c.host === host);
+              const share = hostKeysFound.length ? (hostCandidates.length * 100) / hostKeysFound.length : 0;
+              if (hostKeysFound.length >= 2 && share > cfg.maxHostPct) {
+                blockedHosts.push({ host, reason: `${hostCandidates.length} of ${hostKeysFound.length} keys (${share.toFixed(0)}%) are out of policy, which looks like a policy error rather than drift` });
+                for (let i = candidates.length - 1; i >= 0; i--) if (candidates[i].host === host) candidates.splice(i, 1);
+              }
+            }
+            if (unreachable.length === hosts.size) throw new Error(`No host was reachable: ${unreachable[0].error}`);
+
+            // Ledger: how long has each out-of-policy key been seen? Expired keys are already decided by the policy owner.
+            const eligible = [];
+            for (const c of candidates) {
+              const id = `${c.host}|${c.user}|${c.key.fp}`;
+              const firstSeen = ledger[id] ? ledger[id].first_seen : nowIso;
+              const aged = now - Date.parse(firstSeen) >= cfg.graceHours * 36e5;
+              const firstLine = !newLedger[id]; // a key repeated on several lines is still one key
+              if (firstLine && c.kind === "UNAUTHORIZED_KEY") unauthorizedTotal++;
+              newLedger[id] = { host: c.host, user: c.user, fp: c.key.fp, kind: c.kind, first_seen: firstSeen };
+              if (c.kind === "EXPIRED_KEY" || aged) eligible.push({ ...c, id, first_seen: firstSeen });
+              else if (firstLine) pendingGrace++;
+            }
+
+            // One removal per (host, user, fingerprint); oldest first and capped per run.
+            const byKey = new Map();
+            for (const e of eligible) {
+              const k = e.id;
+              if (!byKey.has(k)) byKey.set(k, { ...e, lines: [] });
+              byKey.get(k).lines.push(e.key.line);
+            }
+            const ordered = [...byKey.values()].sort((a, b) => (a.kind === b.kind ? Date.parse(a.first_seen) - Date.parse(b.first_seen) : a.kind === "EXPIRED_KEY" ? -1 : 1)).slice(0, cfg.maxRemovals);
+
+            const perHost = new Map();
+            for (const r of ordered) {
+              if (!perHost.has(r.host)) perHost.set(r.host, new Map());
+              const users = perHost.get(r.host);
+              if (!users.has(r.user)) users.set(r.user, { user: r.user, fps: [], lines: [], kinds: [] });
+              const u = users.get(r.user);
+              u.fps.push(r.key.fp); u.lines.push(...r.lines); u.kinds.push(r.kind);
+            }
+            for (const [host, users] of perHost) {
+              const removals = [...users.values()];
+              const script = lib.applyScript(removals.map((r) => ({ user: r.user, lines: r.lines })), cfg.akFile, cfg.execId);
+              planHosts.push({
+                host, port: cfg.sshPort, removal_count: removals.reduce((n, r) => n + r.fps.length, 0),
+                users: removals.map((r) => ({ user: r.user, fingerprints: r.fps, kinds: r.kinds })),
+                script_b64: Buffer.from(script).toString("base64"),
+              });
+            }
+            // Retained keys: everything seen for the planned users that is not being removed; the verify step re-checks that they survive.
+            const retained = {};
+            for (const host of perHost.keys()) {
+              retained[host] = {};
+              for (const [user, info] of Object.entries(hostResults.get(host).users)) {
+                if (!perHost.get(host).has(user)) continue;
+                const removed = new Set(perHost.get(host).get(user).fps);
+                retained[host][user] = [...new Set(info.keys.map((k) => k.fp).filter((fp) => !removed.has(fp)))];
+              }
+            }
+            for (const p of planHosts) expected.push({ host: p.host, port: p.port, host_key: hostKeys[p.host] || "", users: p.users.map((u) => ({ user: u.user, removed: u.fingerprints, retained: retained[p.host][u.user] || [] })) });
+
+            const removalsTotal = planHosts.reduce((n, p) => n + p.removal_count, 0);
+            const lines = [
+              ...planHosts.flatMap((p) => p.users.map((u) => `• ${p.host} / ${u.user}: remove ${u.fingerprints.map((f) => f.slice(0, 19) + "…").join(", ")} (${[...new Set(u.kinds)].join(", ")})`)),
+              ...blockedHosts.map((b) => `• *Blocked* ${b.host}: ${b.reason}`),
+              ...unreachable.map((u) => `• *Unreachable* ${u.host}: ${u.error}`),
+              ...findings.filter((f) => f.severity === "critical" || f.severity === "warning").map((f) => `• [${f.kind}] ${f.detail}`),
+            ];
+            const summary = lines.join("\n");
+
+            fs.writeFileSync("ledger.json", JSON.stringify({ version: 1, findings: newLedger }));
+            fs.writeFileSync("plan.json", JSON.stringify(planHosts));
+            fs.writeFileSync("expected.json", JSON.stringify(expected));
+            fs.writeFileSync("findings.json", JSON.stringify({ findings, unreachable, blockedHosts }));
+
+            const critical = findings.some((f) => f.severity === "critical");
+            console.log("::" + JSON.stringify({ outputs: {
+              hosts_total: hosts.size,
+              hosts_unreachable: unreachable.length,
+              keys_total: keysTotal,
+              unauthorized_total: unauthorizedTotal,
+              pending_grace: pendingGrace,
+              removals_total: removalsTotal,
+              hosts_in_plan: planHosts.length,
+              blocked_hosts: blockedHosts.length,
+              has_ops: planHosts.length > 0,
+              policy_sha: policySha,
+              plan: planHosts,
+              has_attention: planHosts.length > 0 || blockedHosts.length > 0 || unreachable.length > 0 || critical,
+              summary,
+            } }) + "::");
+          })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+  - id: gate_attention
+    type: io.kestra.plugin.core.flow.If
+    description: Only alert when keys are planned for removal, a host was blocked or unreachable, or the connecting key itself is out of policy.
+    condition: "{{ outputs.scan_hosts.vars.has_attention }}"
+    then:
+      - id: notify_plan
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the removal plan and every host that could not be audited.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": ":key: *SSH key policy drift* (execution `" ~ execution.id ~ "`, dry_run=" ~ inputs.dry_run ~ "): " ~ outputs.scan_hosts.vars.removals_total ~ " key(s) planned for removal on " ~ outputs.scan_hosts.vars.hosts_in_plan ~ " host(s), " ~ outputs.scan_hosts.vars.pending_grace ~ " still inside the grace window.",
+            "attachments": [ { "color": "#E2B93B", "text": outputs.scan_hosts.vars.summary } ]
+          } | toJson }}
+
+      - id: gate_ops
+        type: io.kestra.plugin.core.flow.If
+        description: Blocked or unreachable hosts end here; only a concrete removal plan continues.
+        condition: "{{ outputs.scan_hosts.vars.has_ops }}"
+        then:
+          - id: gate_dry_run
+            type: io.kestra.plugin.core.flow.If
+            description: Dry runs stop after reporting so the plan can be reviewed before any file is edited.
+            condition: "{{ inputs.dry_run }}"
+            then:
+              - id: log_dry_run
+                type: io.kestra.plugin.core.log.Log
+                description: Record what a real run would remove.
+                message: "Dry run: {{ outputs.scan_hosts.vars.removals_total }} key(s) would be removed. Set dry_run to false to enable enforcement."
+            else:
+              - id: pause_for_approval
+                type: io.kestra.plugin.core.flow.Pause
+                description: Hold the plan for an operator. Unapproved plans fail after 12 hours and the ledger is not advanced.
+                pauseDuration: PT12H
+                behavior: FAIL
+                onResume:
+                  - id: confirm_count
+                    type: INT
+                    defaults: 0
+                    description: Type the number of keys listed in the Slack plan. A different number aborts the run.
+                  - id: approver_note
+                    type: STRING
+                    defaults: ""
+                    description: Change ticket or reason recorded in the audit entry.
+
+              - id: check_confirmation
+                type: io.kestra.plugin.core.flow.If
+                description: The operator must have read the plan well enough to repeat its size.
+                condition: "{{ (outputs.pause_for_approval.onResume.confirm_count ~ '') != (outputs.scan_hosts.vars.removals_total ~ '') }}"
+                then:
+                  - id: fail_confirmation
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Abort before any authorized_keys file is touched.
+                    errorMessage: "Confirmation mismatch: the plan removes {{ outputs.scan_hosts.vars.removals_total }} key(s) but {{ outputs.pause_for_approval.onResume.confirm_count }} was entered."
+
+              - id: recheck_policy
+                type: io.kestra.plugin.core.flow.WorkingDirectory
+                description: The policy may have changed while the plan waited for approval, for example a key granted to a new engineer. Fetch it again and stop before editing any host if it differs from the policy the plan was built on.
+                tasks:
+                  - id: clone_policy_again
+                    type: io.kestra.plugin.git.Clone
+                    description: Fetch the policy a second time.
+                    url: "{{ inputs.policy_repo_url }}"
+                    branch: "{{ inputs.policy_branch }}"
+                    directory: policy_repo
+                    # username: your-git-user-name # Needed only for private repositories
+                    # password: "{{ secret('POLICY_REPO_TOKEN') }}" # Needed only for private repositories
+
+                  - id: compare_policy
+                    type: io.kestra.plugin.scripts.shell.Commands
+                    description: Compare the checksum of the policy file with the one recorded when the plan was made.
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                    containerImage: alpine:3.20
+                    env:
+                      POLICY_FILE: "policy_repo/{{ inputs.policy_path }}"
+                      PLANNED_SHA: "{{ outputs.scan_hosts.vars.policy_sha }}"
+                    commands:
+                      - |
+                        set -eu
+                        current=$(sha256sum "$POLICY_FILE" | cut -d' ' -f1)
+                        if [ "$current" != "$PLANNED_SHA" ]; then
+                          echo "The policy file changed after the plan was made (planned $PLANNED_SHA, now $current). No host was edited. Run the flow again to plan against the new policy." >&2
+                          exit 1
+                        fi
+                        echo "policy unchanged since the plan ($current)"
+
+              - id: remediate_hosts
+                type: io.kestra.plugin.core.flow.Loop
+                description: Edit one host at a time so a failure stops the rollout instead of spreading.
+                values: "{{ outputs.scan_hosts.vars.plan }}"
+                concurrencyLimit: 1
+                tasks:
+                  - id: remove_keys
+                    type: io.kestra.plugin.fs.ssh.Command
+                    description: Back up each authorized_keys next to the original, then delete exactly the lines recorded at scan time.
+                    host: "{{ item.value.host }}"
+                    port: "{{ item.value.port }}"
+                    authMethod: PUBLIC_KEY
+                    username: "{{ inputs.ssh_user }}"
+                    privateKey: "{{ secret('SSH_PRIVATE_KEY') }}"
+                    commands:
+                      - "echo '{{ item.value.script_b64 }}' | base64 -d | {{ inputs.use_sudo ? 'sudo -n ' : '' }}sh -s"
+
+              - id: verify_removal
+                type: io.kestra.plugin.scripts.node.Script
+                description: Read every touched host again. Removed fingerprints must be gone, retained ones must still be there and each backup must exist.
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                containerImage: node:20-slim
+                beforeCommands:
+                  - npm install --no-save --no-audit --no-fund ssh2@1.17.0
+                inputFiles:
+                  lib.js: "{{ vars.lib_js }}"
+                  expected.json: "{{ outputs.scan_hosts.outputFiles['expected.json'] }}"
+                env:
+                  SSH_USER: "{{ inputs.ssh_user }}"
+                  SSH_PRIVATE_KEY: "{{ secret('SSH_PRIVATE_KEY') }}"
+                  USE_SUDO: "{{ inputs.use_sudo }}"
+                  AUTHORIZED_KEYS_FILE: "{{ inputs.authorized_keys_file }}"
+                  EXECUTION_ID: "{{ execution.id }}"
+                  APPROVER_NOTE: "{{ outputs.pause_for_approval.onResume.approver_note }}"
+                outputFiles:
+                  - audit.json
+                script: |
+                  const fs = require("fs");
+                  const lib = require("./lib.js");
+
+                  const env = (key, fallback) => (process.env[key] !== undefined && process.env[key] !== "" ? process.env[key] : fallback);
+                  const akFile = env("AUTHORIZED_KEYS_FILE", ".ssh/authorized_keys");
+                  const useSudo = env("USE_SUDO", "true") === "true";
+                  const execId = env("EXECUTION_ID", "local").replace(/[^A-Za-z0-9_-]/g, "");
+                  const sshUser = env("SSH_USER", "");
+                  const privateKey = env("SSH_PRIVATE_KEY", "");
+                  const passphrase = env("SSH_PASSPHRASE", "");
+                  if (!sshUser || !privateKey) throw new Error("SSH_USER and SSH_PRIVATE_KEY are required");
+
+                  (async () => {
+                    const expected = JSON.parse(fs.readFileSync("expected.json", "utf8"));
+                    const mismatches = [];
+                    let removedConfirmed = 0;
+                    let retainedConfirmed = 0;
+                    let backupsConfirmed = 0;
+
+                    for (const h of expected) {
+                      let result;
+                      try {
+                        result = await lib.readHost({ host: h.host, port: h.port, username: sshUser, privateKey, passphrase, hostFingerprint: h.host_key || undefined }, h.users.map((u) => u.user), akFile, useSudo, execId);
+                      } catch (err) {
+                        mismatches.push(`${h.host}: cannot re-read after removal (${String(err.message).slice(0, 120)})`);
+                        continue;
+                      }
+                      for (const u of h.users) {
+                        const info = result.users[u.user];
+                        if (!info || info.status !== "OK") { mismatches.push(`${h.host}/${u.user}: authorized_keys is missing after removal`); continue; }
+                        const present = new Set(info.keys.map((k) => k.fp));
+                        for (const fp of u.removed) { if (present.has(fp)) mismatches.push(`${h.host}/${u.user}: ${fp.slice(0, 19)}… is still present`); else removedConfirmed++; }
+                        for (const fp of u.retained) { if (!present.has(fp)) mismatches.push(`${h.host}/${u.user}: retained key ${fp.slice(0, 19)}… disappeared`); else retainedConfirmed++; }
+                        if (result.backups[u.user]) backupsConfirmed++; else mismatches.push(`${h.host}/${u.user}: backup authorized_keys.kestra-bak-${execId} not found`);
+                      }
+                    }
+
+                    const verified = mismatches.length === 0;
+                    const audit = {
+                      executed_at: new Date().toISOString(),
+                      execution_id: process.env.EXECUTION_ID || "",
+                      verified,
+                      hosts_checked: expected.length,
+                      removed_confirmed: removedConfirmed,
+                      retained_confirmed: retainedConfirmed,
+                      backups_confirmed: backupsConfirmed,
+                      approver_note: process.env.APPROVER_NOTE || "",
+                      mismatches,
+                      backup_suffix: `kestra-bak-${execId}`,
+                      expected,
+                    };
+                    fs.writeFileSync("audit.json", JSON.stringify(audit));
+                    console.log("::" + JSON.stringify({ outputs: { verified, removed_confirmed: removedConfirmed, retained_confirmed: retainedConfirmed, backups_confirmed: backupsConfirmed, mismatch_summary: mismatches.slice(0, 10).join("; ") } }) + "::");
+                  })().catch((err) => { console.error(err.stack || String(err)); process.exit(1); });
+
+              - id: check_verification
+                type: io.kestra.plugin.core.flow.If
+                description: A host that does not match the plan is an incident, not a success.
+                condition: "{{ not outputs.verify_removal.vars.verified }}"
+                then:
+                  - id: fail_verification
+                    type: io.kestra.plugin.core.execution.Fail
+                    description: Stop before the ledger is advanced.
+                    errorMessage: "authorized_keys do not match the plan after removal: {{ outputs.verify_removal.vars.mismatch_summary }}"
+
+              - id: record_audit
+                type: io.kestra.plugin.core.kv.Set
+                description: Keep the last verified change set, approver note and backup name for review and rollback.
+                key: "{{ render(vars.audit_key) }}"
+                kvType: JSON
+                value: "{{ read(outputs.verify_removal.outputFiles['audit.json']) }}"
+
+              - id: notify_result
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                description: Confirm the verified result and point to the backups.
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                payload: >-
+                  {{ {
+                    "text": ":white_check_mark: *SSH key policy drift* verified: " ~ outputs.verify_removal.vars.removed_confirmed ~ " key(s) removed, " ~ outputs.verify_removal.vars.retained_confirmed ~ " retained key(s) re-checked, " ~ outputs.verify_removal.vars.backups_confirmed ~ " backup(s) confirmed (authorized_keys.kestra-bak-" ~ execution.id ~ ")."
+                  } | toJson }}
+        else:
+          - id: log_no_removals
+            type: io.kestra.plugin.core.log.Log
+            description: Nothing to remove, but blocked or unreachable hosts need follow-up.
+            message: "No removal planned. {{ outputs.scan_hosts.vars.blocked_hosts }} host(s) blocked, {{ outputs.scan_hosts.vars.hosts_unreachable }} unreachable."
+    else:
+      - id: log_in_policy
+        type: io.kestra.plugin.core.log.Log
+        description: Every audited key is in policy or still inside the grace window.
+        message: "Audited {{ outputs.scan_hosts.vars.keys_total }} key(s) on {{ outputs.scan_hosts.vars.hosts_total }} host(s): no enforcement needed, {{ outputs.scan_hosts.vars.pending_grace }} key(s) inside the grace window."
+
+  - id: persist_ledger
+    type: io.kestra.plugin.core.kv.Set
+    description: Advance the first-seen ledger only after the run finished cleanly, so a rejected or failed run is re-evaluated from the same state.
+    key: "{{ render(vars.ledger_key) }}"
+    kvType: STRING
+    value: "{{ read(outputs.scan_hosts.outputFiles['ledger.json']) }}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Page the channel when the policy is invalid, no host is reachable, approval times out, confirmation is wrong or verification finds a mismatch.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *SSH key policy drift enforcement failed* (execution `" ~ execution.id ~ "`). The ledger was not advanced; check the hosts' authorized_keys backups before the next run."
+      } | toJson }}
+
+extend:
+  title: SSH Authorized Keys Policy Drift Enforcement Gate
+  metaTitle: SSH authorized_keys Drift Enforcement from Git Policy | Kestra
+  shortDescription: Enforces a Git-held SSH key policy across Linux hosts by fingerprint, ages out-of-policy keys in KV, removes them after count-confirmed approval with backups, and verifies every host.
+  metaDescription: Compare authorized_keys on Linux hosts with a Git policy by fingerprint, remove drift after approval with backups, and verify each host over SSH.
+  description: |
+    Keys pile up in authorized_keys: contractors who left, test keys, a laptop key copied "just for today". This blueprint treats a Git-held policy as the truth, ages out-of-policy keys, and removes them safely instead of just alerting.
+
+    ## How it works
+
+    1. A webhook (from a Git push on the policy repo) or a four-hourly schedule starts the flow; `concurrency` allows one run at a time.
+    2. `clone_policy` (`io.kestra.plugin.git.Clone`) fetches the policy: groups of hosts, users and allowed key fingerprints with optional owner and expiry.
+    3. `scan_hosts` connects to each host with `ssh2`, reads every user's authorized_keys and computes OpenSSH SHA256 fingerprints, handling option-prefixed lines.
+    4. A key not in the policy enters a KV ledger with its first-seen time and becomes removable after `grace_hours`; an expired key is removable at once. The key Kestra connects with is never removed, weak allowed keys are only reported, and a host where too many keys look wrong is blocked.
+    5. `pause_for_approval` holds the plan until an operator resumes it and types the number of keys.
+    6. `recheck_policy` clones the policy again and stops if its checksum differs from the one the plan was built on, so a key granted while the plan waited is not removed.
+    7. `remediate_hosts` loops over the hosts with `io.kestra.plugin.fs.ssh.Command`, copying each file to `authorized_keys.kestra-bak-<execution>` and deleting only the recorded lines.
+    8. `verify_removal` reads every host again: removed fingerprints gone, retained ones present, backups exist.
+
+    ## What you get
+
+    - Drift removal with a rollback file on every host instead of an alert nobody acts on.
+    - Protection against lockout, empty policies and policy typos.
+    - A verified audit entry in KV with the approver note.
+
+    ## Who it's for
+
+    - Platform and security teams that manage SSH access to Linux fleets.
+
+    ## Why orchestrate this with Kestra
+
+    The grace ledger needs memory, the removal needs a human decision and the proof needs an independent second read. Git, SSH, KV, `Pause` and `Loop` are one declarative flow.
+
+    ## Prerequisites
+
+    - Linux hosts reachable over SSH with passwordless sudo for the Kestra account, Docker on the worker and a Slack webhook.
+    - The SHA256 host key fingerprint of every policy host in the policy's `host_keys`. The scan and the verification refuse to talk to a host that does not match. The edit step uses the Kestra SSH task, which does not check host keys by default, so the verification read is what proves the result.
+
+    ### Secrets
+
+    - `SSH_PRIVATE_KEY`: unencrypted private key of the Kestra account.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook.
+    - `SSH_DRIFT_WEBHOOK_KEY`: key protecting the webhook trigger.
+
+    ## Quick start
+
+    1. Start a test host with `docker run -d -p 2222:2222 -e PUBLIC_KEY="$(cat kestra.pub)" -e USER_NAME=kestra -e SUDO_ACCESS=true linuxserver/openssh-server`, set `ssh_port` to 2222 and list `host.docker.internal` as the policy host.
+    2. Commit an `access-policy.json` listing the host, the users, their allowed fingerprints (`ssh-keygen -lf key.pub`) and `host_keys` with the host's fingerprint (`ssh-keyscan -t ed25519 HOST | ssh-keygen -lf -`).
+    3. Create the three secrets, add an unlisted key to the host and execute with `dry_run: true`.
+    4. Execute with `dry_run: false` and `grace_hours: 0`, resume the pause with the planned count and check the verified message.
+
+    ## How to extend
+
+    - Restore from `authorized_keys.kestra-bak-<execution>` from a rollback flow.
+
+    ## Links
+
+    - [OpenSSH authorized_keys format](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT)
+    - [Kestra SSH Command](https://kestra.io/plugins/plugin-fs/ssh/io.kestra.plugin.fs.ssh.command)
+    - [Kestra Git Clone](https://kestra.io/plugins/plugin-git/io.kestra.plugin.git.clone)
+    - [Kestra Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+  tags:
+    - Infrastructure
+  subTags:
+    - Approval Gates
+    - Day 2 Operations
+  ee: false
+  demo: false

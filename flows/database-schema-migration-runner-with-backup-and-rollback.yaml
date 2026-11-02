@@ -1,0 +1,701 @@
+id: database-schema-migration-runner-with-backup-and-rollback
+namespace: company.team
+
+description: |
+  Flyway-style versioned migrations for a DuckDB database file kept in internal storage behind a KV pointer:
+  checksum ledger, dry run by default, approval for prod, verified backup, per-migration transactions,
+  rollback by down scripts or backup restore, post-migration assertions and an audit CSV.
+
+inputs:
+  - id: target
+    type: SELECT
+    values: [dev, staging, prod]
+    defaults: dev
+    description: Database to migrate. Each target has its own KV pointer, ledger and backups. prod needs an approval.
+
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: true (default) validates and prints the pending migrations with their SQL and changes nothing.
+
+  - id: migrations
+    type: JSON
+    description: |
+      Ordered migrations, used when `migrations_file` is empty. One object per version: `version` (V001 or 1),
+      `description`, `up` (required) and `down` (optional; without it a failure is undone by restoring the backup).
+      The defaults are sample migrations for a small orders schema.
+    defaults: |
+      [
+        {"version": "V001", "description": "create customers",
+         "up": "CREATE TABLE customers (id INTEGER PRIMARY KEY, email VARCHAR NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT current_timestamp);",
+         "down": "DROP TABLE customers;"},
+        {"version": "V002", "description": "create orders",
+         "up": "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0), status VARCHAR NOT NULL DEFAULT 'new');\nCREATE INDEX orders_customer_idx ON orders (customer_id);",
+         "down": "DROP INDEX orders_customer_idx;\nDROP TABLE orders;"},
+        {"version": "V003", "description": "seed order statuses",
+         "up": "CREATE TABLE order_statuses (code VARCHAR PRIMARY KEY, label VARCHAR NOT NULL);\nINSERT INTO order_statuses VALUES ('new', 'New'), ('paid', 'Paid'), ('shipped', 'Shipped');",
+         "down": "DROP TABLE order_statuses;"}
+      ]
+
+  - id: migrations_file
+    type: FILE
+    required: false
+    description: |
+      Optional bundle of Flyway-named scripts that replaces `migrations`. Each script starts with a header line
+      `-- V001__create_customers.sql`; its down script is `-- U001__create_customers.sql` (Flyway undo naming).
+
+  - id: verify_checks
+    type: JSON
+    description: Assertions run after the migrations. Each `sql` returns one value that must equal `expect`.
+    defaults: |
+      [
+        {"name": "orders table exists", "sql": "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'orders'", "expect": "1"},
+        {"name": "three order statuses", "sql": "SELECT count(*) FROM order_statuses", "expect": "3"},
+        {"name": "no order without a status", "sql": "SELECT count(*) FROM orders WHERE status IS NULL", "expect": "0"}
+      ]
+
+  - id: backup_retention
+    type: DURATION
+    defaults: P14D
+    description: How long the KV entry of the pre-migration backup is kept (KV `ttl`).
+
+variables:
+  kv_prefix: schema_migrations
+
+checks:
+  - when: "{{ (inputs.migrations_file ?? '') != '' or (inputs.migrations | jq('type == \"array\" and length > 0') | first) }}"
+    message: Give at least one migration, as a non-empty JSON array in `migrations` or as a `migrations_file` bundle.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.verify_checks | jq('type == \"array\" and all(.[]; (.sql // \"\") != \"\" and has(\"expect\"))') | first }}"
+    message: verify_checks must be a JSON array of objects with a `sql` and an `expect` value.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+sla:
+  - id: max_runtime
+    type: MAX_DURATION
+    duration: PT6H
+    behavior: FAIL
+    labels:
+      migration_sla: breached
+
+triggers:
+  - id: nightly_prod_drift_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Dry run against prod every night. Fails if an applied migration was edited (checksum drift) and lists pending ones.
+    cron: "0 2 * * *"
+    inputs:
+      target: prod
+      dry_run: true
+
+tasks:
+  - id: prepare
+    type: io.kestra.plugin.core.flow.Dag
+    description: |
+      Reading the input and reading the target are independent, so they run side by side; `plan` waits for both.
+      Nothing here can change the database: tasks without `outputDbFile` work on a temporary copy that is thrown away.
+    concurrent: 3
+    tasks:
+      - task:
+          id: parse_migrations
+          type: io.kestra.plugin.jdbc.duckdb.Queries
+          description: |
+            Parses the inline list or the bundle file, computes a SHA-256 checksum per up script (line endings
+            normalised, so a Windows checkout does not look like drift) and fails with every problem listed at once.
+          url: "jdbc:duckdb:"
+          fetchType: FETCH_ONE
+          timeout: PT2M
+          parameters:
+            inline: "{{ inputs.migrations | toJson }}"
+            bundle: "{{ (inputs.migrations_file ?? '') != '' ? read(inputs.migrations_file) : '' }}"
+            use_file: "{{ (inputs.migrations_file ?? '') != '' }}"
+          sql: |
+            CREATE MACRO clean(s) AS trim(replace(coalesce(s, ''), chr(13), ''), ' ' || chr(9) || chr(10));
+            CREATE TABLE inline_rows AS
+            SELECT i AS ord, a[i] AS m,
+                   trim(coalesce(json_extract_string(a[i], '$.version'), '')) AS label,
+                   trim(coalesce(json_extract_string(a[i], '$.description'), '')) AS description,
+                   coalesce(json_extract_string(a[i], '$.up'), '') AS up_sql,
+                   nullif(clean(json_extract_string(a[i], '$.down')), '') AS down_sql
+            FROM (SELECT from_json(:inline, '["JSON"]') AS a) s, range(1, len(s.a) + 1) t(i)
+            WHERE :use_file = 'false';
+
+            CREATE TABLE lines AS
+            SELECT unnest(arr) AS l, generate_subscripts(arr, 1) AS ln
+            FROM (SELECT string_split(replace(:bundle, chr(13), ''), chr(10)) AS arr)
+            WHERE :use_file = 'true';
+            CREATE MACRO is_header(l) AS regexp_matches(l, '^--\s*[VvUu][0-9]+__[A-Za-z0-9_.-]+\.sql\s*$');
+            CREATE TABLE tagged AS
+            SELECT ln, l, is_header(l) AS hdr, sum(CASE WHEN is_header(l) THEN 1 ELSE 0 END) OVER (ORDER BY ln) AS grp FROM lines;
+            CREATE TABLE parts AS
+            SELECT h.grp, upper(regexp_extract(h.l, '^--\s*([VvUu])', 1)) AS kind,
+                   regexp_extract(h.l, '^--\s*[VvUu]([0-9]+)__', 1) AS digits,
+                   replace(regexp_extract(h.l, '__([A-Za-z0-9_.-]+)\.sql', 1), '_', ' ') AS description,
+                   regexp_extract(h.l, '^--\s*(\S+)', 1) AS file_name,
+                   clean((SELECT string_agg(b.l, chr(10) ORDER BY b.ln) FROM tagged b WHERE b.grp = h.grp AND NOT b.hdr)) AS body
+            FROM tagged h WHERE h.hdr;
+
+            CREATE TABLE candidates AS
+            SELECT ord, label, regexp_extract(label, '^[Vv]?([0-9]+)$', 1) AS digits, description, up_sql, down_sql, json_keys(m) AS keys FROM inline_rows
+            UNION ALL
+            SELECT v.grp, v.file_name, v.digits, v.description, v.body,
+                   (SELECT nullif(any_value(u.body), '') FROM parts u WHERE u.kind = 'U' AND CAST(u.digits AS BIGINT) = CAST(v.digits AS BIGINT)), NULL
+            FROM parts v WHERE v.kind = 'V';
+            CREATE TABLE ranked AS SELECT *, TRY_CAST(nullif(digits, '') AS INTEGER) AS rank FROM candidates;
+
+            CREATE MACRO txn_control(s) AS regexp_matches(coalesce(s, ''), '(?im)^\s*(BEGIN|COMMIT|ROLLBACK|ABORT|END)\b(\s+TRANSACTION)?\s*;');
+            CREATE MACRO escapes_db(s) AS regexp_matches(coalesce(s, ''), '(?im)^\s*(ATTACH|DETACH|USE|EXPORT\s+DATABASE|IMPORT\s+DATABASE)\b');
+            CREATE TABLE problems AS
+            SELECT 0 AS ord, 'the bundle file has no header line such as -- V001__create_customers.sql' AS msg WHERE :use_file = 'true' AND (SELECT count(*) FROM parts) = 0
+            UNION ALL SELECT 0, 'the bundle file has SQL before its first -- V...__name.sql header' WHERE EXISTS (SELECT 1 FROM tagged WHERE grp = 0 AND trim(l) <> '')
+            UNION ALL SELECT ord, 'migration ' || ord || ' has version "' || label || '"; use a whole number such as V001' FROM ranked WHERE coalesce(rank, 0) <= 0
+            UNION ALL SELECT ord, label || ' has an empty up script' FROM ranked WHERE clean(up_sql) = ''
+            UNION ALL SELECT ord, label || ' has an unknown key "' || k || '" (allowed: version, description, up, down)' FROM ranked, unnest(keys) u(k) WHERE k NOT IN ('version', 'description', 'up', 'down')
+            UNION ALL SELECT min(ord), 'version ' || rank || ' is defined ' || count(*) || ' times (' || string_agg(label, ', ') || ')' FROM ranked WHERE rank > 0 GROUP BY rank HAVING count(*) > 1
+            UNION ALL SELECT u.grp, u.file_name || ' is a down script without a matching V' || u.digits || ' up script' FROM parts u WHERE u.kind = 'U' AND NOT EXISTS (SELECT 1 FROM parts v WHERE v.kind = 'V' AND CAST(v.digits AS BIGINT) = CAST(u.digits AS BIGINT))
+            UNION ALL SELECT min(grp), 'version ' || CAST(digits AS BIGINT) || ' has ' || count(*) || ' down scripts' FROM parts WHERE kind = 'U' GROUP BY CAST(digits AS BIGINT) HAVING count(*) > 1
+            UNION ALL SELECT ord, label || ' controls the transaction itself (BEGIN/COMMIT/ROLLBACK); each migration already runs in one transaction' FROM ranked WHERE txn_control(up_sql) OR txn_control(down_sql)
+            UNION ALL SELECT ord, label || ' ends with a comment; end each script with a SQL statement (an empty or comment-only statement fails the run)' FROM ranked WHERE regexp_matches(clean(up_sql), '(--[^'';\n]*|\*/)$') OR regexp_matches(clean(down_sql), '(--[^'';\n]*|\*/)$')
+            UNION ALL SELECT ord, label || ' has an empty statement (;;)' FROM ranked WHERE regexp_matches(up_sql, ';\s*;') OR regexp_matches(coalesce(down_sql, ''), ';\s*;')
+            UNION ALL SELECT ord, label || ' uses ATTACH, DETACH, USE, EXPORT or IMPORT DATABASE, which would act outside the target database' FROM ranked WHERE escapes_db(up_sql) OR escapes_db(down_sql);
+            CREATE TABLE gate AS SELECT CASE WHEN count(*) > 0 THEN error('Invalid migrations, nothing was changed. ' || string_agg(msg, '; ' ORDER BY ord)) END AS ok FROM problems;
+
+            SELECT count(*) AS migration_count,
+                   CASE WHEN :use_file = 'true' THEN 'file' ELSE 'inline' END AS source,
+                   CAST(to_json(list(json_object(
+                     'version', 'V' || printf('%03d', rank), 'rank', rank, 'description', description,
+                     'checksum', sha256(clean(up_sql)),
+                     'up', clean(up_sql),
+                     'up_exec', regexp_replace(clean(up_sql), '[;\s]+$', ''),
+                     'down', nullif(clean(down_sql), ''),
+                     'down_exec', regexp_replace(nullif(clean(down_sql), ''), '[;\s]+$', '')) ORDER BY rank)) AS VARCHAR) AS migrations
+            FROM ranked;
+      - task:
+          id: current_db
+          type: io.kestra.plugin.core.kv.Get
+          description: KV pointer to the target's current database file in internal storage. Missing means a fresh target.
+          key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+          errorOnMissing: false
+      - task:
+          id: last_failure
+          type: io.kestra.plugin.core.kv.Get
+          description: The migration that failed and was rolled back in an earlier run, if any (kept 30 days).
+          key: "{{ vars.kv_prefix }}_{{ inputs.target }}_last_failure"
+          errorOnMissing: false
+      - task:
+          id: read_ledger
+          type: io.kestra.plugin.jdbc.duckdb.Queries
+          description: Reads `schema_history` from a temporary copy of the target. Skipped on a fresh target.
+          runIf: "{{ (outputs.current_db.value ?? '') != '' }}"
+          databaseUri: "{{ outputs.current_db.value ?? '' }}"
+          fetchType: FETCH
+          timeout: PT5M
+          retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+          sql: |
+            CREATE TABLE IF NOT EXISTS schema_history (version_rank INTEGER PRIMARY KEY, version VARCHAR NOT NULL, description VARCHAR,
+              checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL, execution_id VARCHAR NOT NULL, down_script VARCHAR);
+            SELECT version_rank, version, description, checksum, CAST(applied_at AS VARCHAR) AS applied_at, execution_id,
+                   down_script IS NOT NULL AS has_down
+            FROM schema_history ORDER BY version_rank;
+        dependsOn: [current_db]
+      - task:
+          id: plan
+          type: io.kestra.plugin.jdbc.duckdb.Queries
+          description: |
+            Compares the input with the ledger and fails fast, before any backup or change, when an applied migration
+            was edited (checksum drift), is missing from the input, or a new version is older than the applied head.
+          url: "jdbc:duckdb:"
+          fetchType: FETCH_ONE
+          timeout: PT2M
+          parameters:
+            migrations: "{{ outputs.parse_migrations.outputs[0].row.migrations }}"
+            ledger: "{{ (outputs.read_ledger.outputs[0].rows ?? []) | toJson }}"
+            db_key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+            target: "{{ inputs.target }}"
+            execution_id: "{{ execution.id }}"
+          sql: |
+            CREATE TABLE m AS SELECT CAST(json_extract_string(x, '$.rank') AS INTEGER) AS rank, x FROM (SELECT unnest(from_json(:migrations, '["JSON"]')) AS x);
+            CREATE TABLE h AS SELECT CAST(json_extract_string(x, '$.version_rank') AS INTEGER) AS rank, json_extract_string(x, '$.version') AS version,
+                   json_extract_string(x, '$.checksum') AS checksum, json_extract_string(x, '$.applied_at') AS applied_at
+            FROM (SELECT unnest(from_json(:ledger, '["JSON"]')) AS x);
+            CREATE TABLE problems AS
+            SELECT h.rank, h.version || ' was changed after it was applied on ' || :target || ' (' || h.applied_at || ' UTC); ledger checksum ' || left(h.checksum, 12) || ', input ' || left(json_extract_string(m.x, '$.checksum'), 12) || '. Revert the edit and add a new migration instead' AS msg
+            FROM h JOIN m USING (rank) WHERE h.checksum <> json_extract_string(m.x, '$.checksum')
+            UNION ALL SELECT h.rank, h.version || ' is applied on ' || :target || ' but missing from the input' FROM h WHERE rank NOT IN (SELECT rank FROM m)
+            UNION ALL SELECT m.rank, json_extract_string(m.x, '$.version') || ' is new but older than the applied head ' || (SELECT max(version) FROM h) || ' (out of order)'
+            FROM m WHERE rank NOT IN (SELECT rank FROM h) AND rank < (SELECT coalesce(max(rank), 0) FROM h);
+            CREATE TABLE gate AS SELECT CASE WHEN count(*) > 0 THEN error('Ledger validation failed for ' || :target || ', nothing was changed. ' || string_agg(msg, '; ' ORDER BY rank)) END AS ok FROM problems;
+
+            CREATE TABLE pending AS
+            SELECT rank, x, coalesce(lag(rank) OVER (ORDER BY rank), (SELECT coalesce(max(rank), 0) FROM h)) AS expect_rank
+            FROM m WHERE rank NOT IN (SELECT rank FROM h);
+            SELECT (SELECT coalesce(max(rank), 0) FROM h) AS head_rank,
+                   (SELECT coalesce(max(version), 'none') FROM h) AS head_version,
+                   (SELECT count(*) FROM h) AS applied_count,
+                   (SELECT count(*) FROM pending) AS pending_count,
+                   (SELECT coalesce(string_agg(json_extract_string(x, '$.version'), ', ' ORDER BY rank), '') FROM pending) AS pending_versions,
+                   (SELECT coalesce(string_agg(json_extract_string(x, '$.version'), ', ' ORDER BY rank), '') FROM pending WHERE json_extract_string(x, '$.down') IS NULL) AS without_down,
+                   (SELECT coalesce(json_extract_string(arg_max(x, rank), '$.version'), 'none') FROM m) AS target_version,
+                   (SELECT coalesce(CAST(to_json(list(json_merge_patch(x, json_object('expect_rank', expect_rank, 'db_key', :db_key,
+                       'run_execution_id', :execution_id)) ORDER BY rank)) AS VARCHAR), '[]') FROM pending) AS items;
+        dependsOn: [parse_migrations, read_ledger]
+
+  - id: log_plan
+    type: io.kestra.plugin.core.log.Log
+    description: The dry-run report. Also printed before a real run, so the log shows exactly which SQL was applied.
+    message: |
+      {{ inputs.dry_run ? 'DRY RUN' : 'MIGRATE' }} {{ inputs.target }}: head {{ outputs.plan.outputs[0].row.head_version }} ({{ outputs.plan.outputs[0].row.applied_count }} applied), {{ outputs.plan.outputs[0].row.pending_count }} pending{{ outputs.plan.outputs[0].row.pending_count > 0 ? ': ' ~ outputs.plan.outputs[0].row.pending_versions : ', schema is up to date' }}. Source: {{ outputs.parse_migrations.outputs[0].row.source }} ({{ outputs.parse_migrations.outputs[0].row.migration_count }} migrations).{% if outputs.plan.outputs[0].row.without_down != '' %} Without a down script: {{ outputs.plan.outputs[0].row.without_down }} (a failure falls back to the backup).{% endif %}{% if (outputs.last_failure.value ?? '') != '' %} Previous attempt: {{ outputs.last_failure.value.version }} failed on {{ outputs.last_failure.value.at }} and was rolled back ({{ outputs.last_failure.value.method }}).{% endif %}
+      {% for m in fromJson(outputs.plan.outputs[0].row.items) %}
+      -- {{ m.version }} {{ m.description }} (checksum {{ m.checksum | slice(0, 12) }})
+      {{ m.up }}
+      -- down: {{ m.down ?? 'none, backup restore' }}
+      {% endfor %}
+
+  - id: migrate
+    type: io.kestra.plugin.core.flow.If
+    description: Everything that changes the target. Skipped on a dry run and when nothing is pending, so re-runs are no-ops.
+    condition: "{{ not inputs.dry_run and outputs.plan.outputs[0].row.pending_count > 0 }}"
+    then:
+      - id: prod_approval
+        type: io.kestra.plugin.core.flow.If
+        description: Only prod waits for a human. dev and staging continue directly.
+        condition: "{{ inputs.target == 'prod' }}"
+        then:
+          - id: notify_approver
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: allowFailure so a missing Slack secret never blocks the approval itself; the request is also visible in the UI.
+            allowFailure: true
+            timeout: PT30S
+            retry: {type: exponential, interval: PT5S, maxInterval: PT30S, maxAttempts: 3}
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: ":lock: Approve {{ outputs.plan.outputs[0].row.pending_versions }} on prod (head {{ outputs.plan.outputs[0].row.head_version }})? {{ kestra.url ?? 'http://localhost:8080' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+          - id: wait_for_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: "Waits up to 4 hours; without an answer the Pause fails (`behavior: FAIL`) and nothing is changed."
+            pauseDuration: PT4H
+            behavior: FAIL
+            onResume:
+              - id: approve
+                type: BOOL
+                displayName: Apply the pending migrations listed in log_plan to prod?
+                defaults: false
+              - id: reason
+                type: STRING
+                defaults: ""
+          - id: check_decision
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ not (outputs.wait_for_approval.onResume.approve ?? false) }}"
+            then:
+              - id: rejected
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Migration of prod rejected{{ (outputs.wait_for_approval.onResume.reason ?? '') != '' ? ': ' ~ outputs.wait_for_approval.onResume.reason : '' }}. Nothing was changed."
+
+      - id: recheck_pointer
+        type: io.kestra.plugin.core.kv.Get
+        description: Re-reads the pointer after the approval wait (optimistic lock).
+        key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+        errorOnMissing: false
+      - id: target_unchanged
+        type: io.kestra.plugin.core.flow.If
+        description: Hard fail if someone moved the target while this run was planning or waiting; the plan would be stale.
+        condition: "{{ (outputs.recheck_pointer.value ?? '') != (outputs.current_db.value ?? '') }}"
+        then:
+          - id: stale_plan
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "{{ inputs.target }} changed since the plan was made. Nothing was changed; run again to plan against the new state."
+
+      - id: bootstrap
+        type: io.kestra.plugin.core.flow.If
+        description: A fresh target gets an empty database with the ledger table, so the backup and rollback paths are the same as for an existing one.
+        condition: "{{ (outputs.current_db.value ?? '') == '' }}"
+        then:
+          - id: create_database
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            outputDbFile: true
+            timeout: PT5M
+            sql: |
+              CREATE TABLE schema_history (version_rank INTEGER PRIMARY KEY, version VARCHAR NOT NULL, description VARCHAR,
+                checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL, execution_id VARCHAR NOT NULL, down_script VARCHAR);
+          - id: save_new_database
+            type: io.kestra.plugin.core.kv.Set
+            key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+            value: "{{ outputs.create_database.databaseUri }}"
+
+      - id: take_backup
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: |
+          Copies the current database into this execution's storage and proves the copy opens and has a readable ledger
+          before anything is applied. Hard fail: no verified backup, no migration. Safe to retry, it only reads.
+        databaseUri: "{{ outputs.create_database.databaseUri ?? outputs.current_db.value }}"
+        outputDbFile: true
+        fetchType: FETCH_ONE
+        timeout: PT15M
+        retry: {type: exponential, interval: PT10S, maxInterval: PT2M, maxAttempts: 3}
+        sql: |
+          SELECT count(*) AS ledger_rows, coalesce(max(version_rank), 0) AS head_rank,
+                 (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()) AS tables
+          FROM schema_history;
+      - id: register_backup
+        type: io.kestra.plugin.core.kv.Set
+        description: Timestamped backup entry; the KV `ttl` expires it after `backup_retention`.
+        key: "{{ vars.kv_prefix }}_{{ inputs.target }}_backup_{{ execution.startDate | date('yyyyMMdd-HHmmss', timeZone='UTC') }}"
+        kvType: JSON
+        ttl: "{{ inputs.backup_retention }}"
+        value: |
+          {{ {'uri': outputs.take_backup.databaseUri, 'head': outputs.plan.outputs[0].row.head_version, 'tables': outputs.take_backup.outputs[0].row.tables, 'execution_id': execution.id} | toJson }}
+
+      - id: apply_migrations
+        type: io.kestra.plugin.core.flow.Loop
+        description: |
+          One migration per iteration, strictly in order (`concurrencyLimit: 1`). `transmitFailed: true` stops the
+          remaining iterations at the first failure, and `allowFailure: true` lets the flow continue to the rollback
+          instead of jumping straight to `errors`.
+        values: "{{ outputs.plan.outputs[0].row.items }}"
+        concurrencyLimit: 1
+        transmitFailed: true
+        allowFailure: true
+        tasks:
+          - id: live_db
+            type: io.kestra.plugin.core.kv.Get
+            key: "{{ fromJson(item.value).db_key }}"
+            errorOnMissing: true
+          - id: apply_migration
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: |
+              The up script and its ledger row in one transaction. The first statement checks that the ledger head is
+              the version this migration expects, so it can never apply on top of a gap. No retry: a failing migration
+              fails the same way again, and the rollback below is the right answer.
+            databaseUri: "{{ outputs.live_db.value }}"
+            outputDbFile: true
+            transaction: true
+            timeout: PT30M
+            sql: |
+              {% set m = fromJson(item.value) %}
+              SET TimeZone = 'UTC';
+              SELECT CASE WHEN coalesce((SELECT max(version_rank) FROM schema_history), 0) <> {{ m.expect_rank }}
+                THEN error('{{ m.version }} expects the ledger head at rank {{ m.expect_rank }}, refusing to apply') END AS head_guard;
+              {{ m.up_exec }};
+              INSERT INTO schema_history VALUES ({{ m.rank }}, '{{ m.version }}', '{{ m.description | replace({"'": "''"}) }}', '{{ m.checksum }}',
+                CAST(now() AS TIMESTAMP), '{{ m.run_execution_id }}', {{ (m.down ?? '') == '' ? 'NULL' : "'" ~ (m.down | replace({"'": "''"})) ~ "'" }});
+          - id: advance_pointer
+            type: io.kestra.plugin.core.kv.Set
+            description: The migration becomes live only here, by moving the pointer to the new file.
+            key: "{{ fromJson(item.value).db_key }}"
+            value: "{{ outputs.apply_migration.databaseUri }}"
+          - id: confirm_pointer
+            type: io.kestra.plugin.core.kv.Get
+            description: Reads the pointer back, so `applied` is only true when the new file is really live.
+            key: "{{ fromJson(item.value).db_key }}"
+        outputs:
+          - id: row
+            type: JSON
+            value: |
+              {{ {'version': fromJson(item.value).version, 'rank': fromJson(item.value).rank, 'applied': outputs.apply_migration.databaseUri is defined and (outputs.confirm_pointer.value ?? '') == outputs.apply_migration.databaseUri, 'item': fromJson(item.value)} | toJson }}
+
+      - id: recheck_live
+        type: io.kestra.plugin.core.kv.Get
+        description: The pointer after the Loop, i.e. the last migration that really went live.
+        key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+        errorOnMissing: true
+
+      - id: verify_schema
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: |
+          Post-migration assertions on a copy of the new state: ledger head, then every `verify_checks` entry. allowFailure:
+          a check query that errors counts as a failed check and triggers the rollback, it does not stop the flow.
+        runIf: "{{ (outputs.apply_migrations.outputs ?? []) | jq('all(.[]; .outputs.row.applied)') | first }}"
+        allowFailure: true
+        databaseUri: "{{ outputs.recheck_live.value ?? '' }}"
+        fetchType: FETCH
+        timeout: PT10M
+        sql: |
+          SELECT name, actual, expected, actual IS NOT DISTINCT FROM expected AS ok FROM (
+            SELECT 0 AS pos, 'ledger head is {{ outputs.plan.outputs[0].row.target_version }}' AS name, CAST((SELECT max(version) FROM schema_history) AS VARCHAR) AS actual, '{{ outputs.plan.outputs[0].row.target_version }}' AS expected
+            {% for c in inputs.verify_checks %}
+            UNION ALL SELECT {{ loop.index + 1 }}, '{{ (c.name ?? ('check ' ~ (loop.index + 1))) | replace({"'": "''"}) }}', CAST(({{ c.sql }}) AS VARCHAR), '{{ (c.expect ~ '') | replace({"'": "''"}) }}'
+            {% endfor %}
+          ) ORDER BY pos;
+
+      - id: verdict
+        type: io.kestra.plugin.core.output.OutputValues
+        description: What was applied in this run, what failed, and whether a rollback is needed.
+        values:
+          applied_items: "{{ (outputs.apply_migrations.outputs ?? []) | jq('[sort_by(.item.iteration)[] | .outputs.row | select(.applied) | .item]') | first | toJson }}"
+          failed: "{{ (outputs.apply_migrations.outputs ?? []) | jq('[sort_by(.item.iteration)[] | .outputs.row | select(.applied | not) | {version}] | first // {}') | first | toJson }}"
+          failed_checks: "{{ outputs.verify_schema.outputs is defined ? (outputs.verify_schema.outputs[0].rows | jq('[.[] | select(.ok | not) | .name + \" (got \" + (.actual // \"NULL\") + \", expected \" + .expected + \")\"]') | first | join('; ')) : (((outputs.apply_migrations.outputs ?? []) | jq('all(.[]; .outputs.row.applied)') | first) ? 'the verification query failed, see verify_schema' : '') }}"
+          all_have_down: "{{ (outputs.apply_migrations.outputs ?? []) | jq('all(.[] | .outputs.row | select(.applied); .item.down != null)') | first }}"
+
+      - id: log_verification
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          Applied in this run: {{ fromJson(outputs.verdict.values.applied_items) | jq('[.[].version]') | first | join(', ') }}{{ fromJson(outputs.verdict.values.failed).version is defined ? '; failed: ' ~ fromJson(outputs.verdict.values.failed).version : '' }}.
+          {% for c in (outputs.verify_schema.outputs[0].rows ?? []) %}{{ c.ok ? 'PASS' : 'FAIL' }} {{ c.name }}: got {{ c.actual ?? 'NULL' }}, expected {{ c.expected }}
+          {% endfor %}
+
+      - id: rollback
+        type: io.kestra.plugin.core.flow.If
+        description: A failed migration or a failed check puts the target back where this run found it, then fails the run.
+        condition: "{{ fromJson(outputs.verdict.values.failed).version is defined or outputs.verdict.values.failed_checks != '' }}"
+        then:
+          - id: undo_with_down_scripts
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (fromJson(outputs.verdict.values.applied_items) | length) > 0 and (outputs.verdict.values.all_have_down ~ '') == 'true' }}"
+            then:
+              - id: run_down_scripts
+                type: io.kestra.plugin.jdbc.duckdb.Queries
+                description: |
+                  Down scripts of this run's migrations, newest first, plus their ledger rows, in ONE transaction. It
+                  must end at the pre-run head. allowFailure: if any down script fails, the backup restore takes over.
+                allowFailure: true
+                databaseUri: "{{ outputs.recheck_live.value }}"
+                outputDbFile: true
+                transaction: true
+                timeout: PT30M
+                sql: |
+                  {% for m in fromJson(outputs.verdict.values.applied_items) | reverse %}
+                  {{ m.down_exec }};
+                  DELETE FROM schema_history WHERE version_rank = {{ m.rank }};
+                  {% endfor %}
+                  SELECT CASE WHEN coalesce((SELECT max(version_rank) FROM schema_history), 0) <> {{ outputs.plan.outputs[0].row.head_rank }}
+                    THEN error('down scripts did not return the ledger to rank {{ outputs.plan.outputs[0].row.head_rank }}') END AS head_guard;
+              - id: save_down_result
+                type: io.kestra.plugin.core.kv.Set
+                runIf: "{{ outputs.run_down_scripts.databaseUri is defined }}"
+                key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+                value: "{{ outputs.run_down_scripts.databaseUri ?? '' }}"
+          - id: restore_backup
+            type: io.kestra.plugin.core.kv.Set
+            description: Fallback when a down script is missing or failed. Points the target back at the verified backup copy.
+            runIf: "{{ (fromJson(outputs.verdict.values.applied_items) | length) > 0 and outputs.run_down_scripts.databaseUri is not defined }}"
+            key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+            value: "{{ outputs.take_backup.databaseUri }}"
+          - id: recheck_after_rollback
+            type: io.kestra.plugin.core.kv.Get
+            key: "{{ vars.kv_prefix }}_{{ inputs.target }}_db"
+          - id: inspect_rollback
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: Reads the live target after the rollback (read-only copy) for the assertion below.
+            databaseUri: "{{ outputs.recheck_after_rollback.value }}"
+            fetchType: FETCH_ONE
+            timeout: PT10M
+            retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+            sql: |
+              SELECT coalesce(max(version_rank), 0) AS head_rank,
+                     (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()) AS tables
+              FROM schema_history;
+          - id: assert_rollback
+            type: io.kestra.plugin.core.execution.Assert
+            description: Hard invariant. If the rolled-back target does not match the backup, `errors` raises a manual-intervention alert.
+            conditions:
+              - "{{ outputs.inspect_rollback.outputs[0].row.head_rank == outputs.take_backup.outputs[0].row.head_rank }}"
+              - "{{ outputs.inspect_rollback.outputs[0].row.tables == outputs.take_backup.outputs[0].row.tables }}"
+            errorMessage: "ROLLBACK NOT VERIFIED on {{ inputs.target }}: expected head rank {{ outputs.take_backup.outputs[0].row.head_rank }} and tables {{ outputs.take_backup.outputs[0].row.tables }}. Manual intervention needed; backup at {{ outputs.take_backup.databaseUri }}"
+          - id: remember_failure
+            type: io.kestra.plugin.core.kv.Set
+            description: Kept 30 days so the next run (and the nightly dry run) reports what failed last time.
+            key: "{{ vars.kv_prefix }}_{{ inputs.target }}_last_failure"
+            kvType: JSON
+            ttl: P30D
+            value: |
+              {{ {'version': fromJson(outputs.verdict.values.failed).version ?? 'verification', 'checks': outputs.verdict.values.failed_checks, 'at': execution.startDate, 'execution_id': execution.id,
+                  'method': (fromJson(outputs.verdict.values.applied_items) | length) == 0 ? 'nothing to undo' : (outputs.run_down_scripts.databaseUri is defined ? 'down scripts' : 'backup restore')} | toJson }}
+          - id: report_rollback
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: >-
+              {{ fromJson(outputs.verdict.values.failed).version is defined ? fromJson(outputs.verdict.values.failed).version ~ ' failed. ' ~ (errorLogs() | jq('[.[] | select(.taskId == "apply_migrations") | .message] | first // ""') | first) : 'Verification failed: ' ~ outputs.verdict.values.failed_checks }}.
+              {{ (fromJson(outputs.verdict.values.applied_items) | length) == 0 ? 'Nothing had been applied in this run.' : ('Rolled back ' ~ (fromJson(outputs.verdict.values.applied_items) | jq('[.[].version] | reverse') | first | join(', ')) ~ (outputs.run_down_scripts.databaseUri is defined ? ' with down scripts.' : ((outputs.verdict.values.all_have_down ~ '') == 'true' ? ' by restoring the backup, because a down script failed.' : ' by restoring the backup, because a down script is missing.'))) }}
+              {{ inputs.target }} is back at {{ outputs.plan.outputs[0].row.head_version }}.
+
+      - id: clear_failure
+        type: io.kestra.plugin.core.kv.Delete
+        description: Reached only when everything applied and verified, so the failure note from an earlier run is removed.
+        key: "{{ vars.kv_prefix }}_{{ inputs.target }}_last_failure"
+        errorOnMissing: false
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Migration run on {{ inputs.target }} failed in task {{ ((errorLogs() | length) > 0 and ((errorLogs() | last).taskId ?? '') != '') ? (errorLogs() | last).taskId : 'none' }}: {{ (errorLogs() | length) > 0 ? (errorLogs() | last).message : 'no task error was logged (expired approval or SLA breach)' }} {{ kestra.url ?? 'http://localhost:8080' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: allowFailure so a missing `SLACK_WEBHOOK_URL` does not hide the original error; the same text is in the ERROR log above.
+    allowFailure: true
+    timeout: PT30S
+    retry: {type: exponential, interval: PT5S, maxInterval: PT30S, maxAttempts: 3}
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":rotating_light: Schema migration on `{{ inputs.target }}` failed in `{{ ((errorLogs() | length) > 0 and ((errorLogs() | last).taskId ?? '') != '') ? (errorLogs() | last).taskId : 'none' }}`: {{ (errorLogs() | length) > 0 ? (errorLogs() | last).message : 'no task error was logged (expired approval or SLA breach)' }} {{ kestra.url ?? 'http://localhost:8080' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+finally:
+  - id: write_audit
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Always runs (success, dry run, drift, rejection, rollback) and writes one audit row per migration.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT5M
+    outputFiles:
+      - audit_csv
+    parameters:
+      migrations: "{{ outputs.parse_migrations.outputs[0].row.migrations ?? '[]' }}"
+      ledger: "{{ (outputs.read_ledger.outputs[0].rows ?? []) | toJson }}"
+      planned: "{{ outputs.plan.outputs[0].row.items ?? '[]' }}"
+      applied: "{{ outputs.verdict.values.applied_items ?? '[]' }}"
+      failed: "{{ (fromJson(outputs.verdict.values.failed ?? '{}').version ?? '') }}"
+      rolled_back: "{{ outputs.inspect_rollback is defined }}"
+      method: "{{ outputs.run_down_scripts.databaseUri is defined ? 'down_script' : 'backup_restore' }}"
+      mode: "{{ inputs.dry_run ? 'dry_run' : ((outputs.wait_for_approval.onResume is defined and not outputs.wait_for_approval.onResume.approve) ? 'rejected' : 'apply') }}"
+      target: "{{ inputs.target }}"
+      execution_id: "{{ execution.id }}"
+      backup: "{{ outputs.take_backup.databaseUri ?? '' }}"
+    sql: |
+      CREATE TABLE m AS SELECT CAST(json_extract_string(x, '$.rank') AS INTEGER) AS rank, json_extract_string(x, '$.version') AS version,
+             json_extract_string(x, '$.description') AS description, json_extract_string(x, '$.checksum') AS checksum
+      FROM (SELECT unnest(from_json(:migrations, '["JSON"]')) AS x);
+      CREATE TABLE h AS SELECT CAST(json_extract_string(x, '$.version_rank') AS INTEGER) AS rank, json_extract_string(x, '$.checksum') AS checksum,
+             json_extract_string(x, '$.applied_at') AS applied_at, json_extract_string(x, '$.execution_id') AS applied_by_execution
+      FROM (SELECT unnest(from_json(:ledger, '["JSON"]')) AS x);
+      CREATE TABLE p AS SELECT CAST(json_extract_string(x, '$.rank') AS INTEGER) AS rank FROM (SELECT unnest(from_json(:planned, '["JSON"]')) AS x);
+      CREATE TABLE a AS SELECT CAST(json_extract_string(x, '$.rank') AS INTEGER) AS rank FROM (SELECT unnest(from_json(:applied, '["JSON"]')) AS x);
+      CREATE TABLE audit AS
+      SELECT :execution_id AS run_execution_id, :target AS target, :mode AS run_mode, m.version, m.description, m.checksum,
+             CASE WHEN h.checksum IS NOT NULL AND h.checksum <> m.checksum THEN 'checksum_drift'
+                  WHEN h.rank IS NOT NULL THEN 'already_applied'
+                  WHEN m.rank NOT IN (SELECT rank FROM p) THEN 'not_planned'
+                  WHEN :mode = 'dry_run' THEN 'would_apply'
+                  WHEN :mode = 'rejected' THEN 'rejected'
+                  WHEN m.version = :failed THEN 'failed'
+                  WHEN m.rank IN (SELECT rank FROM a) AND CAST(:rolled_back AS BOOLEAN) THEN 'rolled_back_' || :method
+                  WHEN m.rank IN (SELECT rank FROM a) THEN 'applied'
+                  ELSE 'not_run' END AS status,
+             h.applied_at, h.applied_by_execution, nullif(:backup, '') AS backup_uri
+      FROM m LEFT JOIN h USING (rank) ORDER BY m.rank;
+      COPY audit TO '{{ outputFiles.audit_csv }}' (HEADER, DELIMITER ',');
+      SELECT :target AS target, :mode AS run_mode, count(*) AS migrations,
+             count(*) FILTER (WHERE status = 'already_applied') AS already_applied,
+             count(*) FILTER (WHERE status IN ('applied', 'would_apply')) AS applied_or_would_apply,
+             count(*) FILTER (WHERE status LIKE 'rolled_back%') AS rolled_back,
+             coalesce(string_agg(version, ',') FILTER (WHERE status = 'failed'), '') AS failed,
+             coalesce(string_agg(version, ',') FILTER (WHERE status = 'checksum_drift'), '') AS drift,
+             count(*) FILTER (WHERE status IN ('not_run', 'rejected')) AS not_run
+      FROM audit;
+  - id: log_audit
+    type: io.kestra.plugin.core.log.Log
+    message: "Audit: {{ (outputs.write_audit.outputs[0].row ?? {}) | toJson }} {{ outputs.write_audit.outputFiles.audit_csv ?? '' }}"
+
+afterExecution:
+  - id: notify_outcome
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: |
+      Runs once the final state is known. On 2.0.5 an SLA breach fails the run at once and skips `finally`, so this is
+      where it is reported. Skipped for ordinary failures, which `errors` already reported.
+    runIf: "{{ execution.state != 'FAILED' or (labels.migration_sla ?? '') == 'breached' }}"
+    allowFailure: true
+    timeout: PT30S
+    retry: {type: exponential, interval: PT5S, maxInterval: PT30S, maxAttempts: 3}
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "Schema migration {{ inputs.dry_run ? 'dry run' : 'run' }} on `{{ inputs.target }}` ended {{ execution.state }}{{ (labels.migration_sla ?? '') == 'breached' ? ' because the 6-hour SLA was breached; check the ledger before re-running' : '' }}. Audit: {{ (outputs.write_audit.outputs[0].row ?? {}) | toJson }} {{ kestra.url ?? 'http://localhost:8080' }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+outputs:
+  - id: audit_csv
+    type: FILE
+    value: "{{ outputs.write_audit.outputFiles.audit_csv }}"
+  - id: summary
+    type: JSON
+    value: "{{ outputs.write_audit.outputs[0].row }}"
+
+extend:
+  title: Versioned database schema migrations with checksum ledger, backup and automatic rollback
+  metaTitle: Flyway-Style Schema Migrations with Backup and Rollback | Kestra
+  shortDescription: Apply versioned up/down SQL migrations to a DuckDB database with a checksum ledger, dry run, prod approval, verified backup, rollback by down scripts or backup restore, post-migration assertions and an audit CSV.
+  metaDescription: Flyway-style schema migrations in Kestra with checksum drift detection, dry run, prod approval, verified backup, automatic rollback and an audit CSV.
+  description: |
+    Schema changes are the deployment step that hurts most when it goes wrong: a script edited after it ran on prod, a migration that fails halfway, a rollback nobody has rehearsed. This flow is a small, self-contained migration runner in the style of Flyway. It keeps a `schema_history` ledger inside the database, refuses to run when an applied script was edited, shows the SQL before anything changes, asks for approval on prod, takes a verified backup, applies each migration in its own transaction and, when something fails, puts the database back where it found it.
+
+    The target is a real DuckDB database file kept in Kestra internal storage, with one KV pointer per target (`dev`, `staging`, `prod`). The default migrations are sample data for a small orders schema; replace them with your own.
+
+    ## How it works
+
+    1. `checks` block the execution before it exists when no migration or no valid `verify_checks` list is given. The default run is a dry run.
+    2. `prepare` is a `Dag`: `parse_migrations` (inline JSON or a bundle of Flyway-named `V001__name.sql` / `U001__name.sql` scripts) runs while `current_db` and `read_ledger` read the target; `plan` waits for both. Parsing reports every problem at once: duplicate versions, down scripts without an up script, empty scripts, `BEGIN`/`COMMIT` inside a script, `ATTACH`, scripts that end with a comment.
+    3. `plan` fails fast, before any backup, when an applied migration's SHA-256 checksum changed, when an applied version is missing from the input, or when a new version is older than the head (out of order). Line endings are normalised, so a Windows checkout is not drift.
+    4. `log_plan` prints the pending versions with their up and down SQL. A dry run stops here.
+    5. On `prod`, `wait_for_approval` pauses (4 hours, `behavior: FAIL`) with an approve flag and a reason. A rejection ends the run with nothing changed. `target_unchanged` then checks that the pointer did not move while waiting.
+    6. `take_backup` copies the database and proves the copy opens and has a readable ledger; `register_backup` stores it under a timestamped KV key with `ttl: backup_retention`.
+    7. `apply_migrations` (Loop, one at a time) runs the up script and its ledger row in one transaction. A guard statement refuses to apply on top of an unexpected head. Only after the commit does `advance_pointer` move the KV pointer.
+    8. `verify_schema` runs your assertions plus a ledger-head check. A failed migration or a failed assertion triggers `rollback`: all down scripts of this run, newest first, in one transaction; if a down script is missing or fails, the pointer goes back to the backup. `assert_rollback` proves the result matches the backup, then the run fails with a clear message.
+    9. `finally` writes the audit CSV, `errors` alerts with the failed task and an execution link, and `afterExecution` reports the outcome, including SLA breaches.
+
+    ## The safety model
+
+    Tasks without `outputDbFile` read a throwaway copy, so they cannot change the target. A change exists only once its transaction committed and the pointer moved. That makes a killed run safe: run it again and the ledger continues where it stopped.
+
+    ## What this blueprint teaches
+
+    - **`Dag`** (`prepare`): explicit dependencies instead of a fixed order; input parsing and ledger reading run side by side.
+    - **Flow `checks`** (`checks`): reject an empty migration list before an execution is created.
+    - **KV `ttl`** (`register_backup`, `remember_failure`): backup entries expire after `backup_retention`; the last failure is kept 30 days and shown by the next run.
+    - **`finally`** (`write_audit`): the audit CSV is written after success, dry run, drift, rejection or rollback.
+    - **`sla` + `afterExecution`** (`max_runtime`, `notify_outcome`): on 2.0.5 an SLA breach fails the run at once and skips `finally`; `afterExecution` still reports it (label `migration_sla: breached`).
+    - **`concurrency`** (`limit: 1`, `FAIL`): a single writer; a second run fails at once instead of queueing behind an approval.
+    - **Loop `transmitFailed: true` + `allowFailure: true`** (`apply_migrations`): stop at the first failure but continue to the rollback instead of jumping to `errors`. Migrations are ordered, so per-item isolation is deliberately not used.
+    - **`Assert`** (`assert_rollback`): a hard invariant; if the rollback cannot be proven, `errors` asks for manual intervention.
+
+    ## DuckDB, SQLite and Postgres
+
+    The SQLite plugin offers the same pattern: swap `io.kestra.plugin.jdbc.duckdb.Queries` with `databaseUri` for `io.kestra.plugin.jdbc.sqlite.Queries` with `sqliteFile`. For Postgres, drop the pointer and `outputDbFile`, use `io.kestra.plugin.jdbc.postgresql.Queries` with a JDBC URL from secrets, back up with `pg_dump` in a script task and restore with `pg_restore`. The ledger, checksums, plan, approval, per-migration transactions, down scripts and checks work unchanged, because Postgres DDL is transactional (except `CREATE INDEX CONCURRENTLY`, which needs its own non-transactional step).
+
+    ## What you get
+
+    - A `schema_history` ledger: version, checksum, applied_at, execution id and the down script.
+    - Fail-fast checksum drift detection, and a nightly prod dry run.
+    - Rollback by down scripts, or a backup restore when one is missing or fails.
+    - An audit CSV (`audit_csv`) with one row and status per migration, and a `summary` output.
+
+    ## Who it's for
+
+    - Platform and data engineers who own an embedded or analytics database.
+    - Teams that want reviewed, approved schema changes without a separate migration server.
+
+    ## Why orchestrate this with Kestra
+
+    Approvals, backups, retries, timeouts, alerts and the audit are declared next to the SQL, and every run is its own audit trail.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the DuckDB and Slack plugins. No external database is needed.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: approval requests, failure alerts and outcomes (optional; everything is also in the logs).
+
+    ## Quick start
+
+    1. Execute with the defaults: a dry run on `dev` that lists V001 to V003 and their SQL.
+    2. Run again with `dry_run: false`, then once more to see the no-op.
+    3. Add a V004 to `migrations`, or upload a bundle in `migrations_file`, and run on `prod` to try the approval.
+
+    ## How to extend
+
+    - Keep the bundle in Git and sync it as a namespace file.
+    - Add data checks to `verify_checks`, such as row counts that must hold.
+    - Copy the audit CSV to object storage or your change-management tool.
+
+    ## Links
+
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries), [SQLite Queries](https://kestra.io/plugins/plugin-jdbc-sqlite/io.kestra.plugin.jdbc.sqlite.queries)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop), [Dag](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.dag), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause), [Assert](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.assert)
+    - [Flyway versioned and undo migrations](https://documentation.red-gate.com/flyway/flyway-concepts/migrations)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Testing & Quality
+    - Approval Gates
+  ee: false
+  demo: false

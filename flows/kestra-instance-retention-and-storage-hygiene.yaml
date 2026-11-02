@@ -1,0 +1,698 @@
+id: kestra-instance-retention-and-storage-hygiene
+namespace: company.team
+
+description: |
+  Per-namespace retention for executions, logs, DEBUG logs, expired KV and orphaned files of this Kestra instance.
+  Every run counts first through the Kestra API; deleting needs `dry_run: false` and, above a threshold, an approval.
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: true (default) only counts and reports what would be deleted. false deletes, irreversibly.
+
+  - id: retention_rules
+    type: JSON
+    description: |
+      One rule per namespace. `namespace` also covers its child namespaces (company.team covers company.team.etl).
+      `executions_keep_days` and `logs_keep_days` are required; `logs_keep_days` cannot exceed `executions_keep_days`.
+      Optional: `debug_logs_keep_days` (shorter window for TRACE and DEBUG logs), `purge_states` (execution states
+      to purge, default every terminal state), `purge_expired_kv` (default true), `sweep_orphan_files` (default false).
+    defaults: |
+      [
+        {"namespace": "company.prod", "executions_keep_days": 90, "logs_keep_days": 30, "debug_logs_keep_days": 3,
+         "purge_states": ["SUCCESS", "WARNING", "SKIPPED", "RETRIED", "RESUBMITTED"], "purge_expired_kv": true},
+        {"namespace": "company.team", "executions_keep_days": 30, "logs_keep_days": 14, "debug_logs_keep_days": 2},
+        {"namespace": "company.dev", "executions_keep_days": 7, "logs_keep_days": 7, "sweep_orphan_files": true}
+      ]
+
+  - id: approval_threshold
+    type: INT
+    defaults: 5000
+    min: 0
+    description: A real purge that would delete more executions and log lines than this waits for an approval.
+
+  - id: mode
+    type: SELECT
+    values: [all, replay]
+    defaults: all
+    description: replay only processes the namespaces that failed in a previous run (stored in KV for 40 days).
+
+  - id: kestra_api_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of this Kestra instance's API, as seen from the worker.
+
+variables:
+  tenant: main
+  state_key: kestra_retention
+  terminal_states: ["SUCCESS", "WARNING", "FAILED", "KILLED", "CANCELLED", "SKIPPED", "RETRIED", "RESUBMITTED"]
+
+checks:
+  - when: "{{ inputs.retention_rules | jq('type == \"array\" and length > 0') | first }}"
+    message: retention_rules must be a non-empty JSON array of rules.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ inputs.dry_run or (inputs.retention_rules | jq('[.[] | select((.namespace // \"\") | tostring | test(\"^ *$\"))] | length == 0') | first) }}"
+    message: Refusing a real purge with an empty namespace scope. PurgeLogs and PurgeExecutions treat a missing namespace as every namespace of the instance.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+sla:
+  - id: max_runtime
+    type: MAX_DURATION
+    duration: PT12H
+    behavior: FAIL
+    labels:
+      retention_sla: breached
+
+triggers:
+  - id: monthly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 3 1 * *"
+    description: First day of the month at 03:00. Runs with the defaults, so a dry-run report, until you set `dry_run` to false here.
+
+tasks:
+  - id: failed_last_run
+    type: io.kestra.plugin.core.kv.Get
+    description: Namespaces that failed in an earlier run (dead-letter list), read by `mode = replay`.
+    key: "{{ vars.state_key }}_failed_namespaces"
+    errorOnMissing: false
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Validates every rule and refuses the whole run if any rule is wrong, listing every problem at once (hard fail:
+      a typo in a retention rule must never turn into a wider purge). Computes the cutoffs from one anchor, the scheduled date or the execution start,
+      so the counts, the approval and the purge all use the same dates.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT2M
+    parameters:
+      rules: "{{ inputs.retention_rules | toJson }}"
+      failed: "{{ (outputs.failed_last_run.value ?? []) | toJson }}"
+      terminal: "{{ vars.terminal_states | toJson }}"
+      mode: "{{ inputs.mode }}"
+      dry_run: "{{ inputs.dry_run }}"
+      anchor: "{{ trigger.date ?? execution.startDate }}"
+      api: "{{ inputs.kestra_api_url | trim }}"
+      tenant: "{{ vars.tenant }}"
+    sql: |
+      SET TimeZone = 'UTC';
+      CREATE TABLE raw AS
+      WITH l AS (SELECT from_json(:rules, '["JSON"]') AS a)
+      SELECT i AS pos, a[i] AS r FROM l, range(1, len(a) + 1) t(i);
+
+      CREATE TABLE rules AS
+      SELECT pos,
+             trim(coalesce(json_extract_string(r, '$.namespace'), '')) AS namespace,
+             TRY_CAST(json_extract_string(r, '$.executions_keep_days') AS INTEGER) AS executions_keep_days,
+             TRY_CAST(json_extract_string(r, '$.logs_keep_days') AS INTEGER) AS logs_keep_days,
+             json_extract_string(r, '$.debug_logs_keep_days') AS debug_raw,
+             TRY_CAST(json_extract_string(r, '$.debug_logs_keep_days') AS INTEGER) AS debug_logs_keep_days,
+             CASE WHEN json_extract(r, '$.purge_states') IS NULL THEN from_json(:terminal, '["VARCHAR"]')
+                  ELSE from_json(upper(CAST(json_extract(r, '$.purge_states') AS VARCHAR)), '["VARCHAR"]') END AS purge_states,
+             json_extract_string(r, '$.purge_expired_kv') AS kv_raw,
+             coalesce(TRY_CAST(json_extract_string(r, '$.purge_expired_kv') AS BOOLEAN), true) AS purge_expired_kv,
+             json_extract_string(r, '$.sweep_orphan_files') AS sweep_raw,
+             coalesce(TRY_CAST(json_extract_string(r, '$.sweep_orphan_files') AS BOOLEAN), false) AS sweep_orphan_files,
+             json_keys(r) AS rule_keys
+      FROM raw;
+
+      CREATE TABLE problems AS
+      SELECT pos, 'rule ' || pos || ' has no namespace, and an empty scope means every namespace of the instance' AS msg FROM rules WHERE namespace = ''
+      UNION ALL SELECT pos, 'rule ' || pos || ' namespace "' || namespace || '" is not a valid namespace' FROM rules WHERE namespace <> '' AND NOT regexp_full_match(namespace, '[a-z0-9][a-z0-9._-]*')
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') needs executions_keep_days as a whole number >= 0' FROM rules WHERE coalesce(executions_keep_days, -1) < 0
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') needs logs_keep_days as a whole number >= 0' FROM rules WHERE coalesce(logs_keep_days, -1) < 0
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') keeps logs longer than executions, which would leave logs without their execution' FROM rules WHERE logs_keep_days > executions_keep_days
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') debug_logs_keep_days must be a whole number between 0 and logs_keep_days' FROM rules WHERE debug_raw IS NOT NULL AND (debug_logs_keep_days IS NULL OR debug_logs_keep_days < 0 OR debug_logs_keep_days > logs_keep_days)
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') has an unknown key "' || k || '"' FROM rules, unnest(rule_keys) u(k)
+                WHERE k NOT IN ('namespace', 'executions_keep_days', 'logs_keep_days', 'debug_logs_keep_days', 'purge_states', 'purge_expired_kv', 'sweep_orphan_files')
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') purge_states contains ' || s || ', only terminal states can be purged' FROM rules, unnest(purge_states) u(s)
+                WHERE s NOT IN (SELECT unnest(from_json(:terminal, '["VARCHAR"]')))
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') sweeps orphan files but keeps some execution states, the sweep would delete the files of those kept executions' FROM rules
+                WHERE sweep_orphan_files AND len(list_distinct(purge_states)) < len(from_json(:terminal, '["VARCHAR"]'))
+      UNION ALL SELECT pos, 'rule ' || pos || ' (' || namespace || ') purge_expired_kv and sweep_orphan_files must be true or false' FROM rules
+                WHERE (kv_raw IS NOT NULL AND TRY_CAST(kv_raw AS BOOLEAN) IS NULL) OR (sweep_raw IS NOT NULL AND TRY_CAST(sweep_raw AS BOOLEAN) IS NULL)
+      UNION ALL SELECT min(pos), 'namespace ' || namespace || ' has ' || count(*) || ' rules' FROM rules WHERE namespace <> '' GROUP BY namespace HAVING count(*) > 1
+      UNION ALL SELECT c.pos, 'rule ' || p.pos || ' (' || p.namespace || ') also covers rule ' || c.pos || ' (' || c.namespace || ') because purges include child namespaces; split the parent rule or drop one'
+                FROM rules p JOIN rules c ON p.namespace <> '' AND starts_with(c.namespace, p.namespace || '.');
+
+      CREATE TABLE gate AS SELECT CASE WHEN count(*) > 0 THEN error('Invalid retention_rules, nothing was counted or deleted. ' || string_agg(msg, '; ' ORDER BY pos)) END AS ok FROM problems;
+
+      CREATE TABLE selected AS
+      SELECT r.*, CAST(:anchor AS TIMESTAMPTZ) AS anchor FROM rules r
+      WHERE :mode <> 'replay' OR namespace IN (SELECT unnest(from_json(:failed, '["VARCHAR"]')));
+
+      CREATE MACRO iso(ts) AS strftime(ts, '%Y-%m-%dT%H') || chr(58) || strftime(ts, '%M') || chr(58) || strftime(ts, '%SZ');
+
+      SELECT (SELECT count(*) FROM rules) AS rules_total,
+             (SELECT count(*) FROM selected) AS rule_count,
+             (SELECT iso(CAST(:anchor AS TIMESTAMPTZ))) AS anchor_utc,
+             (SELECT coalesce(CAST(to_json(list(json_object(
+                 'namespace', namespace,
+                 'dry_run', CAST(:dry_run AS BOOLEAN),
+                 'api', rtrim(:api, '/') || '/api/v1/' || :tenant,
+                 'executions_keep_days', executions_keep_days,
+                 'logs_keep_days', logs_keep_days,
+                 'debug_logs_keep_days', debug_logs_keep_days,
+                 'executions_cutoff', iso(anchor - to_days(executions_keep_days)),
+                 'logs_cutoff', iso(anchor - to_days(logs_keep_days)),
+                 'debug_logs_cutoff', CASE WHEN debug_logs_keep_days IS NULL THEN '' ELSE iso(anchor - to_days(debug_logs_keep_days)) END,
+                 'purge_states', list_distinct(purge_states),
+                 'states_csv', array_to_string(list_distinct(purge_states), ','),
+                 'purge_expired_kv', purge_expired_kv,
+                 'sweep_orphan_files', sweep_orphan_files) ORDER BY pos)) AS VARCHAR), '[]') FROM selected) AS items;
+
+  - id: nothing_to_do
+    type: io.kestra.plugin.core.flow.If
+    description: "A replay with an empty dead-letter list: the loops run zero iterations and the audit is empty. (No `Exit`: on 2.0.5 it skipped `finally`.)"
+    condition: "{{ outputs.plan.outputs[0].row.rule_count == 0 }}"
+    then:
+      - id: log_nothing
+        type: io.kestra.plugin.core.log.Log
+        message: "No namespace to process (mode {{ inputs.mode }}, {{ outputs.plan.outputs[0].row.rules_total }} rules)."
+
+  - id: count_before
+    type: io.kestra.plugin.core.flow.Loop
+    description: |
+      Counts, per namespace, what each purge would delete, with the same filters as the purge tasks. Each iteration is
+      isolated: a namespace whose count fails is reported and skipped, the others continue (`transmitFailed: false`).
+    values: "{{ outputs.plan.outputs[0].row.items }}"
+    concurrencyLimit: 2
+    transmitFailed: false
+    tasks:
+      - id: count_executions
+        type: io.kestra.plugin.core.http.Request
+        description: |
+          Terminal executions of the purged states that ended on or before the cutoff (same filter as PurgeExecutions).
+          The explicit 1970 start date is needed: with only an end date the API applies a default window and answers 422
+          ("Start date must be before End Date") for older cutoffs, seen here with 30 and 90 days. Three attempts with exponential backoff; the task retry also repeats a
+          4xx, so a wrong URL or credential fails within a minute, and only this namespace is skipped.
+        uri: "{{ fromJson(item.value).api }}/executions/search"
+        params:
+          "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+          "filters[state][IN]": "{{ fromJson(item.value).states_csv }}"
+          "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+          "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).executions_cutoff }}"
+          dateFilter: END_DATE
+          size: "1"
+        options:
+          auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+        timeout: PT1M
+        retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+      - id: count_loop_iterations
+        type: io.kestra.plugin.core.http.Request
+        description: |
+          Kestra 2.0 runs every Loop iteration as a sub-execution of kind LOOP. The default search hides them, but
+          PurgeExecutions deletes them too, so they are counted separately and added to the executions total.
+        uri: "{{ fromJson(item.value).api }}/executions/search"
+        params:
+          "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+          "filters[kind][EQUALS]": LOOP
+          "filters[state][IN]": "{{ fromJson(item.value).states_csv }}"
+          "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+          "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).executions_cutoff }}"
+          dateFilter: END_DATE
+          size: "1"
+        options:
+          auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+        timeout: PT1M
+        retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+      - id: count_logs
+        type: io.kestra.plugin.core.http.Request
+        description: Log lines of every level up to the logs cutoff, execution and trigger logs alike (same scope as PurgeLogs).
+        uri: "{{ fromJson(item.value).api }}/logs/search"
+        params:
+          "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+          "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+          "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).logs_cutoff }}"
+          size: "1"
+        options:
+          auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+        timeout: PT1M
+        retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+      - id: count_debug_logs
+        type: io.kestra.plugin.core.http.Request
+        description: TRACE and DEBUG lines between the logs cutoff and the shorter debug cutoff, so nothing is counted twice.
+        runIf: "{{ fromJson(item.value).debug_logs_cutoff != '' }}"
+        uri: "{{ fromJson(item.value).api }}/logs/search"
+        params:
+          "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+          "filters[level][IN]": "TRACE,DEBUG"
+          "filters[startDate][GREATER_THAN]": "{{ fromJson(item.value).logs_cutoff }}"
+          "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).debug_logs_cutoff }}"
+          size: "1"
+        options:
+          auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+        timeout: PT1M
+        retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+      - id: preview_orphan_files
+        type: io.kestra.plugin.core.storage.PurgeStorage
+        description: |
+          Native dry run (`dryRun: true`) of the file sweep; deletes nothing. It also counts folders of executions that
+          purge_executions removes first, so the real sweep usually deletes fewer.
+        runIf: "{{ fromJson(item.value).sweep_orphan_files }}"
+        namespace: "{{ fromJson(item.value).namespace }}"
+        endDate: "{{ fromJson(item.value).executions_cutoff }}"
+        dryRun: true
+        timeout: PT30M
+    outputs:
+      - id: row
+        type: JSON
+        value: |
+          {{ {
+            'namespace': fromJson(item.value).namespace,
+            'rule': fromJson(item.value),
+            'executions': outputs.count_executions.body is defined and outputs.count_loop_iterations.body is defined ? fromJson(outputs.count_executions.body).total + fromJson(outputs.count_loop_iterations.body).total : null,
+            'loop_iterations': outputs.count_loop_iterations.body is defined ? fromJson(outputs.count_loop_iterations.body).total : null,
+            'logs': outputs.count_logs.body is defined ? fromJson(outputs.count_logs.body).total : null,
+            'debug_logs': outputs.count_debug_logs.body is defined ? fromJson(outputs.count_debug_logs.body).total : null,
+            'storage_dirs': outputs.preview_orphan_files.purgedCount ?? null,
+            'ok': outputs.count_executions.body is defined and outputs.count_loop_iterations.body is defined and outputs.count_logs.body is defined
+                  and (fromJson(item.value).debug_logs_cutoff == '' or outputs.count_debug_logs.body is defined)
+                  and (not fromJson(item.value).sweep_orphan_files or outputs.preview_orphan_files.purgedCount is defined)
+          } | toJson }}
+
+  - id: preview
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Totals of the dry-run counts, the namespaces whose count failed and the rules that are safe to purge.
+    values:
+      would_delete: "{{ (outputs.count_before.outputs ?? []) | jq('[.[].outputs.row | (.executions // 0) + (.logs // 0) + (.debug_logs // 0)] | add // 0') | first }}"
+      count_failed: "{{ (outputs.count_before.outputs ?? []) | jq('[.[].outputs.row | select(.ok != true) | .namespace]') | first | toJson }}"
+      purgeable: "{{ (outputs.count_before.outputs ?? []) | jq('[.[].outputs.row | select(.ok == true) | .rule]') | first | toJson }}"
+
+  - id: log_preview
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ inputs.dry_run ? 'DRY RUN' : 'PURGE' }} anchor {{ outputs.plan.outputs[0].row.anchor_utc }}: {{ outputs.preview.values.would_delete }} executions and log lines match across {{ outputs.plan.outputs[0].row.rule_count }} namespace(s).
+      {% for o in (outputs.count_before.outputs ?? []) %}{{ o.outputs.row.namespace }}: executions={{ o.outputs.row.executions ?? 'n/a' }} (Loop iterations {{ o.outputs.row.loop_iterations ?? 'n/a' }}) logs={{ o.outputs.row.logs ?? 'n/a' }} debug_logs={{ o.outputs.row.debug_logs ?? 'n/a' }} storage_dirs={{ o.outputs.row.storage_dirs ?? 'n/a' }}{{ o.outputs.row.ok ? '' : ' COUNT FAILED, skipped' }}
+      {% endfor %}
+
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Only real purges above the threshold wait for a human. Dry runs and small purges continue directly.
+    condition: "{{ not inputs.dry_run and (outputs.preview.values.would_delete | number) > inputs.approval_threshold }}"
+    then:
+      - id: request_approval
+        type: io.kestra.plugin.core.flow.Pause
+        description: "Waits up to 8 hours. Without a decision the Pause fails (`behavior: FAIL`) and nothing is deleted."
+        pauseDuration: PT8H
+        behavior: FAIL
+        onResume:
+          - id: approve
+            type: BOOL
+            displayName: Delete the executions and log lines listed by log_preview? This cannot be undone.
+            defaults: false
+          - id: reason
+            type: STRING
+            defaults: ""
+      - id: check_decision
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ not (outputs.request_approval.onResume.approve ?? false) }}"
+        then:
+          - id: rejected
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "Purge rejected by the approver{{ (outputs.request_approval.onResume.reason ?? '') != '' ? ': ' ~ outputs.request_approval.onResume.reason : '' }}. Nothing was deleted."
+
+  - id: real_purge
+    type: io.kestra.plugin.core.flow.If
+    description: |
+      Gate for the destructive part. This is an `If` on purpose: on Kestra 2.0.5 a `runIf: false` on a Loop marks
+      the Loop SKIPPED but still starts its iterations, so a Loop that deletes data must sit inside an `If`.
+    condition: "{{ not inputs.dry_run and (fromJson(outputs.preview.values.purgeable) | length) > 0 }}"
+    then:
+      - id: purge
+        type: io.kestra.plugin.core.flow.Loop
+        description: |
+          Real purge, one namespace at a time (`concurrencyLimit: 1`, purges are heavy on the database). Only namespaces
+          whose dry-run count succeeded are purged. A failing namespace is recorded and the next one still runs.
+        values: "{{ outputs.preview.values.purgeable }}"
+        concurrencyLimit: 1
+        transmitFailed: false
+        tasks:
+          - id: scope_guard
+            type: io.kestra.plugin.core.flow.If
+            description: Last line of defence right before deletion, independent of the checks and the plan validation.
+            condition: "{{ ((fromJson(item.value).namespace ?? '') | trim) == '' or (fromJson(item.value).dry_run ?? true) }}"
+            then:
+              - id: refuse_purge
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: "Refusing to purge {{ fromJson(item.value).namespace ?? '(no namespace)' }}: {{ (fromJson(item.value).dry_run ?? true) ? 'this rule was planned as a dry run' : 'empty namespace scope' }}."
+
+          - id: apply_rule
+            type: io.kestra.plugin.core.flow.Dag
+            description: |
+              KV cleanup does not depend on the database purges and runs alongside them. Logs, DEBUG logs and the orphan
+              file sweep only start after the execution purge succeeded, so a failed execution purge never leaves executions
+              whose logs or files are already gone.
+            concurrent: 2
+            tasks:
+              - task:
+                  id: purge_executions
+                  type: io.kestra.plugin.core.execution.PurgeExecutions
+                  description: |
+                    Deletes executions, their outputs, metrics and internal-storage files; logs are left to purge_logs (bulk
+                    delete). On local storage `storagesCount` stayed 0 in tests although the execution folders were removed.
+                  namespace: "{{ fromJson(item.value).namespace }}"
+                  endDate: "{{ fromJson(item.value).executions_cutoff }}"
+                  states: "{{ fromJson(item.value).purge_states | toJson }}"
+                  purgeLog: false
+                  timeout: PT2H
+              - task:
+                  id: purge_logs
+                  type: io.kestra.plugin.core.log.PurgeLogs
+                  description: Deletes execution and trigger log lines of every level up to the logs cutoff.
+                  namespace: "{{ fromJson(item.value).namespace }}"
+                  endDate: "{{ fromJson(item.value).logs_cutoff }}"
+                  timeout: PT2H
+                dependsOn: [purge_executions]
+              - task:
+                  id: purge_debug_logs
+                  type: io.kestra.plugin.core.log.PurgeLogs
+                  description: TRACE and DEBUG lines between the logs cutoff and the debug cutoff.
+                  runIf: "{{ fromJson(item.value).debug_logs_cutoff != '' }}"
+                  namespace: "{{ fromJson(item.value).namespace }}"
+                  startDate: "{{ fromJson(item.value).logs_cutoff }}"
+                  endDate: "{{ fromJson(item.value).debug_logs_cutoff }}"
+                  logLevels: [TRACE, DEBUG]
+                  timeout: PT1H
+                dependsOn: [purge_executions]
+              - task:
+                  id: purge_expired_kv
+                  type: io.kestra.plugin.core.kv.PurgeKV
+                  description: |
+                    Only entries whose TTL has already passed (`expiredOnly: true`); live keys are never touched. allowFailure:
+                    PurgeKV errors on a namespace without flows ("namespace does not exist"), and expired keys are already
+                    unreadable, so a failed KV cleanup shows as `not_run` in the audit instead of failing the namespace.
+                  allowFailure: true
+                  runIf: "{{ fromJson(item.value).purge_expired_kv }}"
+                  namespaces: ["{{ fromJson(item.value).namespace }}"]
+                  includeChildNamespaces: true
+                  behavior:
+                    type: key
+                    expiredOnly: true
+                  timeout: PT30M
+              - task:
+                  id: sweep_orphan_files
+                  type: io.kestra.plugin.core.storage.PurgeStorage
+                  description: Execution files older than the executions cutoff that PurgeExecutions did not reach.
+                  runIf: "{{ fromJson(item.value).sweep_orphan_files }}"
+                  namespace: "{{ fromJson(item.value).namespace }}"
+                  endDate: "{{ fromJson(item.value).executions_cutoff }}"
+                  dryRun: false
+                  timeout: PT2H
+                dependsOn: [purge_executions]
+
+          - id: recount_executions
+            type: io.kestra.plugin.core.http.Request
+            description: Same query as count_executions, to prove the purge removed what it matched.
+            uri: "{{ fromJson(item.value).api }}/executions/search"
+            params:
+              "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+              "filters[state][IN]": "{{ fromJson(item.value).states_csv }}"
+              "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+              "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).executions_cutoff }}"
+              dateFilter: END_DATE
+              size: "1"
+            options:
+              auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+            timeout: PT1M
+            retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+          - id: recount_loop_iterations
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ fromJson(item.value).api }}/executions/search"
+            params:
+              "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+              "filters[kind][EQUALS]": LOOP
+              "filters[state][IN]": "{{ fromJson(item.value).states_csv }}"
+              "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+              "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).executions_cutoff }}"
+              dateFilter: END_DATE
+              size: "1"
+            options:
+              auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+            timeout: PT1M
+            retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+
+          - id: recount_logs
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ fromJson(item.value).api }}/logs/search"
+            params:
+              "filters[namespace][PREFIX]": "{{ fromJson(item.value).namespace }}"
+              "filters[startDate][GREATER_THAN_OR_EQUAL_TO]": "1970-01-01T00:00:00Z"
+              "filters[endDate][LESS_THAN_OR_EQUAL_TO]": "{{ fromJson(item.value).logs_cutoff }}"
+              size: "1"
+            options:
+              auth: {type: BASIC, username: "{{ secret('KESTRA_API_USERNAME') }}", password: "{{ secret('KESTRA_API_PASSWORD') }}"}
+            timeout: PT1M
+            retry: {type: exponential, interval: PT5S, maxInterval: PT1M, maxAttempts: 3}
+        outputs:
+          - id: row
+            type: JSON
+            value: |
+              {{ {
+                'namespace': fromJson(item.value).namespace,
+                'executions_deleted': outputs.purge_executions.executionsCount ?? null,
+                'metrics_deleted': outputs.purge_executions.metricsCount ?? null,
+                'files_deleted': outputs.purge_executions.storagesCount ?? null,
+                'outputs_deleted': (outputs.purge_executions.taskOutputsCount ?? 0) + (outputs.purge_executions.executionOutputsCount ?? 0),
+                'logs_deleted': outputs.purge_logs.count ?? null,
+                'debug_logs_deleted': outputs.purge_debug_logs.count ?? null,
+                'kv_deleted': outputs.purge_expired_kv.size ?? null,
+                'orphan_files_deleted': outputs.sweep_orphan_files.deletedFilesCount ?? null,
+                'executions_after': outputs.recount_executions.body is defined and outputs.recount_loop_iterations.body is defined ? fromJson(outputs.recount_executions.body).total + fromJson(outputs.recount_loop_iterations.body).total : null,
+                'loop_iterations_after': outputs.recount_loop_iterations.body is defined ? fromJson(outputs.recount_loop_iterations.body).total : null,
+                'logs_after': outputs.recount_logs.body is defined ? fromJson(outputs.recount_logs.body).total : null,
+                'ok': outputs.recount_executions.body is defined and outputs.recount_loop_iterations.body is defined and outputs.recount_logs.body is defined
+              } | toJson }}
+
+  - id: outcome
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Dead-letter list for this run, failed counts plus failed purges.
+    values:
+      failed: "{{ fromJson(outputs.preview.values.count_failed) | merge((outputs.purge.outputs ?? []) | jq('[.[].outputs.row | select(.ok != true) | .namespace]') | first) | jq('unique') | first | toJson }}"
+
+  - id: dead_letter
+    type: io.kestra.plugin.core.flow.If
+    description: Failed namespaces are kept for 40 days (KV `ttl`) for `mode = replay`; a clean run clears the list.
+    condition: "{{ fromJson(outputs.outcome.values.failed) | length > 0 }}"
+    then:
+      - id: remember_failed
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ vars.state_key }}_failed_namespaces"
+        kvType: JSON
+        value: "{{ outputs.outcome.values.failed }}"
+        ttl: P40D
+      - id: report_partial_failure
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Retention finished for the other namespaces but failed for {{ fromJson(outputs.outcome.values.failed) | join(', ') }}. See the audit CSV, fix the cause, then run with mode = replay."
+    else:
+      - id: clear_failed
+        type: io.kestra.plugin.core.kv.Delete
+        key: "{{ vars.state_key }}_failed_namespaces"
+        errorOnMissing: false
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "Retention run failed in task {{ ((errorLogs() | length) > 0 and (errorLogs()[0].taskId ?? '') != '') ? errorLogs()[0].taskId : 'none' }}: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'no task error was logged, which is how an expired approval or an SLA breach ends the run' }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: allowFailure so a missing `SLACK_WEBHOOK_URL` does not hide the original error; the same text is in the ERROR log above.
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":rotating_light: Kestra retention {{ inputs.dry_run ? 'dry run' : 'PURGE' }} failed in `{{ ((errorLogs() | length) > 0 and (errorLogs()[0].taskId ?? '') != '') ? errorLogs()[0].taskId : 'none' }}`: {{ (errorLogs() | length) > 0 ? errorLogs()[0].message : 'no task error was logged (expired approval or SLA breach)' }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+finally:
+  - id: write_audit
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Always runs, also after a rejection, a validation error or a partial failure, so every run leaves an audit CSV.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    timeout: PT5M
+    outputFiles:
+      - audit_csv
+    parameters:
+      before: "{{ (outputs.count_before.outputs ?? []) | toJson }}"
+      after: "{{ (outputs.purge.outputs ?? []) | toJson }}"
+      dry_run: "{{ inputs.dry_run }}"
+      execution_id: "{{ execution.id }}"
+      anchor: "{{ trigger.date ?? execution.startDate }}"
+    sql: |
+      SET TimeZone = 'UTC';
+      CREATE TABLE b AS SELECT json_extract(o, '$.outputs.row') AS r FROM (SELECT unnest(from_json(:before, '["JSON"]')) AS o);
+      CREATE TABLE a AS SELECT json_extract(o, '$.outputs.row') AS r FROM (SELECT unnest(from_json(:after, '["JSON"]')) AS o)
+      QUALIFY row_number() OVER (PARTITION BY json_extract_string(r, '$.namespace') ORDER BY length(CAST(r AS VARCHAR)) DESC) = 1;
+      CREATE MACRO n(j, k) AS TRY_CAST(json_extract_string(j, '$.' || k) AS BIGINT);
+      CREATE TABLE joined AS
+      SELECT json_extract_string(b.r, '$.namespace') AS namespace, b.r AS br, a.r AS ar, json_extract(b.r, '$.rule') AS rule,
+             coalesce(TRY_CAST(json_extract_string(b.r, '$.ok') AS BOOLEAN), false) AS count_ok,
+             CASE WHEN a.r IS NULL THEN NULL ELSE coalesce(TRY_CAST(json_extract_string(a.r, '$.ok') AS BOOLEAN), false) END AS purge_ok
+      FROM b LEFT JOIN a ON json_extract_string(a.r, '$.namespace') = json_extract_string(b.r, '$.namespace');
+      CREATE TABLE audit AS
+      WITH t(data_type, keep_key, cutoff_key, before_key, deleted_key, after_key, debug_only, sweep_only, kv_only) AS (VALUES
+        ('executions', 'executions_keep_days', 'executions_cutoff', 'executions', 'executions_deleted', 'executions_after', false, false, false),
+        ('loop_iterations', 'executions_keep_days', 'executions_cutoff', 'loop_iterations', NULL, 'loop_iterations_after', false, false, false),
+        ('execution_outputs', 'executions_keep_days', 'executions_cutoff', NULL, 'outputs_deleted', NULL, false, false, false),
+        ('metrics', 'executions_keep_days', 'executions_cutoff', NULL, 'metrics_deleted', NULL, false, false, false),
+        ('execution_files', 'executions_keep_days', 'executions_cutoff', NULL, 'files_deleted', NULL, false, false, false),
+        ('logs', 'logs_keep_days', 'logs_cutoff', 'logs', 'logs_deleted', 'logs_after', false, false, false),
+        ('debug_logs', 'debug_logs_keep_days', 'debug_logs_cutoff', 'debug_logs', 'debug_logs_deleted', NULL, true, false, false),
+        ('expired_kv', NULL, NULL, NULL, 'kv_deleted', NULL, false, false, true),
+        ('orphan_storage', 'executions_keep_days', 'executions_cutoff', 'storage_dirs', 'orphan_files_deleted', NULL, false, true, false))
+      SELECT :execution_id AS run_execution_id,
+             CASE WHEN CAST(:dry_run AS BOOLEAN) THEN 'dry_run' ELSE 'purge' END AS run_mode,
+             j.namespace, t.data_type,
+             CASE WHEN t.keep_key IS NULL THEN NULL ELSE n(j.rule, t.keep_key) END AS keep_days,
+             CASE WHEN t.cutoff_key IS NULL THEN NULL ELSE json_extract_string(j.rule, '$.' || t.cutoff_key) END AS cutoff_utc,
+             CASE WHEN t.before_key IS NULL THEN NULL ELSE n(j.br, t.before_key) END AS matched_before,
+             CASE WHEN j.ar IS NULL OR t.deleted_key IS NULL THEN NULL ELSE n(j.ar, t.deleted_key) END AS deleted,
+             CASE WHEN j.ar IS NULL OR t.after_key IS NULL THEN NULL ELSE n(j.ar, t.after_key) END AS remaining_after,
+             CASE WHEN NOT j.count_ok THEN 'count_failed_not_purged'
+                  WHEN CAST(:dry_run AS BOOLEAN) THEN 'would_delete'
+                  WHEN j.purge_ok IS NULL THEN 'not_purged'
+                  WHEN NOT j.purge_ok THEN 'purge_failed'
+                  WHEN n(j.ar, t.deleted_key) IS NULL AND t.deleted_key IS NOT NULL THEN 'not_run'
+                  ELSE 'deleted' END AS status
+      FROM joined j CROSS JOIN t
+      WHERE (NOT t.debug_only OR json_extract_string(j.rule, '$.debug_logs_cutoff') <> '')
+        AND (NOT t.sweep_only OR CAST(json_extract_string(j.rule, '$.sweep_orphan_files') AS BOOLEAN))
+        AND (NOT t.kv_only OR CAST(json_extract_string(j.rule, '$.purge_expired_kv') AS BOOLEAN))
+      ORDER BY j.namespace, t.data_type;
+      COPY audit TO '{{ outputFiles.audit_csv }}' (HEADER, DELIMITER ',');
+      SELECT count(DISTINCT namespace) AS namespaces,
+             CAST(coalesce(sum(matched_before) FILTER (WHERE data_type IN ('executions', 'logs', 'debug_logs')), 0) AS BIGINT) AS matched_before,
+             CAST(coalesce(sum(deleted) FILTER (WHERE data_type IN ('executions', 'logs', 'debug_logs')), 0) AS BIGINT) AS deleted,
+             CAST(coalesce(sum(remaining_after) FILTER (WHERE data_type IN ('executions', 'logs')), 0) AS BIGINT) AS remaining_after,
+             CAST(coalesce(sum(deleted) FILTER (WHERE data_type = 'expired_kv'), 0) AS BIGINT) AS kv_deleted,
+             coalesce(string_agg(DISTINCT namespace, ', ') FILTER (WHERE status IN ('count_failed_not_purged', 'purge_failed')), '') AS failed_namespaces
+      FROM audit;
+
+  - id: log_audit
+    type: io.kestra.plugin.core.log.Log
+    message: "Audit ({{ inputs.dry_run ? 'dry run' : 'purge' }}): {{ outputs.write_audit.outputs[0].row | toJson }}"
+
+afterExecution:
+  - id: notify_outcome
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: |
+      Runs once the final state is known. On 2.0.5 an SLA breach fails the run at once: `finally` does not run, so this
+      is the only place that reports it. Skipped for ordinary failures, which the `errors` branch already reported.
+    runIf: "{{ execution.state != 'FAILED' or (labels.retention_sla ?? '') == 'breached' }}"
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: "Kestra retention {{ inputs.dry_run ? 'dry run' : 'purge' }} ended {{ execution.state }}{{ (labels.retention_sla ?? '') == 'breached' ? ' because the 12-hour SLA was breached (no audit CSV was written)' : '' }}. Matched before: {{ outputs.preview.values.would_delete ?? 'n/a' }}. Audit: {{ (outputs.write_audit.outputs[0].row ?? {}) | toJson }} {{ kestra.url ?? inputs.kestra_api_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+
+outputs:
+  - id: audit_csv
+    type: FILE
+    value: "{{ outputs.write_audit.outputFiles.audit_csv }}"
+  - id: summary
+    type: JSON
+    value: "{{ outputs.write_audit.outputs[0].row }}"
+
+extend:
+  title: Kestra instance retention policy with dry run, approval and audit CSV
+  metaTitle: Kestra Retention Policy for Executions, Logs and KV | Kestra
+  shortDescription: Per-namespace retention for a self-hosted Kestra instance. Counts first, purges executions, logs, DEBUG logs, expired KV and orphaned files only when asked, with an approval gate and an audit CSV.
+  metaDescription: Safe, auditable Kestra retention per namespace. Dry-run counts, approval gate, PurgeExecutions, PurgeLogs, PurgeKV and an audit CSV of every deletion.
+  description: |
+    Every self-hosted Kestra instance slowly fills its database and internal storage with old executions, logs, metrics and KV entries. This flow is a retention policy you can hand to operators: one JSON rule per namespace (production keeps more than dev), a dry run by default that only counts, an approval before large deletions, and an audit CSV of what was or would be deleted per namespace and data type. It runs against the real Kestra API of the instance it lives on; nothing is simulated. The default rules are sample values for `company.prod`, `company.team` and `company.dev`: replace them with your own.
+
+    ## How it works
+
+    1. A monthly `Schedule` (or a manual run) starts the flow. Flow `checks` block the execution before it is created when `retention_rules` is not a non-empty array, or when a real purge has a rule with an empty namespace.
+    2. `plan` (DuckDB) validates every rule and fails the run listing all problems: unknown keys (a typo such as `execution_keep_days`), negative or missing days, logs kept longer than executions, non-terminal `purge_states`, duplicate namespaces and overlapping rules (`company` would also purge `company.prod`, because purges include child namespaces). It computes every cutoff from one anchor, the schedule date or the execution start.
+    3. `count_before` (Loop) asks the Kestra API, per namespace, how many executions, hidden Loop iterations, log lines and DEBUG/TRACE lines match the filters the purge tasks use. `preview_orphan_files` uses the native `dryRun: true` of `PurgeStorage`. `log_preview` prints the counts.
+    4. A real purge above `approval_threshold` pauses in `request_approval` with an `approve` and `reason` form. A rejection, or 8 hours without an answer, ends the run with nothing deleted.
+    5. `real_purge` runs one namespace at a time, only for namespaces whose count succeeded, then recounts what is left.
+    6. Failed namespaces go to a KV dead-letter list with a 40-day `ttl`; `mode: replay` reprocesses only them. `finally` always writes the audit CSV, and `afterExecution` sends the outcome.
+
+    ## What each purge removes
+
+    Every deletion is irreversible (there is no recycle bin): keep a database backup if you may need the history.
+
+    - `purge_executions` (`PurgeExecutions`): execution records of the listed terminal states that ended before the cutoff, with their task and flow outputs, metrics and internal-storage files, Loop iteration sub-executions included. Running and paused executions never match.
+    - `purge_logs` and `purge_debug_logs` (`PurgeLogs`): execution and trigger log lines up to the cutoff; the second only TRACE and DEBUG lines in the shorter window.
+    - `purge_expired_kv` (`PurgeKV`, `expiredOnly: true`): KV entries whose TTL has passed. They are already unreadable, but the old value is gone.
+    - `sweep_orphan_files` (`PurgeStorage`, opt-in): execution files older than the cutoff that no purge reached. Rules that keep some states are refused, because the sweep would delete the files of kept executions.
+
+    Flows, namespace files, secrets and live KV keys are never touched.
+
+    ## What this blueprint teaches
+
+    - **Flow `checks`** (`checks`): reject unsafe input before an execution exists. The second check exists because `PurgeExecutions` and `PurgeLogs` treat a missing namespace as every namespace.
+    - **Loop iterations are isolated sub-executions** (`count_before`, `purge`): `transmitFailed: false` and Loop `outputs` collect one row per namespace, failed ones included, so one bad namespace never stops the others.
+    - **`If` around a destructive Loop** (`real_purge`): on Kestra 2.0.5 a Loop with `runIf: false` is marked SKIPPED but its iterations still run. `scope_guard` re-checks the dry-run flag inside each iteration.
+    - **`Dag`** (`apply_rule`): the KV cleanup runs alongside; logs, DEBUG logs and the file sweep wait for `purge_executions`, so a failed execution purge never leaves executions without their logs.
+    - **`Pause` with `onResume`** (`request_approval`, `check_decision`): a human decision with a reason, and `behavior: FAIL` when nobody answers.
+    - **KV `ttl` dead-letter and replay** (`remember_failed`, `failed_last_run`, `mode`): the list expires on its own after 40 days, and a clean run deletes it.
+    - **`finally`** (`write_audit`): the audit CSV is written after a success, a rejection, a validation error or a partial failure.
+    - **`errors` with `errorLogs()`** (`log_failure`, `alert_failure`): failed task id, message and execution link.
+    - **`sla` and `afterExecution`** (`max_runtime`, `notify_outcome`): on 2.0.5 an SLA breach fails the run at once and skips `finally`, so `afterExecution`, which runs once the final state is known, is the hook that reports it (label `retention_sla: breached`).
+    - **`concurrency`** (`limit: 1`, `FAIL`): a second run fails immediately instead of purging in parallel. Loop iterations do not count against the limit.
+
+    ## What you get
+
+    - A dry-run report per namespace before anything is deleted, then deleted and remaining counts.
+    - An audit CSV (`audit_csv` output) with namespace, data type, keep days, cutoff, matched, deleted, remaining and status.
+    - Loop iteration executions counted, which the default search and the UI list leave out.
+    - Idempotent runs: a second run finds nothing to delete.
+
+    ## Who it's for
+
+    - Platform teams and administrators running a self-hosted Kestra OSS instance.
+    - Operators who need a reviewable retention policy per environment.
+
+    ## Why orchestrate this with Kestra
+
+    The policy is versioned YAML, the run history is its own audit trail, and approvals, retries, timeouts, alerts and replay are declared, not hand-written around a cron job running `DELETE` statements.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the DuckDB and Slack plugins, and an API user that can read executions and logs.
+    - `kestra_api_url` reachable from the worker (`http://localhost:8080` on a single-node install).
+
+    ### Secrets
+
+    - `KESTRA_API_USERNAME` and `KESTRA_API_PASSWORD`: basic-auth user for the count requests (required).
+    - `SLACK_WEBHOOK_URL`: alert and outcome messages (optional; every message is also in the logs).
+
+    ## Quick start
+
+    1. Add the secrets and replace the sample `retention_rules` with your namespaces and days.
+    2. Run with the defaults and read `log_preview` and the audit CSV.
+    3. Run with `dry_run: false` once the counts look right, and approve if asked.
+    4. Add `inputs: {dry_run: false}` to the `monthly` trigger to enforce the policy every month.
+
+    ## How to extend
+
+    - Keep failed executions longer with a `purge_states` list, as in the `company.prod` sample rule.
+    - Add `PurgeFiles` for old namespace file versions, or copy the audit CSV to object storage.
+    - Raise `concurrencyLimit` on `purge` if your database handles parallel purges.
+
+    ## Links
+
+    - [PurgeExecutions](https://kestra.io/plugins/core/execution/io.kestra.plugin.core.execution.purgeexecutions), [PurgeLogs](https://kestra.io/plugins/core/log/io.kestra.plugin.core.log.purgelogs), [PurgeKV](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.purgekv), [PurgeStorage](https://kestra.io/plugins/core/storage/io.kestra.plugin.core.storage.purgestorage)
+    - [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop), [Dag](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.dag), [Pause](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra API reference](https://kestra.io/docs/api-reference)
+  tags:
+    - Infrastructure
+    - Core
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+    - Failure Alerting Mechanics
+  ee: false
+  demo: false

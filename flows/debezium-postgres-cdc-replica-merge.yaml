@@ -1,0 +1,309 @@
+id: debezium-postgres-cdc-replica-merge
+namespace: company.team
+
+description: |
+  Keep a PostgreSQL replica table in sync with a source table through Debezium change data capture.
+  Inserts, updates and deletes are merged in order, and a restarted or late batch never overwrites newer data.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+variables:
+  max_deletes_per_batch: 500
+  mass_delete_kv_key: cdc_customers_allow_mass_delete
+
+tasks:
+  - id: create_replica_tables
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Create the replica table, the staging table and the live view if they do not exist.
+    url: "{{ secret('CDC_REPLICA_JDBC_URL') }}"
+    username: "{{ secret('CDC_REPLICA_USER') }}"
+    password: "{{ secret('CDC_REPLICA_PASSWORD') }}"
+    sql: |
+      CREATE SCHEMA IF NOT EXISTS cdc;
+
+      CREATE TABLE IF NOT EXISTS cdc.customers (
+        id bigint PRIMARY KEY,
+        email text,
+        full_name text,
+        plan text,
+        notes text,
+        updated_at timestamptz,
+        _cdc_lsn bigint NOT NULL,
+        _cdc_deleted boolean NOT NULL DEFAULT false,
+        _cdc_applied_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS cdc.customers_changes (
+        seq bigserial PRIMARY KEY,
+        execution_id text NOT NULL,
+        id bigint NOT NULL,
+        email text,
+        full_name text,
+        plan text,
+        notes text,
+        updated_at text,
+        deleted boolean NOT NULL,
+        metadata jsonb NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS customers_changes_execution_idx
+        ON cdc.customers_changes (execution_id);
+
+      CREATE OR REPLACE VIEW cdc.customers_live AS
+        SELECT id, email, full_name, plan, notes, updated_at
+        FROM cdc.customers
+        WHERE NOT _cdc_deleted;
+
+  - id: stage_changes
+    type: io.kestra.plugin.jdbc.postgresql.Batch
+    description: Load every change event of this batch into the staging table, in capture order.
+    url: "{{ secret('CDC_REPLICA_JDBC_URL') }}"
+    username: "{{ secret('CDC_REPLICA_USER') }}"
+    password: "{{ secret('CDC_REPLICA_PASSWORD') }}"
+    from: "{{ trigger.uris['shop.customers'] }}"
+    sql: |
+      INSERT INTO cdc.customers_changes
+        (execution_id, id, email, full_name, plan, notes, updated_at, deleted, metadata)
+      VALUES ('{{ execution.id }}', ?, ?, ?, ?, ?, ?, ?, ?)
+    columns:
+      - id
+      - email
+      - full_name
+      - plan
+      - notes
+      - updated_at
+      - deleted
+      - metadata
+
+  - id: count_changes
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Count the keys and deletes in this batch for the mass-delete guard.
+    url: "{{ secret('CDC_REPLICA_JDBC_URL') }}"
+    username: "{{ secret('CDC_REPLICA_USER') }}"
+    password: "{{ secret('CDC_REPLICA_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH latest AS (
+        SELECT DISTINCT ON (id) id, deleted
+        FROM cdc.customers_changes
+        WHERE execution_id = '{{ execution.id }}'
+        ORDER BY id, (metadata -> 'source' ->> 'lsn')::bigint DESC, seq DESC
+      )
+      SELECT
+        count(*) AS keys,
+        count(*) FILTER (WHERE deleted) AS deletes
+      FROM latest
+
+  - id: mass_delete_guard
+    type: io.kestra.plugin.core.flow.If
+    description: Stop before a batch that deletes more rows than expected is applied, unless an operator approved it.
+    condition: "{{ outputs.count_changes.row.deletes > vars.max_deletes_per_batch and kv(vars.mass_delete_kv_key, errorOnMissing=false) != true }}"
+    then:
+      - id: block_mass_delete
+        type: io.kestra.plugin.core.execution.Fail
+        description: Checked again on restart, so an approval set after the alert lets the batch continue.
+        condition: "{{ kv(vars.mass_delete_kv_key, errorOnMissing=false) != true }}"
+        errorMessage: "Batch deletes {{ outputs.count_changes.row.deletes }} rows, more than {{ vars.max_deletes_per_batch }}. Nothing was applied. If the deletes are expected, set KV key {{ vars.mass_delete_kv_key }} to true and restart this execution."
+
+  - id: apply_changes
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Merge the latest event per key into the replica. Older events than the replica row are skipped.
+    url: "{{ secret('CDC_REPLICA_JDBC_URL') }}"
+    username: "{{ secret('CDC_REPLICA_USER') }}"
+    password: "{{ secret('CDC_REPLICA_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH latest AS (
+        SELECT DISTINCT ON (id)
+          id, email, full_name, plan, notes,
+          updated_at::timestamptz AS updated_at,
+          deleted,
+          (metadata -> 'source' ->> 'lsn')::bigint AS lsn
+        FROM cdc.customers_changes
+        WHERE execution_id = '{{ execution.id }}'
+        ORDER BY id, lsn DESC, seq DESC
+      ),
+      merged AS (
+        INSERT INTO cdc.customers AS r
+          (id, email, full_name, plan, notes, updated_at, _cdc_lsn, _cdc_deleted, _cdc_applied_at)
+        SELECT id, email, full_name, plan, notes, updated_at, lsn, deleted, now()
+        FROM latest
+        ON CONFLICT (id) DO UPDATE SET
+          email = CASE WHEN EXCLUDED._cdc_deleted THEN r.email ELSE EXCLUDED.email END,
+          full_name = CASE WHEN EXCLUDED._cdc_deleted THEN r.full_name ELSE EXCLUDED.full_name END,
+          plan = CASE WHEN EXCLUDED._cdc_deleted THEN r.plan ELSE EXCLUDED.plan END,
+          notes = CASE
+            WHEN EXCLUDED._cdc_deleted OR EXCLUDED.notes = '__debezium_unavailable_value' THEN r.notes
+            ELSE EXCLUDED.notes
+          END,
+          updated_at = CASE WHEN EXCLUDED._cdc_deleted THEN r.updated_at ELSE EXCLUDED.updated_at END,
+          _cdc_lsn = EXCLUDED._cdc_lsn,
+          _cdc_deleted = EXCLUDED._cdc_deleted,
+          _cdc_applied_at = now()
+        WHERE r._cdc_lsn < EXCLUDED._cdc_lsn
+        RETURNING r._cdc_deleted
+      ),
+      cleared AS (
+        DELETE FROM cdc.customers_changes
+        WHERE execution_id = '{{ execution.id }}'
+        RETURNING 1
+      )
+      SELECT
+        (SELECT count(*) FROM cleared) AS events,
+        (SELECT count(*) FROM latest) AS keys,
+        (SELECT count(*) FROM merged WHERE NOT _cdc_deleted) AS upserted,
+        (SELECT count(*) FROM merged WHERE _cdc_deleted) AS deleted,
+        (SELECT count(*) FROM latest) - (SELECT count(*) FROM merged) AS skipped_stale
+
+  - id: reset_mass_delete_approval
+    type: io.kestra.plugin.core.kv.Delete
+    description: Remove a one-time mass-delete approval after it was used.
+    key: "{{ vars.mass_delete_kv_key }}"
+    errorOnMissing: false
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      cdc.customers: {{ outputs.apply_changes.row.events }} events,
+      {{ outputs.apply_changes.row.upserted }} upserted,
+      {{ outputs.apply_changes.row.deleted }} deleted,
+      {{ outputs.apply_changes.row.skipped_stale }} skipped as older than the replica.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: One alert per failed batch. Staged events stay in place, so a restart continues the batch.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{
+        {
+          "text": "CDC replica cdc.customers: execution " ~ execution.id ~ " failed at " ~ ((errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown') ~ ". " ~ ((errorLogs() | length) > 0 ? errorLogs()[0].message : '') ~ " Staged events stay in cdc.customers_changes; restart the execution after you fix the cause."
+        } | toJson
+      }}
+
+triggers:
+  - id: customers_changes
+    type: io.kestra.plugin.debezium.postgres.Trigger
+    hostname: "{{ secret('CDC_SOURCE_HOST') }}"
+    port: "5432"
+    username: "{{ secret('CDC_SOURCE_USER') }}"
+    password: "{{ secret('CDC_SOURCE_PASSWORD') }}"
+    database: shop
+    pluginName: PGOUTPUT
+    slotName: kestra_customers_replica
+    publicationName: kestra_customers_replica
+    snapshotMode: INITIAL
+    includedTables: public.customers
+    maxRecords: 5000
+    interval: PT1M
+
+extend:
+  title: Replicate PostgreSQL inserts, updates and deletes with Debezium CDC
+  metaTitle: PostgreSQL CDC Replica with Debezium Upserts and Deletes | Kestra
+  shortDescription: Capture changes from a PostgreSQL table with Debezium and merge inserts, updates and deletes into a replica table, in order and safe to restart.
+  metaDescription: Keep a PostgreSQL replica in sync with Debezium CDC. Merge inserts, updates and deletes by LSN, keep TOAST values and stop on mass deletes.
+  description: |
+    Debezium captures PostgreSQL row changes without Kafka Connect, and a JDBC
+    Batch task can append them to a table. A replica that matches the source
+    needs more: updates and deletes in order, and no old event written over a
+    newer row. This flow stages each batch of change events and merges it into
+    the replica with one SQL statement.
+
+    ## How it works
+
+    1. The Debezium PostgreSQL Trigger reads the replication slot every minute.
+       The first run copies a snapshot of `public.customers`. Each event has the
+       primary key, a `deleted` flag and the source LSN in `metadata`.
+    2. `create_replica_tables` creates `cdc.customers`, the staging table
+       `cdc.customers_changes` and the view `cdc.customers_live` if missing.
+    3. `stage_changes` loads the events into the staging table with the
+       execution ID. `metadata` goes into a `jsonb` column for the LSN.
+    4. `count_changes` keeps the last event per key. `mass_delete_guard` stops
+       a batch that deletes more than `max_deletes_per_batch` rows, unless the
+       KV approval is set.
+    5. `apply_changes` upserts the last event per key only when its LSN is newer
+       than the row's `_cdc_lsn`. A delete sets `_cdc_deleted`. An unchanged
+       TOAST value (`__debezium_unavailable_value`) keeps the replica value.
+    6. The flow removes a used approval and logs the counts. On failure,
+       `alert_failure` sends one Slack message with the task and the error.
+
+    ## What you get
+
+    - `cdc.customers_live` with the same rows and values as the source.
+    - `_cdc_lsn`, `_cdc_deleted` and `_cdc_applied_at` for audits and
+      incremental reads.
+    - Batches applied in order (`concurrency` limit 1, `QUEUE`). A restarted
+      or late batch never replaces a newer row or brings back a deleted row.
+    - A mass-delete stop with a one-time approval.
+    - Counts in `outputs.apply_changes.row`: `events`, `keys`, `upserted`,
+      `deleted` and `skipped_stale`.
+
+    ## Who it's for
+
+    - Data engineers who copy OLTP tables into a reporting database and need
+      current state, not an append-only log.
+    - Platform teams who need tables in another database without Kafka.
+
+    ## Why orchestrate this with Kestra
+
+    - Debezium offsets stay in the KV store and each change file stays with its
+      execution, so a failed batch restarts without reading the WAL again.
+    - Flow concurrency keeps batches in order without a lock table.
+    - Secrets keep passwords and the webhook out of the YAML.
+    - The approval is a KV value and a restart, with no extra service.
+
+    ## Prerequisites
+
+    - PostgreSQL 10 or later with `wal_level=logical`, and a user with
+      `REPLICATION` and `SELECT` on the table. The source table needs a
+      primary key.
+    - A PostgreSQL target where the user can create the `cdc` schema.
+
+    ### Secrets
+
+    - `CDC_SOURCE_HOST`, `CDC_SOURCE_USER`, `CDC_SOURCE_PASSWORD`: source
+      database connection.
+    - `CDC_REPLICA_JDBC_URL`, `CDC_REPLICA_USER`, `CDC_REPLICA_PASSWORD`:
+      target database, for example `jdbc:postgresql://host:5432/analytics`.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for failure alerts.
+
+    ## Quick start
+
+    1. Run `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16 -c wal_level=logical`.
+    2. Create databases `shop` and `analytics`. In `shop`, create
+       `public.customers (id bigint PRIMARY KEY, email text NOT NULL, full_name text, plan text NOT NULL, notes text, updated_at timestamptz NOT NULL DEFAULT now())`
+       and insert rows.
+    3. Add the secrets and save the flow. The first execution copies the
+       snapshot within a minute.
+    4. Change rows in `shop`, then compare with `cdc.customers_live`.
+    5. Delete more than 500 rows to test the guard. Set KV key
+       `cdc_customers_allow_mass_delete` to `true` and restart the execution.
+
+    ## How to extend
+
+    - Another table: change `includedTables`, the `trigger.uris` key
+      (`<database>.<table>`), the SQL column lists and the Batch `columns`.
+    - Add the TOAST `CASE` to each large `text`, `jsonb` or `bytea` column, or
+      set `REPLICA IDENTITY FULL` on the source table.
+    - Purge tombstones older than your restart window in a scheduled flow.
+    - Limits: Debezium skips `TRUNCATE` by default, and new source columns are
+      not copied until you add them. If you drop the slot, also delete this
+      flow's `debezium-state` KV entry.
+
+    ## Links
+
+    - [Debezium PostgreSQL plugin](https://kestra.io/plugins/plugin-debezium-postgres)
+    - [JDBC PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Flow concurrency](https://kestra.io/docs/workflow-components/concurrency)
+    - [Debezium PostgreSQL connector, TOASTed values](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)
+    - [PostgreSQL INSERT ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html)
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - ELT & Warehouse Loading
+  ee: false
+  demo: false

@@ -1,0 +1,298 @@
+id: mongodb-change-stream-resume-token-recovery
+namespace: company.team
+description: |
+  Hand off MongoDB change-stream events to a durable outbox without losing the resume position.
+  Each event and its checkpoint are committed in one MongoDB transaction; a later run resumes after the last committed event.
+  A collection invalidation switches the next run to startAfter, while an unusable token fails rather than silently skipping history.
+concurrency:
+  limit: 1
+  behavior: QUEUE
+triggers:
+  - id: on_consumer_wakeup
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: mongodb-change-stream-resume-change-me
+    description: "POST /api/v1/main/executions/webhook/company.team/mongodb-change-stream-resume-token-recovery/mongodb-change-stream-resume-change-me after a producer writes."
+  - id: scheduled_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    disabled: true
+    description: "Enable as a backstop after setting the connection secret and reviewing the first live checkpoint."
+inputs:
+  - id: database
+    type: STRING
+    defaults: change_demo
+    description: "Database containing the watched collection and the durable checkpoint/outbox collections."
+  - id: collection
+    type: STRING
+    defaults: orders
+    description: "Collection to watch; keep this unchanged for a saved consumer checkpoint."
+  - id: consumer_id
+    type: STRING
+    defaults: orders-to-outbox
+    description: "Stable consumer identity; changing it starts a new live stream, not a replay of old events."
+  - id: checkpoint_collection
+    type: STRING
+    defaults: kestra_change_checkpoints
+    description: "Collection for the resume token and watched-source identity."
+  - id: outbox_collection
+    type: STRING
+    defaults: kestra_change_outbox
+    description: "Collection receiving idempotency-keyed event handoffs in the same transaction as the checkpoint."
+  - id: docker_network
+    type: STRING
+    defaults: bridge
+    description: "Docker network for the Python task; use the network containing the replica set in a local test."
+  - id: max_events
+    type: INT
+    defaults: 50
+    description: "Maximum events handled per run, capped at 500 to bound execution time and replay work."
+  - id: max_wait_seconds
+    type: INT
+    defaults: 10
+    description: "Time to wait for new events after catching up, capped at 30 seconds."
+tasks:
+  - id: explain_handoff
+    type: io.kestra.plugin.core.log.Log
+    message: "Watching {{ inputs.database }}.{{ inputs.collection }} as {{ inputs.consumer_id }}; a run stops after {{ inputs.max_events }} events or {{ inputs.max_wait_seconds }} idle seconds."
+
+  - id: capture_and_checkpoint
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Atomically insert each source event into the outbox and advance the saved resume token."
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.docker_network }}"
+    dependencies:
+      - pymongo==4.15.3
+      - kestra==2.0.0
+    env:
+      MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+      SOURCE_DATABASE: "{{ inputs.database }}"
+      SOURCE_COLLECTION: "{{ inputs.collection }}"
+      CONSUMER_ID: "{{ inputs.consumer_id }}"
+      CHECKPOINT_COLLECTION: "{{ inputs.checkpoint_collection }}"
+      OUTBOX_COLLECTION: "{{ inputs.outbox_collection }}"
+      MAX_EVENTS: "{{ inputs.max_events }}"
+      MAX_WAIT_SECONDS: "{{ inputs.max_wait_seconds }}"
+    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+    script: |
+      import hashlib
+      import os
+      import re
+      import time
+
+      from bson import json_util
+      from kestra import Kestra
+      from pymongo import MongoClient
+      from pymongo.errors import PyMongoError
+
+      def name(key):
+          value = os.environ[key]
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,62}", value):
+              raise ValueError(f"{key} must contain 1-63 letters, digits, underscores or hyphens and start with a letter")
+          return value
+
+      db_name = name("SOURCE_DATABASE")
+      source_name = name("SOURCE_COLLECTION")
+      consumer = name("CONSUMER_ID")
+      checkpoint_name = name("CHECKPOINT_COLLECTION")
+      outbox_name = name("OUTBOX_COLLECTION")
+      if len({source_name, checkpoint_name, outbox_name}) != 3:
+          raise ValueError("The source, checkpoint and outbox collection names must be distinct")
+      max_events = int(os.environ["MAX_EVENTS"])
+      wait_seconds = int(os.environ["MAX_WAIT_SECONDS"])
+      if not 1 <= max_events <= 500 or not 1 <= wait_seconds <= 30:
+          raise ValueError("max_events must be 1-500 and max_wait_seconds must be 1-30")
+      uri = os.environ["MONGODB_URI"]
+      if not uri.startswith(("mongodb://", "mongodb+srv://")):
+          raise ValueError("MONGODB_URI must be a MongoDB connection URI")
+
+      client = MongoClient(uri, serverSelectionTimeoutMS=3000, retryWrites=True)
+      hello = client.admin.command("hello")
+      if not hello.get("setName"):
+          raise RuntimeError("This blueprint requires a MongoDB replica set, not a standalone server or mongos")
+      config = client.admin.command("replSetGetConfig")["config"]
+      replica_set_id = str(config.get("settings", {}).get("replicaSetId", ""))
+      if not replica_set_id:
+          raise RuntimeError("The replica set did not return replicaSetId; cannot pin the checkpoint to this deployment")
+      db = client[db_name]
+      source = db[source_name]
+      checkpoints = db[checkpoint_name]
+      outbox = db[outbox_name]
+      checkpoints.update_one(
+          {"_id": consumer},
+          {"$setOnInsert": {"source": f"{db_name}.{source_name}", "replicaSetId": replica_set_id,
+                            "token": None, "mode": "resumeAfter"}},
+          upsert=True,
+      )
+      checkpoint = checkpoints.find_one({"_id": consumer})
+      expected_source = f"{db_name}.{source_name}"
+      if checkpoint.get("source") != expected_source:
+          raise RuntimeError("Consumer checkpoint belongs to another source; use the original source or a new consumer_id")
+      if checkpoint.get("replicaSetId") != replica_set_id:
+          raise RuntimeError("Consumer checkpoint belongs to another replica set; reconcile from a verified snapshot before reset")
+      token = checkpoint.get("token")
+      mode = checkpoint.get("mode", "resumeAfter")
+      if mode not in ("resumeAfter", "startAfter") or (token is not None and not isinstance(token, dict)):
+          raise RuntimeError("Checkpoint is malformed; restore a verified token before retrying")
+      options = {"full_document": "updateLookup", "max_await_time_ms": 1000}
+      if token is not None:
+          options["start_after" if mode == "startAfter" else "resume_after"] = token
+      count = 0
+      handed_off = 0
+      last_id = ""
+      status = "IDLE"
+      deadline = time.monotonic() + wait_seconds
+      try:
+          with source.watch([], **options) as stream:
+              while count < max_events and time.monotonic() < deadline:
+                  event = stream.try_next()
+                  if event is None:
+                      continue
+                  next_token = event["_id"]
+                  event_id = hashlib.sha256(json_util.dumps(next_token, sort_keys=True).encode()).hexdigest()
+                  next_mode = "startAfter" if event["operationType"] == "invalidate" else "resumeAfter"
+
+                  def commit_handoff(session):
+                      changed = checkpoints.update_one(
+                          {"_id": consumer, "token": token, "source": expected_source},
+                          {"$set": {"token": next_token, "mode": next_mode}},
+                          session=session,
+                      )
+                      if changed.matched_count != 1:
+                          raise RuntimeError("Checkpoint changed during this run; retry from the current token")
+                      if next_mode == "resumeAfter":
+                          outbox.insert_one(
+                              {"_id": f"{consumer}/{event_id}", "consumer": consumer,
+                               "source": expected_source, "event": event},
+                              session=session,
+                          )
+
+                  with client.start_session() as session:
+                      session.with_transaction(commit_handoff)
+                  token = next_token
+                  count += 1
+                  if next_mode == "resumeAfter":
+                      handed_off += 1
+                  last_id = event_id
+                  status = "INVALIDATED" if next_mode == "startAfter" else "HANDED_OFF"
+                  deadline = time.monotonic() + wait_seconds
+                  if next_mode == "startAfter":
+                      break
+              if count < max_events and status != "INVALIDATED":
+                  watermark = stream.resume_token
+                  if watermark is None and token is None:
+                      raise RuntimeError("MongoDB did not provide an idle resume token; refusing to leave an uncheckpointed gap")
+                  if watermark is not None and watermark != token:
+                      advanced = checkpoints.update_one(
+                          {"_id": consumer, "token": token, "source": expected_source},
+                          {"$set": {"token": watermark, "mode": "resumeAfter"}},
+                      )
+                      if advanced.matched_count != 1:
+                          raise RuntimeError("Checkpoint changed while saving the idle watermark")
+                      token = watermark
+      except PyMongoError as exc:
+          detail = getattr(exc, "details", None)
+          message = detail.get("errmsg", "") if isinstance(detail, dict) else ""
+          cause = f"{exc.__class__.__name__} (code {getattr(exc, 'code', 'n/a')}): {message[:180]}"
+          if token is not None:
+              raise RuntimeError(
+                  "Change-stream read or atomic handoff failed. Check MongoDB and the oplog window; "
+                  "if the token cannot resume, reconcile from a verified snapshot before resetting this consumer. "
+                  f"MongoDB error: {cause}"
+              ) from exc
+          raise
+      finally:
+          client.close()
+      Kestra.outputs({"status": status, "events_handed_off": handed_off,
+                      "last_event_id": last_id, "consumer_id": consumer})
+
+  - id: report_handoff
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ outputs.capture_and_checkpoint.vars.events_handed_off }} event(s) processed; state {{ outputs.capture_and_checkpoint.vars.status }}; consumer {{ inputs.consumer_id }}."
+
+  - id: alert_on_invalidation
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.capture_and_checkpoint.vars.status == 'INVALIDATED' }}"
+    then:
+      - id: notify_collection_changed
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "MongoDB change stream {{ inputs.database }}.{{ inputs.collection }} was invalidated. Consumer {{ inputs.consumer_id }} saved its invalidate token; confirm the collection recreation and run again with startAfter. Execution {{ execution.id }}."
+        retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+errors:
+  - id: alert_recovery_failed
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      MongoDB change-stream handoff failed for {{ inputs.consumer_id }} in Kestra execution {{ execution.id }}.
+      Open the execution and inspect the failed task; likely causes include an invalid input, an unavailable replica set,
+      an unusable resume token, or an outbox transaction failure. Do not clear the checkpoint until the missing interval
+      is reconciled from a verified source.
+outputs:
+  - id: handoff
+    type: JSON
+    value: "{{ outputs.capture_and_checkpoint.vars ?? {} }}"
+extend:
+  title: Resume MongoDB Change Streams Without Losing the Handoff
+  shortDescription: Persist a change-stream token and an idempotent outbox event in one transaction, then resume safely after interruption.
+  metaTitle: MongoDB Change Stream Resume Token Recovery with Kestra
+  metaDescription: Recover MongoDB change streams with persisted resume tokens, atomic outbox handoff, and explicit history-loss failures in Kestra.
+  description: |
+    A change-stream consumer can crash between delivering an event and saving its position. This flow writes the event to a MongoDB outbox and advances the resume token in the same transaction. Its bounded run can be woken by webhook or a disabled schedule. It never silently resets an unusable token.
+
+    ## How it works
+    1. `explain_handoff` logs the watched source and run bounds.
+    2. `capture_and_checkpoint` checks the replica set, verifies the checkpoint belongs to the same collection, resumes with the saved token, and commits each outbox entry with its new token in one transaction.
+    3. `report_handoff` records the count and status; `alert_on_invalidation` warns when a drop or rename requires `startAfter` on the next run.
+
+    ## Error handling
+    Inputs, source identity and the replica-set ID are checked before opening a stream. An expired or invalid token fails with recovery guidance; it is never reset to the current time. MongoDB errors are retried with backoff. The flow-level alert names the execution and tells the operator to reconcile the missing interval before resetting a consumer. Atomic MongoDB transactions prevent an outbox entry without its checkpoint, but downstream outbox delivery still requires an idempotent consumer.
+
+    ## What this blueprint teaches about Kestra
+    A bounded Kestra execution can hand off change-stream events transactionally, retain a durable cursor between runs, and use an event trigger with a scheduled backstop. The `If` branch treats MongoDB invalidation as a distinct operational state.
+
+    ## What you get
+    - Outbox documents keyed by consumer and SHA-256 digest of each source resume token.
+    - A checkpoint document containing the full token, source identity, replica-set ID and resume mode.
+    - The `handoff` JSON flow output with status, count and last event ID.
+
+    ## Prerequisites
+    - MongoDB replica set; this flow does not support standalone servers or sharded clusters.
+    - Kestra worker with Docker task runner access and a Python container that can reach MongoDB.
+    - A Slack incoming webhook for error and invalidation alerts.
+
+    ### Secrets
+    - `MONGODB_URI`: URI for a user allowed to watch the source, read/write checkpoint and outbox collections, and run `replSetGetConfig` (the read-only `clusterMonitor` role includes it).
+    - `SLACK_WEBHOOK_URL`: incoming webhook URL for operational alerts.
+
+    ### Inputs
+    - `database` (STRING, `change_demo`) and `collection` (STRING, `orders`): watched source.
+    - `consumer_id` (STRING, `orders-to-outbox`): stable identity for one cursor.
+    - `checkpoint_collection` and `outbox_collection` (STRING): durable state collections.
+    - `docker_network` (STRING, `bridge`): task network; change to the MongoDB network for local Docker.
+    - `max_events` (INT, `50`) and `max_wait_seconds` (INT, `10`): per-run work bounds.
+
+    ### Outputs
+    - `handoff` (JSON): `IDLE`, `HANDED_OFF` or `INVALIDATED`, count, consumer and last event ID. Failed runs do not emit flow outputs.
+
+    ## Quick start
+    1. Configure both secrets and make the Python task's Docker network able to reach the replica set host in `MONGODB_URI`.
+    2. Run once while writing a test document into `change_demo.orders`; inspect the outbox and checkpoint. An initial run starts at the current point in the stream, so first take a source snapshot if earlier documents matter.
+    3. Run again after another write. The saved token resumes after the previous event; enabling the disabled schedule provides a periodic backstop.
+
+    ## Plugins used
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script) for PyMongo's change-stream API and transaction.
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook) for actionable alerts.
+    - [Docker task runner](https://kestra.io/plugins/core/docker-task-runner/io.kestra.plugin.scripts.runner.docker.docker) for an isolated Python environment.
+
+    ## Links
+    - [MongoDB change-stream resume semantics](https://www.mongodb.com/docs/manual/changestreams/)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+  ee: false
+  demo: false

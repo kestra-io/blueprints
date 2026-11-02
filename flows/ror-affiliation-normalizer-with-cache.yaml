@@ -1,0 +1,699 @@
+id: ror-affiliation-normalizer-with-cache
+namespace: company.team
+
+description: |
+  Turn messy institution strings from author lists, grant records or a CRM into ROR IDs with
+  canonical names, countries and organisation types. Each string is cleaned and deduplicated
+  in DuckDB, multi-affiliation strings are split on semicolons, and only strings the cache has
+  not seen go to the ROR API v2 affiliation matcher. Every answer is kept in a Parquet cache,
+  bucketing happens after the lookup so thresholds can change without re-querying, reviewer
+  decisions come back in as overrides, and only newly found review items are alerted.
+
+inputs:
+  - id: affiliations_csv
+    type: STRING
+    description: |
+      Inline CSV with a header row. Any columns are kept; the one named by `affiliation_column` is matched.
+      Ignored when `affiliations_file` is uploaded. The defaults mix clean names, duplicates written differently,
+      a PubMed-style string with an email, a two-institution string, an ambiguous one, bare names ROR cannot place
+      and CRM placeholders.
+    defaults: |
+      id,affiliation
+      1,"Massachusetts Institute of Technology, Cambridge, MA, USA"
+      2,"  massachusetts institute of technology,  Cambridge, MA, USA. "
+      3,"1 Dept of Chemistry, Univ. of Oxford, UK"
+      4,"Department of Physics, University of California, Berkeley, CA 94720, USA. Electronic address: jdoe@berkeley.edu"
+      5,"Dept of Neurology, Massachusetts General Hospital; Harvard Medical School, Boston, MA"
+      6,"Universidade de São Paulo, Brazil"
+      7,"Universidade de Sao Paulo, Brazil"
+      8,"Karolinska Institutet, Stockholm, Sweden"
+      9,"Inst. of Physics, Chinese Acad. of Sciences, Beijing"
+      10,"Universität Heidelberg"
+      11,"Stanford"
+      12,"Harvard"
+      13,"N/A"
+      14,"Self-employed"
+
+  - id: affiliations_file
+    type: FILE
+    required: false
+    description: Optional CSV upload (header row, comma separated) for real lists. Takes precedence over `affiliations_csv`.
+
+  - id: affiliation_column
+    type: STRING
+    defaults: affiliation
+    description: Name of the column holding the affiliation text.
+
+  - id: split_multi_affiliations
+    type: BOOL
+    defaults: true
+    description: |
+      Split a cell on `;` and match each part separately. ROR returns at most one chosen organisation per
+      request, so `Hospital A; University B` would otherwise lose University B. The output has one row per part.
+
+  - id: overrides_csv
+    type: STRING
+    description: |
+      Reviewer decisions, header `affiliation,ror_id`. The affiliation is normalised the same way as the input,
+      so spacing, case and accents do not matter. `ror_id` may be the full `https://ror.org/...` URL or the bare
+      9-character id. Overrides win over the matcher; ids ROR does not know are reported and ignored.
+    defaults: |
+      affiliation,ror_id
+      Stanford,https://ror.org/00f54p054
+
+  - id: auto_accept_score
+    type: FLOAT
+    defaults: 1.0
+    description: |
+      When ROR marks no candidate as `chosen`, accept the top candidate only if its score is at least this,
+      it is the only candidate at that score and it leads the runner-up by `min_margin`. ROR scores of 0.9
+      and above are often wrong institutions, so the default only accepts a lone perfect score.
+
+  - id: min_margin
+    type: FLOAT
+    defaults: 0.05
+    description: Minimum lead of the top candidate over the runner-up for a score-based accept.
+
+  - id: review_score
+    type: FLOAT
+    defaults: 0.8
+    description: Top candidates scoring at least this (and not accepted) go to NEEDS_REVIEW; lower scores and empty results are NO_MATCH.
+
+  - id: skip_pattern
+    type: STRING
+    defaults: "n a|na|none|null|unknown|not applicable|self employed|freelance|independent( researcher| scholar| consultant)?|retired|private|home|tbd|0"
+    description: RE2 pattern matched against the whole normalised key (lower case, accents removed, punctuation as spaces). Matching strings are SKIPPED without an API call.
+
+  - id: recheck_after_days
+    type: INT
+    defaults: 90
+    description: Query cached strings again when ROR did not choose a match and the answer is older than this many days (ROR publishes new organisations roughly monthly). 0 disables rechecks.
+
+  - id: max_lookups
+    type: INT
+    defaults: 1000
+    description: Cap on API calls per run; the rest show as PENDING and go in the next run.
+
+  - id: use_ror_client_id
+    type: BOOL
+    defaults: false
+    description: Send the `ROR_CLIENT_ID` secret in the `Client-Id` header. ROR plans 2,000 requests per 5 minutes with a client id and 50 without; the flow paces itself either way.
+
+  - id: cache_key
+    type: STRING
+    defaults: ror_affiliation_cache
+    description: KV key holding the URI of the Parquet cache. Use a different key per dataset if you want separate caches.
+
+triggers:
+  - id: monthly_recheck
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 5 3 * *"
+    description: ROR ships a data release about once a month; a monthly run re-queries unresolved strings older than `recheck_after_days` and leaves the rest to the cache.
+
+  - id: after_author_export
+    type: io.kestra.plugin.core.trigger.Flow
+    disabled: true
+    description: Enable and point at the flow that exports your author or grant list; it must expose a FILE output named `affiliations_csv`.
+    inputs:
+      affiliations_file: "{{ trigger.outputs.affiliations_csv }}"
+    dependsOn:
+      - namespace: company.team
+        flowId: author-list-export
+        states: [SUCCESS]
+
+tasks:
+  - id: inline_affiliations
+    type: io.kestra.plugin.core.storage.Write
+    description: Puts the inline CSV in internal storage so the inline text and an uploaded file are read the same way.
+    content: "{{ inputs.affiliations_csv }}"
+    extension: .csv
+
+  - id: inline_overrides
+    type: io.kestra.plugin.core.storage.Write
+    content: "{{ inputs.overrides_csv }}"
+    extension: .csv
+
+  - id: previous_cache
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ inputs.cache_key }}"
+    errorOnMissing: false
+    description: URI of the Parquet cache written by the last run; missing on the first run.
+
+  - id: bootstrap
+    type: io.kestra.plugin.core.flow.If
+    description: First run only. Writes an empty cache with the right schema so later tasks have a single code path.
+    condition: "{{ outputs.previous_cache.value is not defined or outputs.previous_cache.value is empty }}"
+    then:
+      - id: empty_cache
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        fetchType: NONE
+        outputFiles:
+          - cache_parquet
+        sql: |
+          CREATE TABLE cache (
+            lookup_kind VARCHAR, lookup_key VARCHAR, query_sent VARCHAR, http_status INTEGER, result_count INTEGER,
+            chosen BOOLEAN, ror_id VARCHAR, ror_name VARCHAR, country_code VARCHAR, country VARCHAR, org_types VARCHAR,
+            org_status VARCHAR, successor_ror_id VARCHAR, score DOUBLE, matching_type VARCHAR, runner_up_score DOUBLE,
+            top_score_ties INTEGER, candidates VARCHAR, looked_up_at TIMESTAMP
+          );
+          COPY cache TO '{{ outputFiles.cache_parquet }}' (FORMAT PARQUET);
+
+  - id: plan_lookups
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Cleans each affiliation (drops leading footnote markers, email addresses and PubMed "Electronic address" tails,
+      collapses whitespace), splits on `;` when asked, and builds a match key (lower case, accents removed, punctuation
+      as spaces) so `Univ. of Oxford` and `univ of oxford` are one lookup. Placeholders matching `skip_pattern` are
+      skipped. Overrides are normalised the same way and their ROR ids validated. The pending list holds the keys and
+      override ids not in the cache, plus cached unresolved keys older than `recheck_after_days`.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      affiliations.csv: "{{ inputs.affiliations_file ?? outputs.inline_affiliations.uri }}"
+      overrides.csv: "{{ outputs.inline_overrides.uri }}"
+      cache.parquet: "{{ outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+    outputFiles:
+      - rows_parquet
+      - overrides_parquet
+      - pending_csv
+    sql: |
+      CREATE MACRO clean_text(s) AS
+        regexp_replace(
+          regexp_replace(
+            regexp_replace(
+              regexp_replace(
+                regexp_replace(coalesce(s, ''), '(?i)electronic address:.*$', ''),
+              '[^\s,;()]+@[^\s,;()]+\.[a-zA-Z]{2,}', ' ', 'g'),
+            '^\s*(\d{1,3}|[*†‡§¶#]+)[).:,]?\s+', ''),
+          '\s+', ' ', 'g'),
+        '^[\s,;.:]+|[\s,;.:]+$', '', 'g');
+      CREATE MACRO match_key(s) AS trim(regexp_replace(lower(strip_accents(s)), '[^\p{L}\p{N}]+', ' ', 'g'));
+
+      CREATE TABLE src AS
+      SELECT *, row_number() OVER () AS input_row
+      FROM read_csv('affiliations.csv', header = true, all_varchar = true);
+
+      CREATE TABLE rows AS
+      WITH exploded AS (
+        SELECT input_row,
+               unnest(range(1, len(parts) + 1)) AS part_no,
+               unnest(parts) AS affiliation_part,
+               len(parts) AS part_count
+        FROM (
+          SELECT input_row,
+                 CASE WHEN {{ inputs.split_multi_affiliations }} AND contains(coalesce("{{ inputs.affiliation_column }}", ''), ';')
+                      THEN list_filter(string_split("{{ inputs.affiliation_column }}", ';'), x -> trim(x) <> '')
+                      ELSE [coalesce("{{ inputs.affiliation_column }}", '')] END AS parts
+          FROM src
+        )
+      )
+      SELECT s.*, CAST(e.part_no AS INTEGER) AS part_no, CAST(e.part_count AS INTEGER) AS part_count,
+             trim(e.affiliation_part) AS affiliation_part,
+             clean_text(e.affiliation_part) AS query_text,
+             match_key(clean_text(e.affiliation_part)) AS affiliation_key,
+             match_key(clean_text(e.affiliation_part)) = '' OR regexp_full_match(match_key(clean_text(e.affiliation_part)), '{{ inputs.skip_pattern | replace({"'": "''"}) }}') AS skip
+      FROM src s JOIN exploded e USING (input_row);
+
+      CREATE TABLE overrides AS
+      SELECT match_key(clean_text(affiliation)) AS affiliation_key,
+             arg_max(trim(ror_id), line) AS ror_id_raw,
+             nullif(regexp_extract(lower(arg_max(trim(ror_id), line)), '^(?:https?://ror\.org/)?(0[a-z0-9]{6}[0-9]{2})/?$', 1), '') AS override_ror_id
+      FROM (SELECT *, row_number() OVER () AS line FROM read_csv('overrides.csv', header = true, all_varchar = true,
+                                                                columns = {'affiliation': 'VARCHAR', 'ror_id': 'VARCHAR'}))
+      WHERE match_key(clean_text(affiliation)) <> ''
+      GROUP BY 1;
+
+      CREATE TABLE cache AS SELECT * FROM read_parquet('cache.parquet');
+
+      CREATE TABLE wanted AS
+      SELECT 'affiliation' AS lookup_kind, affiliation_key AS lookup_key,
+             arg_min(query_text, input_row * 1000 + part_no) AS query,
+             min(input_row * 1000 + part_no) AS first_seen
+      FROM rows WHERE NOT skip
+      GROUP BY affiliation_key
+      UNION ALL
+      SELECT DISTINCT 'ror_id', override_ror_id, override_ror_id, 0 FROM overrides WHERE override_ror_id IS NOT NULL;
+
+      CREATE TABLE due AS
+      SELECT w.*, c.lookup_key IS NOT NULL AS is_recheck
+      FROM wanted w
+      LEFT JOIN cache c ON c.lookup_kind = w.lookup_kind AND c.lookup_key = w.lookup_key
+      WHERE c.lookup_key IS NULL
+         OR ({{ inputs.recheck_after_days }} > 0 AND NOT c.chosen
+             AND c.looked_up_at < TIMESTAMP '{{ execution.startDate | date("yyyy-MM-dd HH:mm:ss.SSSSSS", timeZone="UTC") }}' - to_days({{ inputs.recheck_after_days }}));
+
+      CREATE TABLE pending AS
+      SELECT * FROM due ORDER BY lookup_kind DESC, first_seen LIMIT {{ inputs.max_lookups }};
+
+      COPY (SELECT * FROM rows) TO '{{ outputFiles.rows_parquet }}' (FORMAT PARQUET);
+      COPY (SELECT * FROM overrides) TO '{{ outputFiles.overrides_parquet }}' (FORMAT PARQUET);
+      COPY (SELECT lookup_kind, lookup_key, query FROM pending) TO '{{ outputFiles.pending_csv }}' (HEADER true, DELIMITER ',');
+
+      SELECT
+        (SELECT count(*) FROM src) AS input_rows,
+        (SELECT count(*) FROM rows) AS affiliation_parts,
+        (SELECT count(*) FROM src WHERE input_row IN (SELECT input_row FROM rows WHERE part_count > 1)) AS multi_affiliation_rows,
+        (SELECT count(*) FILTER (WHERE skip) FROM rows) AS skipped_parts,
+        (SELECT count(DISTINCT affiliation_key) FILTER (WHERE NOT skip) FROM rows) AS unique_keys,
+        (SELECT count(*) FROM overrides) AS overrides,
+        (SELECT coalesce(string_agg(ror_id_raw, ', '), '') FROM overrides WHERE override_ror_id IS NULL) AS malformed_overrides,
+        (SELECT count(*) FROM wanted WHERE lookup_kind = 'affiliation') - (SELECT count(*) FROM due WHERE lookup_kind = 'affiliation') AS from_cache,
+        (SELECT count(*) FILTER (WHERE is_recheck) FROM due) AS rechecks,
+        (SELECT count(*) FROM pending) AS to_lookup,
+        (SELECT count(*) FROM due) - (SELECT count(*) FROM pending) AS deferred,
+        (SELECT count(*) FROM cache) AS cache_size_before,
+        (SELECT count(*) FROM cache) = 0 AS is_baseline;
+
+  - id: lookup_new
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.plan_lookups.outputs[0].row.to_lookup > 0 }}"
+    then:
+      - id: ror_lookup
+        type: io.kestra.plugin.scripts.python.Script
+        description: |
+          One GET per pending string to `/v2/organizations?affiliation=...` and one per new override id to
+          `/v2/organizations/{id}`, paced (0.2 s between calls with a client id, 1 s without), with retries on 429 and
+          5xx that honour `Retry-After`. If ROR keeps rate limiting, the batch stops and the rest stays pending for the
+          next run instead of failing. Only the fields the flow needs are kept: ROR's `chosen` pick (or the top-scored
+          candidate), its display name, country, types, status and successor, the runner-up score, the number of
+          candidates tied at the top score and the top three candidates for reviewers. Standard library only.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        inputFiles:
+          pending.csv: "{{ outputs.plan_lookups.outputFiles.pending_csv }}"
+        outputFiles:
+          - lookups.jsonl
+        env:
+          ROR_CLIENT_ID: "{{ inputs.use_ror_client_id ? secret('ROR_CLIENT_ID') : '' }}"
+          RUN_STARTED: "{{ execution.startDate | date('yyyy-MM-dd HH:mm:ss.SSSSSS', timeZone='UTC') }}"
+          PYTHONIOENCODING: utf-8
+        script: |
+          import csv, json, os, time, urllib.error, urllib.parse, urllib.request
+
+          API = "https://api.ror.org/v2/organizations"
+          client_id = os.environ.get("ROR_CLIENT_ID", "").strip()
+          pace = 0.2 if client_id else 1.0
+          headers = {"Accept": "application/json", "User-Agent": "kestra-ror-affiliation-normalizer/1.0 (+https://kestra.io)"}
+          if client_id:
+              headers["Client-Id"] = client_id
+
+          class RateLimited(Exception):
+              pass
+
+          def get(url):
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                          return r.status, json.load(r)
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404:
+                          return 404, None
+                      if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                          wait = min(float(e.headers.get("Retry-After") or 2 ** (attempt + 2)), 60)
+                          print(f"HTTP {e.code} from ROR, retrying in {wait:.0f}s")
+                          time.sleep(wait)
+                          continue
+                      if e.code == 429:
+                          raise RateLimited()
+                      return e.code, None
+                  except (urllib.error.URLError, TimeoutError) as e:
+                      if attempt < 3:
+                          time.sleep(2 ** (attempt + 1))
+                          continue
+                      return None, None
+              return None, None
+
+          def describe(org):
+              names = org.get("names") or []
+              display = next((n["value"] for n in names if "ror_display" in n.get("types", [])), names[0]["value"] if names else None)
+              geo = ((org.get("locations") or [{}])[0]).get("geonames_details") or {}
+              successors = [r["id"] for r in org.get("relationships") or [] if r.get("type") == "successor"]
+              return {
+                  "ror_id": org.get("id"), "ror_name": display,
+                  "country_code": geo.get("country_code"), "country": geo.get("country_name"),
+                  "org_types": ";".join(org.get("types") or []), "org_status": org.get("status"),
+                  "successor_ror_id": ";".join(successors) or None,
+              }
+
+          empty = {k: None for k in ("ror_id", "ror_name", "country_code", "country", "org_types", "org_status", "successor_ror_id")}
+          stats = {"affiliation_calls": 0, "id_calls": 0, "chosen": 0, "unchosen": 0, "empty": 0, "unknown_ids": 0, "errors": 0, "rate_limited": False}
+          with open("pending.csv", newline="", encoding="utf-8") as f:
+              pending = list(csv.DictReader(f))
+
+          with open("lookups.jsonl", "w", encoding="utf-8") as out:
+              for i, row in enumerate(pending):
+                  if i:
+                      time.sleep(pace)
+                  kind, key, query = row["lookup_kind"], row["lookup_key"], row["query"]
+                  rec = {"lookup_kind": kind, "lookup_key": key, "query_sent": query, "looked_up_at": os.environ["RUN_STARTED"],
+                         "chosen": False, "score": None, "matching_type": None, "runner_up_score": None, "top_score_ties": 0, "candidates": "[]"}
+                  try:
+                      if kind == "ror_id":
+                          stats["id_calls"] += 1
+                          status, body = get(f"{API}/{key}")
+                          rec.update(http_status=status, result_count=1 if body else 0, **(describe(body) if body else empty))
+                          if status == 404:
+                              stats["unknown_ids"] += 1
+                      else:
+                          stats["affiliation_calls"] += 1
+                          status, body = get(f"{API}?affiliation={urllib.parse.quote(query)}")
+                          items = sorted((body or {}).get("items") or [], key=lambda it: -(it.get("score") or 0))
+                          pick = next((it for it in items if it.get("chosen")), items[0] if items else None)
+                          rec.update(http_status=status, result_count=len(items), **(describe(pick["organization"]) if pick else empty))
+                          if pick:
+                              others = [it.get("score") or 0 for it in items if it is not pick]
+                              rec.update(chosen=bool(pick.get("chosen")), score=pick.get("score"), matching_type=pick.get("matching_type"),
+                                         runner_up_score=max(others) if others else None,
+                                         top_score_ties=sum(1 for it in items if it.get("score") == pick.get("score")))
+                              stats["chosen" if pick.get("chosen") else "unchosen"] += 1
+                          elif status == 200:
+                              stats["empty"] += 1
+                          rec["candidates"] = json.dumps([{**{k: v for k, v in describe(it["organization"]).items() if k in ("ror_id", "ror_name", "country_code")},
+                                                           "score": it.get("score"), "chosen": it.get("chosen")} for it in items[:3]], ensure_ascii=False)
+                  except RateLimited:
+                      stats["rate_limited"] = True
+                      print(f"ROR keeps returning 429; stopping after {i} of {len(pending)} lookups, the rest stay pending")
+                      break
+                  if rec["http_status"] not in (200, 404):
+                      stats["errors"] += 1
+                      print(f"Lookup failed for {kind} {key!r} (HTTP {rec['http_status']}); it stays pending")
+                      continue
+                  out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+          print(f"ROR lookups: {stats}")
+          print("::" + json.dumps({"outputs": stats}) + "::")
+
+      - id: merge_cache
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        description: Replaces the looked-up keys in the cache with the fresh answers and writes the new Parquet file. Failed lookups are not written, so they are retried next run.
+        url: "jdbc:duckdb:"
+        fetchType: FETCH_ONE
+        inputFiles:
+          lookups.jsonl: "{{ outputs.ror_lookup.outputFiles['lookups.jsonl'] }}"
+          cache.parquet: "{{ outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+        outputFiles:
+          - cache_parquet
+        sql: |
+          CREATE TABLE fresh AS
+          SELECT lookup_kind, lookup_key, query_sent, http_status, result_count, chosen, ror_id, ror_name, country_code, country,
+                 org_types, org_status, successor_ror_id, score, matching_type, runner_up_score, top_score_ties, candidates,
+                 CAST(looked_up_at AS TIMESTAMP) AS looked_up_at
+          FROM read_json('lookups.jsonl', format = 'newline_delimited', columns = {
+            'lookup_kind': 'VARCHAR', 'lookup_key': 'VARCHAR', 'query_sent': 'VARCHAR', 'http_status': 'INTEGER', 'result_count': 'INTEGER',
+            'chosen': 'BOOLEAN', 'ror_id': 'VARCHAR', 'ror_name': 'VARCHAR', 'country_code': 'VARCHAR', 'country': 'VARCHAR',
+            'org_types': 'VARCHAR', 'org_status': 'VARCHAR', 'successor_ror_id': 'VARCHAR', 'score': 'DOUBLE', 'matching_type': 'VARCHAR',
+            'runner_up_score': 'DOUBLE', 'top_score_ties': 'INTEGER', 'candidates': 'VARCHAR', 'looked_up_at': 'VARCHAR'});
+
+          CREATE TABLE cache AS
+          SELECT * FROM read_parquet('cache.parquet') c
+          WHERE NOT EXISTS (SELECT 1 FROM fresh f WHERE f.lookup_kind = c.lookup_kind AND f.lookup_key = c.lookup_key)
+          UNION ALL BY NAME
+          SELECT * FROM fresh;
+
+          COPY cache TO '{{ outputFiles.cache_parquet }}' (FORMAT PARQUET);
+
+          SELECT (SELECT count(*) FROM fresh) AS written, (SELECT count(*) FROM cache) AS cache_size;
+
+      - id: save_cache
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ inputs.cache_key }}"
+        value: "{{ outputs.merge_cache.outputFiles.cache_parquet }}"
+        description: Points the KV key at the new cache. Older cache files stay with their executions until purged.
+
+  - id: classify
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Buckets every affiliation part with the current thresholds, so changing them re-buckets cached answers without
+      new API calls. Order: SKIPPED placeholder, valid override, PENDING (not looked up yet), MATCHED when ROR set
+      `chosen` on an active organisation, MATCHED by score when the top candidate passes `auto_accept_score` alone and
+      with `min_margin`, NEEDS_REVIEW when the top score reaches `review_score` (or ROR chose an inactive organisation),
+      otherwise NO_MATCH. Writes the enriched CSV (all input columns plus the ROR fields) and a review queue with one row
+      per unresolved string, its occurrences and the top three candidates, ready to copy into `overrides_csv`.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      rows.parquet: "{{ outputs.plan_lookups.outputFiles.rows_parquet }}"
+      overrides.parquet: "{{ outputs.plan_lookups.outputFiles.overrides_parquet }}"
+      cache.parquet: "{{ outputs.merge_cache.outputFiles.cache_parquet ?? outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+    outputFiles:
+      - enriched_csv
+      - review_csv
+    sql: |
+      CREATE TABLE rows AS SELECT * FROM read_parquet('rows.parquet');
+      CREATE TABLE cache AS SELECT * FROM read_parquet('cache.parquet');
+
+      CREATE TABLE ov AS
+      SELECT o.affiliation_key, o.ror_id_raw, o.override_ror_id, c.http_status, c.ror_id, c.ror_name, c.country_code, c.country,
+             c.org_types, c.org_status, c.successor_ror_id, c.looked_up_at
+      FROM read_parquet('overrides.parquet') o
+      LEFT JOIN cache c ON c.lookup_kind = 'ror_id' AND c.lookup_key = o.override_ror_id;
+
+      CREATE TABLE decided AS
+      SELECT r.*,
+             c.looked_up_at AS c_looked_up_at, CASE WHEN o.http_status = 200 THEN o.looked_up_at END AS o_looked_up_at, c.result_count, c.chosen, c.score, c.runner_up_score, c.top_score_ties, c.candidates,
+             o.http_status = 200 AS use_override,
+             CASE
+               WHEN r.skip THEN 'SKIPPED'
+               WHEN o.http_status = 200 THEN 'MATCHED'
+               WHEN c.lookup_key IS NULL THEN 'PENDING'
+               WHEN c.chosen AND c.org_status = 'active' THEN 'MATCHED'
+               WHEN c.chosen THEN 'NEEDS_REVIEW'
+               WHEN c.score >= {{ inputs.auto_accept_score }} AND c.top_score_ties = 1 AND c.org_status = 'active'
+                    AND c.score - coalesce(c.runner_up_score, 0) >= {{ inputs.min_margin }} THEN 'MATCHED'
+               WHEN c.score >= {{ inputs.review_score }} THEN 'NEEDS_REVIEW'
+               ELSE 'NO_MATCH' END AS match_bucket,
+             CASE
+               WHEN r.skip THEN 'placeholder'
+               WHEN o.http_status = 200 THEN 'override'
+               WHEN c.lookup_key IS NULL THEN 'not_looked_up_yet'
+               WHEN c.chosen AND c.org_status = 'active' THEN 'ror_chosen'
+               WHEN c.chosen THEN 'ror_chosen_' || c.org_status
+               WHEN c.score >= {{ inputs.auto_accept_score }} AND c.top_score_ties = 1 AND c.org_status = 'active'
+                    AND c.score - coalesce(c.runner_up_score, 0) >= {{ inputs.min_margin }} THEN 'score'
+               WHEN c.score >= {{ inputs.review_score }} AND c.top_score_ties > 1 THEN 'tied_top_score'
+               WHEN c.score >= {{ inputs.review_score }} THEN 'unconfirmed_candidate'
+               WHEN coalesce(c.result_count, 0) = 0 THEN 'no_candidates'
+               ELSE 'low_score' END AS match_reason,
+             CASE WHEN o.http_status = 200 THEN o.ror_id ELSE c.ror_id END AS ror_id,
+             CASE WHEN o.http_status = 200 THEN o.ror_name ELSE c.ror_name END AS ror_name,
+             CASE WHEN o.http_status = 200 THEN o.country_code ELSE c.country_code END AS country_code,
+             CASE WHEN o.http_status = 200 THEN o.country ELSE c.country END AS country,
+             CASE WHEN o.http_status = 200 THEN o.org_types ELSE c.org_types END AS org_types,
+             CASE WHEN o.http_status = 200 THEN o.org_status ELSE c.org_status END AS org_status,
+             CASE WHEN o.http_status = 200 THEN o.successor_ror_id ELSE c.successor_ror_id END AS successor_ror_id
+      FROM rows r
+      LEFT JOIN ov o ON o.affiliation_key = r.affiliation_key AND NOT r.skip
+      LEFT JOIN cache c ON c.lookup_kind = 'affiliation' AND c.lookup_key = r.affiliation_key AND NOT r.skip AND coalesce(o.http_status, 0) <> 200;
+
+      CREATE TABLE result AS
+      SELECT * EXCLUDE (input_row, part_count, skip, use_override, result_count, chosen, runner_up_score, top_score_ties, candidates,
+                        c_looked_up_at, o_looked_up_at, score, query_text, affiliation_key, match_bucket, match_reason,
+                        ror_id, ror_name, country_code, country, org_types, org_status, successor_ror_id),
+             query_text AS query_sent, affiliation_key, match_bucket, match_reason,
+             CASE WHEN match_bucket = 'MATCHED' THEN ror_id END AS ror_id,
+             CASE WHEN match_bucket = 'MATCHED' THEN ror_name END AS ror_name,
+             CASE WHEN match_bucket = 'MATCHED' THEN country_code END AS country_code,
+             CASE WHEN match_bucket = 'MATCHED' THEN country END AS country,
+             CASE WHEN match_bucket = 'MATCHED' THEN org_types END AS org_types,
+             CASE WHEN match_bucket = 'MATCHED' THEN org_status END AS org_status,
+             CASE WHEN match_bucket = 'MATCHED' THEN successor_ror_id END AS successor_ror_id,
+             score AS ror_score,
+             CASE WHEN match_bucket IN ('NEEDS_REVIEW', 'NO_MATCH') THEN candidates END AS candidates,
+             coalesce(o_looked_up_at, c_looked_up_at) AS looked_up_at,
+             coalesce(o_looked_up_at, c_looked_up_at) < TIMESTAMP '{{ execution.startDate | date("yyyy-MM-dd HH:mm:ss.SSSSSS", timeZone="UTC") }}' AS from_cache,
+             input_row AS _order,
+             c_looked_up_at = TIMESTAMP '{{ execution.startDate | date("yyyy-MM-dd HH:mm:ss.SSSSSS", timeZone="UTC") }}' AS _new
+      FROM decided;
+
+      COPY (SELECT * EXCLUDE (_order, _new) FROM result ORDER BY _order, part_no)
+        TO '{{ outputFiles.enriched_csv }}' (HEADER true, DELIMITER ',');
+
+      CREATE TABLE review AS
+      SELECT affiliation_key, arg_min(query_sent, _order) AS affiliation, count(*) AS occurrences,
+             any_value(match_bucket) AS match_bucket, any_value(match_reason) AS match_reason,
+             max(ror_score) AS top_score, bool_or(_new) AS new_this_run, any_value(candidates) AS candidates
+      FROM result WHERE match_bucket IN ('NEEDS_REVIEW', 'NO_MATCH')
+      GROUP BY affiliation_key;
+
+      COPY (
+        SELECT affiliation, occurrences, match_bucket, match_reason, top_score, new_this_run,
+               json_extract_string(candidates, '$[0].ror_id') AS candidate_1_ror_id, json_extract_string(candidates, '$[0].ror_name') AS candidate_1_name,
+               json_extract_string(candidates, '$[0].country_code') AS candidate_1_country, CAST(json_extract(candidates, '$[0].score') AS DOUBLE) AS candidate_1_score,
+               json_extract_string(candidates, '$[1].ror_id') AS candidate_2_ror_id, json_extract_string(candidates, '$[1].ror_name') AS candidate_2_name,
+               CAST(json_extract(candidates, '$[1].score') AS DOUBLE) AS candidate_2_score,
+               json_extract_string(candidates, '$[2].ror_id') AS candidate_3_ror_id, json_extract_string(candidates, '$[2].ror_name') AS candidate_3_name,
+               CAST(json_extract(candidates, '$[2].score') AS DOUBLE) AS candidate_3_score,
+               '' AS override_ror_id
+        FROM review ORDER BY match_bucket DESC, occurrences DESC, affiliation
+      ) TO '{{ outputFiles.review_csv }}' (HEADER true, DELIMITER ',');
+
+      SELECT
+        count(*) AS rows_out,
+        count(*) FILTER (WHERE match_bucket = 'MATCHED') AS matched,
+        count(*) FILTER (WHERE match_reason = 'ror_chosen') AS matched_ror_chosen,
+        count(*) FILTER (WHERE match_reason = 'score') AS matched_by_score,
+        count(*) FILTER (WHERE match_reason = 'override') AS matched_by_override,
+        count(*) FILTER (WHERE match_bucket = 'NEEDS_REVIEW') AS needs_review,
+        count(*) FILTER (WHERE match_bucket = 'NO_MATCH') AS no_match,
+        count(*) FILTER (WHERE match_bucket = 'SKIPPED') AS skipped,
+        count(*) FILTER (WHERE match_bucket = 'PENDING') AS pending,
+        count(*) FILTER (WHERE from_cache) AS answered_from_cache,
+        count(DISTINCT ror_id) AS distinct_organisations,
+        round(100.0 * count(*) FILTER (WHERE match_bucket = 'MATCHED') / nullif(count(*) FILTER (WHERE match_bucket <> 'SKIPPED'), 0), 1) AS match_rate_pct,
+        (SELECT count(*) FROM review) AS review_queue,
+        (SELECT count(*) FILTER (WHERE new_this_run) FROM review) AS new_in_review_queue,
+        (SELECT coalesce(string_agg(ror_id_raw, ', '), '') FROM ov WHERE http_status = 404) AS unknown_override_ids,
+        (SELECT coalesce(string_agg(format('- "{}" ({}, {}): {}', affiliation, match_bucket, match_reason,
+                  coalesce(json_extract_string(candidates, '$[0].ror_name') || ' ' || json_extract_string(candidates, '$[0].ror_id') || ' score ' || json_extract_string(candidates, '$[0].score'), 'no candidates')),
+                  chr(10) ORDER BY match_bucket DESC, affiliation), '')
+           FROM (SELECT * FROM review WHERE new_this_run ORDER BY occurrences DESC LIMIT 15)) AS new_review_items,
+        CASE WHEN (SELECT count(*) FILTER (WHERE new_this_run) FROM review) > 0 THEN 'NEW_REVIEW_ITEMS'
+             WHEN (SELECT count(*) FROM review) > 0 THEN 'REVIEW_BACKLOG'
+             ELSE 'ALL_RESOLVED' END AS triage
+      FROM result;
+
+  - id: triage
+    type: io.kestra.plugin.core.flow.Switch
+    description: Routes on what changed. Only strings looked up in this run can raise an alert, so the backlog is not re-announced every month.
+    value: "{{ outputs.classify.outputs[0].row.triage }}"
+    cases:
+      NEW_REVIEW_ITEMS:
+        - id: log_new_review
+          type: io.kestra.plugin.core.log.Log
+          level: WARN
+          message: |
+            {{ outputs.classify.outputs[0].row.new_in_review_queue }} new affiliation strings need a decision ({{ outputs.classify.outputs[0].row.review_queue }} in the review queue):
+            {{ outputs.classify.outputs[0].row.new_review_items }}
+
+        - id: notify_review
+          type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+          allowFailure: true
+          description: allowFailure keeps the run usable when the webhook is not configured; the review queue is still in the outputs and the logs.
+          url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+          messageText: |
+            *ROR affiliation review*: {{ outputs.classify.outputs[0].row.new_in_review_queue }} new strings need a decision ({{ outputs.classify.outputs[0].row.matched }} of {{ outputs.classify.outputs[0].row.rows_out }} rows matched, {{ outputs.classify.outputs[0].row.match_rate_pct }} percent).
+            {{ outputs.classify.outputs[0].row.new_review_items }}
+            Review queue CSV: {{ kestra.url ?? '' }}/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}/outputs
+
+      REVIEW_BACKLOG:
+        - id: log_backlog
+          type: io.kestra.plugin.core.log.Log
+          message: Nothing new to review; {{ outputs.classify.outputs[0].row.review_queue }} strings are still waiting in the review queue. Add decisions to `overrides_csv` to resolve them.
+
+    defaults:
+      - id: log_resolved
+        type: io.kestra.plugin.core.log.Log
+        message: "Review queue is empty: {{ outputs.classify.outputs[0].row.matched }} parts matched, {{ outputs.classify.outputs[0].row.skipped }} placeholders skipped, {{ outputs.classify.outputs[0].row.pending }} still pending for the next run."
+
+  - id: warn_unknown_overrides
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ outputs.classify.outputs[0].row.unknown_override_ids is not empty or outputs.plan_lookups.outputs[0].row.malformed_overrides is not empty }}"
+    level: WARN
+    message: "Ignored overrides. Not a ROR id: [{{ outputs.plan_lookups.outputs[0].row.malformed_overrides }}]. Unknown to ROR: [{{ outputs.classify.outputs[0].row.unknown_override_ids }}]"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ outputs.plan_lookups.outputs[0].row.is_baseline ? 'BASELINE run (empty cache). ' : '' }}{{ outputs.plan_lookups.outputs[0].row.input_rows }} input rows, {{ outputs.plan_lookups.outputs[0].row.affiliation_parts }} affiliation parts ({{ outputs.plan_lookups.outputs[0].row.multi_affiliation_rows }} rows split), {{ outputs.plan_lookups.outputs[0].row.unique_keys }} unique strings, {{ outputs.plan_lookups.outputs[0].row.skipped_parts }} placeholders skipped.
+      Lookups: {{ outputs.plan_lookups.outputs[0].row.from_cache }} strings answered from the cache, {{ outputs.plan_lookups.outputs[0].row.to_lookup }} sent to ROR ({{ outputs.plan_lookups.outputs[0].row.rechecks }} rechecks), {{ outputs.plan_lookups.outputs[0].row.deferred }} deferred; ROR calls this run: {{ outputs.ror_lookup.vars.affiliation_calls ?? 0 }} affiliation, {{ outputs.ror_lookup.vars.id_calls ?? 0 }} override id.
+      Buckets: {{ outputs.classify.outputs[0].row.matched }} MATCHED ({{ outputs.classify.outputs[0].row.matched_ror_chosen }} chosen by ROR, {{ outputs.classify.outputs[0].row.matched_by_score }} by score, {{ outputs.classify.outputs[0].row.matched_by_override }} by override), {{ outputs.classify.outputs[0].row.needs_review }} NEEDS_REVIEW, {{ outputs.classify.outputs[0].row.no_match }} NO_MATCH, {{ outputs.classify.outputs[0].row.skipped }} SKIPPED, {{ outputs.classify.outputs[0].row.pending }} PENDING; {{ outputs.classify.outputs[0].row.distinct_organisations }} distinct organisations, match rate {{ outputs.classify.outputs[0].row.match_rate_pct }} percent.
+
+outputs:
+  - id: enriched_csv
+    type: FILE
+    value: "{{ outputs.classify.outputFiles.enriched_csv }}"
+  - id: review_csv
+    type: FILE
+    value: "{{ outputs.classify.outputFiles.review_csv }}"
+  - id: summary
+    type: JSON
+    value: "{{ outputs.classify.outputs[0].row }}"
+  - id: lookup_plan
+    type: JSON
+    value: "{{ outputs.plan_lookups.outputs[0].row }}"
+  - id: cache_parquet
+    type: FILE
+    value: "{{ outputs.merge_cache.outputFiles.cache_parquet ?? outputs.previous_cache.value ?? outputs.empty_cache.outputFiles.cache_parquet }}"
+
+extend:
+  title: Normalize Institution Affiliations to ROR IDs with a Parquet Cache and a Review Queue
+  metaTitle: ROR Affiliation Matching with DuckDB Cache and Review Queue | Kestra
+  shortDescription: Clean, split and deduplicate messy affiliation strings in DuckDB, match only the new ones against the ROR API v2 affiliation endpoint, bucket them into matched, needs-review and no-match with tunable thresholds, and feed reviewer decisions back as overrides.
+  metaDescription: Match messy affiliation strings to ROR IDs with the ROR v2 API, DuckDB and a Parquet cache, bucket them for review and re-query only new strings.
+  description: |
+    Author lists, grant records and CRM accounts spell the same institution a dozen ways: `Univ. of Oxford`, `1 Dept of Chemistry, University of Oxford, UK`, a PubMed string with an email tail, or two institutions in one cell. The Research Organization Registry (ROR) has an affiliation matcher that returns candidate organisations with a score and, when it is confident, one marked `chosen`. This flow wraps it for real lists: DuckDB cleans and deduplicates the strings, only strings the Parquet cache has not seen go to ROR, the decision is made after the lookup so thresholds can change without new calls, ambiguous strings land in a review queue with their top three candidates, and reviewer decisions come back as overrides. Only review items found in the current run are alerted.
+
+    ## How it works
+
+    1. A monthly `Schedule` re-checks unresolved strings (ROR ships new organisations about once a month); a disabled `Flow` trigger can run it after the flow that exports your author or grant list, passing its `affiliations_csv` file output.
+    2. `inline_affiliations` and `inline_overrides` (Storage Write) put the inline CSVs in internal storage; an uploaded `affiliations_file` takes precedence. `previous_cache` (KV Get) reads the cache URI and `bootstrap` (If) writes an empty cache on the first run.
+    3. `plan_lookups` (DuckDB) removes footnote markers, email addresses and `Electronic address:` tails, collapses whitespace, splits cells on `;` (ROR chooses at most one organisation per request) and builds a match key (lower case, accents removed, punctuation as spaces, non-Latin letters kept). Placeholders such as `N/A` or `Self-employed` matching `skip_pattern` are skipped. Override ROR ids are validated. The pending list holds keys and override ids not in the cache, plus unresolved keys older than `recheck_after_days`, capped by `max_lookups`.
+    4. `lookup_new` (If) runs `ror_lookup` (Python, standard library) only when something is pending: one `GET /v2/organizations?affiliation=` per string and one `GET /v2/organizations/{id}` per new override id, paced, with retries on 429 and 5xx that honour `Retry-After`. If ROR keeps rate limiting, the rest stays pending instead of failing. It keeps the `chosen` pick (or the top candidate), display name, country, types, status, successor, runner-up score, ties at the top score and the top three candidates. `merge_cache` (DuckDB) writes the new Parquet cache; failed lookups are not cached. `save_cache` (KV Set) stores its URI.
+    5. `classify` (DuckDB) buckets each part: override, then `chosen` on an active organisation, then a score-based accept (score at least `auto_accept_score`, alone at the top, ahead of the runner-up by `min_margin`) as MATCHED; a top score at or above `review_score` or a tie as NEEDS_REVIEW; otherwise NO_MATCH. ROR itself advises using `chosen` rather than the score, so the default `auto_accept_score` of 1.0 only accepts a lone perfect score; scores of 0.9 and above are often a different institution. It writes the enriched CSV and a review queue CSV.
+    6. `triage` (Switch) routes on `NEW_REVIEW_ITEMS` (WARN log plus Slack), `REVIEW_BACKLOG` (info log) or the default (all resolved). `warn_unknown_overrides` names override ids that are malformed or unknown to ROR, and `summary` logs the counts.
+
+    ## What you get
+
+    - An enriched CSV with every input column plus part number, cleaned query, bucket, reason, ROR id, canonical name, country, organisation types, status and successor, score, and whether the answer came from the cache.
+    - A review queue CSV: one row per unresolved string with occurrences, reason (`tied_top_score`, `unconfirmed_candidate`, `no_candidates`, `low_score`) and the top three candidates, ready to copy into `overrides_csv`.
+    - A Parquet cache shared by any list: re-runs and grown lists only query new strings, and changing thresholds re-buckets without API calls.
+    - Alerts only for strings first seen this run, not the whole backlog every month.
+
+    ## Who it's for
+
+    - Research offices and librarians reconciling publication or grant affiliations for reporting.
+    - Data engineers enriching author, funder or CRM records with persistent organisation identifiers.
+    - Scholarly publishing and repository teams adding ROR ids to metadata before deposit.
+
+    ## Why orchestrate this with Kestra
+
+    - KV plus Parquet in internal storage make the cache stateful without a database.
+    - DuckDB `inputFiles` and `outputFiles` keep cleaning, planning and bucketing as readable SQL.
+    - `If` skips the API step when everything is cached; `Switch` separates new review work from backlog.
+    - Schedule and Flow triggers run the same flow on a calendar or after an upstream export.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the JDBC DuckDB, Python script and Slack plugins.
+    - Python 3.9 or later on the worker; the script uses the standard library only. It runs with the `Process` task runner; switch to the Docker runner with a `python:3.12-slim` image if your workers run containers.
+    - Outbound HTTPS to `api.ror.org`. No key is needed. ROR plans 2,000 requests per 5 minutes with a client id and 50 without; the flow paces at 1 request per second without one and 5 per second with one.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: incoming webhook for new review items (optional; without it `notify_review` fails with `allowFailure` and the run ends in WARNING).
+    - `ROR_CLIENT_ID`: ROR API client id sent as the `Client-Id` header when `use_ror_client_id` is true (optional).
+
+    ## Quick start
+
+    1. Import and **Execute** with the defaults: 14 rows, 15 parts after splitting, 11 unique strings, 2 placeholders skipped. The baseline sends 11 affiliation lookups and 1 override lookup and returns 9 MATCHED (8 chosen by ROR, 1 override), 3 NEEDS_REVIEW (a three-way tie at score 1.0, Harvard Medical School with Boston University as top candidate, Universität Heidelberg with SRH University as top candidate) and 1 NO_MATCH (`Harvard`).
+    2. Execute again: 11 strings from the cache, 0 ROR calls, `REVIEW_BACKLOG`.
+    3. Copy decisions from the review CSV into `overrides_csv` and add rows; only new strings and new override ids are queried.
+    4. Change `auto_accept_score` or `review_score` to see the buckets move with no API calls.
+    5. Add `SLACK_WEBHOOK_URL`, optionally `ROR_CLIENT_ID`, and leave the monthly schedule on.
+
+    ## How to extend
+
+    - Enable the `Flow` trigger after an ORCID, Crossref or OpenAlex export and load the enriched CSV into your warehouse.
+    - Keep `overrides_csv` in a namespace file so reviewers edit decisions without touching the flow.
+    - ROR only returns active organisations from the matcher, but an override can point at an inactive one; use `successor_ror_id` to remap it to its successor.
+    - Open a Jira or GitHub issue per new review item instead of, or in addition to, Slack.
+
+    ## Links
+
+    - [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+    - [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get) and [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if) and [Switch](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.switch)
+    - [Flow trigger](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.flow) and [Schedule](https://kestra.io/plugins/core/trigger/io.kestra.plugin.core.trigger.schedule)
+    - [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [ROR API v2 affiliation parameter](https://ror.readme.io/docs/api-affiliation) and [REST API](https://ror.readme.io/docs/rest-api)
+    - [ROR API client id](https://ror.readme.io/docs/client-id)
+  tags:
+    - Data
+  subTags:
+    - File & Data Processing Basics
+    - Testing & Quality
+    - ELT & Data Landing
+  ee: false
+  demo: false
