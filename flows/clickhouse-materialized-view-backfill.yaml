@@ -1,0 +1,339 @@
+id: clickhouse-materialized-view-backfill
+namespace: company.analytics
+description: >-
+  Add a materialized view to a ClickHouse table that already holds data, then
+  rebuild its history one month at a time with no gap and no double count,
+  checking every month against the source.
+
+concurrency:
+  limit: 1
+
+variables:
+  url: jdbc:clickhouse://localhost:8123/default
+  database: default
+  source_table: events
+  source_time_column: ts
+  target_table: page_views_hourly
+  target_time_column: hour
+  view: page_views_hourly_mv
+  staging_table: page_views_hourly_backfill
+  cutoff_lead_minutes: 2
+  kv_prefix: clickhouse_mv_backfill_page_views_hourly_mv
+  # The view's query. __FILTER__ becomes "ts >= cutoff" in the view and
+  # "one month, before the cutoff" in each backfill step, so the live view and
+  # the backfill always run the same aggregation.
+  view_query: |
+    SELECT toStartOfHour(ts) AS hour, page, count() AS views
+    FROM default.events
+    WHERE __FILTER__
+    GROUP BY hour, page
+  target_ddl: |
+    CREATE TABLE IF NOT EXISTS {{ vars.database }}.{{ vars.target_table }}
+    (
+        hour DateTime,
+        page LowCardinality(String),
+        views UInt64
+    )
+    ENGINE = SummingMergeTree
+    PARTITION BY toYYYYMM(hour)
+    ORDER BY (page, hour)
+  # The same quantity measured on each side. Every check compares these two.
+  source_measure: count()
+  target_measure: sum(views)
+
+tasks:
+  - id: saved_cutoff
+    type: io.kestra.plugin.core.kv.Get
+    description: The cutoff saved by an earlier run. A re-run reuses it, so the view and the backfill keep agreeing on one cutoff.
+    key: "{{ vars.kv_prefix }}_cutoff"
+
+  - id: plan
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Pick the cutoff on the ClickHouse clock, a few minutes ahead and rounded to the minute, or reuse the saved one.
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      WITH
+        '{{ outputs.saved_cutoff.value ?? '' }}' AS saved,
+        ifNull(parseDateTimeBestEffortOrNull(saved),
+               toStartOfMinute(now()) + INTERVAL {{ vars.cutoff_lead_minutes }} MINUTE) AS cutoff_at
+      SELECT
+        toString(cutoff_at) AS cutoff,
+        toString(toYYYYMM(cutoff_at)) AS cutoff_month,
+        if(saved = '', 'new', 'reused') AS cutoff_source,
+        greatest(1, dateDiff('second', now(), cutoff_at) + 5) AS wait_seconds,
+        toString(count()) AS rows_after_cutoff
+      FROM {{ vars.database }}.{{ vars.source_table }}
+      WHERE {{ vars.source_time_column }} >= cutoff_at
+
+  - id: no_rows_after_cutoff
+    type: io.kestra.plugin.core.execution.Assert
+    description: A new cutoff must be in the future of every source row, otherwise rows already past it would land in neither the view nor the backfill.
+    conditions:
+      - "{{ outputs.plan.row.cutoff_source == 'reused' or outputs.plan.row.rows_after_cutoff == '0' }}"
+    errorMessage: "{{ outputs.plan.row.rows_after_cutoff }} source rows are already at or after the cutoff {{ outputs.plan.row.cutoff }}. Fix the future-dated rows or raise cutoff_lead_minutes."
+
+  - id: save_cutoff
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ vars.kv_prefix }}_cutoff"
+    value: "{{ outputs.plan.row.cutoff }}"
+
+  - id: create_view
+    type: io.kestra.plugin.jdbc.clickhouse.Queries
+    description: Create the target, an empty staging copy with the same engine and partition key, and the view that only takes rows at or after the cutoff.
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    transaction: false
+    sql: |
+      {{ render(vars.target_ddl) }};
+      CREATE TABLE IF NOT EXISTS {{ vars.database }}.{{ vars.staging_table }} AS {{ vars.database }}.{{ vars.target_table }};
+      CREATE MATERIALIZED VIEW IF NOT EXISTS {{ vars.database }}.{{ vars.view }} TO {{ vars.database }}.{{ vars.target_table }} AS
+      {{ vars.view_query | replace({'__FILTER__': vars.source_time_column ~ " >= toDateTime('" ~ outputs.plan.row.cutoff ~ "')"}) }}
+
+  - id: check_shape
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Read back what ClickHouse actually created, because IF NOT EXISTS silently keeps an older view or table.
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        (SELECT partition_key FROM system.tables
+         WHERE database = '{{ vars.database }}' AND name = '{{ vars.target_table }}') AS target_partition_key,
+        toString((SELECT countIf(position(create_table_query, '{{ outputs.plan.row.cutoff }}') > 0) FROM system.tables
+                  WHERE database = '{{ vars.database }}' AND name = '{{ vars.view }}')) AS view_has_cutoff
+
+  - id: view_uses_cutoff
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_shape.row.view_has_cutoff == '1' }}"
+    errorMessage: "{{ vars.view }} already existed without the cutoff {{ outputs.plan.row.cutoff }}, so backfilling would double count. Drop it or use a new view name."
+
+  - id: target_is_monthly
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_shape.row.target_partition_key == 'toYYYYMM(' ~ vars.target_time_column ~ ')' }}"
+    errorMessage: "The target is partitioned by '{{ outputs.check_shape.row.target_partition_key }}'. Months are swapped in as whole partitions, so it must be PARTITION BY toYYYYMM({{ vars.target_time_column }})."
+
+  - id: wait_for_cutoff
+    type: io.kestra.plugin.core.flow.Sleep
+    description: Wait until the cutoff has passed, so live rows already flow through the view before history is touched.
+    duration: "PT{{ outputs.plan.row.wait_seconds }}S"
+
+  - id: months
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Every month of source data before the cutoff, oldest first.
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT toString(toYYYYMM({{ vars.source_time_column }})) AS month, count() AS source_rows
+      FROM {{ vars.database }}.{{ vars.source_table }}
+      WHERE {{ vars.source_time_column }} < toDateTime('{{ outputs.plan.row.cutoff }}')
+      GROUP BY month
+      ORDER BY month
+
+  - id: backfill
+    type: io.kestra.plugin.core.flow.Loop
+    description: One month at a time. Each month is built and checked in staging, swapped in as a whole partition, then marked done.
+    values: "{{ outputs.months.rows | jq('map(.month)') | first | toJson }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: skip_done
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ kv(vars.kv_prefix ~ '_' ~ item.value, errorOnMissing=false) != 'done' }}"
+        then:
+          - id: fill_staging
+            type: io.kestra.plugin.jdbc.clickhouse.Queries
+            url: "{{ vars.url }}"
+            username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+            password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+            transaction: false
+            sql: |
+              TRUNCATE TABLE {{ vars.database }}.{{ vars.staging_table }};
+              INSERT INTO {{ vars.database }}.{{ vars.staging_table }}
+              {{ vars.view_query | replace({'__FILTER__': 'toYYYYMM(' ~ vars.source_time_column ~ ') = ' ~ item.value ~ ' AND ' ~ vars.source_time_column ~ " < toDateTime('" ~ outputs.plan.row.cutoff ~ "')"}) }}
+
+          - id: measure_staging
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            url: "{{ vars.url }}"
+            username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+            password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT
+                toString((SELECT {{ vars.source_measure }} FROM {{ vars.database }}.{{ vars.source_table }}
+                          WHERE toYYYYMM({{ vars.source_time_column }}) = {{ item.value }}
+                            AND {{ vars.source_time_column }} < toDateTime('{{ outputs.plan.row.cutoff }}'))) AS source_total,
+                toString((SELECT {{ vars.target_measure }} FROM {{ vars.database }}.{{ vars.staging_table }})) AS staging_total,
+                (SELECT arrayStringConcat(arraySort(groupUniqArray(_partition_id)), ',')
+                 FROM {{ vars.database }}.{{ vars.staging_table }}) AS staging_partitions
+
+          - id: staging_matches_source
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ outputs.measure_staging.row.source_total == outputs.measure_staging.row.staging_total }}"
+              - "{{ outputs.measure_staging.row.staging_partitions == item.value }}"
+            errorMessage: "Month {{ item.value }}: source {{ outputs.measure_staging.row.source_total }}, staging {{ outputs.measure_staging.row.staging_total }} in partitions '{{ outputs.measure_staging.row.staging_partitions }}'. Nothing was swapped in."
+
+          - id: swap
+            type: io.kestra.plugin.core.flow.If
+            description: A past month is replaced, which is safe to repeat. The cutoff month already holds the view's live rows, so it is added once.
+            condition: "{{ item.value != outputs.plan.row.cutoff_month }}"
+            then:
+              - id: replace_month
+                type: io.kestra.plugin.jdbc.clickhouse.Query
+                url: "{{ vars.url }}"
+                username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+                password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+                sql: ALTER TABLE {{ vars.database }}.{{ vars.target_table }} REPLACE PARTITION ID '{{ item.value }}' FROM {{ vars.database }}.{{ vars.staging_table }}
+            else:
+              - id: in_doubt
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ kv(vars.kv_prefix ~ '_' ~ item.value, errorOnMissing=false) == 'attaching' }}"
+                then:
+                  - id: stop_in_doubt
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "An earlier run stopped while adding month {{ item.value }}, so it may already be in {{ vars.target_table }}. Compare the month's totals, then set the KV key {{ vars.kv_prefix }}_{{ item.value }} to done, or delete it to add the month again."
+
+              - id: mark_attaching
+                type: io.kestra.plugin.core.kv.Set
+                key: "{{ vars.kv_prefix }}_{{ item.value }}"
+                value: attaching
+
+              - id: attach_month
+                type: io.kestra.plugin.jdbc.clickhouse.Query
+                url: "{{ vars.url }}"
+                username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+                password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+                sql: ALTER TABLE {{ vars.database }}.{{ vars.target_table }} ATTACH PARTITION ID '{{ item.value }}' FROM {{ vars.database }}.{{ vars.staging_table }}
+
+          - id: measure_target
+            type: io.kestra.plugin.jdbc.clickhouse.Query
+            url: "{{ vars.url }}"
+            username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+            password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT toString({{ vars.target_measure }}) AS target_total
+              FROM {{ vars.database }}.{{ vars.target_table }}
+              WHERE toYYYYMM({{ vars.target_time_column }}) = {{ item.value }}
+
+          - id: target_matches_staging
+            type: io.kestra.plugin.core.execution.Assert
+            description: A past month must equal staging exactly. The cutoff month also holds live rows, so it must be at least staging.
+            conditions:
+              - "{{ item.value != outputs.plan.row.cutoff_month ? outputs.measure_target.row.target_total == outputs.measure_staging.row.staging_total : (outputs.measure_target.row.target_total | number) >= (outputs.measure_staging.row.staging_total | number) }}"
+            errorMessage: "Month {{ item.value }}: target {{ outputs.measure_target.row.target_total }} after the swap, staging {{ outputs.measure_staging.row.staging_total }}."
+
+          - id: mark_done
+            type: io.kestra.plugin.core.kv.Set
+            key: "{{ vars.kv_prefix }}_{{ item.value }}"
+            value: done
+
+  - id: final_check
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    description: Compare every past month in one pass. The view never writes to them, so live inserts cannot make this check flaky.
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        toString((SELECT {{ vars.source_measure }} FROM {{ vars.database }}.{{ vars.source_table }}
+                  WHERE toYYYYMM({{ vars.source_time_column }}) < {{ outputs.plan.row.cutoff_month }})) AS source_past_months,
+        toString((SELECT {{ vars.target_measure }} FROM {{ vars.database }}.{{ vars.target_table }}
+                  WHERE toYYYYMM({{ vars.target_time_column }}) < {{ outputs.plan.row.cutoff_month }})) AS target_past_months
+
+  - id: past_months_match
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.final_check.row.source_past_months == outputs.final_check.row.target_past_months }}"
+    errorMessage: "Past months differ: source {{ outputs.final_check.row.source_past_months }}, target {{ outputs.final_check.row.target_past_months }}. Rows that arrived late for an already finished month are not in the view; delete that month's KV key and run again."
+
+  - id: drop_staging
+    type: io.kestra.plugin.jdbc.clickhouse.Query
+    url: "{{ vars.url }}"
+    username: "{{ secret('CLICKHOUSE_USERNAME') }}"
+    password: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+    sql: DROP TABLE IF EXISTS {{ vars.database }}.{{ vars.staging_table }}
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ vars.view }} is live from {{ outputs.plan.row.cutoff }} ({{ outputs.plan.row.cutoff_source }} cutoff) and backfilled for {{ outputs.months.size }} month(s) before it. Past months match: {{ outputs.final_check.row.target_past_months }} on both sides."
+
+triggers:
+  - id: on_view_release
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from the CI job that releases the view definition.
+    key: "{{ secret('CLICKHOUSE_BACKFILL_WEBHOOK_KEY') }}"
+
+extend:
+  title: Backfill a New ClickHouse Materialized View Month by Month
+  metaTitle: Backfill ClickHouse Materialized Views Safely | Kestra
+  shortDescription: Add a materialized view to a live ClickHouse table, rebuild its history one month at a time through a staging table, and check every month against the source.
+  metaDescription: Add a ClickHouse materialized view to a live table and backfill its history month by month with no gaps or double counts, verified against the source.
+  description: |
+    A new ClickHouse materialized view only sees rows inserted after it exists, and `POPULATE` can miss rows written while it runs. This flow follows the backfill method from the ClickHouse docs: the view starts at a cutoff a few minutes ahead, and the history before it is rebuilt one month at a time.
+
+    ## How it works
+
+    1. The Webhook trigger starts a run, for example from the CI job that releases the view.
+    2. `plan` picks the cutoff on the ClickHouse clock, or reuses the one saved in the KV store. `no_rows_after_cutoff` stops if source rows are already past it.
+    3. `create_view` creates the target, an empty staging copy and the view, filtered to rows at or after the cutoff. Two checks confirm the view has this cutoff and the target is partitioned by month.
+    4. `wait_for_cutoff` sleeps until live rows flow through the view.
+    5. `backfill` loops over each earlier month. It builds the month in staging with the view's query, compares it to the source, then swaps it in with `REPLACE PARTITION`, safe to repeat, or `ATTACH PARTITION` for the cutoff month, which already holds live rows. The month is then checked and marked done.
+    6. `final_check` compares source and target for every past month and the staging table is dropped.
+
+    ## What you get
+
+    - History and live rows in one view, every source row counted once.
+    - Re-runs skip finished months and keep the first cutoff.
+    - A failed run with the numbers, instead of a silent mismatch.
+
+    ## Who it's for
+
+    - Data engineers adding rollups to live ClickHouse tables.
+
+    ## Why orchestrate this with Kestra
+
+    The backfill is ordered DDL and checks that must survive a restart. Kestra keeps the cutoff and each month's progress in the KV store and stops on the first mismatch.
+
+    ## Prerequisites
+
+    - A ClickHouse source table and a target partitioned by `toYYYYMM`.
+    - A user allowed to create tables and views and to run `ALTER TABLE ... PARTITION`.
+
+    ### Secrets
+
+    - `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD`: the ClickHouse login.
+    - `CLICKHOUSE_BACKFILL_WEBHOOK_KEY`: the webhook key.
+
+    ## Quick start
+
+    1. Add the secrets and set `url` and the table names in `variables`.
+    2. Put your query in `view_query`, keeping `__FILTER__` in its `WHERE`.
+    3. Execute the flow and read the `summary` log.
+
+    ## How to extend
+
+    - Add an `errors` task that alerts on a mismatch.
+    - Turn `variables` into inputs to backfill several views.
+
+    ## Links
+
+    - [ClickHouse plugin](https://kestra.io/plugins/plugin-jdbc-clickhouse)
+    - [ClickHouse backfilling guide](https://clickhouse.com/docs/data-modeling/backfilling)
+    - [Partition operations](https://clickhouse.com/docs/sql-reference/statements/alter/partition)
+  tags:
+    - Data
+  subTags:
+    - Data Warehouses
+    - Day 2 Operations
+  ee: false
+  demo: false

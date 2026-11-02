@@ -1,0 +1,445 @@
+id: mongodb-gridfs-orphaned-chunk-and-dangling-file-guard
+namespace: company.database
+
+description: |
+  Audit MongoDB GridFS buckets for orphaned binary chunks whose parent metadata document
+  was deleted or never committed due to interrupted uploads. Tracks orphan age across executions
+  via Kestra KV store, protects in-flight uploads with a configurable grace period, pauses for
+  operator approval before deletion, purges confirmed orphans in safe batches, and reverifies
+  that residual chunk counts drop to zero.
+
+inputs:
+  - id: connection_uri
+    type: STRING
+    displayName: MongoDB Connection URI
+    description: >-
+      Direct MongoDB connection URI (e.g. mongodb://localhost:27017 or mongodb+srv://cluster.mongodb.net).
+      Leave blank to automatically use the MONGODB_URI secret.
+    defaults: ""
+
+  - id: database
+    type: STRING
+    displayName: Database Name
+    description: Target MongoDB database containing the GridFS bucket collections.
+    defaults: "appdata"
+
+  - id: bucket_name
+    type: STRING
+    displayName: GridFS Bucket Name
+    description: Root name of the GridFS bucket prefix (e.g. 'fs' targets 'fs.chunks' and 'fs.files').
+    defaults: "fs"
+
+  - id: min_orphan_age_hours
+    type: INT
+    displayName: In-Flight Upload Grace Period (Hours)
+    description: Minimum time an orphaned chunk cluster must persist across runs before being approved for deletion, sparing active in-flight uploads.
+    defaults: 2
+
+  - id: batch_size
+    type: INT
+    displayName: Purge Batch Size
+    description: Number of files_id clusters to delete in a single batch operation.
+    defaults: 100
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, audits and calculates reclaimable storage without executing deletion tasks.
+    defaults: true
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Enable Auto Remediation
+    description: When true and dry_run is false, prompts the operator for approval and purges confirmed orphaned chunks.
+    defaults: false
+
+triggers:
+  - id: daily_gridfs_hygiene
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Scheduled daily audit for GridFS chunk hygiene. Shipped disabled by default with dry-run enabled.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+tasks:
+  - id: load_previous_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieves previous execution's orphan observation tracker from Kestra KV store to calculate differential age and spare fresh in-flight uploads.
+    key: "mongodb_gridfs_tracker_{{ inputs.database }}_{{ inputs.bucket_name }}"
+    errorOnMissing: false
+
+  - id: detect_orphaned_chunks
+    type: io.kestra.plugin.mongodb.Aggregate
+    description: Executes an index-assisted $lookup aggregation on GridFS chunks against the metadata files collection to identify chunk clusters lacking parent metadata.
+    connection:
+      uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+    database: "{{ inputs.database }}"
+    collection: "{{ inputs.bucket_name }}.chunks"
+    pipeline: |
+      [
+        {
+          "$group": {
+            "_id": "$files_id",
+            "chunk_count": { "$sum": 1 },
+            "first_chunk_id": { "$first": "$_id" }
+          }
+        },
+        {
+          "$lookup": {
+            "from": "{{ inputs.bucket_name }}.files",
+            "localField": "_id",
+            "foreignField": "_id",
+            "as": "file_meta"
+          }
+        },
+        {
+          "$match": {
+            "file_meta": { "$size": 0 }
+          }
+        },
+        {
+          "$project": {
+            "_id": 0,
+            "files_id": { "$toString": "$_id" },
+            "chunk_count": 1,
+            "first_chunk_id": { "$toString": "$first_chunk_id" }
+          }
+        }
+      ]
+    store: FETCH
+
+  - id: classify_and_diff
+    type: io.kestra.plugin.scripts.python.Script
+    description: Cross-references detected unlinked chunk clusters against previous KV state, enforcing in-flight upload grace periods and preparing batched deletion filters.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    script: |
+      import os
+      import json
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      now = datetime.now(timezone.utc)
+      now_iso = now.isoformat()
+
+      # Parse inputs and outputs
+      min_age_hours = {{ inputs.min_orphan_age_hours }}
+      batch_size = {{ inputs.batch_size }}
+      dry_run = "{{ inputs.dry_run }}".lower() == "true"
+
+      # Previous KV state
+      raw_prev_state = """{{ (outputs.load_previous_state.value ?? {}) | toJson }}"""
+      try:
+          prev_state = json.loads(raw_prev_state) if raw_prev_state else {}
+      except Exception:
+          prev_state = {}
+
+      # Detected rows from aggregation
+      raw_detected = """{{ outputs.detect_orphaned_chunks.rows | toJson }}"""
+      try:
+          detected_rows = json.loads(raw_detected) if raw_detected else []
+      except Exception:
+          detected_rows = []
+
+      confirmed_orphans = []
+      spared_in_flight = []
+      new_state = {}
+
+      total_orphan_chunks = 0
+      for item in detected_rows:
+          fid = str(item.get("files_id"))
+          chunks = int(item.get("chunk_count", 1))
+
+          if fid in prev_state:
+              first_seen_str = prev_state[fid].get("first_seen", now_iso)
+              try:
+                  first_seen = datetime.fromisoformat(first_seen_str)
+              except Exception:
+                  first_seen = now
+              age_hours = (now - first_seen).total_seconds() / 3600.0
+
+              if age_hours >= min_age_hours:
+                  confirmed_orphans.append({
+                      "files_id": fid,
+                      "chunk_count": chunks,
+                      "age_hours": round(age_hours, 2),
+                      "first_seen": first_seen_str
+                  })
+                  total_orphan_chunks += chunks
+              else:
+                  spared_in_flight.append({
+                      "files_id": fid,
+                      "chunk_count": chunks,
+                      "age_hours": round(age_hours, 2),
+                      "status": "PROTECTED_GRACE_PERIOD"
+                  })
+              new_state[fid] = {"first_seen": first_seen_str, "chunk_count": chunks}
+          else:
+              spared_in_flight.append({
+                  "files_id": fid,
+                  "chunk_count": chunks,
+                  "age_hours": 0.0,
+                  "status": "FIRST_SEEN_IN_FLIGHT"
+              })
+              new_state[fid] = {"first_seen": now_iso, "chunk_count": chunks}
+
+      # Estimate leaked storage (GridFS default chunk size is 255 KiB = 261120 bytes)
+      estimated_reclaimable_mb = round((total_orphan_chunks * 255) / 1024.0, 2)
+      confirmed_ids = [x["files_id"] for x in confirmed_orphans]
+
+      # Generate BSON Extended JSON target filters for batched deletion
+      batch_filters = []
+      target_oids = [{"$oid": fid} for fid in confirmed_ids]
+      for i in range(0, len(confirmed_ids), batch_size):
+          batch_chunk = confirmed_ids[i:i + batch_size]
+          batch_filters.append({
+              "files_id": {
+                  "$in": [{"$oid": cid} for cid in batch_chunk]
+              }
+          })
+
+      audit_manifest = {
+          "database": "{{ inputs.database }}",
+          "bucket": "{{ inputs.bucket_name }}",
+          "scanned_at": now_iso,
+          "total_detected_clusters": len(detected_rows),
+          "confirmed_orphan_clusters": len(confirmed_orphans),
+          "total_orphaned_chunks": total_orphan_chunks,
+          "estimated_reclaimable_mb": estimated_reclaimable_mb,
+          "spared_in_flight_count": len(spared_in_flight),
+          "dry_run": dry_run,
+          "confirmed_ids": confirmed_ids
+      }
+
+      print(f"GridFS Audit: Found {len(detected_rows)} unlinked cluster(s). Confirmed orphans: {len(confirmed_orphans)} ({total_orphan_chunks} chunks, ~{estimated_reclaimable_mb} MB). Spared in-flight: {len(spared_in_flight)}.")
+
+      output_vars = {
+          "total_detected_count": len(detected_rows),
+          "confirmed_orphan_count": len(confirmed_orphans),
+          "total_orphaned_chunks": total_orphan_chunks,
+          "estimated_reclaimable_mb": estimated_reclaimable_mb,
+          "spared_count": len(spared_in_flight),
+          "confirmed_ids": confirmed_ids,
+          "target_oids": target_oids,
+          "batch_filters": batch_filters,
+          "new_state_snapshot": new_state,
+          "audit_manifest": audit_manifest
+      }
+
+      if Kestra:
+          Kestra.outputs(output_vars)
+      else:
+          print("::" + json.dumps({"outputs": output_vars}) + "::")
+
+  - id: persist_state_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Atomically updates Kestra KV store with latest observation timestamps to ensure accurate cross-run tracking.
+    key: "mongodb_gridfs_tracker_{{ inputs.database }}_{{ inputs.bucket_name }}"
+    value: "{{ outputs.classify_and_diff.vars.new_state_snapshot | toJson }}"
+    kvType: JSON
+
+  - id: gate_orphaned_chunks
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether any confirmed orphaned GridFS chunks exceed retention grace thresholds.
+    condition: "{{ outputs.classify_and_diff.vars.confirmed_orphan_count > 0 }}"
+    then:
+      - id: log_orphans_found
+        type: io.kestra.plugin.core.log.Log
+        description: Logs detected orphan metrics and reclaimable storage volume.
+        message: >-
+          Identified {{ outputs.classify_and_diff.vars.confirmed_orphan_count }} confirmed orphaned GridFS file cluster(s)
+          containing {{ outputs.classify_and_diff.vars.total_orphaned_chunks }} chunk(s) totaling ~{{ outputs.classify_and_diff.vars.estimated_reclaimable_mb }} MB in
+          {{ inputs.database }}.{{ inputs.bucket_name }}. Spared in-flight: {{ outputs.classify_and_diff.vars.spared_count }}. Auto-remediate: {{ inputs.auto_remediate }}, Dry Run: {{ inputs.dry_run }}.
+
+      - id: alert_slack_orphans
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Posts an operational storage leak incident alert to Slack with leak statistics.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "🚨 *MongoDB GridFS Orphaned Chunk Storage Leak Detected*\n• *Database*: `{{ inputs.database }}`\n• *GridFS Bucket*: `{{ inputs.bucket_name }}`\n• *Orphaned File Clusters*: `{{ outputs.classify_and_diff.vars.confirmed_orphan_count }}`\n• *Leaked Chunks*: `{{ outputs.classify_and_diff.vars.total_orphaned_chunks }}`\n• *Estimated Reclaimable Storage*: `~{{ outputs.classify_and_diff.vars.estimated_reclaimable_mb }} MB`\n• *Spared In-Flight Uploads*: `{{ outputs.classify_and_diff.vars.spared_count }}`\n• *Mode*: auto_remediate={{ inputs.auto_remediate }}, dry_run={{ inputs.dry_run }}\n• *Execution ID*: `{{ execution.id }}`"
+          }
+
+      - id: check_remediation_active
+        type: io.kestra.plugin.core.flow.If
+        description: Checks if automated chunk purging is enabled and dry-run mode is disabled.
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: pause_for_operator_approval
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pauses execution for DBA verification before permanently deleting orphaned chunks from the live MongoDB cluster. Auto-cancels (never silently proceeds with deletion) if unattended for 2 hours.
+            pauseDuration: PT2H
+            behavior: CANCEL
+            onResume:
+              - id: confirm_purge
+                type: BOOL
+                displayName: Confirm GridFS Chunk Purge
+                description: Check to confirm authorization to purge confirmed orphaned chunks.
+                defaults: true
+
+          - id: purge_orphaned_chunks
+            type: io.kestra.plugin.core.flow.Loop
+            description: Iterates sequentially over precomputed batch filters to safely delete orphaned chunks without overwhelming database I/O.
+            values: "{{ outputs.classify_and_diff.vars.batch_filters }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: delete_chunk_batch
+                type: io.kestra.plugin.mongodb.Delete
+                description: Deletes a batch of orphaned binary chunks matching confirmed files_id keys.
+                connection:
+                  uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+                database: "{{ inputs.database }}"
+                collection: "{{ inputs.bucket_name }}.chunks"
+                operation: DELETE_MANY
+                filter: "{{ item.value }}"
+
+          - id: verify_post_remediation
+            type: io.kestra.plugin.mongodb.Aggregate
+            description: Post-remediation verification query asserting that zero targeted orphaned chunks survive the deletion.
+            connection:
+              uri: "{{ inputs.connection_uri != '' ? inputs.connection_uri : secret('MONGODB_URI') }}"
+            database: "{{ inputs.database }}"
+            collection: "{{ inputs.bucket_name }}.chunks"
+            pipeline: |
+              [
+                {
+                  "$match": {
+                    "files_id": {
+                      "$in": {{ outputs.classify_and_diff.vars.target_oids | toJson }}
+                    }
+                  }
+                },
+                {
+                  "$count": "remaining_chunks"
+                }
+              ]
+            store: FETCH
+
+          - id: evaluate_verification
+            type: io.kestra.plugin.core.flow.If
+            description: Evaluates whether any targeted orphaned chunk failed to delete.
+            condition: "{{ (outputs.verify_post_remediation.rows | length) > 0 and (outputs.verify_post_remediation.rows[0].remaining_chunks > 0) }}"
+            then:
+              - id: fail_verification
+                type: io.kestra.plugin.core.execution.Fail
+                description: Fails the execution if orphaned chunks survived the purge.
+                errorMessage: >-
+                  Post-remediation verification failed: {{ outputs.verify_post_remediation.rows[0].remaining_chunks }} targeted orphaned chunk(s) still exist in
+                  {{ inputs.database }}.{{ inputs.bucket_name }}.chunks. Inspect MongoDB write concerns or connection locks.
+            else:
+              - id: log_remediation_success
+                type: io.kestra.plugin.core.log.Log
+                description: Confirms that post-remediation verification query returned zero surviving orphaned chunks.
+                message: >-
+                  Successfully purged and verified {{ outputs.classify_and_diff.vars.total_orphaned_chunks }} orphaned chunk(s) across
+                  {{ outputs.classify_and_diff.vars.confirmed_orphan_count }} file cluster(s). Residual targeted chunks: 0. Reclaimed ~{{ outputs.classify_and_diff.vars.estimated_reclaimable_mb }} MB.
+
+        else:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Records planned deletion actions when dry-run mode is enabled or auto-remediation is disabled.
+            message: >-
+              Dry-run mode active (dry_run={{ inputs.dry_run }}, auto_remediate={{ inputs.auto_remediate }}). No chunks were deleted.
+              Planned purge targets {{ outputs.classify_and_diff.vars.confirmed_orphan_count }} file cluster(s) with {{ outputs.classify_and_diff.vars.total_orphaned_chunks }} chunk(s) (~{{ outputs.classify_and_diff.vars.estimated_reclaimable_mb }} MB).
+    else:
+      - id: log_gridfs_clean
+        type: io.kestra.plugin.core.log.Log
+        description: Logs confirmation that GridFS bucket contains zero confirmed orphaned chunks.
+        message: >-
+          GridFS hygiene verified for {{ inputs.database }}.{{ inputs.bucket_name }}: 0 confirmed orphaned chunks detected.
+          Bucket storage integrity intact. Spared in-flight uploads: {{ outputs.classify_and_diff.vars.spared_count }}.
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alerts the platform operations team when a flow execution encounters a fatal connection, aggregation, or assertion failure.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "❌ *MongoDB GridFS Orphan Guard Failed*\nExecution `{{ execution.id }}` failed during GridFS hygiene inspection on `{{ inputs.database }}.{{ inputs.bucket_name }}`. Check execution logs for driver connection or query errors."
+      }
+
+extend:
+  title: MongoDB GridFS Orphaned Chunk and Dangling File Reclamation Guard
+  metaTitle: MongoDB GridFS Orphaned Chunk and Dangling File Guard | Kestra
+  shortDescription: Detect orphaned binary chunks in MongoDB GridFS with $lookup, pause for operator confirmation, purge confirmed orphans, and reverify zero residual storage leaks.
+  metaDescription: Audit MongoDB GridFS buckets for orphaned binary chunks, pause for operator approval, purge confirmed orphans, and verify zero residual chunks.
+  description: |
+    In MongoDB, GridFS partitions large files exceeding the 16 MB BSON document limit into binary chunks stored in `fs.chunks`, linked back to file metadata records in `fs.files` via the `files_id` reference key. During production operations, microservice crashes, network timeouts mid-stream, or naive administrative scripts that delete metadata records directly (`db.fs.files.deleteOne()`) instead of calling the native GridFS bucket driver API leave binary chunks stranded in `fs.chunks`. Because standard application queries only traverse `fs.files`, these unreferenced chunks remain completely invisible, consuming gigabytes or terabytes of WiredTiger storage and filesystem cache without serving live traffic.
+
+    This blueprint provides an automated, production-grade Day 2 operations guard for MongoDB GridFS buckets. It executes an index-assisted `$lookup` aggregation query joining `fs.chunks` against `fs.files` to identify unlinked chunk clusters, compares observations against historical execution state in Kestra KV store to protect active in-flight uploads within an upload grace period, pauses for operator verification before executing destructive mutations, purges confirmed orphans in safe sequential batches, and executes a post-remediation verification query to prove that zero residual orphaned chunks remain.
+
+    ## How it works
+
+    1. `daily_gridfs_hygiene` (`io.kestra.plugin.core.trigger.Schedule`) triggers the audit on a recurring daily maintenance window, defaulting to dry-run mode for audit-only surveillance.
+    2. `load_previous_state` (`io.kestra.plugin.core.kv.Get`) retrieves previous observation timestamps from Kestra KV store to enable differential age tracking.
+    3. `detect_orphaned_chunks` (`io.kestra.plugin.mongodb.Aggregate`) executes an index-assisted server-side aggregation grouping `fs.chunks` by `files_id`, performing an anti-join `$lookup` against `fs.files`, and isolating chunk clusters with no parent metadata document.
+    4. `classify_and_diff` (`io.kestra.plugin.scripts.python.Script`) cross-references detected orphaned IDs with KV history, categorizing items into confirmed aged orphans and in-flight uploads spared by the grace period threshold (`min_orphan_age_hours`), while generating pre-computed BSON Extended JSON batch filters.
+    5. `persist_state_kv` (`io.kestra.plugin.core.kv.Set`) records the updated observation snapshot into Kestra KV store for sequential tracking.
+    6. `gate_orphaned_chunks` (`io.kestra.plugin.core.flow.If`) branches based on whether confirmed orphans were detected. If present, `alert_slack_orphans` posts an incident alert to Slack detailing leaked chunk counts and reclaimable megabytes.
+    7. `check_remediation_active` (`io.kestra.plugin.core.flow.If`) evaluates if `auto_remediate` is enabled and `dry_run` is false. When authorized, `pause_for_operator_approval` (`io.kestra.plugin.core.flow.Pause`) halts execution until a database administrator confirms the purge.
+    8. `purge_orphaned_chunks` (`io.kestra.plugin.core.flow.Loop`) iterates sequentially over batch filters, dispatching `delete_chunk_batch` (`io.kestra.plugin.mongodb.Delete`, `DELETE_MANY`) against `fs.chunks`.
+    9. `verify_post_remediation` (`io.kestra.plugin.mongodb.Aggregate`) re-queries `fs.chunks` across the targeted `files_id` keys, and `fail_verification` (`io.kestra.plugin.core.execution.Fail`) fails the execution if any targeted chunk survived.
+
+    ## What you get
+
+    - **Automated Storage Reclamation**: Reclaims unreferenced disk space and RAM cache in WiredTiger storage engines caused by interrupted uploads or incomplete deletions.
+    - **In-Flight Upload Safety**: Multi-run KV differential state tracking ensures that large active streaming uploads are spared within the configurable grace period.
+    - **Two-Phase Human Approval Gate**: Requires deliberate operator sign-off via interactive UI pause before modifying live database collections.
+    - **Post-Remediation Verification**: Asserts zero residual orphaned chunks on the exact targeted keys post-deletion, preventing silent partial write failures.
+    - **Batch-Throttled Mutations**: Deletes chunks in controlled sequential batches to avoid replication lag spikes and WiredTiger ticket exhaustion.
+
+    ## Who it's for
+
+    - **Database Administrators (DBAs)**: Managing MongoDB clusters running GridFS document or media management workloads.
+    - **Platform & SRE Engineers**: Enforcing storage capacity hygiene and preventing runaway database disk growth.
+    - **Data Platform Teams**: Operating document ingestion pipelines, ML model artifact stores, or customer asset repositories.
+
+    ## Why orchestrate this with Kestra
+
+    Raw cron scripts or manual shell commands to clean GridFS lack cross-run state tracking, risking catastrophic data loss by deleting chunks belonging to active in-flight uploads. Furthermore, ad-hoc scripts provide no audit trail, no human approval gates, and no automated post-remediation verification. Kestra orchestrates this lifecycle declaratively: maintaining persistent KV state across executions, managing interactive pause approval gates, isolating failure alerts in Slack, and providing an immutable audit trail of all purged storage.
+
+    ## Prerequisites
+
+    - A running MongoDB replica set or standalone instance (v4.4+) with network reachability from the Kestra worker.
+    - A database user with `readWrite` privileges on the target database (to execute `$lookup` and `DELETE_MANY` on GridFS collections).
+    - A Slack incoming webhook URL for operational notifications.
+
+    ### Secrets
+
+    - `MONGODB_URI`: Complete MongoDB connection URI (e.g. `mongodb+srv://kestra_admin:secret@cluster0.mongodb.net/admin?retryWrites=true&w=majority`).
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL to receive storage leak alerts and execution status reports.
+
+    ## Quick start
+
+    1. Configure `MONGODB_URI` and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets catalog.
+    2. Run a manual execution with `dry_run: true` and `auto_remediate: false` to audit your GridFS bucket without modifying data.
+    3. Review the execution log and Slack summary to inspect confirmed orphaned chunk counts and estimated reclaimable storage.
+    4. To remediate, execute with `auto_remediate: true` and `dry_run: false`, review the proposed purge plan, and approve the interactive `pause_for_operator_approval` task in the Kestra UI.
+    5. Enable `daily_gridfs_hygiene` schedule to automate ongoing storage hygiene.
+
+    ## How to extend
+
+    - **Corrupted File Metadata Sweep**: Add an inverse probe checking `fs.files` for zero-chunk files (`fs.chunks` count is 0) to purge ghost metadata entries.
+    - **Object Storage Archival**: Chain an `io.kestra.plugin.minio.Upload` or S3 task to archive orphaned binary payloads to cold object storage before deletion for compliance.
+    - **Multi-Bucket Fan-Out**: Wrap the workflow in an outer `ForEach` loop iterating over all GridFS buckets (`fs`, `avatars`, `reports`) across multiple tenant databases.
+
+    ## Links
+
+    - [Kestra MongoDB Plugin Documentation](https://kestra.io/plugins/plugin-mongodb)
+    - [MongoDB GridFS Specification](https://www.mongodb.com/docs/manual/core/gridfs/)
+    - [MongoDB Aggregation $lookup Stage](https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false

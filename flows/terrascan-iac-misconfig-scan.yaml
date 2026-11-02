@@ -1,0 +1,378 @@
+id: terrascan-iac-misconfig-scan
+namespace: company.team
+
+description: |
+  Terrascan policy scanning for infrastructure-as-code changes, so misconfigurations are caught before anything is applied instead of after it is live. A webhook from CI (or the shipped-disabled nightly schedule) starts an execution that stages the Terraform and Kubernetes files, runs two containerized Terrascan scans, and merges their violations in Python. When any policy fires, the run alerts Slack and opens a labeled GitHub issue listing the top policies; a clean scan publishes the pass verdict instead. Every execution outputs the verdict, the violation count, the distinct policy ids, and the summary report URI for the calling pipeline to consume.
+
+triggers:
+  - id: ci_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: CI POSTs to this key whenever a commit changes Terraform or Kubernetes manifests in the watched repository, starting the pre-apply scan.
+    key: "{{ secret('IAC_SCAN_WEBHOOK_KEY') }}"
+
+  - id: nightly_recheck
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Nightly re-scan of the standing repository, shipped disabled so it only runs after an owner switches it on.
+    cron: "0 4 * * *"
+    disabled: true
+
+inputs:
+  - id: iac_repo
+    type: STRING
+    defaults: https://github.com/acme/platform-infra.git
+    description: Repository URL reported by the CI webhook, copied into the Slack alert and the GitHub issue so every finding stays attributable.
+
+  - id: iac_path
+    type: STRING
+    defaults: .
+    description: Path inside the repository that the scans cover, defaulting to the repository root and reused as the fixture staging directory.
+
+  - id: github_repository
+    type: STRING
+    defaults: acme/platform-infra
+    description: Repository in owner/repo form where policy violations open their GitHub issue.
+
+tasks:
+  # --- 1. stage fixtures, scan, and score them ---
+  - id: scan_workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: One shared directory so the staged manifests, both Terrascan reports, and the Python verdict all read and write the same files.
+    tasks:
+      - id: write_fixtures
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Stage a Terraform module and a Kubernetes deployment with deliberate misconfigurations so the gate is reproducible without repository credentials.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: alpine:3.20
+        commands:
+          - |
+            set -eu
+            TARGET="{{ inputs.iac_path }}"
+            mkdir -p "${TARGET}"
+            cat > "${TARGET}/main.tf" <<'TERRAFORM'
+            provider "aws" {
+              region = "eu-west-1"
+            }
+
+            resource "aws_s3_bucket" "public_assets" {
+              bucket = "acme-public-assets"
+              acl    = "public-read"
+            }
+
+            resource "aws_s3_bucket_policy" "public_assets" {
+              bucket = aws_s3_bucket.public_assets.id
+              policy = jsonencode({
+                Version = "2012-10-17"
+                Statement = [{
+                  Sid       = "PublicReadObjects"
+                  Effect    = "Allow"
+                  Principal = "*"
+                  Action    = ["s3:GetObject"]
+                  Resource  = ["arn:aws:s3:::acme-public-assets/*"]
+                }]
+              })
+            }
+
+            resource "aws_security_group" "edge" {
+              name        = "edge-legacy-vendor"
+              vpc_id      = "vpc-0d2f1b6c"
+
+              ingress {
+                from_port   = 22
+                to_port     = 22
+                protocol    = "tcp"
+                cidr_blocks = ["0.0.0.0/0"]
+              }
+            }
+            TERRAFORM
+            cat > "${TARGET}/deployment.yaml" <<'K8S'
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: payments-api
+              namespace: production
+            spec:
+              replicas: 3
+              selector:
+                matchLabels:
+                  app: payments-api
+              template:
+                metadata:
+                  labels:
+                    app: payments-api
+                spec:
+                  serviceAccountName: payments-api
+                  containers:
+                    - name: payments-api
+                      image: acme/payments-api:1.14.2
+                      securityContext:
+                        privileged: true
+                        allowPrivilegeEscalation: true
+                        runAsUser: 0
+                      ports:
+                        - containerPort: 8080
+            K8S
+
+      - id: scan_iac
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Run Terrascan twice in the official container, once per IaC type, writing a JSON report each time and absorbing the scanner exit code so the Python verdict gates the run.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: tenable/terrascan:latest
+        outputFiles:
+          - terrascan-report.json
+          - terrascan-report-k8s.json
+        commands:
+          - terrascan scan -i terraform -d {{ inputs.iac_path }} --output json > terrascan-report.json || true
+          - terrascan scan -i k8s -d {{ inputs.iac_path }} --output json > terrascan-report-k8s.json || true
+
+      - id: parse_violations
+        type: io.kestra.plugin.scripts.python.Script
+        description: Merge both Terrascan reports into one verdict with the violation count, severity breakdown, and distinct policy ids, treating an unreadable report as a blocking finding.
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.12-slim
+        outputFiles:
+          - terrascan-summary.json
+        env:
+          IAC_REPO: "{{ inputs.iac_repo }}"
+          IAC_PATH: "{{ inputs.iac_path }}"
+        script: |
+          import json
+          import os
+
+          SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+          SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+          UNREADABLE_POLICY = "TERRASCAN-REPORT-UNREADABLE"
+
+          def load_report(path):
+              """Read one terrascan JSON report, tolerating log lines around it."""
+              if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+                  return None
+              with open(path, "r", errors="replace") as handle:
+                  raw = handle.read()
+              try:
+                  return json.loads(raw)
+              except ValueError:
+                  start, end = raw.find("{"), raw.rfind("}")
+                  if start > -1 and end > start:
+                      try:
+                          return json.loads(raw[start:end + 1])
+                      except ValueError:
+                          pass
+              return None
+
+          def policy_id(entry):
+              for key in ("rule_id", "rule_ref_id", "reference_id", "id", "rule_name"):
+                  value = entry.get(key)
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()
+              return "UNIDENTIFIED-POLICY"
+
+          def severity_of(entry):
+              value = str(entry.get("severity") or "").strip().upper()
+              return value if value in SEVERITIES else "MEDIUM"
+
+          def evaluate(reports):
+              """Merge reports into verdict, count, severity buckets, and ordered policy ids."""
+              violations, unreadable = [], 0
+              for report in reports:
+                  if not isinstance(report, dict):
+                      unreadable += 1
+                      continue
+                  container = report.get("results")
+                  found = container.get("violations") if isinstance(container, dict) else report.get("violations")
+                  if isinstance(found, list):
+                      violations.extend(entry for entry in found if isinstance(entry, dict))
+              buckets, ranks = {}, {}
+              for entry in violations:
+                  level = severity_of(entry)
+                  buckets[level] = buckets.get(level, 0) + 1
+                  rid, rank = policy_id(entry), SEVERITY_RANK.get(level, 9)
+                  if rid not in ranks or rank < ranks[rid]:
+                      ranks[rid] = rank
+              severities = {key: buckets[key] for key in SEVERITIES if key in buckets}
+              policy_ids = sorted(ranks, key=lambda rid: ranks[rid])
+              if unreadable:
+                  severities["UNPARSEABLE"] = unreadable
+                  policy_ids.insert(0, UNREADABLE_POLICY)
+              count = len(violations) + unreadable
+              return ("violation" if count > 0 else "pass"), count, severities, policy_ids, violations
+
+          def top_policies(violations, limit=5):
+              if not violations:
+                  return "no policy violations"
+              ordered = sorted(violations, key=lambda e: SEVERITY_RANK.get(severity_of(e), 9))
+              lines = []
+              for entry in ordered[:limit]:
+                  where = "%s:%s" % (entry.get("filename") or entry.get("file") or "unknown", entry.get("line", "?"))
+                  name = str(entry.get("rule_name") or "").strip() or "unnamed rule"
+                  text = " ".join(str(entry.get("description") or "").split())[:140]
+                  lines.append("- %s (%s) %s at %s - %s" % (policy_id(entry), severity_of(entry), name, where, text))
+              if len(ordered) > limit:
+                  lines.append("- ... and %d more violation(s)" % (len(ordered) - limit))
+              return "\n".join(lines)
+
+          def main():
+              paths = [
+                  os.environ.get("TERRAFORM_REPORT") or "terrascan-report.json",
+                  os.environ.get("K8S_REPORT") or "terrascan-report-k8s.json",
+              ]
+              verdict, count, severities, policy_ids, violations = evaluate([load_report(p) for p in paths])
+              policy_summary = ", ".join(policy_ids[:8]) or "none"
+              if len(policy_ids) > 8:
+                  policy_summary += " (+%d more)" % (len(policy_ids) - 8)
+              severity_summary = " ".join("%s=%d" % (key, severities[key]) for key in severities) or "none"
+              top = top_policies(violations)
+              if not violations and policy_ids and policy_ids[0] == UNREADABLE_POLICY:
+                  top = "- %s (HIGH) a Terrascan report was missing or unreadable" % UNREADABLE_POLICY
+              summary = {
+                  "repository": os.environ.get("IAC_REPO") or "unknown",
+                  "iac_path": os.environ.get("IAC_PATH") or ".",
+                  "verdict": verdict,
+                  "violation_count": count,
+                  "severities": severities,
+                  "policy_ids": policy_ids,
+                  "top_policies": top,
+                  "reports": paths,
+              }
+              with open("terrascan-summary.json", "w") as handle:
+                  json.dump(summary, handle, indent=2, sort_keys=True)
+              payload = {
+                  "verdict": verdict,
+                  "violation_count": count,
+                  "severities": severities,
+                  "policy_ids": policy_ids,
+                  "severity_summary": severity_summary,
+                  "policy_summary": policy_summary,
+                  "top_policies": summary["top_policies"],
+              }
+              print("::" + json.dumps({"outputs": payload}, ensure_ascii=True) + "::")
+          if __name__ == "__main__":
+              main()
+
+  # --- 2. gate the change on the verdict ---
+  - id: violation_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Any violation, including an unreadable report, escalates to Slack and GitHub; a clean scan records the pass verdict that the outputs publish.
+    condition: "{{ outputs.parse_violations.vars.violation_count > 0 }}"
+    then:
+      - id: alert_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Tell the platform channel that Terrascan blocked the change, with the severity breakdown and the top policy ids.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": "Terrascan blocked an IaC change in {{ inputs.iac_repo }} (path {{ inputs.iac_path }}). {{ outputs.parse_violations.vars.violation_count }} violation(s), severities {{ outputs.parse_violations.vars.severity_summary }}. Top policies {{ outputs.parse_violations.vars.policy_summary }}. Summary {{ outputs.parse_violations.outputFiles['terrascan-summary.json'] }}. Execution {{ execution.id }}."}
+
+      - id: open_issue
+        type: io.kestra.plugin.github.issues.Create
+        description: File one labeled issue listing the top policies, so each misconfiguration is worked from the backlog with the report attached.
+        jwtToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.github_repository }}"
+        title: "Terrascan violations in {{ inputs.iac_repo }} - {{ outputs.parse_violations.vars.violation_count }} policy hit(s)"
+        body: |
+          ## Terrascan policy scan
+
+          Repository `{{ inputs.iac_repo }}`, path `{{ inputs.iac_path }}`. **{{ outputs.parse_violations.vars.violation_count }} violation(s)**, verdict `{{ outputs.parse_violations.vars.verdict }}`, severities `{{ outputs.parse_violations.vars.severities | toJson }}`.
+
+          ### Top policies
+
+          {{ outputs.parse_violations.vars.top_policies }}
+
+          Policy ids - {{ outputs.parse_violations.vars.policy_summary }}
+          Summary report - {{ outputs.parse_violations.outputFiles['terrascan-summary.json'] }}
+          Execution - {{ execution.id }}
+        labels:
+          - terrascan
+          - iac-policy
+
+    else:
+      - id: record_pass
+        type: io.kestra.plugin.core.log.Log
+        description: Record the clean verdict that the outputs publish back to the calling CI job.
+        message: "Terrascan cleared {{ inputs.iac_repo }} at path {{ inputs.iac_path }} with verdict {{ outputs.parse_violations.vars.verdict }} and zero violations across both reports."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Escalate any failure to the ops channel with the execution url.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": "FAILED: {{ flow.id }} {{ execution.id }}"}
+
+outputs:
+  - id: verdict
+    type: STRING
+    description: Gate verdict for the CI job, either violation when a policy fired or a report was unreadable, or pass when both reports were clean.
+    value: "{{ outputs.parse_violations.vars.verdict }}"
+
+  - id: violation_count
+    type: INT
+    description: Total Terrascan violations across both reports, counting each unreadable report as one blocking finding.
+    value: "{{ outputs.parse_violations.vars.violation_count }}"
+
+  - id: policy_ids
+    type: ARRAY
+    description: Distinct Terrascan policy identifiers that fired, ordered by severity with the unreadable-report marker first when present.
+    value: "{{ outputs.parse_violations.vars.policy_ids }}"
+
+  - id: report_uri
+    type: STRING
+    description: Storage URI of the merged Terrascan summary report kept with this execution.
+    value: "{{ outputs.parse_violations.outputFiles['terrascan-summary.json'] }}"
+
+extend:
+  title: Scan Changed Terraform and Kubernetes Files Before They Are Applied
+  metaTitle: Terrascan IaC Misconfiguration Scan Before Apply
+  shortDescription: Scan changed Terraform and Kubernetes manifests with Terrascan, then escalate every policy violation to Slack and a GitHub issue before anything is applied.
+  description: |
+    ## How it works
+    1. `ci_webhook` (event-based `Webhook`, authenticated with the `IAC_SCAN_WEBHOOK_KEY` secret) receives the post-commit call from CI, and `nightly_recheck` (a `Schedule` shipped with `disabled: true`) offers the same scan as a nightly net once an owner switches it on. The repository and path arrive through the `iac_repo` and `iac_path` inputs, so one flow gates any module in the estate.
+    2. `scan_workspace` (`core.flow.WorkingDirectory`) opens one shared directory for the whole gate. `write_fixtures` (`scripts.shell.Commands` running `alpine:3.20` through a Docker `taskRunner`) writes `main.tf` with a public-read S3 bucket, a wildcard read bucket policy, and an SSH security group open to `0.0.0.0/0`, plus `deployment.yaml` with a privileged, root, privilege-escalating container. Staging fixtures keeps the blueprint runnable without repository credentials, and the path input decides where the manifests land.
+    3. `scan_iac` (`scripts.shell.Commands` with `tenable/terrascan:latest` as the Docker `taskRunner`) runs `terrascan scan -i terraform -d <iac_path> --output json > terrascan-report.json || true` and then the matching `-i k8s` scan into `terrascan-report-k8s.json`. Terrascan exits non-zero when it finds violations, so `|| true` absorbs that code and the Python verdict, not the CLI, is what gates the pipeline.
+    4. `parse_violations` (`scripts.python.Script` in `python:3.12-slim`) loads both reports, tolerates log lines wrapped around the JSON, merges every entry under `results.violations`, buckets severities, and collects distinct `rule_id` values ordered by severity. It prints a single `::{"outputs": ...}::` payload with `verdict`, `violation_count`, `severities`, `policy_ids`, `severity_summary`, `policy_summary`, and `top_policies`, and writes the same facts to `terrascan-summary.json`. A missing or unparseable report contributes an `UNPARSEABLE` finding and the `TERRASCAN-REPORT-UNREADABLE` policy id, so a broken scan can never read as clean.
+    5. `violation_gate` (`core.flow.If`) branches on `violation_count`. Over zero, `alert_slack` (`notifications.slack.SlackIncomingWebhook`) posts the counts and the one-line policy summary, and `open_issue` (`github.issues.Create`) files a labeled issue carrying the top policy list, the summary report URI, and the execution id. Zero violations take `record_pass`, which logs the pass verdict that the outputs publish to the calling job, and the flow-level `errors` handler repeats any scanner or worker failure to Slack.
+
+    ## What you get
+    - A pre-apply verdict for Terraform and Kubernetes changes returned as `verdict`, `violation_count`, `policy_ids`, and `report_uri`, so a pipeline can branch on it directly.
+    - One merged view across both IaC types, with severities bucketed from CRITICAL to LOW and policy ids ordered worst first.
+    - Escalation engineers see, a Slack message for the moment and a labeled GitHub issue for the fix, plus an unreadable report that blocks instead of quietly passing.
+
+    ## Who it's for
+    Platform and DevOps teams who run Terrascan in CI today but want the scan, the verdict, the alert, and the backlog ticket in one replayable execution, and security engineers who must prove a misconfiguration was caught before provisioning rather than after it is live.
+
+    ## Why orchestrate this with Kestra
+    A CI step can run Terrascan and fail a build, but it cannot keep the report, the alert, and the ticket in one place, retry a flaky scanner, or hand the same verdict to a nightly sweep without duplicating the pipeline. Kestra gives the scan a durable execution history, a shared working directory for the fixtures and both reports, a branch that escalates or stays quiet, and a failure handler that pings the ops channel instead of leaving a silently broken gate.
+
+    ## Prerequisites
+    - Docker on the Kestra worker, since the fixtures, the scans, and the parser all run through a Docker `taskRunner`.
+    - Network access to pull `tenable/terrascan:latest`, `alpine:3.20`, and `python:3.12-slim`.
+    - A GitHub token with issue-create rights and a CI job that POSTs to the webhook after a commit changes IaC files.
+
+    ### Secrets
+    - `IAC_SCAN_WEBHOOK_KEY`: Shared key CI sends to authenticate the webhook call.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook used for the violation alert and the failure escalation.
+    - `GITHUB_TOKEN`: GitHub token with issue-create rights in the configured repository.
+
+    ## Quick start
+    1. Store the three secrets, point `github_repository` at the project that should receive violation issues, and set `iac_repo` and `iac_path` to the module CI watches, or keep the defaults for a first dry run.
+    2. Run the flow manually. The fixtures stage, both scans write their reports, and `violation_gate` escalates because the staged manifests are deliberately misconfigured.
+    3. Check the Slack message, the labeled issue, and the `report_uri` output, then switch `ci_webhook` on in CI so every IaC commit is gated before apply.
+
+    ## How to extend
+    - Swap the fixture stage for a real checkout by adding a `git.Clone` task in `scan_workspace` ahead of `scan_iac`, keeping the same path input and reports.
+    - Add severity tiers by branching on `outputs.parse_violations.vars.severities`, so warnings open a ticket while only CRITICAL and HIGH block the apply.
+    - Fan out per policy with `core.flow.ForEach` over `policy_ids`, and ship `terrascan-summary.json` to durable storage with `aws.s3.Upload`.
+
+    ## Links
+    - [Terrascan documentation](https://terrascan.io/docs/)
+    - [Kestra Docker task runner](https://kestra.io/plugins/plugin-scripts-docker)
+    - [Kestra Slack and GitHub plugins](https://kestra.io/plugins)
+  metaDescription: Terrascan scans changed Terraform and Kubernetes files from a CI webhook, then escalates every policy violation to Slack and a GitHub issue before apply.
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Infrastructure Automation
+  ee: false
+  demo: false

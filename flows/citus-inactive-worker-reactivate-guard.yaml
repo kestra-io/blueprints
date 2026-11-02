@@ -1,0 +1,512 @@
+id: citus-inactive-worker-reactivate-guard
+namespace: company.team
+
+description: |
+  A Citus worker that went unreachable can be left with isactive = false in pg_dist_node. The
+  coordinator then routes nothing to it: queries fan out to fewer workers, new shards are never
+  placed there and a rebalance cannot use it. The flag does not clear itself when the node comes
+  back, so the cluster keeps running below the capacity it is paying for. This flow lists every
+  primary node in pg_dist_node, proves with citus_check_connection_to_node which inactive nodes
+  answer right now, then calls citus_activate_node behind a dry run and an approval for the ones
+  that answered. It re-reads isactive afterwards and fails the run if a target is still inactive.
+  A node that does not answer is reported and never activated.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: Coordinator JDBC URL
+    description: The Citus coordinator. pg_dist_node and the node health functions live there.
+    defaults: "jdbc:postgresql://localhost:5432/citus"
+
+  - id: exclude_nodes
+    type: JSON
+    displayName: Nodes to leave alone
+    description: >-
+      Nodes that are inactive on purpose, as host:port strings. A node added with
+      citus_add_inactive_node is staged rather than broken, so list the ones you are not ready to
+      put into service. Anything in this list is reported and never activated.
+    defaults: []
+
+  - id: auto_remediate
+    type: BOOL
+    displayName: Auto remediate
+    description: Allow the flow to activate a node. Off means report only.
+    defaults: false
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: Must be false, together with auto_remediate, before any node is activated.
+    defaults: true
+
+  - id: probe_timeout
+    type: DURATION
+    displayName: Health probe ceiling
+    description: >-
+      Hard ceiling on the reachability probe. Each probe of an unreachable node waits up to
+      citus.node_connection_timeout (30 seconds by default), so a cluster with many dead nodes can
+      take minutes. Past this the probe task fails and the errors block reports it.
+    defaults: PT5M
+
+variables:
+  node_cte: |
+    WITH excl AS (
+      SELECT e #>> '{}' AS name
+        FROM json_array_elements('{{ inputs.exclude_nodes }}'::json) AS e
+    ), placement AS (
+      SELECT groupid, count(*)::int AS shard_count
+        FROM pg_dist_placement WHERE shardstate = 1 GROUP BY groupid
+    ), node AS (
+      SELECT n.nodeid, n.nodename, n.nodeport, n.groupid,
+             n.noderole::text AS noderole, n.isactive, n.shouldhaveshards,
+             n.metadatasynced, n.nodecluster::text AS nodecluster,
+             coalesce(p.shard_count, 0) AS shard_placements,
+             ((n.nodename || ':' || n.nodeport) IN (SELECT name FROM excl)) AS excluded,
+             n.groupid = 0 AS is_coordinator
+        FROM pg_dist_node n
+        LEFT JOIN placement p ON p.groupid = n.groupid
+    ), audit AS (
+      SELECT nodeid, nodename, nodeport, groupid, noderole, isactive, shouldhaveshards,
+             metadatasynced, nodecluster, shard_placements, excluded, is_coordinator,
+             CASE
+               WHEN noderole <> 'primary' THEN 'NOT_PRIMARY'
+               WHEN isactive THEN 'ACTIVE'
+               WHEN is_coordinator THEN 'COORDINATOR_INACTIVE'
+               WHEN excluded THEN 'PARKED'
+               ELSE 'INACTIVE'
+             END AS verdict
+        FROM node
+    ), candidate AS (
+      SELECT * FROM audit WHERE verdict = 'INACTIVE'
+    )
+
+tasks:
+  - id: audit
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. One row per node in pg_dist_node with its role, isactive, how many shard
+      placements sit in its group and whether the operator parked it. No network probe here, so
+      this stays instant on any cluster size.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      {{ render(vars.node_cte) }}
+      SELECT * FROM audit ORDER BY groupid, nodename, nodeport
+
+  - id: healthcheck
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >-
+      Read-only. This is the whole safety story. citus_check_connection_to_node opens a real
+      connection from the coordinator to each inactive primary and returns false when it cannot.
+      Only nodes that answered become targets. Activating a node that is still down would make the
+      coordinator route work to something that cannot serve it, so an unanswered node is reported
+      and left inactive.
+    timeout: "{{ inputs.probe_timeout }}"
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      {{ render(vars.node_cte) }}, probed AS (
+        SELECT c.*, coalesce(citus_check_connection_to_node(c.nodename, c.nodeport), false) AS reachable
+          FROM candidate c
+      )
+      SELECT
+        CASE
+          WHEN (SELECT count(*) FROM probed WHERE reachable) > 0 THEN 'REACTIVATE'
+          WHEN (SELECT count(*) FROM probed) > 0 THEN 'UNREACHABLE'
+          ELSE 'OK'
+        END AS state,
+        (SELECT count(*) FROM audit WHERE noderole = 'primary')::int AS primary_nodes,
+        (SELECT count(*) FROM audit WHERE noderole = 'primary' AND isactive)::int AS active_primaries,
+        (SELECT count(*) FROM audit WHERE verdict = 'INACTIVE')::int AS inactive_nodes,
+        (SELECT count(*) FROM audit WHERE verdict = 'PARKED')::int AS parked_nodes,
+        (SELECT count(*) FROM audit WHERE verdict = 'NOT_PRIMARY')::int AS secondary_nodes,
+        (SELECT count(*) FROM probed WHERE reachable)::int AS reachable_count,
+        (SELECT count(*) FROM probed WHERE NOT reachable)::int AS unreachable_count,
+        (SELECT coalesce(sum(shard_placements), 0)::int FROM probed) AS stranded_placements,
+        coalesce((SELECT json_agg(json_build_object(
+                    'nodeid', nodeid, 'nodename', nodename, 'nodeport', nodeport,
+                    'shard_placements', shard_placements) ORDER BY nodename, nodeport)::text
+                    FROM probed WHERE reachable), '[]') AS targets_json,
+        coalesce((SELECT string_agg('SELECT citus_activate_node(' || quote_literal(nodename)
+                    || ', ' || nodeport || ');', ' ' ORDER BY nodename, nodeport)
+                    FROM probed WHERE reachable), '') AS plan_sql,
+        coalesce((SELECT string_agg(nodename || ':' || nodeport || ' (node ' || nodeid
+                    || ', ' || shard_placements || ' shard placements in its group)', '; '
+                    ORDER BY nodename, nodeport)
+                    FROM probed WHERE reachable), '') AS reachable_list,
+        coalesce((SELECT string_agg(nodename || ':' || nodeport || ' (node ' || nodeid || ')', '; '
+                    ORDER BY nodename, nodeport)
+                    FROM probed WHERE NOT reachable), '') AS unreachable_list,
+        coalesce((SELECT string_agg(nodename || ':' || nodeport, '; ' ORDER BY nodename, nodeport)
+                    FROM audit WHERE verdict = 'PARKED'), '') AS parked_list,
+        coalesce((SELECT string_agg(nodename || ':' || nodeport, '; ' ORDER BY nodename, nodeport)
+                    FROM audit WHERE noderole = 'primary' AND isactive), '') AS active_list
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Citus membership on {{ inputs.jdbc_url }} is {{ outputs.healthcheck.row.state }}.
+      {{ outputs.healthcheck.row.active_primaries }} of {{ outputs.healthcheck.row.primary_nodes }}
+      primary nodes are active, so that is how wide a distributed query fans out right now.
+      {{ outputs.healthcheck.row.inactive_nodes }} inactive nodes were probed:
+      {{ outputs.healthcheck.row.reachable_count }} answered and
+      {{ outputs.healthcheck.row.unreachable_count }} did not.
+      {{ outputs.healthcheck.row.parked_nodes }} parked by exclude_nodes,
+      {{ outputs.healthcheck.row.secondary_nodes }} not primary and never touched.
+      Active now: {{ outputs.healthcheck.row.active_list }}.
+      {% for r in outputs.audit.rows %}[{{ r.nodename }}:{{ r.nodeport }} node={{ r.nodeid }} group={{ r.groupid }} role={{ r.noderole }} isactive={{ r.isactive }} placements={{ r.shard_placements }}: {{ r.verdict }}] {% endfor %}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.healthcheck.row.state != 'OK' }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'Citus membership on ' ~ inputs.jdbc_url ~ ' is ' ~ outputs.healthcheck.row.state ~ '. ' ~ outputs.healthcheck.row.active_primaries ~ ' of ' ~ outputs.healthcheck.row.primary_nodes ~ ' primary nodes are active, so queries fan out to that many workers and no new shard can be placed on the rest. ' ~ (outputs.healthcheck.row.reachable_list == '' ? '' : 'Inactive but answering now: ' ~ outputs.healthcheck.row.reachable_list ~ '. ') ~ (outputs.healthcheck.row.unreachable_list == '' ? '' : 'Inactive and still not answering, left alone: ' ~ outputs.healthcheck.row.unreachable_list ~ '. ') ~ (inputs.auto_remediate and not inputs.dry_run ? 'Activation pending approval.' : 'No change applied (auto_remediate=' ~ inputs.auto_remediate ~ ', dry_run=' ~ inputs.dry_run ~ ').')} | toJson }}
+
+      - id: actionable
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.healthcheck.row.reachable_count > 0 }}"
+        then:
+          - id: log_plan
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              The dry run. These are the exact statements this flow would run, one per node that
+              answered the probe: {{ outputs.healthcheck.row.plan_sql }}
+              citus_activate_node flips isactive, syncs the metadata to the node and makes it
+              eligible for shard placement again. It moves no data, so a rebalance is a separate
+              decision taken afterwards.
+              {{ outputs.healthcheck.row.unreachable_list == '' ? '' : 'Not in the plan because the probe got no answer: ' ~ outputs.healthcheck.row.unreachable_list ~ '.' }}
+
+          - id: remediate_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+            then:
+              - id: approve
+                type: io.kestra.plugin.core.flow.Pause
+                description: >-
+                  Resume the execution to run the statements listed by log_plan. Kill it to cancel.
+                  The probe proved these nodes answer a query right now. It cannot prove their data
+                  is the data the cluster expects, so a node that was rebuilt or restored from a
+                  backup is a human decision, not a probe result.
+                onResume:
+                  - id: approved
+                    type: BOOL
+                    description: Set true to activate the nodes listed in the plan. Anything else leaves them inactive.
+                    required: false
+
+              - id: approval_result
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.approve.onResume.approved ?? false }}"
+                then:
+                  - id: remediate_nodes
+                    type: io.kestra.plugin.core.flow.Loop
+                    description: >-
+                      Remediation loop. One citus_activate_node per node, concurrencyLimit 1
+                      because activation takes a lock on pg_dist_node and syncs metadata, so two
+                      at once serialise behind each other anyway. allowFailure on the statement so
+                      one refusal does not stop the pass: the re-read below is what decides the
+                      outcome.
+                    concurrencyLimit: 1
+                    values: "{{ outputs.healthcheck.row.targets_json }}"
+                    tasks:
+                      - id: activate_node
+                        type: io.kestra.plugin.jdbc.postgresql.Query
+                        description: >-
+                          Activate one node. Citus connects to it, syncs pg_dist_node and the
+                          distributed object metadata, then sets isactive. It raises if the node
+                          stopped answering between the probe and this call.
+                        allowFailure: true
+                        url: "{{ inputs.jdbc_url }}"
+                        username: "{{ secret('POSTGRES_USERNAME') }}"
+                        password: "{{ secret('POSTGRES_PASSWORD') }}"
+                        fetchType: NONE
+                        sql: >-
+                          SELECT citus_activate_node('{{ fromJson(item.value).nodename }}', {{ fromJson(item.value).nodeport }})
+
+                  - id: recheck
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    description: >-
+                      The gate. Re-read isactive from pg_dist_node for exactly the nodes that were
+                      targeted, then ask every active node for a trivial answer through
+                      run_command_on_all_nodes. citus_activate_node returns the node id whether or
+                      not the cluster ended up usable, so its return value is never the gate.
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ secret('POSTGRES_USERNAME') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    sql: |
+                      WITH target AS (
+                        SELECT (e.value -> 'nodename') #>> '{}' AS nodename,
+                               ((e.value -> 'nodeport') #>> '{}')::int AS nodeport
+                          FROM json_array_elements('{{ outputs.healthcheck.row.targets_json }}'::json) AS e(value)
+                      ), outcome AS (
+                        SELECT t.nodename, t.nodeport, n.nodeid, n.isactive, n.metadatasynced,
+                               n.shouldhaveshards
+                          FROM target t
+                          LEFT JOIN pg_dist_node n
+                                 ON n.nodename = t.nodename AND n.nodeport = t.nodeport
+                      ), fan AS (
+                        SELECT nodeid, success FROM run_command_on_all_nodes('SELECT 1', true, true)
+                      )
+                      SELECT count(*)::int AS targeted,
+                             (count(*) FILTER (WHERE isactive))::int AS now_active,
+                             (count(*) FILTER (WHERE isactive IS DISTINCT FROM true))::int AS still_inactive,
+                             (count(*) FILTER (WHERE isactive IS DISTINCT FROM true)) = 0 AS fixed,
+                             (SELECT count(*) FROM pg_dist_node WHERE noderole = 'primary' AND isactive)::int AS active_primaries,
+                             (SELECT count(*) FROM fan)::int AS cluster_nodes,
+                             (SELECT count(*) FROM fan WHERE success)::int AS answering_nodes,
+                             (count(*) FILTER (WHERE isactive AND NOT shouldhaveshards))::int AS drained,
+                             coalesce(string_agg(nodename || ':' || nodeport || ' isactive='
+                               || coalesce(isactive::text, 'row gone') || ' metadatasynced='
+                               || coalesce(metadatasynced::text, 'n/a') || ' shouldhaveshards='
+                               || coalesce(shouldhaveshards::text, 'n/a'), '; '
+                               ORDER BY nodename, nodeport), '') AS movement,
+                             coalesce((SELECT string_agg(nodename || ':' || nodeport, '; '
+                               ORDER BY nodename, nodeport) FROM outcome
+                               WHERE isactive IS DISTINCT FROM true), '') AS survivors
+                        FROM outcome
+
+                  - id: verify
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ outputs.recheck.row.fixed }}"
+                    then:
+                      - id: reactivated
+                        type: io.kestra.plugin.core.log.Log
+                        message: >-
+                          {{ outputs.recheck.row.now_active }} of {{ outputs.recheck.row.targeted }}
+                          targeted nodes read back isactive = true from pg_dist_node:
+                          {{ outputs.recheck.row.movement }}. The cluster now has
+                          {{ outputs.recheck.row.active_primaries }} active primary nodes and
+                          {{ outputs.recheck.row.answering_nodes }} of
+                          {{ outputs.recheck.row.cluster_nodes }} of them answered a query through
+                          run_command_on_all_nodes. A rebalance can now move work onto the node.
+                          {{ outputs.recheck.row.drained > 0 ? outputs.recheck.row.drained ~ ' of them still carry shouldhaveshards = false, which is what citus_drain_node leaves behind and what activation does not undo, so new shards stay off that node until citus_set_node_property sets it back to true.' : 'Every activated node carries shouldhaveshards = true, so new shards can be placed on it again.' }}
+                    else:
+                      - id: remediation_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          citus_activate_node ran, but {{ outputs.recheck.row.still_inactive }} of
+                          {{ outputs.recheck.row.targeted }} targeted nodes still read isactive
+                          false in pg_dist_node: {{ outputs.recheck.row.survivors }}. Read back:
+                          {{ outputs.recheck.row.movement }}. Activation needs a superuser, it
+                          raises when the node stops answering between the probe and the call. A
+                          concurrent citus_disable_node or citus_remove_node can undo it. Read
+                          pg_dist_node on the coordinator and the coordinator log for the
+                          connection error.
+                else:
+                  - id: declined
+                    type: io.kestra.plugin.core.log.Log
+                    message: >-
+                      The approval was resumed without approved set to true, so nothing was
+                      activated. {{ outputs.healthcheck.row.reachable_count }} nodes are still
+                      inactive while answering the probe:
+                      {{ outputs.healthcheck.row.reachable_list }}.
+            else:
+              - id: reported_only
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  {{ outputs.healthcheck.row.reachable_count }} inactive nodes answered the probe
+                  and none were activated (auto_remediate={{ inputs.auto_remediate }},
+                  dry_run={{ inputs.dry_run }}). {{ outputs.healthcheck.row.reachable_list }}.
+        else:
+          - id: unreachable_only
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              {{ outputs.healthcheck.row.unreachable_count }} inactive nodes did not answer
+              citus_check_connection_to_node, so this flow activates nothing:
+              {{ outputs.healthcheck.row.unreachable_list }}. A node that is still down belongs
+              out of the cluster. Bringing it back into pg_dist_node while it cannot serve turns a
+              degraded cluster into a failing one, because the coordinator starts planning tasks
+              for a node that answers nothing. Fix the node or its network first, then run this
+              flow again. Shard placements recorded in those groups:
+              {{ outputs.healthcheck.row.stranded_placements }}.
+    else:
+      - id: all_active
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          {{ outputs.healthcheck.row.active_primaries }} of
+          {{ outputs.healthcheck.row.primary_nodes }} primary nodes in pg_dist_node are active and
+          nothing is inactive without being parked on purpose:
+          {{ outputs.healthcheck.row.active_list }}.
+          {{ outputs.healthcheck.row.parked_list == '' ? '' : 'Parked by exclude_nodes and left alone: ' ~ outputs.healthcheck.row.parked_list ~ '.' }}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'Citus inactive worker reactivate guard failed on ' ~ inputs.jdbc_url ~ ' (execution ' ~ execution.id ~ '). Check the logs.'} | toJson }}
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Shipped disabled and always in safe mode.
+    cron: "0 4 * * *"
+    disabled: true
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Citus Inactive Worker Reactivate Guard
+  shortDescription: Find Citus workers left with isactive false in pg_dist_node after an outage, prove each one answers a query right now, then activate the healthy ones behind an approval and read isactive back to confirm the cluster is wide again.
+  metaTitle: Citus Inactive Worker Reactivate Guard with Kestra
+  metaDescription: Detect Citus workers stuck inactive in pg_dist_node, health check them, activate the reachable ones with citus_activate_node and verify isactive flipped.
+  description: |
+    A Citus worker goes unreachable for ten minutes. Something takes it out of the cluster. Maybe `citus_disable_node` run by an operator or by a failover tool. Maybe a node registered with `citus_add_inactive_node` whose activation step never finished. Either way `pg_dist_node` now holds a row with `isactive = false`.
+
+    The node comes back. The flag does not. Citus has no failure detector that walks it back, so the coordinator keeps routing nothing to that worker. Distributed queries fan out to fewer nodes, `create_distributed_table` never places a shard there and a rebalance cannot move work onto it. Nothing errors. The cluster is simply narrower than the architecture diagram says. The only symptom is that everything is a little slower and a lot less resilient than it looks.
+
+    This blueprint reads every row of `pg_dist_node`, proves with `citus_check_connection_to_node` which inactive primaries answer a connection right now, then calls `citus_activate_node` behind a dry run and an approval for those nodes only. It re-reads `isactive` and fails the run if a target is still inactive. A node that does not answer the probe is reported and never activated.
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+    ## Findings
+
+    Six things measured on a live cluster that decided how this flow is built:
+
+    - **Activating a node that is still down is worse than leaving it inactive.** An inactive worker is a degraded cluster that is stable: the coordinator plans around it. Put it back in while it cannot serve and the coordinator starts planning tasks for a node that answers nothing, so queries that worked a second ago fail. That is why reachability is proved before the write and why a node that does not answer is skipped rather than retried.
+    - **`citus_check_connection_to_node` is the right probe and it does not raise.** It opens a real connection from the coordinator to the node and returns `false` with a warning when it cannot, so one read-only query classifies every inactive node without a shell task and without aborting on the first dead host. Measured against a stopped worker it returned `f`; against a live one, `t`.
+    - **`citus_activate_node` raises on an unreachable node rather than quietly doing nothing.** That sounds safe enough to skip the probe. It is not. Without the probe the flow turns a known-down node into a failed execution and a pager alert that reads like the flow is broken. Inside a loop the raise would hide the nodes that could have been fixed. With the probe, a node that is still down is a clean reported outcome and the healthy nodes in the same run are still repaired.
+    - **A failed `citus_add_node` leaves no row at all, so the inactive row has a different origin.** Running `citus_add_node` against a stopped worker raised a connection error and rolled the whole thing back: `pg_dist_node` was unchanged. So an `isactive = false` row is not provisioning debris. It was put there deliberately by `citus_add_inactive_node` or `citus_disable_node`, which is exactly why the flow ships an `exclude_nodes` list for nodes that are staged on purpose.
+    - **`citus_disable_node` refuses a worker that holds the only copy of a shard.** It answers `cannot remove or disable the node ... because it contains the only shard placement for shard N`. On a single worker cluster it refuses again with `disabling the first worker node in the metadata is not allowed`. Drain the node first and it succeeds. So the inactive state belongs to a node that was drained, replicated or never loaded, which is also why the flow reports the shard placements recorded in an inactive node's group instead of assuming there are none.
+    - **Activation does not undo a drain, which is easy to mistake for a fix.** `citus_drain_node` sets `shouldhaveshards = false` on its way out. `citus_activate_node` flips `isactive` back and syncs the metadata, but it leaves `shouldhaveshards` alone. The node then answers queries for shards it already holds while no new shard is ever placed on it, which looks healthy in `pg_dist_node` and still costs capacity. So the re-read reports `shouldhaveshards` per node and says in plain words when `citus_set_node_property` is still needed.
+
+    ## Safety
+
+    - Detection is `SELECT` only against `pg_dist_node`, `pg_dist_placement` and the two Citus health functions.
+    - A write happens only when `auto_remediate` is true, `dry_run` is false, the probe found at least one inactive node that answered, a human resumed the `approve` task and that resume carried `approved: true`. An unanswered resume is not an approval.
+    - Nodes with `noderole` other than `primary` are never acted on. Neither is the coordinator row in group 0.
+    - A node already active is never re-issued. A node listed in `exclude_nodes` is reported and left alone.
+    - The probe has a hard ceiling. Each probe of a dead node waits up to `citus.node_connection_timeout`, so `probe_timeout` bounds the whole pass and a hung cluster reports through the errors block instead of running forever.
+    - The run fails when `isactive` did not flip, so a silent no-op cannot be reported as a repair.
+    - The probe proves a node answers a query, not that its data is correct. A worker rebuilt empty at the same hostname would pass it, which is why the change sits behind a human approval.
+
+    ## How it works
+
+    1. `audit` (`io.kestra.plugin.jdbc.postgresql.Query`, read-only) lists every row of `pg_dist_node` with its role, `isactive`, `metadatasynced`, whether it is the coordinator group and how many shard placements sit in its group, from `pg_dist_placement`.
+    2. Each node gets a verdict:
+
+       | Verdict | Meaning |
+       |---|---|
+       | `ACTIVE` | In service. Queries fan out to it |
+       | `INACTIVE` | A primary with `isactive = false`. The candidate set |
+       | `PARKED` | Inactive and named in `exclude_nodes`. Staged on purpose, never touched |
+       | `COORDINATOR_INACTIVE` | The group 0 row. Reported, never activated by this flow |
+       | `NOT_PRIMARY` | A secondary. Out of scope |
+
+    3. `healthcheck` probes the `INACTIVE` nodes with `citus_check_connection_to_node`, so a healthy cluster runs zero probes. It returns the state (`OK`, `REACTIVATE`, `UNREACHABLE`), the counts, the target list for the loop and the exact statements for the dry run.
+    4. `report` logs how wide the cluster currently fans out against how wide it was provisioned, then one line per node.
+    5. `route` (`io.kestra.plugin.core.flow.If`):
+       - **OK:** `all_active` lists the active nodes and any parked ones.
+       - **anything else:** `alert` posts to Slack.
+         - `unreachable_only` ends the run when no inactive node answered, naming them and saying why activating them would make things worse.
+         - `log_plan` prints the `citus_activate_node` statements, which is the dry run.
+         - `remediate_gate` continues only with `auto_remediate` true and `dry_run` false. Otherwise `reported_only` says what would have changed.
+         - `approve` (`io.kestra.plugin.core.flow.Pause`) waits for a human. `approval_result` stops at `declined` unless the resume carried `approved: true`.
+         - `remediate_nodes` (`io.kestra.plugin.core.flow.Loop`, `concurrencyLimit: 1`) runs one `citus_activate_node` per target with `allowFailure`, so one refusal does not hide the rest.
+         - `recheck` re-reads `isactive` for the targeted nodes and asks every active node for a trivial answer through `run_command_on_all_nodes`.
+         - `verify` logs the before and after. Otherwise `remediation_failed` fails the run with the nodes that are still inactive.
+    6. `errors` alerts Slack when the coordinator cannot be read or the probe pass hits its ceiling.
+
+    ## What you get
+
+    - One row per node with `isactive`, the role, the group and the shard placements recorded against it, so an inactive worker is visible next to the ones carrying the load.
+    - A reachability result per inactive node, from the coordinator, before anything is written.
+    - A refusal that is a reported outcome rather than a failure: a node still down is named and left out of the plan.
+    - The exact statements the flow would run, before anything changes.
+    - An activation that only runs after a human resumes it with an explicit yes.
+    - A re-read of `pg_dist_node` that fails the run when `isactive` did not flip, plus a count of how many nodes answered a query afterwards.
+
+    ## Who it's for
+
+    - Teams running Citus through real worker outages, where a node that recovered is still carrying no work weeks later.
+    - Platform teams who add workers with `citus_add_inactive_node` as part of provisioning and need the activation step to be auditable rather than remembered.
+    - Anyone whose cluster is slower than its node count suggests, with no slow query to point at.
+
+    ## Why orchestrate this with Kestra
+
+    Nothing in Citus walks `isactive` back after an outage. Nothing warns that it is still false. The gap is invisible until someone reads `pg_dist_node` by hand. A schedule closes it: read the membership every morning, send the degraded cluster to Slack, hold the activation behind an approval and keep the probe result plus the before and after `isactive` on the execution, so the day the cluster got narrower is a record rather than a guess.
+
+    ## Tested end to end
+
+    On Kestra 2.0.5 OSS against Citus 12.1 on PostgreSQL 16, with a coordinator and two workers on one Docker network and a local HTTP sink standing in for Slack. `orders` was distributed over 8 shards. The first worker stayed active and untouched in every run, which is what proves the flow is precise rather than lucky. The second worker was taken out of the cluster twice, once with `citus_add_inactive_node` and once with `citus_disable_node` after a drain. Its container was stopped or started to drive the two health paths.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | defaults, inactive worker running | `REACTIVATE`. 2 of 3 primary nodes active, one node answered the probe, one statement planned, nothing applied |
+    | 2 | `auto_remediate: true`, `dry_run: true` | Same plan, nothing applied. `psql` confirms `isactive` still false |
+    | 3 | armed, resumed with no answer | `declined`. Nothing changed |
+    | 4 | armed, approved, worker stopped during the approval window | The re-verify failure. `citus_activate_node` raised, `recheck` read `isactive` false again, `remediation_failed` failed the run, Slack alerted |
+    | 5 | armed, worker still down | The refusal. The probe returned false, `unreachable_only` ended the run, no plan was built, no activation attempted. `psql` confirms `isactive` still false |
+    | 6 | armed, approved, worker running | `isactive` false to true with `metadatasynced` true. 3 of 3 nodes answered `run_command_on_all_nodes` and `verify` passed |
+    | 7 | defaults, straight after run 6 | `OK`. 3 of 3 primary nodes active, zero probes run |
+    | 8 | armed, the node named in `exclude_nodes` | `OK` with the node reported `PARKED`, never probed, never activated |
+    | 9 | armed, approved, node drained before it went inactive | Activated, then flagged: `shouldhaveshards` is still false, so the log says `citus_set_node_property` is still needed |
+    | 10 | armed, approved, `shouldhaveshards` true | Activated with nothing left to do |
+    | 11 | armed, with an inactive secondary in `pg_dist_node` pointing at a host that does not exist | `OK`. Reported `NOT_PRIMARY`, never probed, never activated |
+    | 12 | unreachable coordinator | `audit` failed and the `errors` block alerted |
+
+    Every `isactive` value in that table was read from `pg_dist_node` in `psql` on the coordinator, not only from the Kestra logs. The capacity payoff was measured the same way. While the worker sat inactive, `get_rebalance_table_shards_plan('orders')` returned 0 moves, because a rebalance has nowhere to put a shard. All 8 shards sat on one worker. After the flow activated the node the same call planned 4 moves, the rebalance ran, `citus_shards` showed 4 shards on each worker, `SELECT count(*) FROM orders` still returned all 2000 rows and `EXPLAIN` listed the reactivated host in the plan. The detector was proved the other way too: 1 `INACTIVE` row on the degraded cluster, 0 once every primary was active, with the probe skipped entirely in that case.
+
+    ## Prerequisites
+
+    - A Citus cluster reached through its coordinator, with `citus_activate_node` and `citus_check_connection_to_node` available. Both are present in Citus 12.1, which is the version this was tested on.
+    - A role that can read `pg_dist_node` and `pg_dist_placement` for the detection path.
+    - `citus_activate_node` needs a superuser. A role without it is rejected and the re-read turns that into a failed run rather than a silent pass.
+    - Network reachability from the coordinator to the worker on the port recorded in `pg_dist_node`, which is what the probe tests.
+    - `citus.node_connection_timeout`, 30 seconds by default, bounds each probe of a dead node. Keep `probe_timeout` above the worst case for your node count.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME` / `POSTGRES_PASSWORD`: credentials for the coordinator.
+    - `SLACK_WEBHOOK_URL`: used by `alert` and the `errors` block.
+    - In Kestra OSS, provide each one as a base64-encoded environment variable prefixed `SECRET_`.
+
+    ### Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `jdbc_url` | `jdbc:postgresql://localhost:5432/citus` | Coordinator |
+    | `exclude_nodes` | `[]` | `host:port` entries that are inactive on purpose |
+    | `auto_remediate` | `false` | Allow a node to be activated |
+    | `dry_run` | `true` | Must be `false` before any node is activated |
+    | `probe_timeout` | `PT5M` | Ceiling on the whole reachability pass |
+
+    ## Quick start
+
+    1. Add the `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `SLACK_WEBHOOK_URL` secrets.
+    2. Import the flow and set `jdbc_url` to your coordinator.
+    3. Run it with the defaults and read the per-node table. Put any node you are staging on purpose into `exclude_nodes`.
+    4. Run it with `auto_remediate: true` and `dry_run: false`, then resume the `approve` task with `approved: true` to activate the nodes that answered.
+    5. Enable the `daily` trigger, which always runs in safe mode.
+
+    ## How to extend
+
+    - Chain a rebalance after a successful activation, so the recovered node starts carrying shards instead of only being eligible for them.
+    - Deepen the probe: run a query against the worker directly for its Citus version and its disk headroom, so a node that answers but is not fit to serve is refused too.
+    - Record the active primary count in the KV store each run, so the day the cluster got narrower is an event with a timestamp.
+    - Alert on a node that stays unreachable across several runs, which is a dead host rather than a flapping one.
+    - Point the same audit at `metadatasynced`, so a node that is active but out of sync is caught in the same pass.
+    - Fail a release pipeline when the active primary count is below what the cluster is provisioned for, so a narrow cluster blocks a deploy rather than quietly slowing it.
+
+    ## Links
+
+    - Citus cluster management: https://docs.citusdata.com/en/stable/admin_guide/cluster_management.html
+    - Citus node and table management functions: https://docs.citusdata.com/en/stable/develop/api_udf.html
+    - PostgreSQL plugin: https://kestra.io/plugins/plugin-jdbc-postgres
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Incident Response
+  ee: false
+  demo: false

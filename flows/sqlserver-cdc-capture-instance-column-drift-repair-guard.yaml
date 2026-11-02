@@ -1,0 +1,532 @@
+id: sqlserver-cdc-capture-instance-column-drift-repair-guard
+namespace: company.team
+
+description: |
+  Detect a SQL Server CDC capture instance that is missing columns added to its source table,
+  then create a replacement capture instance and cut over only after a human approval. The
+  detector compares a real Debezium event with sys.columns, so a healthy table and a silent
+  downstream schema loss are different outcomes.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: SQL Server JDBC URL
+    defaults: "{{ secret('SQLSERVER_JDBC_URL') }}"
+  - id: hostname
+    type: STRING
+    defaults: "{{ secret('SQLSERVER_HOST') }}"
+  - id: port
+    type: STRING
+    defaults: "1433"
+  - id: database_name
+    type: STRING
+    defaults: cdc_lab
+  - id: schema_name
+    type: STRING
+    defaults: dbo
+  - id: table_name
+    type: STRING
+    defaults: orders
+  - id: username
+    type: STRING
+    defaults: "{{ secret('SQLSERVER_USERNAME') }}"
+  - id: password
+    type: STRING
+    defaults: "{{ secret('SQLSERVER_PASSWORD') }}"
+  - id: capture_instance
+    type: STRING
+    displayName: Existing CDC capture instance
+    defaults: dbo_orders
+  - id: repair_capture_instance
+    type: STRING
+    displayName: Replacement CDC capture instance
+    defaults: dbo_orders_repair
+  - id: probe_sql
+    type: STRING
+    displayName: Approved canary mutation
+    description: A narrow mutation that creates one post-repair CDC event. Keep it scoped to a disposable canary row.
+    defaults: "UPDATE dbo.orders SET status = status WHERE order_id = 1"
+  - id: protected_tables
+    type: STRING
+    displayName: Protected table list
+    description: Comma-separated schema.table names that may be audited but can never be repaired by this flow.
+    defaults: dbo.audit_log
+  - id: state_name
+    type: STRING
+    defaults: cdc-drift-baseline
+  - id: max_records
+    type: INT
+    defaults: 1
+  - id: max_wait
+    type: STRING
+    defaults: PT15S
+  - id: auto_remediate
+    type: BOOL
+    description: Allow creation of a replacement capture instance and cutover after approval.
+    defaults: false
+  - id: dry_run
+    type: BOOL
+    description: Keep true for the normal audit path. A write requires auto_remediate true and dry_run false.
+    defaults: true
+
+variables:
+  schema_sql: |
+    SELECT
+      c.name AS column_name,
+      c.column_id,
+      CASE WHEN EXISTS (
+        SELECT 1
+        FROM cdc.change_tables ct
+        JOIN cdc.captured_columns cc ON cc.object_id = ct.object_id
+        WHERE ct.source_object_id = t.object_id
+          AND ct.capture_instance = :capture_instance
+          AND cc.column_name = c.name
+      ) THEN 1 ELSE 0 END AS captured_by_current
+    FROM sys.columns c
+    JOIN sys.tables t ON t.object_id = c.object_id
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE s.name = :schema_name
+      AND t.name = :table_name
+      AND c.is_hidden = 0
+    ORDER BY c.column_id
+
+  eligibility_sql: |
+    SELECT
+      t.object_id AS source_object_id,
+      COUNT(c.column_id) AS source_column_count,
+      (SELECT COUNT(*)
+       FROM cdc.change_tables ct0
+       JOIN cdc.captured_columns cc0 ON cc0.object_id = ct0.object_id
+       WHERE ct0.source_object_id = t.object_id
+         AND ct0.capture_instance = :capture_instance) AS current_capture_column_count,
+      CASE WHEN EXISTS (
+        SELECT 1 FROM cdc.change_tables ct1
+        WHERE ct1.source_object_id = t.object_id
+          AND ct1.capture_instance = :capture_instance
+      ) THEN 1 ELSE 0 END AS current_instance_present,
+      CASE WHEN EXISTS (
+        SELECT 1 FROM cdc.change_tables ct2
+        WHERE ct2.source_object_id = t.object_id
+          AND ct2.capture_instance = :repair_capture_instance
+      ) THEN 1 ELSE 0 END AS repair_instance_present
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    JOIN sys.columns c ON c.object_id = t.object_id AND c.is_hidden = 0
+    WHERE s.name = :schema_name
+      AND t.name = :table_name
+    GROUP BY t.object_id
+
+tasks:
+  - id: read_schema
+    type: io.kestra.plugin.jdbc.sqlserver.Query
+    description: Read the source table columns and whether the existing capture instance contains each one.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ inputs.username }}"
+    password: "{{ inputs.password }}"
+    trustServerCertificate: true
+    fetchType: FETCH
+    sql: "{{ render(vars.schema_sql) }}"
+    parameters:
+      schema_name: "{{ inputs.schema_name }}"
+      table_name: "{{ inputs.table_name }}"
+      capture_instance: "{{ inputs.capture_instance }}"
+
+  - id: capture_current
+    type: io.kestra.plugin.debezium.sqlserver.Capture
+    description: Capture a bounded real CDC window from the current instance. The payload is the detector input.
+    hostname: "{{ inputs.hostname }}"
+    port: "{{ inputs.port }}"
+    username: "{{ inputs.username }}"
+    password: "{{ inputs.password }}"
+    database: "{{ inputs.database_name }}"
+    snapshotMode: SCHEMA_ONLY
+    format: INLINE
+    splitTable: "OFF"
+    maxRecords: "{{ inputs.max_records }}"
+    maxWait: "{{ inputs.max_wait }}"
+    stateName: "{{ inputs.state_name }}"
+    properties:
+      database.encrypt: "false"
+      table.include.list: "{{ inputs.schema_name }}.{{ inputs.table_name }}"
+
+  - id: current_event_json
+    type: io.kestra.plugin.serdes.json.IonToJson
+    description: Convert the captured CDC payload to JSON for an independent field-set comparison.
+    from: "{{ outputs.capture_current.uris.data }}"
+
+  - id: compare_current
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compare fields emitted by Debezium with the live sys.columns result; metadata fields are excluded.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      events.json: "{{ outputs.current_event_json.uri }}"
+    env:
+      SOURCE_COLUMNS_JSON: "{{ outputs.read_schema.rows | toJson }}"
+    script: |
+      import json
+      import os
+
+      with open("events.json", encoding="utf-8") as handle:
+          raw = handle.read().strip()
+      try:
+          payload = json.loads(raw)
+          events = payload if isinstance(payload, list) else [payload]
+      except json.JSONDecodeError:
+          events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+      source = json.loads(os.environ["SOURCE_COLUMNS_JSON"])
+      source_fields = [row["column_name"] for row in source]
+      emitted_fields = sorted({key for event in events for key in event if key not in {"deleted", "key", "metadata"}})
+      missing = sorted(set(source_fields) - set(emitted_fields))
+      extra = sorted(set(emitted_fields) - set(source_fields))
+      verdict = {
+          "event_count": len(events),
+          "source_column_count": len(source_fields),
+          "emitted_field_count": len(emitted_fields),
+          "emitted_fields": emitted_fields,
+          "missing_columns": missing,
+          "extra_fields": extra,
+          "drift": bool(missing),
+      }
+      print(json.dumps(verdict, sort_keys=True))
+      print("::" + json.dumps({"outputs": verdict}) + "::")
+
+  - id: require_event
+    type: io.kestra.plugin.core.flow.If
+    description: A quiet CDC window cannot prove schema health, so the guard fails rather than claiming a clean result.
+    condition: "{{ outputs.compare_current.vars.event_count == 0 }}"
+    then:
+      - id: no_event
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "No CDC event arrived in the bounded window. The guard cannot prove that {{ inputs.schema_name }}.{{ inputs.table_name }} is carrying its current columns."
+
+  - id: route
+    type: io.kestra.plugin.core.flow.If
+    description: Keep healthy tables report-only and send only a real field-set drift into the guarded repair path.
+    condition: "{{ outputs.compare_current.vars.drift and not (inputs.protected_tables contains (inputs.schema_name ~ '.' ~ inputs.table_name)) }}"
+    then:
+      - id: alert_drift
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {{ {'text': 'SQL Server CDC field drift on ' ~ inputs.database_name ~ '.' ~ inputs.schema_name ~ '.' ~ inputs.table_name ~ ': missing from Debezium event ' ~ (outputs.compare_current.vars.missing_columns | join(', ')) ~ '. No capture instance write runs unless auto_remediate=true, dry_run=false and approval is granted. Execution ' ~ execution.id ~ '.'} | toJson }}
+
+      - id: remediation_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+        then:
+          - id: approve_repair
+            type: io.kestra.plugin.core.flow.Pause
+            description: Human approval is required before creating a second capture instance or issuing the canary mutation.
+            onResume:
+              - id: approved
+                type: BOOL
+                defaults: false
+                description: Set true to create and verify the replacement capture instance. Anything else leaves the old instance in place.
+
+          - id: approved_gate
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.approve_repair.onResume.approved ?? false }}"
+            then:
+              - id: recheck_eligibility
+                type: io.kestra.plugin.jdbc.sqlserver.Query
+                description: Re-read the source and capture-instance counts after approval; a changed target is refused.
+                url: "{{ inputs.jdbc_url }}"
+                username: "{{ inputs.username }}"
+                password: "{{ inputs.password }}"
+                trustServerCertificate: true
+                fetchType: FETCH_ONE
+                sql: "{{ render(vars.eligibility_sql) }}"
+                parameters:
+                  schema_name: "{{ inputs.schema_name }}"
+                  table_name: "{{ inputs.table_name }}"
+                  capture_instance: "{{ inputs.capture_instance }}"
+                  repair_capture_instance: "{{ inputs.repair_capture_instance }}"
+
+              - id: stale_plan_gate
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.recheck_eligibility.row.current_instance_present != 1 or outputs.recheck_eligibility.row.repair_instance_present == 1 or outputs.recheck_eligibility.row.current_capture_column_count >= outputs.recheck_eligibility.row.source_column_count }}"
+                then:
+                  - id: stale_plan
+                    type: io.kestra.plugin.core.execution.Fail
+                    errorMessage: "The approved CDC repair plan is stale or already changed: current_instance={{ outputs.recheck_eligibility.row.current_instance_present }}, repair_instance={{ outputs.recheck_eligibility.row.repair_instance_present }}, current_columns={{ outputs.recheck_eligibility.row.current_capture_column_count }}, source_columns={{ outputs.recheck_eligibility.row.source_column_count }}. No write was attempted."
+                else:
+                  - id: create_repair_capture
+                    type: io.kestra.plugin.jdbc.sqlserver.Query
+                    description: Create the replacement capture instance with SQL Server's own CDC procedure.
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ inputs.username }}"
+                    password: "{{ inputs.password }}"
+                    trustServerCertificate: true
+                    fetchType: NONE
+                    sql: |
+                      EXEC sys.sp_cdc_enable_table
+                        @source_schema = :schema_name,
+                        @source_name = :table_name,
+                        @role_name = NULL,
+                        @supports_net_changes = 0,
+                        @capture_instance = :repair_capture_instance;
+                    parameters:
+                      schema_name: "{{ inputs.schema_name }}"
+                      table_name: "{{ inputs.table_name }}"
+                      repair_capture_instance: "{{ inputs.repair_capture_instance }}"
+
+                  - id: probe_change
+                    type: io.kestra.plugin.jdbc.sqlserver.Queries
+                    description: Apply the caller-supplied narrow canary mutation so the replacement instance emits a post-cutover event.
+                    url: "{{ inputs.jdbc_url }}"
+                    username: "{{ inputs.username }}"
+                    password: "{{ inputs.password }}"
+                    trustServerCertificate: true
+                    transaction: false
+                    fetchType: NONE
+                    sql: |
+                      {{ inputs.probe_sql }};
+                      EXEC sys.sp_cdc_scan;
+
+                  - id: capture_repaired
+                    type: io.kestra.plugin.debezium.sqlserver.Capture
+                    description: Capture from only the replacement instance and prove the added field is now emitted.
+                    hostname: "{{ inputs.hostname }}"
+                    port: "{{ inputs.port }}"
+                    username: "{{ inputs.username }}"
+                    password: "{{ inputs.password }}"
+                    database: "{{ inputs.database_name }}"
+                    snapshotMode: INITIAL_ONLY
+                    format: INLINE
+                    splitTable: "OFF"
+                    maxRecords: "{{ inputs.max_records }}"
+                    maxWait: "{{ inputs.max_wait }}"
+                    stateName: "{{ inputs.state_name }}-repair"
+                    properties:
+                      database.encrypt: "false"
+                      table.include.list: "{{ inputs.schema_name }}.{{ inputs.table_name }}"
+                      capture.instance.include.list: "{{ inputs.repair_capture_instance }}"
+
+                  - id: repaired_event_json
+                    type: io.kestra.plugin.serdes.json.IonToJson
+                    from: "{{ outputs.capture_repaired.uris.data }}"
+
+                  - id: compare_repaired
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Re-run the independent field-set comparison against the replacement capture instance.
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    inputFiles:
+                      events.json: "{{ outputs.repaired_event_json.uri }}"
+                    env:
+                      SOURCE_COLUMNS_JSON: "{{ outputs.read_schema.rows | toJson }}"
+                    script: |
+                      import json
+                      import os
+
+                      with open("events.json", encoding="utf-8") as handle:
+                          raw = handle.read().strip()
+                      try:
+                          payload = json.loads(raw)
+                          events = payload if isinstance(payload, list) else [payload]
+                      except json.JSONDecodeError:
+                          events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+                      source_fields = [row["column_name"] for row in json.loads(os.environ["SOURCE_COLUMNS_JSON"])]
+                      emitted_fields = sorted({key for event in events for key in event if key not in {"deleted", "key", "metadata"}})
+                      missing = sorted(set(source_fields) - set(emitted_fields))
+                      verdict = {"event_count": len(events), "emitted_fields": emitted_fields, "missing_columns": missing, "drift": bool(missing)}
+                      print(json.dumps(verdict, sort_keys=True))
+                      print("::" + json.dumps({"outputs": verdict}) + "::")
+
+                  - id: verify_repaired_event
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ outputs.compare_repaired.vars.event_count == 0 or outputs.compare_repaired.vars.drift }}"
+                    then:
+                      - id: repair_failed
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: "Replacement capture verification failed: {{ outputs.compare_repaired.vars.event_count }} event(s), still missing {{ outputs.compare_repaired.vars.missing_columns | join(', ') }}. The old capture instance remains enabled for operator recovery."
+                    else:
+                      - id: cutover
+                        type: io.kestra.plugin.jdbc.sqlserver.Query
+                        description: Disable the old instance only after the replacement event proved the new field set.
+                        url: "{{ inputs.jdbc_url }}"
+                        username: "{{ inputs.username }}"
+                        password: "{{ inputs.password }}"
+                        trustServerCertificate: true
+                        fetchType: NONE
+                        sql: |
+                          EXEC sys.sp_cdc_disable_table
+                            @source_schema = :schema_name,
+                            @source_name = :table_name,
+                            @capture_instance = :capture_instance;
+                        parameters:
+                          schema_name: "{{ inputs.schema_name }}"
+                          table_name: "{{ inputs.table_name }}"
+                          capture_instance: "{{ inputs.capture_instance }}"
+
+                      - id: verify_cutover
+                        type: io.kestra.plugin.jdbc.sqlserver.Query
+                        description: Read CDC metadata after cutover and fail if the replacement is not the only active instance.
+                        url: "{{ inputs.jdbc_url }}"
+                        username: "{{ inputs.username }}"
+                        password: "{{ inputs.password }}"
+                        trustServerCertificate: true
+                        fetchType: FETCH_ONE
+                        sql: "{{ render(vars.eligibility_sql) }}"
+                        parameters:
+                          schema_name: "{{ inputs.schema_name }}"
+                          table_name: "{{ inputs.table_name }}"
+                          capture_instance: "{{ inputs.capture_instance }}"
+                          repair_capture_instance: "{{ inputs.repair_capture_instance }}"
+
+                      - id: verify_cutover_result
+                        type: io.kestra.plugin.core.flow.If
+                        condition: "{{ outputs.verify_cutover.row.current_instance_present == 1 or outputs.verify_cutover.row.repair_instance_present != 1 }}"
+                        then:
+                          - id: cutover_failed
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: "CDC cutover did not land: old_instance={{ outputs.verify_cutover.row.current_instance_present }}, repair_instance={{ outputs.verify_cutover.row.repair_instance_present }}."
+                        else:
+                          - id: repaired
+                            type: io.kestra.plugin.core.log.Log
+                            message: "CDC drift repaired and cut over for {{ inputs.database_name }}.{{ inputs.schema_name }}.{{ inputs.table_name }}. The replacement event carried {{ outputs.compare_repaired.vars.emitted_fields | join(', ') }}."
+            else:
+              - id: declined
+                type: io.kestra.plugin.core.log.Log
+                message: "CDC drift remains {{ outputs.compare_current.vars.missing_columns | join(', ') }}. Approval was declined; no capture instance or canary write ran."
+        else:
+          - id: dry_run
+            type: io.kestra.plugin.core.log.Log
+            message: "CDC drift detected. Missing from the current event: {{ outputs.compare_current.vars.missing_columns | join(', ') }}. No write ran because auto_remediate={{ inputs.auto_remediate }} and dry_run={{ inputs.dry_run }}."
+    else:
+      - id: protected_or_healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "{% if inputs.protected_tables contains (inputs.schema_name ~ '.' ~ inputs.table_name) %}Protected table {{ inputs.schema_name }}.{{ inputs.table_name }} was audited and no repair path is allowed. Drift={{ outputs.compare_current.vars.drift }}.{% else %}CDC event field set is healthy for {{ inputs.database_name }}.{{ inputs.schema_name }}.{{ inputs.table_name }}: {{ outputs.compare_current.vars.emitted_fields | join(', ') }}.{% endif %}"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'text': 'SQL Server CDC capture-instance drift guard failed for ' ~ inputs.database_name ~ '.' ~ inputs.schema_name ~ '.' ~ inputs.table_name ~ ' (execution ' ~ execution.id ~ '). No successful repair is assumed; inspect the failed task before retrying.'} | toJson }}
+
+triggers:
+  - id: scheduled_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "*/30 * * * *"
+    inputs:
+      auto_remediate: false
+      dry_run: true
+
+extend:
+  title: Repair SQL Server CDC Capture Instance Column Drift
+  shortDescription: Detect missing SQL Server CDC columns in real Debezium events, then approve and verify a replacement capture instance cutover.
+  metaTitle: SQL Server CDC Capture Instance Drift Repair Guard
+  metaDescription: Compare SQL Server CDC event fields with sys.columns and safely cut over to a verified replacement capture instance.
+  description: |
+    ## Safety
+
+    An `ALTER TABLE ... ADD COLUMN` does not update an existing SQL Server CDC capture instance. Debezium continues emitting successful events with the old field set, so a replica can lose a column without an alert.
+
+    | Guard | What it stops |
+    | --- | --- |
+    | Real event versus `sys.columns` | A quiet success when CDC payloads silently omit a source column |
+    | Read after Pause | Applying a plan after another operator changed the capture instances |
+    | Second instance and post-change capture | Cutting over to a capture table that still omits the added column |
+    | Final CDC metadata read | Reporting success when the old instance was not actually disabled |
+
+    ## How it works
+
+    1. `read_schema` (`io.kestra.plugin.jdbc.sqlserver.Query`) reads the live source columns and the existing capture instance membership.
+    2. `capture_current` (`io.kestra.plugin.debezium.sqlserver.Capture`) takes a bounded event window. `current_event_json` (`io.kestra.plugin.serdes.json.IonToJson`) and `compare_current` (`io.kestra.plugin.scripts.python.Script`) compare the emitted fields with the source catalog.
+    3. A healthy event ends in `healthy`. Drift alerts Slack. The disabled `scheduled_sweep` (`io.kestra.plugin.core.trigger.Schedule`) always forces the safe inputs.
+    4. A write requires `auto_remediate: true`, `dry_run: false` and an approved `approve_repair` (`io.kestra.plugin.core.flow.Pause`). `recheck_eligibility` reads the source and capture counts again before `create_repair_capture` (`io.kestra.plugin.jdbc.sqlserver.Query`) calls `sp_cdc_enable_table`.
+    5. `probe_change` makes the caller's narrow canary mutation. `capture_repaired` uses `capture.instance.include.list` to read only the replacement. `compare_repaired` fails the run if a source column is still absent, then `cutover` disables the old instance and `verify_cutover` reads the final state.
+
+    ## What you get
+
+    - A detector based on the CDC payload itself, not a lag or row-count proxy.
+    - A dry-run report with exact missing fields and no database writes.
+    - A human-gated replacement capture instance, a canary event proof and an explicit cutover check.
+    - A failed run when the replacement event or final CDC metadata does not match the requested recovery.
+
+    ## Who it's for
+
+    - Platform teams operating SQL Server CDC replicas through Debezium.
+    - Data engineers who need schema changes to reach downstream consumers without a Kafka Connect outage.
+    - On-call operators repairing a silent CDC field loss with a reviewable execution record.
+
+    ## Why orchestrate this with Kestra
+
+    SQL Server exposes the capture metadata and Debezium exposes the event payload, but neither coordinates a stale-plan approval, a bounded canary, a replacement capture instance and a verified cutover. Kestra keeps those reads, the guarded stored-procedure call, the post-change event proof and the Slack failure path in one versioned execution.
+
+    ## Tested end to end
+
+    The test fixture runs Kestra 2.0.5 with `plugin-debezium-sqlserver` 2.0.5 and `plugin-jdbc-sqlserver` 2.1.0 against the pinned `mcr.microsoft.com/mssql/server:2022-latest` image. It includes healthy, drift dry-run, declined approval, remediation, repeat, ineffective-write, race, protected-table and lookalike cases with independent `sqlcmd` assertions.
+
+    | Case | Execution | Result |
+    | --- | --- | --- |
+    | Healthy control | `sxk03IdRWEcb8gQqXbdoQ` | 3 source columns and 3 emitted fields |
+    | Drift dry run | `4a8orojJwh3nN1MigOwEyY` | 4 source columns, 3 emitted, `notes` missing |
+    | Approved remediation | `3sxq8554qUDM8vvxi7PRFP` | Replacement emitted 4 fields and old instance was absent |
+    | Repeat | `1fkPlsbSLbZRhgpLVlzHLU` | Replacement remained healthy with 4 fields |
+    | Declined approval | `5bOqQNC2iqgvtv8T1qH8bo` | Drift remained and no write ran |
+    | Protected table | `4tpFXIgWt9w1zm67qvktwX` | Drift detected and repair path unavailable |
+    | Race during Pause | `1DzxoSGGB4UM57Y6yacVrS` | Failed before write after the plan became stale |
+    | Refused write | `1rUTBqRM589pLklkMAUl6Y` | SQL Server refused the invalid canary mutation |
+    | Independent healthy | `1fxTmHeDcO0FXr2HkLSwQC` | Healthy on a fresh fixture |
+    | Independent remediation | `4QpllR2iD9fnbg47FO26uE` | Fresh replacement event carried `notes` |
+
+    ## Prerequisites
+
+    - SQL Server 2022 with CDC enabled on the target database and table.
+    - A login that can read `sys.columns`, `cdc.change_tables` and `cdc.captured_columns`, execute `sp_cdc_enable_table` and `sp_cdc_disable_table` and mutate the supplied canary row.
+    - Kestra 2.0.5 with the Debezium SQL Server, JDBC SQL Server, SerDes JSON, Python, Slack and core plugins.
+
+    ### Secrets
+
+    - `SQLSERVER_USERNAME` and `SQLSERVER_PASSWORD`: the CDC operator login.
+    - `SLACK_WEBHOOK_URL`: failure and drift alert destination.
+
+    ### Inputs
+
+    | Input | Type | Default | Purpose |
+    | --- | --- | --- | --- |
+    | `jdbc_url` | STRING | SQL Server container URL | JDBC connection for catalog and CDC writes |
+    | `database_name`, `schema_name`, `table_name` | STRING | `cdc_lab`, `dbo`, `orders` | Source table identity |
+    | `capture_instance` | STRING | `dbo_orders` | Existing instance to inspect and later disable |
+    | `repair_capture_instance` | STRING | `dbo_orders_repair` | New unique instance name |
+    | `protected_tables` | STRING | `dbo.audit_log` | Comma-separated schema.table values that are audit-only |
+    | `probe_sql` | STRING | Update canary row 1 | Narrow mutation after the new instance is created |
+    | `auto_remediate` | BOOL | `false` | Enables the approval-gated write path |
+    | `dry_run` | BOOL | `true` | Must be false for writes |
+
+    ## Quick start
+
+    1. Enable CDC on the database and table, then insert a canary row that the supplied `probe_sql` can update.
+    2. Add the two secrets and set the JDBC, Debezium host, table and capture-instance inputs.
+    3. Execute with `auto_remediate: false` and `dry_run: true`; inspect `compare_current` for the emitted and missing fields.
+    4. For an approved repair, execute with `auto_remediate: true` and `dry_run: false`, approve `approve_repair` and inspect `compare_repaired` plus `verify_cutover`.
+
+    ## How to extend
+
+    - Run one flow execution per tracked table, each with a stable `state_name` and a unique replacement capture instance.
+    - Put audit or legal-hold tables in `protected_tables`; they are still compared and reported, but the repair branch is unavailable.
+    - Replace `probe_sql` with an application-safe canary update or trigger the replacement capture externally before the bounded capture task.
+    - Add a downstream replica check after `verify_cutover` when the application must prove the new column survived the sink as well as the CDC source.
+
+    Limits: the guard proves the source event field set and CDC instance cutover. It does not prove that an already-running downstream consumer has advanced to the new schema and the caller must provide a safe canary mutation.
+
+    ## Links
+
+    - Debezium SQL Server connector: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html
+    - Kestra Debezium SQL Server plugin: https://kestra.io/plugins/plugin-debezium-sqlserver
+    - SQL Server CDC stored procedures: https://learn.microsoft.com/sql/relational-databases/system-stored-procedures/sys-sp-cdc-enable-table-transact-sql
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+
+  tags:
+    - Data
+  subTags:
+    - Realtime & Streaming
+    - Day 2 Operations
+  ee: false
+  demo: false
+

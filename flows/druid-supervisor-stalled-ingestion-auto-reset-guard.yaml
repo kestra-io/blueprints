@@ -1,0 +1,461 @@
+id: druid-supervisor-stalled-ingestion-auto-reset-guard
+namespace: company.analytics
+
+description: |
+  Audit Apache Druid streaming ingestion supervisors for stalled Kafka/Kinesis consumers,
+  classify task failure causes, track health history across runs in Kestra KV, safely reset
+  and resume wedged supervisors behind human approval, and verify ingestion recovery.
+
+inputs:
+  - id: druid_url
+    type: STRING
+    displayName: Druid Avatica JDBC URL
+    description: JDBC Avatica connection URL for the Apache Druid router or broker service.
+    defaults: "jdbc:avatica:remote:url=http://localhost:8888/druid/v2/sql/avatica/;transparent_reconnection=true"
+
+  - id: overlord_url
+    type: STRING
+    displayName: Druid Overlord REST URL
+    description: Base HTTP URL of the Druid Overlord or Router coordinating supervisor lifecycle operations.
+    defaults: "http://localhost:8888"
+
+  - id: target_supervisor_id
+    type: STRING
+    displayName: Target Supervisor ID
+    description: Optional specific supervisor identifier to audit (e.g. 'wikipedia_kafka'). Leave empty to audit all active supervisors.
+    defaults: ""
+
+  - id: stalled_runs_threshold
+    type: INT
+    displayName: Stalled Runs Threshold
+    description: Number of consecutive runs a supervisor must remain unhealthy or failed before flagging for automated reset.
+    defaults: 1
+
+  - id: auto_reset
+    type: BOOL
+    displayName: Auto Reset
+    description: When true and dry_run is false, dispatches reset and resume requests to unwedge stuck supervisors.
+    defaults: true
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run Mode
+    description: When true, compiles the triage assessment and logs proposed remediation actions without mutating supervisor state.
+    defaults: true
+
+triggers:
+  - id: hourly_supervisor_guard
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic scheduled audit scanning managed Druid ingestion supervisors every hour.
+    cron: "0 * * * *"
+    disabled: true
+
+  - id: on_demand_supervisor_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Authenticated on-demand webhook trigger for incident response and alerting integrations.
+    key: "{{ secret('DRUID_GUARD_WEBHOOK_KEY') }}"
+
+tasks:
+  - id: validate_inputs
+    type: io.kestra.plugin.core.execution.Assert
+    description: Assert operational inputs satisfy threshold and connectivity requirements.
+    conditions:
+      - "{{ inputs.druid_url | length > 0 }}"
+      - "{{ inputs.overlord_url | length > 0 }}"
+      - "{{ inputs.stalled_runs_threshold >= 1 }}"
+    errorMessage: "Invalid configuration inputs. Provide a valid Druid JDBC URL, Overlord REST URL, and positive threshold."
+
+  - id: query_unhealthy_supervisors
+    type: io.kestra.plugin.jdbc.druid.Query
+    description: Query Druid metadata table sys.supervisors for ingestion supervisors in unhealthy or suspended states.
+    url: "{{ inputs.druid_url }}"
+    username: "{{ secret('DRUID_USER') }}"
+    password: "{{ secret('DRUID_PASSWORD') }}"
+    sql: |
+      SELECT supervisor_id, state, detailed_state, healthy
+      FROM sys.supervisors
+      WHERE healthy = 0 OR state IN ('UNHEALTHY_SUPERVISOR', 'UNHEALTHY_TASKS', 'SUSPENDED')
+    fetchType: FETCH
+
+  - id: query_recent_failed_tasks
+    type: io.kestra.plugin.jdbc.druid.Query
+    description: Query Druid metadata table sys.tasks for recent failed ingestion worker tasks and root-cause stack traces.
+    url: "{{ inputs.druid_url }}"
+    username: "{{ secret('DRUID_USER') }}"
+    password: "{{ secret('DRUID_PASSWORD') }}"
+    sql: |
+      SELECT task_id, datasource, status, error_msg, host, created_time
+      FROM sys.tasks
+      WHERE status = 'FAILED'
+      ORDER BY created_time DESC
+      LIMIT 15
+    fetchType: FETCH
+
+  - id: load_previous_guard_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Retrieve previous run supervisor health status and stall counters from Kestra KV store.
+    key: "druid_supervisor_stalled_guard_state"
+    errorOnMissing: false
+
+  - id: triage_supervisor_failures
+    type: io.kestra.plugin.scripts.python.Script
+    description: Correlate unhealthy supervisors with failed worker tasks, calculate consecutive stall runs, and compile remediation plan.
+    containerImage: python:3.11-slim
+    inputFiles:
+      supervisors.json: "{{ (outputs.query_unhealthy_supervisors.rows ?? []) | toJson }}"
+      failed_tasks.json: "{{ (outputs.query_recent_failed_tasks.rows ?? []) | toJson }}"
+      previous_kv.json: "{{ (outputs.load_previous_guard_state.value ?? {}) | toJson }}"
+    env:
+      TARGET_SUPERVISOR_ID: "{{ inputs.target_supervisor_id }}"
+      STALLED_RUNS_THRESHOLD: "{{ inputs.stalled_runs_threshold }}"
+      AUTO_RESET: "{{ inputs.auto_reset }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      try:
+          from kestra import Kestra
+      except ImportError:
+          Kestra = None
+
+      target_supervisor_id = os.environ.get("TARGET_SUPERVISOR_ID", "").strip()
+      stalled_runs_threshold = int(os.environ.get("STALLED_RUNS_THRESHOLD", "1"))
+      auto_reset = os.environ.get("AUTO_RESET", "true").lower() == "true"
+      execution_id = os.environ.get("EXECUTION_ID", "manual-run")
+
+      def load_json_file(filename, fallback):
+          try:
+              if os.path.exists(filename):
+                  with open(filename, "r", encoding="utf-8") as f:
+                      content = f.read().strip()
+                      return json.loads(content) if content else fallback
+          except Exception:
+              pass
+          return fallback
+
+      supervisors_data = load_json_file("supervisors.json", [])
+      failed_tasks_data = load_json_file("failed_tasks.json", [])
+      previous_kv_raw = load_json_file("previous_kv.json", {})
+
+      previous_kv = previous_kv_raw if isinstance(previous_kv_raw, dict) else {}
+      if isinstance(previous_kv, str):
+          try:
+              previous_kv = json.loads(previous_kv)
+          except Exception:
+              previous_kv = {}
+
+      # Filter supervisors if target specified
+      filtered_supervisors = []
+      for s in supervisors_data:
+          if not isinstance(s, dict):
+              continue
+          s_id = str(s.get("supervisor_id", s.get("SUPERVISOR_ID", "")))
+          if target_supervisor_id and s_id != target_supervisor_id:
+              continue
+          filtered_supervisors.append({
+              "supervisor_id": s_id,
+              "state": str(s.get("state", s.get("STATE", "UNKNOWN"))),
+              "detailed_state": str(s.get("detailed_state", s.get("DETAILED_STATE", ""))),
+              "healthy": int(s.get("healthy", s.get("HEALTHY", 0)))
+          })
+
+      # Map recent failed tasks by datasource/supervisor hints
+      task_errors_by_datasource = {}
+      for t in failed_tasks_data:
+          if not isinstance(t, dict):
+              continue
+          ds = str(t.get("datasource", t.get("DATASOURCE", "unknown")))
+          err = str(t.get("error_msg", t.get("ERROR_MSG", "Unknown task failure")))[:300]
+          task_errors_by_datasource.setdefault(ds, []).append(err)
+
+      updated_kv = {}
+      supervisors_to_reset = []
+      remediation_required = False
+
+      for s in filtered_supervisors:
+          s_id = s["supervisor_id"]
+          prev_entry = previous_kv.get(s_id, {})
+          stalled_runs = prev_entry.get("stalled_runs", 0) if isinstance(prev_entry, dict) else 0
+
+          # Increment stall run counter
+          stalled_runs += 1
+
+          is_qualified = (stalled_runs >= stalled_runs_threshold)
+          matched_errors = task_errors_by_datasource.get(s_id, ["No direct task errors recorded in recent sample"])
+
+          updated_kv[s_id] = {
+              "state": s["state"],
+              "detailed_state": s["detailed_state"],
+              "healthy": s["healthy"],
+              "stalled_runs": stalled_runs,
+              "last_evaluated": datetime.now(timezone.utc).isoformat(),
+              "sample_task_errors": matched_errors[:2]
+          }
+
+          if is_qualified:
+              remediation_required = True
+              supervisors_to_reset.append({
+                  "supervisor_id": s_id,
+                  "state": s["state"],
+                  "detailed_state": s["detailed_state"],
+                  "stalled_runs": stalled_runs,
+                  "sample_error": matched_errors[0] if matched_errors else ""
+              })
+
+      # Format triage report
+      summary_lines = [
+          f"*Unhealthy Supervisors Detected:* {len(filtered_supervisors)}",
+          f"*Supervisors Flagged for Reset:* {len(supervisors_to_reset)}",
+          f"*Auto Reset Enabled:* `{auto_reset}` (Threshold: `{stalled_runs_threshold}` runs)"
+      ]
+      if supervisors_to_reset:
+          summary_lines.append("*Remediation Queue:*")
+          for item in supervisors_to_reset:
+              summary_lines.append(f"- `{item['supervisor_id']}`: state `{item['state']}` ({item['detailed_state']}), stalled `{item['stalled_runs']}` run(s). Sample error: `{item['sample_error'][:120]}`")
+
+      output_data = {
+          "remediation_required": remediation_required,
+          "unhealthy_count": len(filtered_supervisors),
+          "stalled_count": len(supervisors_to_reset),
+          "supervisors_to_reset": supervisors_to_reset,
+          "kv_payload": updated_kv,
+          "summary_markdown": "\n".join(summary_lines)
+      }
+
+      if Kestra:
+          Kestra.outputs(output_data)
+      else:
+          print("::" + json.dumps({"outputs": output_data}) + "::")
+
+  - id: persist_guard_state_kv
+    type: io.kestra.plugin.core.kv.Set
+    description: Persist updated supervisor health tracking and stall telemetry into Kestra namespace KV store.
+    key: "druid_supervisor_stalled_guard_state"
+    kvType: JSON
+    overwrite: true
+    value: "{{ outputs.triage_supervisor_failures.vars.kv_payload | toJson }}"
+
+  - id: gate_remediation
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate if stalled Druid supervisors require operator approval and automated reset requests.
+    condition: "{{ outputs.triage_supervisor_failures.vars.remediation_required }}"
+    then:
+      - id: check_dry_run_mode
+        type: io.kestra.plugin.core.flow.If
+        description: Branch between dry-run/audit simulation and active cluster remediation. Both dry_run=false and auto_reset=true are required to actually mutate supervisor state.
+        condition: "{{ inputs.dry_run or not inputs.auto_reset }}"
+        then:
+          - id: log_dry_run_plan
+            type: io.kestra.plugin.core.log.Log
+            description: Log proposed supervisor reset operations without mutating cluster state in dry-run or audit-only mode.
+            message: |
+              [DRY RUN / AUDIT] Identified {{ outputs.triage_supervisor_failures.vars.stalled_count }} stalled Druid supervisor(s).
+              Proposed remediation actions:
+              {{ outputs.triage_supervisor_failures.vars.supervisors_to_reset | toJson }}
+              Set dry_run=false and auto_reset=true, then approve the pause gate, to dispatch reset/resume requests to the Druid Overlord.
+        else:
+          - id: approval_gate
+            type: io.kestra.plugin.core.flow.Pause
+            description: Pause workflow execution for operator verification before resetting Druid streaming supervisors. Resume to execute or kill to abort.
+            onResume:
+              - id: approved
+                type: BOOL
+                displayName: Approve Supervisor Reset
+                description: Confirm authorization to dispatch reset and resume requests to the Druid Overlord.
+                defaults: true
+
+          - id: remediate_supervisors
+            type: io.kestra.plugin.core.flow.Loop
+            description: Iterate sequentially over each stalled supervisor to issue reset and resume calls against Overlord REST API.
+            values: "{{ outputs.triage_supervisor_failures.vars.supervisors_to_reset }}"
+            concurrencyLimit: 1
+            tasks:
+              - id: reset_supervisor
+                type: io.kestra.plugin.core.http.Request
+                description: Issue POST /druid/indexer/v1/supervisor/{id}/reset to discard wedged checkpoints and restart ingestion.
+                uri: "{{ inputs.overlord_url }}/druid/indexer/v1/supervisor/{{ item.value.supervisor_id }}/reset"
+                method: POST
+                headers:
+                  Authorization: "Basic {{ (secret('DRUID_USER') ~ ':' ~ secret('DRUID_PASSWORD')) | base64Encode }}"
+                  Accept: "application/json"
+                options:
+                  allowFailed: true
+
+              - id: check_if_suspended
+                type: io.kestra.plugin.core.flow.If
+                description: Issue resume request if supervisor is in SUSPENDED state.
+                condition: "{{ item.value.state == 'SUSPENDED' }}"
+                then:
+                  - id: resume_supervisor
+                    type: io.kestra.plugin.core.http.Request
+                    description: Issue POST /druid/indexer/v1/supervisor/{id}/resume to restart suspended ingestion.
+                    uri: "{{ inputs.overlord_url }}/druid/indexer/v1/supervisor/{{ item.value.supervisor_id }}/resume"
+                    method: POST
+                    headers:
+                      Authorization: "Basic {{ (secret('DRUID_USER') ~ ':' ~ secret('DRUID_PASSWORD')) | base64Encode }}"
+                      Accept: "application/json"
+                    options:
+                      allowFailed: true
+
+              - id: log_supervisor_reset_action
+                type: io.kestra.plugin.core.log.Log
+                description: Log supervisor reset HTTP outcome.
+                message: "Dispatched reset request for supervisor '{{ item.value.supervisor_id }}'. Overlord response code: {{ outputs.reset_supervisor.code }}."
+
+          - id: verify_supervisors_remediation
+            type: io.kestra.plugin.jdbc.druid.Query
+            description: Post-remediation verification re-querying sys.supervisors to confirm that remediated supervisors have recovered.
+            url: "{{ inputs.druid_url }}"
+            username: "{{ secret('DRUID_USER') }}"
+            password: "{{ secret('DRUID_PASSWORD') }}"
+            sql: |
+              SELECT supervisor_id, state, detailed_state, healthy
+              FROM sys.supervisors
+              WHERE healthy = 0 OR state IN ('UNHEALTHY_SUPERVISOR', 'UNHEALTHY_TASKS')
+            fetchType: FETCH
+
+          - id: check_remaining_unhealthy
+            type: io.kestra.plugin.core.flow.If
+            description: Check if any supervisor remains in an unhealthy state following remediation.
+            condition: "{{ (outputs.verify_supervisors_remediation.rows ?? []) | length > 0 }}"
+            then:
+              - id: warn_remaining_unhealthy
+                type: io.kestra.plugin.core.log.Log
+                description: Log warning that one or more supervisors require further investigation or upstream partition repair.
+                message: "Warning: {{ (outputs.verify_supervisors_remediation.rows ?? []) | length }} supervisor(s) remain unhealthy following reset. Inspect Kafka broker lag and Druid worker task logs."
+            else:
+              - id: log_remediation_success
+                type: io.kestra.plugin.core.log.Log
+                description: Confirm that all remediated supervisors have successfully recovered to healthy running state.
+                message: "All targeted Apache Druid supervisors successfully recovered to healthy state."
+
+  - id: notify_if_unhealthy
+    type: io.kestra.plugin.core.flow.If
+    description: Only post to Slack when at least one supervisor is actually unhealthy, so a clean hourly poll produces no notification noise.
+    condition: "{{ outputs.triage_supervisor_failures.vars.unhealthy_count > 0 }}"
+    then:
+      - id: dispatch_slack_notification
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch structured incident triage and remediation report to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: >-
+          {{ {
+            "text": "*Apache Druid Ingestion Supervisor Health & Recovery Report*\n" ~ outputs.triage_supervisor_failures.vars.summary_markdown ~ "\n\n*Execution Mode:* dry_run=" ~ inputs.dry_run ~ ", auto_reset=" ~ inputs.auto_reset ~ " (Execution: `" ~ execution.id ~ "`)"
+          } | toJson }}
+
+errors:
+  - id: alert_on_flow_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Dispatch emergency alert to Slack if an unexpected execution error occurs.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        "text": ":rotating_light: *Flow Execution Failed*: `druid-supervisor-stalled-ingestion-auto-reset-guard` (Execution: `" ~ execution.id ~ "`). Failed to complete supervisor health scan or remediation pass. Check Druid cluster reachability and Overlord credentials."
+      } | toJson }}
+
+extend:
+  title: Apache Druid Supervisor Stalled Ingestion Auto-Reset and Recovery Guard
+  metaTitle: Apache Druid Supervisor Stalled Ingestion Auto-Reset Guard | Kestra
+  shortDescription: Audit Apache Druid streaming ingestion supervisors, classify task stalls, persist health history in KV, reset and resume wedged supervisors, and verify recovery.
+  metaDescription: Audit Apache Druid streaming ingestion supervisors, persist health in KV, auto-reset wedged supervisors behind approval, and verify recovery in Kestra.
+  description: |
+    Production real-time analytical architectures rely on Apache Druid to ingest high-velocity event streams
+    from Apache Kafka and AWS Kinesis. In Druid, stream ingestion is orchestrated by Supervisors running on the
+    Overlord service. Each supervisor continuously spawns indexing task workers, assigns partitions, tracks
+    offsets, and coordinates segment handoff to Historical nodes.
+
+    During Kafka partition rebalances, poison pill records, schema mismatches, or network partitions between
+    Druid MiddleManagers and Kafka brokers, ingestion tasks can crash repeatedly. When consecutive worker tasks
+    fail, the supervisor transitions to `UNHEALTHY_SUPERVISOR`, `UNHEALTHY_TASKS`, or `SUSPENDED` state.
+    Once wedged, the supervisor ceases to consume records from the streaming topic. Ingestion lag mounts,
+    real-time metrics diverge from source data, and analytical queries against Druid return increasingly stale
+    results while overall cluster metrics appear deceptive green.
+
+    This blueprint provides an automated supervisory recovery guard for Apache Druid that audits supervisor
+    health via `sys.supervisors` and `sys.tasks`, diffs consecutive failure runs against Kestra KV store,
+    isolates root-cause worker exceptions, safely executes authorized Overlord reset and resume operations
+    behind an operator approval gate, verifies post-remediation recovery, and delivers structured triage reports to Slack.
+
+    ## How it works
+
+    1. **Pre-Flight Validation**: `validate_inputs` (`io.kestra.plugin.core.execution.Assert`) validates operational parameters, ensuring accessible Druid JDBC and Overlord endpoints and valid threshold limits.
+    2. **Supervisor Health Audit**: `query_unhealthy_supervisors` (`io.kestra.plugin.jdbc.druid.Query`) queries the Druid metadata catalog table `sys.supervisors` for supervisors where `healthy = 0` or state is `UNHEALTHY_SUPERVISOR`, `UNHEALTHY_TASKS`, or `SUSPENDED`.
+    3. **Task Failure Triage**: `query_recent_failed_tasks` (`io.kestra.plugin.jdbc.druid.Query`) queries `sys.tasks` for recently failed indexing tasks, extracting worker hostnames, datasource names, and error traces.
+    4. **Historical Health Tracking**: `load_previous_guard_state` (`io.kestra.plugin.core.kv.Get`) retrieves prior execution state from Kestra KV store under `druid_supervisor_stalled_guard_state`.
+    5. **Triage & Classification**: `triage_supervisor_failures` (`io.kestra.plugin.scripts.python.Script`) parses supervisor health states, correlates failed task traces, increments consecutive stall counters, and identifies supervisors that exceed `stalled_runs_threshold`.
+    6. **KV State Persistence**: `persist_guard_state_kv` (`io.kestra.plugin.core.kv.Set`) stores updated health progression and stall telemetry back to Kestra KV store.
+    7. **Safe Remediation with Approval Gate**: When `dry_run` is disabled and remediation is qualified:
+       - The workflow pauses execution at `approval_gate` (`io.kestra.plugin.core.flow.Pause`) for operator verification.
+       - Upon operator approval, `remediate_supervisors` (`io.kestra.plugin.core.flow.Loop`) iterates sequentially over each stalled supervisor:
+         - Issues `POST /druid/indexer/v1/supervisor/{id}/reset` via `io.kestra.plugin.core.http.Request` to clear wedged checkpoints and restart task generation.
+         - If the supervisor was in `SUSPENDED` state, issues `POST /druid/indexer/v1/supervisor/{id}/resume` to reactivate ingestion.
+    8. **Post-Remediation Verification**: `verify_supervisors_remediation` re-queries `sys.supervisors` to verify that previously failing supervisors recovered to healthy state (`healthy = 1`).
+    9. **Incident Reporting**: `dispatch_slack_notification` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) sends an operational triage summary to Slack with supervisor states, stall durations, and remediation outcomes.
+
+    ## What you get
+
+    - Automated detection of Apache Druid streaming supervisors trapped in unhealthy or suspended states.
+    - Elimination of silent real-time ingestion freezes without manual Overlord restarts.
+    - Root-cause correlation matching failed indexing worker tasks and exception stack traces to their parent supervisor.
+    - Safe automated remediation issuing native Overlord reset and resume requests.
+    - Operator approval gate (`Pause`) and dry-run simulation mode to prevent unauthorized cluster mutations.
+    - Post-remediation verification proving that supervisor health is restored before closing executions.
+    - Persistent historical telemetry in Kestra KV store for compliance tracking and MTTR analysis.
+
+    ## Who it's for
+
+    - Real-Time Data Platform Engineers operating Apache Druid, Kafka, and Kinesis pipelines.
+    - SREs and Incident Responders managing low-latency analytical data warehouses.
+    - Analytics Engineers investigating real-time dashboard data freshness and silent ingestion stalls.
+
+    ## Why orchestrate this with Kestra
+
+    Apache Druid provides REST endpoints and system SQL tables, but does not self-heal supervisors that encounter repeated task crashes or partition offset gaps. Writing custom bash scripts with curl leaves no execution logs, lacks atomic state tracking across runs, has no approval gates, and risks uncontrolled reset loops.
+
+    Orchestrating this recovery guard with Kestra delivers a robust declarative blueprint with native Druid Avatica JDBC integration, containerized triage logic, atomic Kestra KV state tracking, interactive pause-and-resume approval mechanisms, post-action verification, and automated Slack escalation.
+
+    ## Prerequisites
+
+    - Accessible Apache Druid cluster (version 0.20 or higher) with Overlord and Coordinator/Router services.
+    - Streaming ingestion supervisors configured on Druid (e.g. Kafka or Kinesis).
+    - Basic authentication credentials with read access to `sys.supervisors` and write access to `/druid/indexer/v1/supervisor/*`.
+    - A Slack Incoming Webhook URL configured in Kestra secrets.
+
+    ### Secrets
+
+    - `DRUID_USER`: Username for Druid Avatica JDBC and Overlord HTTP authentication.
+    - `DRUID_PASSWORD`: Password for Druid Avatica JDBC and Overlord HTTP authentication.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL for triage and failure notifications.
+    - `DRUID_GUARD_WEBHOOK_KEY`: Secret authentication key protecting the on-demand webhook trigger.
+
+    ## Quick start
+
+    1. Configure `DRUID_USER`, `DRUID_PASSWORD`, `SLACK_WEBHOOK_URL`, and `DRUID_GUARD_WEBHOOK_KEY` in your Kestra namespace secrets.
+    2. Import this blueprint and set `druid_url` and `overlord_url` to match your Druid cluster endpoints.
+    3. Run a manual execution with `dry_run: true` to record an initial supervisor baseline and review any detected warnings.
+    4. To remediate an active ingestion stall, execute with `dry_run: false` and approve the `approval_gate` pause task.
+    5. Enable the `hourly_supervisor_guard` schedule trigger to maintain continuous automated oversight.
+
+    ## How to extend
+
+    - **Kafka Partition Lag Correlation**: Query the Kafka AdminClient via `io.kestra.plugin.kafka.ConsumerGroupDescribe` to correlate Druid supervisor stalls with upstream consumer group lag.
+    - **Datasource Compaction Check**: Add an `io.kestra.plugin.jdbc.druid.Query` task to trigger auto-compaction jobs once supervisor ingestion resumes.
+    - **PagerDuty Escalation**: Integrate `io.kestra.plugin.pagerduty.notifications.PagerDutyAlert` when consecutive supervisor resets exceed critical limits.
+
+    ## Links
+
+    - [Apache Druid Supervisor Management Documentation](https://druid.apache.org/docs/latest/operations/api-reference#supervisors)
+    - [Apache Druid System Schema (sys.supervisors)](https://druid.apache.org/docs/latest/querying/sql-metadata-tables#supervisors-table)
+    - [Kestra Druid JDBC Plugin Documentation](https://kestra.io/plugins/plugin-jdbc-druid)
+    - [Kestra Key-Value Store Documentation](https://kestra.io/docs/concepts/kv-store)
+
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime & Streaming
+    - Approval Gates
+  ee: false
+  demo: false

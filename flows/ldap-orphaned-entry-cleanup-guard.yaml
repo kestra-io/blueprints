@@ -1,0 +1,574 @@
+id: ldap-orphaned-entry-cleanup-guard
+namespace: company.team
+
+description: |
+  Find LDAP entries whose own owner DN no longer resolves inside the directory, delete the aged ones behind an approval gate, then re-search to prove they are gone.
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: When true the flow only reports orphaned entries and never deletes anything.
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: When true (and dry_run is false) the flow deletes the aged orphans after approval.
+  - id: ldap_host
+    type: STRING
+    defaults: ldap.example.com
+    description: Hostname of the LDAP server.
+  - id: ldap_port
+    type: INT
+    defaults: 389
+    description: LDAP port.
+  - id: bind_dn
+    type: STRING
+    defaults: cn=admin,dc=example,dc=org
+    description: Bind DN with permission to search the tree and delete entries.
+  - id: ldap_password
+    type: STRING
+    defaults: "{{ secret('LDAP_PASSWORD') }}"
+    description: Bind password. Defaults to the LDAP_PASSWORD secret.
+  - id: base_dn
+    type: STRING
+    defaults: dc=example,dc=org
+    description: Base DN of the audit. Only entries under here can be reported or deleted.
+  - id: entry_filter
+    type: STRING
+    defaults: "(objectClass=*)"
+    description: >-
+      Filter that selects the entries to audit. The flow ANDs it with a presence test on the reference attribute, so the default audits every entry that carries one. Narrow it to one object class to scope the audit.
+  - id: reference_attribute
+    type: SELECT
+    values:
+      - owner
+      - manager
+      - seeAlso
+      - roleOccupant
+    defaults: owner
+    description: >-
+      The DN valued attribute that points at the thing an entry belongs to. owner for service accounts plus host and device entries, manager for people, seeAlso or roleOccupant where your schema uses those.
+  - id: resolve_base_dn
+    type: STRING
+    defaults: dc=example,dc=org
+    description: >-
+      Base DN of the existence search. A reference pointing outside this subtree is reported as out of scope rather than missing, because this search could not have seen it.
+  - id: resolve_filter
+    type: STRING
+    defaults: "(objectClass=*)"
+    description: Filter of the existence search. Keep it wide enough to return every entry a reference may legitimately point at.
+  - id: min_age_hours
+    type: INT
+    defaults: 24
+    description: >-
+      Age gate. An orphan is deleted only once its createTimestamp is at least this many hours old, so an entry still being provisioned is left alone. An entry with no readable createTimestamp is always spared.
+  - id: protected_dns
+    type: STRING
+    defaults: cn=admin,dc=example,dc=org;ou=system,dc=example,dc=org
+    description: >-
+      Allowlist of DNs that are never deleted, semicolon separated because a DN already contains commas. A listed DN protects itself plus everything under it.
+  - id: max_deletions
+    type: INT
+    defaults: 5
+    description: >-
+      Per run ceiling. If the run finds more deletable orphans than this it writes no delete records at all, reports the count then fails, because a sudden jump usually means the existence search was wrong rather than the directory.
+
+tasks:
+  - id: scan_referencing
+    type: io.kestra.plugin.ldap.Search
+    description: Read every entry under the base DN that carries the reference attribute, with its createTimestamp, as LDIF.
+    hostname: "{{ inputs.ldap_host }}"
+    port: "{{ inputs.ldap_port }}"
+    userDn: "{{ inputs.bind_dn }}"
+    password: "{{ inputs.ldap_password }}"
+    baseDn: "{{ inputs.base_dn }}"
+    filter: "(&{{ inputs.entry_filter }}({{ inputs.reference_attribute }}=*))"
+    attributes:
+      - cn
+      - objectClass
+      - createTimestamp
+      - "{{ inputs.reference_attribute }}"
+
+  - id: scan_existing
+    type: io.kestra.plugin.ldap.Search
+    description: Read every DN that exists under the resolve base, which is the set a reference has to point into.
+    hostname: "{{ inputs.ldap_host }}"
+    port: "{{ inputs.ldap_port }}"
+    userDn: "{{ inputs.bind_dn }}"
+    password: "{{ inputs.ldap_password }}"
+    baseDn: "{{ inputs.resolve_base_dn }}"
+    filter: "{{ inputs.resolve_filter }}"
+    attributes:
+      - objectClass
+
+  - id: classify
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Resolve every reference against the set of DNs that exist, then split the entries whose references all fail to resolve into deletable orphans plus the ones spared by the age gate, the allowlist or an unreadable timestamp.
+    containerImage: python:3.12-slim
+    inputFiles:
+      referencing.ldif: "{{ outputs.scan_referencing.uri }}"
+      existing.ldif: "{{ outputs.scan_existing.uri }}"
+    outputFiles:
+      - targets.ldif
+    script: |
+      import base64, json, re
+      from datetime import datetime, timedelta, timezone
+
+      MIN_AGE_HOURS = {{ inputs.min_age_hours }}
+      MAX_DELETIONS = {{ inputs.max_deletions }}
+      REF_ATTR = """{{ inputs.reference_attribute }}""".strip().lower()
+      RESOLVE_BASE = """{{ inputs.resolve_base_dn }}""".strip()
+      PROTECTED_RAW = """{{ inputs.protected_dns }}"""
+      NOW = datetime.now(timezone.utc)
+
+      def norm(dn):
+          return ",".join(p.strip() for p in (dn or "").split(",")).lower()
+
+      def parse(path):
+          raw = open(path, "r", encoding="utf-8", errors="replace").read()
+          unfolded = re.sub(r"\n[ ]", "", raw)
+          entries = []
+          cur = {}
+          def flush():
+              if cur.get("dn"):
+                  entries.append(dict(cur))
+              cur.clear()
+          for line in unfolded.splitlines():
+              if not line.strip():
+                  flush()
+                  continue
+              if line.startswith("#") or ":" not in line:
+                  continue
+              key, _, val = line.partition(":")
+              key = key.strip().lower()
+              val = val.lstrip()
+              if val.startswith("<"):
+                  continue
+              if val.startswith(":"):
+                  try:
+                      val = base64.b64decode(val[1:].strip()).decode("utf-8", "replace")
+                  except Exception:
+                      continue
+              cur.setdefault(key, []).append(val)
+          flush()
+          return entries
+
+      def age_hours(ts):
+          if not ts:
+              return None
+          m = re.match(r"^(\d{14})(?:[.,]\d+)?(Z|[+-]\d{2}:?\d{2})?$", ts.strip())
+          if not m:
+              return None
+          try:
+              dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+          except ValueError:
+              return None
+          off = m.group(2)
+          if off and off != "Z":
+              sign = 1 if off[0] == "+" else -1
+              dt = dt - sign * timedelta(hours=int(off[1:3]), minutes=int(off[-2:]))
+          return (NOW - dt).total_seconds() / 3600.0
+
+      def ldif_dn_line(dn):
+          plain = dn.isascii() and dn == dn.strip() and not dn.startswith(("<", ":")) and "\n" not in dn
+          if plain:
+              return "dn: " + dn
+          return "dn:: " + base64.b64encode(dn.encode("utf-8")).decode("ascii")
+
+      protected = [norm(p) for p in PROTECTED_RAW.split(";") if p.strip()]
+      base_n = norm(RESOLVE_BASE)
+      existing = set(norm(e["dn"][0]) for e in parse("existing.ldif"))
+      total_entries = len(existing)
+
+      targets = []
+      orphans = []
+      fresh = []
+      guarded = []
+      unknown_age = []
+      out_of_scope = []
+      resolved = 0
+      for e in parse("referencing.ldif"):
+          dn = e["dn"][0]
+          refs = [r for r in (e.get(REF_ATTR) or []) if r.strip()]
+          if not refs:
+              continue
+          nrefs = [norm(r) for r in refs]
+          if base_n and any(not r.endswith(base_n) for r in nrefs):
+              out_of_scope.append(dn)
+              continue
+          if any(r in existing for r in nrefs):
+              resolved += 1
+              continue
+          orphans.append(dn)
+          ndn = norm(dn)
+          if any(ndn == p or ndn.endswith("," + p) for p in protected):
+              guarded.append(dn)
+              continue
+          age = age_hours((e.get("createtimestamp") or [None])[0])
+          if age is None:
+              unknown_age.append(dn)
+              continue
+          if age < MIN_AGE_HOURS:
+              fresh.append(dn)
+              continue
+          targets.append(dn)
+
+      over = len(targets) > MAX_DELETIONS
+      lines = []
+      if not over:
+          for d in targets:
+              lines.append(ldif_dn_line(d))
+              lines.append("objectClass: top")
+              lines.append("")
+      open("targets.ldif", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
+      print("SCAN entries_with_reference={} references_resolved={} orphans={} deletable={} directory_entries={}".format(
+          len(parse("referencing.ldif")), resolved, len(orphans), len(targets), total_entries))
+      print("SPARED fresh={} protected={} unknown_age={} out_of_scope={} min_age_hours={} ceiling={}".format(
+          len(fresh), len(guarded), len(unknown_age), len(out_of_scope), MIN_AGE_HOURS, MAX_DELETIONS))
+      for d in targets:
+          print("DELETABLE " + d)
+      for d in fresh:
+          print("SPARED_FRESH " + d)
+      for d in guarded:
+          print("SPARED_PROTECTED " + d)
+      for d in unknown_age:
+          print("SPARED_UNKNOWN_AGE " + d)
+      for d in out_of_scope:
+          print("OUT_OF_SCOPE " + d)
+      if over:
+          print("CEILING deletable={} exceeds max_deletions={}, wrote no delete records".format(len(targets), MAX_DELETIONS))
+
+      out = {
+          "count": len(targets),
+          "orphan_count": len(orphans),
+          "has_targets": "yes" if (targets and not over) else "no",
+          "has_orphans": "yes" if orphans else "no",
+          "over_ceiling": "yes" if over else "no",
+          "spared_fresh": len(fresh),
+          "spared_protected": len(guarded),
+          "spared_unknown_age": len(unknown_age),
+          "out_of_scope": len(out_of_scope),
+          "total_entries": total_entries,
+          "target_dns": ", ".join(targets) if targets else "none",
+          "spared_dns": ", ".join(fresh + guarded + unknown_age) if (fresh or guarded or unknown_age) else "none",
+      }
+      print("::" + json.dumps({"outputs": out}) + "::")
+
+  - id: findings_alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.classify.vars.has_orphans == 'yes' }}"
+    then:
+      - id: log_findings
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          Orphaned entries under {{ inputs.base_dn }}: {{ outputs.classify.vars.orphan_count }}. Deletable after the gates: {{ outputs.classify.vars.count }} ({{ outputs.classify.vars.target_dns }}). Spared: {{ outputs.classify.vars.spared_dns }}. Directory holds {{ outputs.classify.vars.total_entries }} entries.
+      - id: notify_findings
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Post the detection result to Slack so an operator sees the orphans even on a read-only run.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "text": "LDAP orphan guard found {{ outputs.classify.vars.orphan_count }} entry(ies) under {{ inputs.base_dn }} whose {{ inputs.reference_attribute }} DN no longer resolves. Deletable: {{ outputs.classify.vars.count }} ({{ outputs.classify.vars.target_dns }}). Spared: {{ outputs.classify.vars.spared_dns }}. over_ceiling={{ outputs.classify.vars.over_ceiling }} dry_run={{ inputs.dry_run }} auto_remediate={{ inputs.auto_remediate }}."
+          }
+
+  - id: ceiling_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Refuse the whole run before anyone is asked to approve it, when the deletable count is over the per run ceiling.
+    condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.classify.vars.over_ceiling == 'yes' }}"
+    then:
+      - id: refuse_over_ceiling
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          Refusing to delete. {{ outputs.classify.vars.count }} deletable orphans is over the max_deletions ceiling of {{ inputs.max_deletions }}. Check the existence search scope, then raise the ceiling deliberately if the count is real.
+
+  - id: remediate_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.auto_remediate and not inputs.dry_run and outputs.classify.vars.has_targets == 'yes' }}"
+    then:
+      - id: approval_hold
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          A delete is irreversible and these are live auth objects, so the write waits for a human. Resume with approved set to true to delete the listed DNs. Set it false to cancel.
+        onResume:
+          - id: approved
+            type: BOOL
+            defaults: false
+            description: Set true to delete the orphaned entries listed by the classify step.
+      - id: apply_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.approval_hold.onResume.approved ?? false }}"
+        then:
+          - id: delete_orphans
+            type: io.kestra.plugin.ldap.Delete
+            description: >-
+              Delete each DN in the LDIF the classify step wrote. The task logs a refused DN and keeps going, so the re-search below is the real gate.
+            hostname: "{{ inputs.ldap_host }}"
+            port: "{{ inputs.ldap_port }}"
+            userDn: "{{ inputs.bind_dn }}"
+            password: "{{ inputs.ldap_password }}"
+            inputs:
+              - "{{ outputs.classify.outputFiles['targets.ldif'] }}"
+          - id: verify_referencing
+            type: io.kestra.plugin.ldap.Search
+            description: Re-read the referencing entries after the delete.
+            hostname: "{{ inputs.ldap_host }}"
+            port: "{{ inputs.ldap_port }}"
+            userDn: "{{ inputs.bind_dn }}"
+            password: "{{ inputs.ldap_password }}"
+            baseDn: "{{ inputs.base_dn }}"
+            filter: "(&{{ inputs.entry_filter }}({{ inputs.reference_attribute }}=*))"
+            attributes:
+              - cn
+              - objectClass
+              - createTimestamp
+              - "{{ inputs.reference_attribute }}"
+          - id: verify_existing
+            type: io.kestra.plugin.ldap.Search
+            description: Re-read every DN that exists, which also gives the entry count after the delete.
+            hostname: "{{ inputs.ldap_host }}"
+            port: "{{ inputs.ldap_port }}"
+            userDn: "{{ inputs.bind_dn }}"
+            password: "{{ inputs.ldap_password }}"
+            baseDn: "{{ inputs.resolve_base_dn }}"
+            filter: "{{ inputs.resolve_filter }}"
+            attributes:
+              - objectClass
+
+          - id: verify_classify
+            type: io.kestra.plugin.scripts.python.Script
+            description: >-
+              Re-run the same resolution against the re-read directory. Any deletable orphan still present means a delete was refused. An entry count below the expected floor means more went than was asked for.
+            containerImage: python:3.12-slim
+            inputFiles:
+              referencing.ldif: "{{ outputs.verify_referencing.uri }}"
+              existing.ldif: "{{ outputs.verify_existing.uri }}"
+            script: |
+              import base64, json, re
+              from datetime import datetime, timedelta, timezone
+
+              MIN_AGE_HOURS = {{ inputs.min_age_hours }}
+              REF_ATTR = """{{ inputs.reference_attribute }}""".strip().lower()
+              RESOLVE_BASE = """{{ inputs.resolve_base_dn }}""".strip()
+              PROTECTED_RAW = """{{ inputs.protected_dns }}"""
+              BEFORE_ENTRIES = int("{{ outputs.classify.vars.total_entries }}")
+              REQUESTED = int("{{ outputs.classify.vars.count }}")
+              NOW = datetime.now(timezone.utc)
+
+              def norm(dn):
+                  return ",".join(p.strip() for p in (dn or "").split(",")).lower()
+
+              def parse(path):
+                  raw = open(path, "r", encoding="utf-8", errors="replace").read()
+                  unfolded = re.sub(r"\n[ ]", "", raw)
+                  entries = []
+                  cur = {}
+                  def flush():
+                      if cur.get("dn"):
+                          entries.append(dict(cur))
+                      cur.clear()
+                  for line in unfolded.splitlines():
+                      if not line.strip():
+                          flush()
+                          continue
+                      if line.startswith("#") or ":" not in line:
+                          continue
+                      key, _, val = line.partition(":")
+                      key = key.strip().lower()
+                      val = val.lstrip()
+                      if val.startswith("<"):
+                          continue
+                      if val.startswith(":"):
+                          try:
+                              val = base64.b64decode(val[1:].strip()).decode("utf-8", "replace")
+                          except Exception:
+                              continue
+                      cur.setdefault(key, []).append(val)
+                  flush()
+                  return entries
+
+              def age_hours(ts):
+                  if not ts:
+                      return None
+                  m = re.match(r"^(\d{14})(?:[.,]\d+)?(Z|[+-]\d{2}:?\d{2})?$", ts.strip())
+                  if not m:
+                      return None
+                  try:
+                      dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                  except ValueError:
+                      return None
+                  off = m.group(2)
+                  if off and off != "Z":
+                      sign = 1 if off[0] == "+" else -1
+                      dt = dt - sign * timedelta(hours=int(off[1:3]), minutes=int(off[-2:]))
+                  return (NOW - dt).total_seconds() / 3600.0
+
+              protected = [norm(p) for p in PROTECTED_RAW.split(";") if p.strip()]
+              base_n = norm(RESOLVE_BASE)
+              existing = set(norm(e["dn"][0]) for e in parse("existing.ldif"))
+              after_entries = len(existing)
+
+              survivors = []
+              for e in parse("referencing.ldif"):
+                  dn = e["dn"][0]
+                  refs = [r for r in (e.get(REF_ATTR) or []) if r.strip()]
+                  if not refs:
+                      continue
+                  nrefs = [norm(r) for r in refs]
+                  if base_n and any(not r.endswith(base_n) for r in nrefs):
+                      continue
+                  if any(r in existing for r in nrefs):
+                      continue
+                  ndn = norm(dn)
+                  if any(ndn == p or ndn.endswith("," + p) for p in protected):
+                      continue
+                  age = age_hours((e.get("createtimestamp") or [None])[0])
+                  if age is None or age < MIN_AGE_HOURS:
+                      continue
+                  survivors.append(dn)
+
+              floor = BEFORE_ENTRIES - REQUESTED
+              lost_extra = max(0, floor - after_entries)
+              print("VERIFY requested={} survivors={} entries_before={} entries_after={} expected_floor={}".format(
+                  REQUESTED, len(survivors), BEFORE_ENTRIES, after_entries, floor))
+              for d in survivors:
+                  print("SURVIVED " + d)
+              if lost_extra:
+                  print("UNEXPECTED_LOSS {} more entries went than were requested".format(lost_extra))
+              out = {
+                  "count": len(survivors),
+                  "has_targets": "yes" if survivors else "no",
+                  "unexpected_loss": "yes" if lost_extra else "no",
+                  "entries_before": BEFORE_ENTRIES,
+                  "entries_after": after_entries,
+                  "survivor_dns": ", ".join(survivors) if survivors else "none",
+              }
+              print("::" + json.dumps({"outputs": out}) + "::")
+          - id: assert_gone
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.verify_classify.vars.has_targets == 'yes' or outputs.verify_classify.vars.unexpected_loss == 'yes' }}"
+            then:
+              - id: delete_did_not_land
+                type: io.kestra.plugin.core.execution.Fail
+                errorMessage: >-
+                  Re-search says the delete did not land as asked. Still orphaned: {{ outputs.verify_classify.vars.survivor_dns }}. Entry count went from {{ outputs.verify_classify.vars.entries_before }} to {{ outputs.verify_classify.vars.entries_after }}, unexpected_loss={{ outputs.verify_classify.vars.unexpected_loss }}.
+          - id: log_applied
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Deleted {{ outputs.classify.vars.count }} orphaned entry(ies). Directory went from {{ outputs.verify_classify.vars.entries_before }} to {{ outputs.verify_classify.vars.entries_after }} entries.
+        else:
+          - id: log_declined
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              Approval declined, nothing was deleted. {{ outputs.classify.vars.count }} orphaned entry(ies) are still there: {{ outputs.classify.vars.target_dns }}.
+
+triggers:
+  - id: daily_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Daily audit. Disabled by default and pinned to safe mode so enabling it never deletes anything without a deliberate change.
+    cron: "0 6 * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert on any failure, including a run refused by the ceiling or failed by the re-search.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "LDAP orphaned entry cleanup guard FAILED (execution {{ execution.id }}). Either the ceiling refused the run or the re-search found an orphan still there. Check the directory and the run logs."
+      }
+
+extend:
+  title: Delete Orphaned LDAP Entries Whose Owner DN No Longer Resolves
+  shortDescription: Resolve every entry's owner DN against the directory itself, then delete the aged orphans behind an approval gate and re-search to prove they are gone.
+  metaTitle: LDAP Orphaned Entry Cleanup Guard with Kestra
+  metaDescription: Find LDAP entries whose owner DN no longer resolves, delete the aged orphans after approval, then re-search to prove the delete landed.
+  description: |
+    Decommission a service or a host and its LDAP entry usually stays. The owning group is deleted, the entry that pointed at it is not, so a bindable account outlives the thing it was created for. Nothing errors, so nobody notices. This blueprint resolves every entry's own reference attribute against the directory it lives in, finds the ones pointing at a DN that is gone, then deletes the aged ones once a human approves.
+
+    ## Safety
+
+    A delete is irreversible and the entries here are authentication objects. Delete the wrong one and the failure is an outage nobody can diagnose, because the account did not break, it stopped existing: binds fail with "invalid credentials", the service looks misconfigured, the entry is not in the directory to inspect. So the flow reports by default, writes only when two inputs are flipped, pauses for a human first, then holds the write behind three guards. An age gate keeps an entry that is still being provisioned. An allowlist of DNs is never touched. A per run ceiling refuses the whole run when the count is higher than expected. In that case the flow writes no delete records at all, so even a hand-edited gate has nothing to act on. Anything the flow cannot read it spares: an entry with no readable createTimestamp is reported rather than deleted, the same for a reference pointing outside the search scope.
+
+    ## How it works
+
+    1. `scan_referencing` (`io.kestra.plugin.ldap.Search`) reads every entry under the base DN that carries the reference attribute (`owner` by default), with its `createTimestamp`, into an LDIF file.
+    2. `scan_existing` (`io.kestra.plugin.ldap.Search`) reads every DN that exists under the resolve base. That set is what a reference has to point into. One directory, no outside inventory.
+    3. `classify` (`io.kestra.plugin.scripts.python.Script`) resolves each entry's references against that set. An entry counts as orphaned only when every one of its reference values fails to resolve, so an entry with a second live owner is left alone. The orphans are then split: deletable, spared by the age gate, spared by the allowlist, spared because the timestamp was unreadable. It writes one LDIF record per deletable DN plus the counts.
+    4. `findings_alert` (`io.kestra.plugin.core.flow.If`) logs the result then posts it to Slack whenever anything is orphaned, so a read-only run still surfaces the problem.
+    5. `ceiling_gate` fails the run before the approval when the deletable count is over `max_deletions`.
+    6. `remediate_gate` runs only when `auto_remediate` is true, `dry_run` is false and there is something to delete. It pauses, then `delete_orphans` (`io.kestra.plugin.ldap.Delete`) deletes each DN in the LDIF.
+    7. `verify_referencing` plus `verify_existing` re-read the directory and `verify_classify` re-runs the same resolution. `assert_gone` fails the run if any deletable orphan is still there. It fails the same way when the entry count dropped below the expected floor.
+
+    ## What you get
+
+    - A list of entries whose owner, manager or other reference DN no longer resolves, which is where a decommissioned service leaves a live auth object behind.
+    - A detection that stays inside the directory. There is no second system to keep in sync, so there is nothing to get stale.
+    - Three guards on an irreversible write: an age gate, a DN allowlist, a per run ceiling. Each one reports what it spared.
+    - A re-search that fails the run when a delete did not land, because the Delete task logs a refused DN and keeps going.
+    - An entry count before and after, so a delete that took more than it was asked for fails the run too.
+
+    ## Who it's for
+
+    - IT and identity teams running OpenLDAP or 389 Directory Server who decommission services faster than they clean up the directory.
+    - Security teams that need dead auth objects gone rather than listed, with proof they went.
+    - Platform teams who want a scheduled audit that is safe to leave on, because it reports by default.
+
+    ## Why orchestrate this with Kestra
+
+    Doing this by hand is two `ldapsearch` runs, a diff in a spreadsheet, an `ldapdelete` that nobody re-checks. The risky part is not the search, it is deciding what to delete then proving only that went. Kestra puts the detection, the age and allowlist logic, the ceiling, the human approval, the delete plus the re-search in one audited run, with the Slack trail attached. The read-only default makes it safe to schedule.
+
+    ## Tested end to end
+
+    Run against OpenLDAP (osixia/openldap 1.5.0) with 11 seeded entries: two owning groups, four entries carrying an `owner` DN, four OUs. Against the intact directory the scan resolved all four references and reported zero orphans. Deleting both owning groups made four entries dangle and detection found exactly those four with identical inputs. A `dry_run` pass reported them and left all nine entries in place, confirmed with `ldapsearch`. A run with `min_age_hours` at 24 spared the freshly created orphan. The allowlist spared the entry under `ou=system`. A ceiling of 1 against 2 deletable orphans refused the run before the pause. A declined approval deleted nothing. An approved run deleted both target DNs, the re-search returned zero and `ldapsearch` went from 9 entries to 7 with only those two gone. A non-leaf orphan proved the re-search gate: the Delete task reported success while the server refused it. The re-search failed the run.
+
+    ## Prerequisites
+
+    An LDAP directory reachable from Kestra, plus a bind account allowed to search the tree and delete entries. The bind account also needs to see `createTimestamp`, which the age gate reads.
+
+    ### Secrets
+
+    - `LDAP_PASSWORD`: bind password for the account named in `bind_dn`.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the findings alert plus the failure alert.
+
+    ### Inputs
+
+    - `dry_run` (default true) and `auto_remediate` (default false): both guard every delete.
+    - `ldap_host`, `ldap_port`, `bind_dn`, `base_dn`: connection plus audit scope.
+    - `entry_filter` (default `(objectClass=*)`) and `reference_attribute` (default `owner`): which entries to audit and which DN valued attribute to resolve.
+    - `resolve_base_dn` and `resolve_filter`: the existence search. A reference pointing outside it is reported as out of scope, never as missing.
+    - `min_age_hours` (default 24): an orphan is deletable only once it is this old.
+    - `protected_dns` (semicolon separated): DNs that are never deleted, including everything under them.
+    - `max_deletions` (default 5): the per run ceiling.
+
+    ## Quick start
+
+    1. Add the `LDAP_PASSWORD` and `SLACK_WEBHOOK_URL` secrets to your namespace.
+    2. Run with the defaults. The flow reports orphans then writes nothing.
+    3. Read the spared lines in the log. Tune `min_age_hours`, `protected_dns` plus `max_deletions` until the deletable list is one you would sign off.
+    4. Run with `dry_run` false and `auto_remediate` true, then approve the pause to delete.
+    5. Enable the schedule once you trust the report. It stays read-only until you change its inputs.
+
+    ## How to extend
+
+    - Set `reference_attribute` to `manager` to find people entries whose manager left. Use `seeAlso` where your schema records the owning object there.
+    - Point `base_dn` at one OU to scope the audit, keeping `resolve_base_dn` at the directory root so references out of that OU still resolve.
+    - Add a step before the delete that writes each target entry to object storage, giving yourself a restore path.
+    - Replace the delete with a move into a quarantine OU if your policy wants the entries held before they go.
+
+    ## Links
+
+    - LDAP plugin docs: https://kestra.io/plugins/plugin-ldap
+    - This blueprint was created by [zkasuran](https://github.com/zkasuran).
+  tags:
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false

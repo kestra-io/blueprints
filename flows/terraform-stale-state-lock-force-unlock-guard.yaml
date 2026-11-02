@@ -1,0 +1,592 @@
+id: terraform-stale-state-lock-force-unlock-guard
+namespace: company.team
+
+description: >-
+  Find the lock record a killed terraform apply left in the S3 backend's
+  DynamoDB lock table, prove it is orphaned rather than live, then release it
+  with terraform force-unlock behind an approval. The backend is read again
+  afterwards and the run fails if the lock is still there.
+
+labels:
+  owner: platform-team
+  system: terraform
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    description: Report only. No unlock reaches the backend while this is true.
+
+  - id: auto_remediate
+    type: BOOL
+    defaults: false
+    description: >-
+      Allow the unlock. Releasing a lock needs this true, dry_run false plus an
+      approved Pause.
+
+  - id: backend_bucket
+    type: STRING
+    defaults: tfstate
+    description: S3 bucket holding the Terraform state object.
+
+  - id: state_key
+    type: STRING
+    defaults: prod/terraform.tfstate
+    description: >-
+      State object key inside the bucket. The S3 backend stores its lock under
+      the primary key "<bucket>/<key>", so these two inputs identify the lock
+      record as well as the state.
+
+  - id: lock_table
+    type: STRING
+    defaults: terraform-locks
+    description: DynamoDB table the S3 backend uses for state locking.
+
+  - id: min_lock_age_minutes
+    type: INT
+    defaults: 30
+    description: >-
+      Grace window. A lock younger than this is treated as live even when
+      nothing else objects, because a long apply is normal.
+
+  - id: liveness_sample_seconds
+    type: INT
+    defaults: 10
+    description: >-
+      Gap between the two lock samples. An orphaned record never changes. A
+      pipeline that is still running plans or applies replaces the lock ID, so
+      a change between samples means hands off.
+
+  - id: approval_window
+    type: DURATION
+    defaults: PT30M
+    description: >-
+      How long the Pause waits for an answer. It resumes unapproved when the
+      window closes, which leaves the lock in place.
+
+  - id: aws_region
+    type: STRING
+    defaults: us-east-1
+    description: Region the bucket plus the lock table live in.
+
+  - id: endpoint_url
+    type: STRING
+    defaults: ""
+    description: >-
+      Override the AWS endpoint. Leave empty for AWS. Set it to run against
+      LocalStack or an S3 compatible gateway.
+
+  - id: terraform_image
+    type: STRING
+    defaults: hashicorp/terraform:1.9
+    description: >-
+      Terraform image used for the unlock. Pin it to the version your stack
+      runs, since the S3 backend lock mechanism changed across releases.
+
+  - id: docker_network
+    type: STRING
+    defaults: ""
+    displayName: Docker network for the task containers
+    description: >-
+      Network the AWS CLI plus Terraform containers join. Leave empty for
+      Docker's default bridge. Set it when the endpoint is only reachable on a
+      private network.
+
+  - id: access_key_id
+    type: STRING
+    defaults: ""
+    description: Overrides the AWS_ACCESS_KEY_ID secret when set. Leave empty in production.
+
+  - id: secret_access_key
+    type: STRING
+    defaults: ""
+    description: Overrides the AWS_SECRET_ACCESS_KEY secret when set. Leave empty in production.
+
+variables:
+  cli_image: public.ecr.aws/aws-cli/aws-cli:latest
+  lock_record_key: "{{ inputs.backend_bucket }}/{{ inputs.state_key }}"
+
+tasks:
+  - id: read_lock_record
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: >-
+      Read the lock record twice with a gap between the samples. The first
+      sample reports whether a lock exists at all. The second one decides
+      whether it is moving, which is the only liveness signal the backend
+      actually carries. A read error fails the task instead of reporting a
+      clean backend.
+    containerImage: "{{ vars.cli_image }}"
+    region: "{{ inputs.aws_region }}"
+    accessKeyId: "{{ inputs.access_key_id != '' ? inputs.access_key_id : secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ inputs.secret_access_key != '' ? inputs.secret_access_key : secret('AWS_SECRET_ACCESS_KEY') }}"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      entryPoint: []
+      networkMode: "{{ inputs.docker_network }}"
+    env:
+      LOCK_TABLE: "{{ inputs.lock_table }}"
+      LOCK_KEY: "{{ render(vars.lock_record_key) }}"
+      SAMPLE_SECONDS: "{{ inputs.liveness_sample_seconds }}"
+      EP: "{{ inputs.endpoint_url != '' ? '--endpoint-url ' ~ inputs.endpoint_url : '' }}"
+    commands:
+      - |
+        set -e
+        KEY=$(jq -nc --arg k "$LOCK_KEY" '{LockID:{S:$k}}')
+        get_item() {
+          if ! aws dynamodb get-item --table-name "$LOCK_TABLE" --key "$KEY" \
+               --consistent-read $EP --output json > "$1" 2> err.txt; then
+            echo "cannot read lock table $LOCK_TABLE" >&2
+            cat err.txt >&2
+            exit 2
+          fi
+          [ -s "$1" ] || printf '{}' > "$1"
+        }
+        info_field() {
+          INFO=$(jq -r '.Item.Info.S // ""' "$1")
+          if [ -z "$INFO" ]; then printf ''; else printf '%s' "$INFO" | jq -r --arg f "$2" '.[$f] // ""'; fi
+        }
+        get_item sample1.json
+        FIRST_PRESENT=$(jq -r 'if .Item then "yes" else "no" end' sample1.json)
+        FIRST_ID=$(info_field sample1.json ID)
+        if [ "$FIRST_PRESENT" = "yes" ] && [ "$SAMPLE_SECONDS" -gt 0 ]; then
+          sleep "$SAMPLE_SECONDS"
+        fi
+        get_item sample2.json
+        PRESENT=$(jq -r 'if .Item then "yes" else "no" end' sample2.json)
+        LOCK_ID=$(info_field sample2.json ID)
+        OPERATION=$(info_field sample2.json Operation)
+        WHO=$(info_field sample2.json Who)
+        CREATED=$(info_field sample2.json Created)
+        AGE=0
+        if [ -n "$CREATED" ]; then
+          CLEAN=$(printf '%s' "$CREATED" | sed -E 's/\.[0-9]+Z?$/Z/')
+          EPOCH=$(date -u -d "$CLEAN" +%s 2>/dev/null || echo 0)
+          NOW=$(date -u +%s)
+          [ "$EPOCH" -gt 0 ] && AGE=$(( (NOW - EPOCH) / 60 ))
+        fi
+        CHURNED=no
+        if [ "$FIRST_PRESENT" = "yes" ] && [ "$PRESENT" = "yes" ] && [ "$FIRST_ID" != "$LOCK_ID" ]; then
+          CHURNED=yes
+        fi
+        FINDINGS=0
+        [ "$PRESENT" = "yes" ] && FINDINGS=1
+        echo "lock record for $LOCK_KEY in $LOCK_TABLE:"
+        cat sample2.json
+        echo ""
+        printf '::%s::\n' "$(jq -nc \
+          --arg p "$PRESENT" --arg i "$LOCK_ID" --arg o "$OPERATION" --arg w "$WHO" \
+          --arg c "$CREATED" --arg a "$AGE" --arg ch "$CHURNED" --arg f "$FINDINGS" \
+          '{outputs:{lock_present:$p,lock_id:$i,lock_operation:$o,lock_who:$w,lock_created:$c,lock_age_minutes:$a,lock_churned:$ch,findings:$f}}')"
+
+  - id: log_detection
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      Lock scan on {{ inputs.lock_table }} for {{ render(vars.lock_record_key) }}:
+      findings={{ outputs.read_lock_record.vars.findings }}
+      present={{ outputs.read_lock_record.vars.lock_present }}
+      lock_id={{ outputs.read_lock_record.vars.lock_id }}
+      operation={{ outputs.read_lock_record.vars.lock_operation }}
+      held_by={{ outputs.read_lock_record.vars.lock_who }}
+      created={{ outputs.read_lock_record.vars.lock_created }}
+      age_minutes={{ outputs.read_lock_record.vars.lock_age_minutes }}
+      changed_between_samples={{ outputs.read_lock_record.vars.lock_churned }}
+      grace_minutes={{ inputs.min_lock_age_minutes }}
+
+  - id: backend_is_clean
+    type: io.kestra.plugin.core.flow.If
+    description: No lock record at all. Every plan and apply can acquire the lock.
+    condition: "{{ outputs.read_lock_record.vars.lock_present != 'yes' }}"
+    then:
+      - id: nothing_to_unlock
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No lock record under {{ render(vars.lock_record_key) }} in
+          {{ inputs.lock_table }}. 0 findings, nothing to release.
+
+  - id: lock_held
+    type: io.kestra.plugin.core.flow.If
+    description: A lock exists. Decide whether it is orphaned before touching it.
+    condition: "{{ outputs.read_lock_record.vars.lock_present == 'yes' }}"
+    then:
+      - id: refuse_young_lock
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          Inside the grace window. A long apply holds its lock for minutes, so
+          an unlock here would run a second apply against live state.
+        condition: "{{ (outputs.read_lock_record.vars.lock_age_minutes | number) < inputs.min_lock_age_minutes }}"
+        then:
+          - id: young_lock_left_alone
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: >-
+              Lock {{ outputs.read_lock_record.vars.lock_id }} is
+              {{ outputs.read_lock_record.vars.lock_age_minutes }} minute(s) old,
+              under the {{ inputs.min_lock_age_minutes }} minute grace window.
+              Treating it as live. No unlock.
+
+      - id: refuse_moving_lock
+        type: io.kestra.plugin.core.flow.If
+        description: >-
+          The lock ID changed between the two samples, so something is taking
+          and releasing this lock right now.
+        condition: "{{ outputs.read_lock_record.vars.lock_churned == 'yes' }}"
+        then:
+          - id: moving_lock_left_alone
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: >-
+              Lock ID changed within {{ inputs.liveness_sample_seconds }}s on
+              {{ render(vars.lock_record_key) }}. An apply pipeline is active.
+              No unlock.
+
+      - id: stale_lock
+        type: io.kestra.plugin.core.flow.If
+        description: Past the grace window with a lock ID that did not move.
+        condition: "{{ (outputs.read_lock_record.vars.lock_age_minutes | number) >= inputs.min_lock_age_minutes and outputs.read_lock_record.vars.lock_churned == 'no' }}"
+        then:
+          - id: report_stale_lock
+            type: io.kestra.plugin.core.log.Log
+            level: WARN
+            message: >-
+              Stale lock on {{ render(vars.lock_record_key) }}. ID
+              {{ outputs.read_lock_record.vars.lock_id }} from
+              {{ outputs.read_lock_record.vars.lock_operation }} held by
+              {{ outputs.read_lock_record.vars.lock_who }} since
+              {{ outputs.read_lock_record.vars.lock_created }}
+              ({{ outputs.read_lock_record.vars.lock_age_minutes }} minutes).
+              Release command: terraform force-unlock -force
+              {{ outputs.read_lock_record.vars.lock_id }}
+
+          - id: unlock_gate
+            type: io.kestra.plugin.core.flow.If
+            description: >-
+              The write gate. Both switches plus an approval have to line up
+              before Terraform is allowed near the backend.
+            condition: "{{ inputs.auto_remediate and not inputs.dry_run }}"
+            then:
+              - id: approve_unlock
+                type: io.kestra.plugin.core.flow.Pause
+                description: >-
+                  Hold for a human. Releasing a lock that is actually live lets
+                  two applies write the same state file, which is how state
+                  gets corrupted.
+                pauseDuration: "{{ inputs.approval_window }}"
+                onResume:
+                  - id: approved
+                    type: BOOL
+                    required: false
+                    description: Set true to release the lock named in the log above.
+
+              - id: approval_outcome
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.approve_unlock.onResume.approved ?? false }}"
+                then:
+                  - id: recheck_lock
+                    type: io.kestra.plugin.aws.cli.AwsCLI
+                    description: >-
+                      Read the lock again after the approval. If the ID moved
+                      while the Pause was open, the lock being held now is not
+                      the one that was approved.
+                    containerImage: "{{ vars.cli_image }}"
+                    region: "{{ inputs.aws_region }}"
+                    accessKeyId: "{{ inputs.access_key_id != '' ? inputs.access_key_id : secret('AWS_ACCESS_KEY_ID') }}"
+                    secretKeyId: "{{ inputs.secret_access_key != '' ? inputs.secret_access_key : secret('AWS_SECRET_ACCESS_KEY') }}"
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      entryPoint: []
+                      networkMode: "{{ inputs.docker_network }}"
+                    env:
+                      LOCK_TABLE: "{{ inputs.lock_table }}"
+                      LOCK_KEY: "{{ render(vars.lock_record_key) }}"
+                      EP: "{{ inputs.endpoint_url != '' ? '--endpoint-url ' ~ inputs.endpoint_url : '' }}"
+                    commands:
+                      - |
+                        set -e
+                        KEY=$(jq -nc --arg k "$LOCK_KEY" '{LockID:{S:$k}}')
+                        if ! aws dynamodb get-item --table-name "$LOCK_TABLE" --key "$KEY" \
+                             --consistent-read $EP --output json > now.json 2> err.txt; then
+                          echo "cannot read lock table $LOCK_TABLE" >&2
+                          cat err.txt >&2
+                          exit 2
+                        fi
+                        [ -s now.json ] || printf '{}' > now.json
+                        PRESENT=$(jq -r 'if .Item then "yes" else "no" end' now.json)
+                        INFO=$(jq -r '.Item.Info.S // ""' now.json)
+                        if [ -z "$INFO" ]; then LOCK_ID=""; else LOCK_ID=$(printf '%s' "$INFO" | jq -r '.ID // ""'); fi
+                        cat now.json
+                        echo ""
+                        printf '::%s::\n' "$(jq -nc --arg p "$PRESENT" --arg i "$LOCK_ID" \
+                          '{outputs:{lock_present:$p,lock_id:$i}}')"
+
+                  - id: same_lock_check
+                    type: io.kestra.plugin.core.flow.If
+                    description: Release only the exact lock the operator saw plus approved.
+                    condition: "{{ outputs.recheck_lock.vars.lock_present == 'yes' and outputs.recheck_lock.vars.lock_id == outputs.read_lock_record.vars.lock_id }}"
+                    then:
+                      - id: force_unlock
+                        type: io.kestra.plugin.terraform.cli.TerraformCLI
+                        description: >-
+                          Release the lock through Terraform's own backend
+                          client so the backend sees a real unlock rather than
+                          a hand deleted row. allowFailure lets the re-read be
+                          the judge.
+                        taskRunner:
+                          type: io.kestra.plugin.scripts.runner.docker.Docker
+                          networkMode: "{{ inputs.docker_network }}"
+                        containerImage: "{{ inputs.terraform_image }}"
+                        allowFailure: true
+                        env:
+                          AWS_ACCESS_KEY_ID: "{{ inputs.access_key_id != '' ? inputs.access_key_id : secret('AWS_ACCESS_KEY_ID') }}"
+                          AWS_SECRET_ACCESS_KEY: "{{ inputs.secret_access_key != '' ? inputs.secret_access_key : secret('AWS_SECRET_ACCESS_KEY') }}"
+                          AWS_REGION: "{{ inputs.aws_region }}"
+                        inputFiles:
+                          backend.tf: |
+                            terraform {
+                              backend "s3" {
+                                bucket         = "{{ inputs.backend_bucket }}"
+                                key            = "{{ inputs.state_key }}"
+                                region         = "{{ inputs.aws_region }}"
+                                dynamodb_table = "{{ inputs.lock_table }}"
+                            {% if inputs.endpoint_url != '' %}
+                                endpoints = {
+                                  s3       = "{{ inputs.endpoint_url }}"
+                                  dynamodb = "{{ inputs.endpoint_url }}"
+                                }
+                                use_path_style              = true
+                                skip_credentials_validation = true
+                                skip_metadata_api_check     = true
+                                skip_region_validation      = true
+                                skip_requesting_account_id  = true
+                            {% endif %}
+                              }
+                            }
+                        beforeCommands:
+                          - terraform init -input=false -no-color
+                        commands:
+                          - terraform force-unlock -force -no-color {{ outputs.read_lock_record.vars.lock_id }}
+
+                      - id: verify_lock_released
+                        type: io.kestra.plugin.aws.cli.AwsCLI
+                        description: >-
+                          Read the backend again. A force-unlock task that went
+                          green carries no information on its own, so this read
+                          decides the outcome.
+                        containerImage: "{{ vars.cli_image }}"
+                        region: "{{ inputs.aws_region }}"
+                        accessKeyId: "{{ inputs.access_key_id != '' ? inputs.access_key_id : secret('AWS_ACCESS_KEY_ID') }}"
+                        secretKeyId: "{{ inputs.secret_access_key != '' ? inputs.secret_access_key : secret('AWS_SECRET_ACCESS_KEY') }}"
+                        taskRunner:
+                          type: io.kestra.plugin.scripts.runner.docker.Docker
+                          entryPoint: []
+                          networkMode: "{{ inputs.docker_network }}"
+                        env:
+                          LOCK_TABLE: "{{ inputs.lock_table }}"
+                          LOCK_KEY: "{{ render(vars.lock_record_key) }}"
+                          EP: "{{ inputs.endpoint_url != '' ? '--endpoint-url ' ~ inputs.endpoint_url : '' }}"
+                        commands:
+                          - |
+                            set -e
+                            KEY=$(jq -nc --arg k "$LOCK_KEY" '{LockID:{S:$k}}')
+                            if ! aws dynamodb get-item --table-name "$LOCK_TABLE" --key "$KEY" \
+                                 --consistent-read $EP --output json > after.json 2> err.txt; then
+                              echo "cannot read lock table $LOCK_TABLE" >&2
+                              cat err.txt >&2
+                              exit 2
+                            fi
+                            [ -s after.json ] || printf '{}' > after.json
+                            PRESENT=$(jq -r 'if .Item then "yes" else "no" end' after.json)
+                            REMAINING=0
+                            [ "$PRESENT" = "yes" ] && REMAINING=1
+                            echo "lock record after the unlock attempt:"
+                            cat after.json
+                            echo ""
+                            printf '::%s::\n' "$(jq -nc --arg p "$PRESENT" --arg r "$REMAINING" \
+                              '{outputs:{lock_present:$p,remaining:$r}}')"
+
+                      - id: unlock_landed
+                        type: io.kestra.plugin.core.flow.If
+                        description: >-
+                          Fail the run when the lock survived, so a wedged
+                          backend never reports success.
+                        condition: "{{ outputs.verify_lock_released.vars.lock_present == 'yes' }}"
+                        then:
+                          - id: still_locked
+                            type: io.kestra.plugin.core.log.Log
+                            level: ERROR
+                            message: >-
+                              Lock record still present on
+                              {{ render(vars.lock_record_key) }} after
+                              terraform force-unlock. remaining={{ outputs.verify_lock_released.vars.remaining }}
+                              (was 1 before the attempt). The backend is still
+                              wedged.
+                          - id: fail_still_locked
+                            type: io.kestra.plugin.core.execution.Fail
+                            errorMessage: >-
+                              force-unlock did not release
+                              {{ outputs.read_lock_record.vars.lock_id }} on
+                              {{ render(vars.lock_record_key) }}. The lock
+                              record is still in {{ inputs.lock_table }}.
+                        else:
+                          - id: unlock_confirmed
+                            type: io.kestra.plugin.core.log.Log
+                            message: >-
+                              Lock released. {{ render(vars.lock_record_key) }}
+                              went from 1 lock record to
+                              {{ outputs.verify_lock_released.vars.remaining }}.
+                              Released ID was
+                              {{ outputs.read_lock_record.vars.lock_id }}. Plan
+                              plus apply can acquire the lock again.
+                    else:
+                      - id: lock_moved_under_us
+                        type: io.kestra.plugin.core.log.Log
+                        level: ERROR
+                        message: >-
+                          Refusing the unlock. Approved ID was
+                          {{ outputs.read_lock_record.vars.lock_id }}, the
+                          backend now reports
+                          present={{ outputs.recheck_lock.vars.lock_present }}
+                          id={{ outputs.recheck_lock.vars.lock_id }}. Something
+                          took the lock while the Pause was open.
+                      - id: fail_lock_moved
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: >-
+                          Lock on {{ render(vars.lock_record_key) }} changed
+                          during the approval. Nothing was unlocked. Re-run the
+                          check.
+                else:
+                  - id: approval_declined
+                    type: io.kestra.plugin.core.log.Log
+                    level: WARN
+                    message: >-
+                      Unlock declined or the approval window closed with no
+                      answer. Lock {{ outputs.read_lock_record.vars.lock_id }}
+                      stays in place. Nothing was changed.
+            else:
+              - id: report_only
+                type: io.kestra.plugin.core.log.Log
+                message: >-
+                  Report only (dry_run={{ inputs.dry_run }},
+                  auto_remediate={{ inputs.auto_remediate }}). Would run
+                  terraform force-unlock -force
+                  {{ outputs.read_lock_record.vars.lock_id }} against
+                  {{ render(vars.lock_record_key) }}. No call was made.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "text": "Terraform stale lock guard failed on {{ inputs.backend_bucket }}/{{ inputs.state_key }} (table {{ inputs.lock_table }}). Execution {{ execution.id }}. Check whether the lock record is still held before running plan or apply."
+      }
+
+triggers:
+  - id: hourly_lock_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: >-
+      Hourly sweep in report mode. Disabled by default. Enable it after the
+      backend inputs point at your own state.
+    cron: "17 * * * *"
+    disabled: true
+    inputs:
+      dry_run: true
+      auto_remediate: false
+
+extend:
+  title: Release a Stale Terraform State Lock with a Guarded force-unlock
+  shortDescription: Detect the lock record a killed terraform apply leaves in the S3 backend lock table, prove it is orphaned, then release it with a gated force-unlock.
+  metaTitle: Guarded Terraform force-unlock for a Stale State Lock on Kestra
+  metaDescription: Detect an orphaned Terraform state lock in DynamoDB, prove it is not live, then release it with a gated force-unlock and a re-read that fails the run.
+  demo: false
+  ee: false
+  tags:
+    - Infrastructure
+  subTags:
+    - Infrastructure Automation
+    - Day 2 Operations
+    - Approval Gates
+  description: |
+    A killed `terraform apply` leaves its lock record behind in the S3 backend's DynamoDB lock table. Every later `plan` and `apply` then stops at `Error acquiring the state lock`, so the stack is frozen until somebody copies the lock ID out of the error message and runs `terraform force-unlock` by hand. This blueprint does that work with the checks a human would skip at 2am.
+
+    ## Safety
+    `force-unlock` is the one Terraform command that can make things worse. Releasing a lock that is actually live lets two applies write the same state file, which loses resources from state, leaves real infrastructure orphaned in the cloud account plus forces a manual `terraform import` for every lost address. So the unlock sits behind four gates that all have to agree: the lock has to be older than `min_lock_age_minutes`, its ID must not have changed between two samples, `auto_remediate` has to be true with `dry_run` false, plus a human has to approve the Pause. The flow re-reads the lock after the approval and refuses when the ID moved, because the lock being held then is not the lock that was approved.
+
+    The flow never runs `terraform plan` as a probe. `plan` takes the state lock itself, so a probe would create the record it is meant to be hunting.
+
+    ## How it works
+    1. `read_lock_record` (`io.kestra.plugin.aws.cli.AwsCLI`) reads the lock item from DynamoDB with a consistent read, waits `liveness_sample_seconds`, then reads it again. The S3 backend keys its lock on `<bucket>/<key>`, so `backend_bucket` plus `state_key` identify the record. The `Info` attribute carries the lock ID, the operation, who held it plus the creation time, which is where the age comes from. A read error exits 2 rather than reporting a clean backend.
+    2. `log_detection` (`io.kestra.plugin.core.log.Log`) prints the findings count, the lock ID, the operation, the holder, the age in minutes plus whether the ID changed between samples.
+    3. `backend_is_clean` (`io.kestra.plugin.core.flow.If`) ends the run with 0 findings when no lock record exists.
+    4. `lock_held` branches into three decisions. `refuse_young_lock` leaves anything inside the grace window alone, because a long apply holds its lock for minutes. `refuse_moving_lock` leaves the lock alone when the ID changed between the two samples, which means a pipeline is actively taking the lock. `stale_lock` is the only branch that goes further.
+    5. `unlock_gate` checks `auto_remediate and not dry_run`. The `else` branch logs the exact `force-unlock` command it would have run plus stops there, which is the default posture of this flow.
+    6. `approve_unlock` (`io.kestra.plugin.core.flow.Pause`) holds for `approval_window`. An expired window resumes with no answer, which reads as declined.
+    7. `recheck_lock` reads the lock again after the approval. `same_lock_check` compares the ID against the one that was approved plus refuses if it moved.
+    8. `force_unlock` (`io.kestra.plugin.terraform.cli.TerraformCLI`) writes a backend-only `backend.tf`, runs `terraform init -input=false`, then `terraform force-unlock -force <id>`. It carries `allowFailure: true` on purpose, because a green CLI task is not evidence that the lock went away.
+    9. `verify_lock_released` reads the lock record one more time. `unlock_landed` fails the run through `io.kestra.plugin.core.execution.Fail` when the record is still there, so a backend that stayed wedged never reports success.
+    10. The `errors` block posts to Slack through `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` with the backend path plus the execution id.
+
+    ## What you get
+    - A stale lock cleared without anyone hand copying a UUID out of a failed pipeline log.
+    - A liveness test that uses the only signal the backend carries, which is whether the lock ID is moving.
+    - An audit trail per execution: the lock ID, the operation, the holder, the age, who approved plus the state of the record afterwards.
+    - A run that fails loudly when the unlock did not land, instead of a green task over a still frozen backend.
+    - Report-only by default, so the first thing you get is an inventory of wedged backends.
+
+    ## Who it's for
+    Platform plus SRE teams running Terraform through CI against an S3 backend with DynamoDB locking, where a cancelled job or a dead runner wedges the whole stack until somebody with credentials intervenes.
+
+    ## Why orchestrate this with Kestra
+    The unlock is cheap. The decision around it is not. Kestra holds the age window, the two-sample liveness test, the approval, the re-check after the approval plus the re-read that fails the run in one declarative file, with every value logged per execution. A shell script in CI can run `force-unlock`, but it has nowhere to park a human approval plus no record of what the lock looked like before the release.
+
+    ## Tested end to end
+    Run against LocalStack with a real S3 backend plus a real DynamoDB lock table, with `endpoint_url` pointed at the LocalStack endpoint:
+    - Clean backend: 0 findings, `backend_is_clean` reports nothing to release.
+    - Stale lock seeded as a killed apply leaves it: detection reports 1 finding with the lock ID, the operation, the holder plus an age in minutes.
+    - `dry_run=true`: the exact `force-unlock` command is logged. The lock record is still in DynamoDB afterwards.
+    - `auto_remediate=true` with `dry_run=false` plus an approved Pause: `terraform force-unlock` releases the lock, the re-read reports 0 records left. `terraform plan` failed with `Error acquiring the state lock` before the run plus succeeded after it.
+    - Declined Pause: the lock record is unchanged.
+    - Unlock blocked by a broken backend: the re-read still sees the record plus the run fails.
+
+    ## Prerequisites
+    ### Secrets
+    - `AWS_ACCESS_KEY_ID`: credentials that can read the lock table plus delete the lock item.
+    - `AWS_SECRET_ACCESS_KEY`: the matching secret key.
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the failure alert.
+
+    ### Inputs
+    - `dry_run` (BOOL, default `true`): report only.
+    - `auto_remediate` (BOOL, default `false`): allow the unlock.
+    - `backend_bucket` (STRING, default `tfstate`): bucket holding the state object.
+    - `state_key` (STRING, default `prod/terraform.tfstate`): state object key.
+    - `lock_table` (STRING, default `terraform-locks`): DynamoDB lock table.
+    - `min_lock_age_minutes` (INT, default `30`): grace window before a lock counts as stale.
+    - `liveness_sample_seconds` (INT, default `10`): gap between the two lock samples.
+    - `approval_window` (DURATION, default `PT30M`): how long the Pause waits.
+    - `aws_region` (STRING, default `us-east-1`): region of the bucket plus the table.
+    - `endpoint_url` (STRING, default empty): endpoint override for LocalStack or an S3 compatible gateway.
+    - `terraform_image` (STRING, default `hashicorp/terraform:1.9`): image used for the unlock.
+    - `access_key_id` / `secret_access_key` (STRING, default empty): override the AWS secrets for a sandbox run.
+
+    ## Quick start
+    1. Add `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` plus `SLACK_WEBHOOK_URL` as Kestra secrets.
+    2. Set `backend_bucket`, `state_key`, `lock_table` plus `aws_region` to the backend you want watched.
+    3. Run it with the defaults. It reads the lock record twice then reports. Nothing is written.
+    4. Read the `log_detection` line. A finding carries the lock ID, the operation, the holder plus the age.
+    5. When the lock really is orphaned, re-run with `auto_remediate=true` plus `dry_run=false`, then approve the Pause from the UI or through `POST /api/v1/main/executions/{id}/actions/resume`.
+    6. Enable `hourly_lock_sweep` once the inputs are right. It stays in report mode.
+
+    ## How to extend
+    - Point `terraform_image` at an OpenTofu image to run the same guard against a tofu managed backend.
+    - Swap the Slack task for PagerDuty or Opsgenie when a wedged backend should page.
+    - Add an `io.kestra.plugin.aws.s3.List` call on the state key before the unlock, so a state object written after the lock was taken blocks the release.
+    - Raise `min_lock_age_minutes` above your longest apply, then drop `liveness_sample_seconds` to zero on a backend no pipeline touches.
+    - Loop the whole flow over several backends with `io.kestra.plugin.core.flow.Subflow` plus a list of bucket and key pairs.
+
+    ## Links
+    - [terraform force-unlock](https://developer.hashicorp.com/terraform/cli/commands/force-unlock)
+    - [S3 backend state locking](https://developer.hashicorp.com/terraform/language/backend/s3)
+    - [TerraformCLI task](https://kestra.io/plugins/plugin-terraform/cli/io.kestra.plugin.terraform.cli.terraformcli)
+    - [AWS CLI task](https://kestra.io/plugins/plugin-aws/cli/io.kestra.plugin.aws.cli.awscli)
+    - [Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).

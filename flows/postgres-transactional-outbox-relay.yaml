@@ -1,0 +1,574 @@
+id: postgres-transactional-outbox-relay
+namespace: company.team
+description: |
+  Relay a transactional outbox table from PostgreSQL to a RabbitMQ exchange.
+  Batches are claimed with a lease so overlapping runs never publish the same
+  row, events of one aggregate are published strictly in order, the outbox id
+  is the AMQP message id, failures back off and dead-letter after max_attempts,
+  and Slack hears about dead letters and a lagging outbox.
+
+triggers:
+  - id: outbox_rows
+    type: io.kestra.plugin.jdbc.postgresql.Trigger
+    description: |
+      The event-based entry point: starts a run as soon as the outbox has events ready to publish
+      (pending, out of backoff, not leased, not waiting behind an older event). Enable it after the first manual run.
+    disabled: true
+    interval: PT10S
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT count(*) AS ready
+      FROM outbox o
+      WHERE o.status = 'pending' AND o.next_attempt_at <= now()
+        AND (o.claimed_until IS NULL OR o.claimed_until <= now())
+        AND NOT EXISTS (SELECT 1 FROM outbox d
+                        WHERE d.aggregate_type = o.aggregate_type AND d.aggregate_id = o.aggregate_id AND d.id < o.id
+                          AND (d.status = 'dead' OR (d.status = 'pending' AND (d.next_attempt_at > now() OR d.claimed_until > now()))))
+      HAVING count(*) > 0
+  - id: after_commit
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: |
+      Optional low-latency nudge from the application right after it commits an outbox row:
+      curl -X POST http://localhost:8080/api/v1/main/executions/webhook/company.team/postgres-transactional-outbox-relay/$KEY
+    key: "{{ secret('OUTBOX_RELAY_WEBHOOK_KEY') }}"
+  - id: backstop
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Runs the lag check even when nothing is ready, e.g. when every pending event waits behind a dead letter.
+    disabled: true
+    cron: "*/5 * * * *"
+
+inputs:
+  - id: exchange
+    type: STRING
+    defaults: domain-events
+    description: Exchange to publish to. Messages use the routing key <aggregate_type>.<event_type>, so a topic exchange lets consumers bind to order.* or *.OrderPlaced.
+  - id: batch_size
+    type: INT
+    defaults: 50
+    description: Events claimed per run. Each event is published in its own Loop iteration (about 5 per second in testing), so 50 takes about 10 seconds.
+  - id: lease_seconds
+    type: INT
+    defaults: 300
+    description: How long a claim stays valid. It is renewed before each publish; a run that dies leaves its rows to be picked up after this long.
+  - id: max_attempts
+    type: INT
+    defaults: 5
+    description: Failed relay attempts before an event is dead-lettered. Each attempt already retries the publish 3 times.
+  - id: backoff_seconds
+    type: INT
+    defaults: 30
+    description: Wait after the first failed attempt; it doubles on each later attempt, up to one hour.
+  - id: stop_after_failures
+    type: INT
+    defaults: 3
+    description: Stop the batch after this many failed events in one run. Several failures in a row usually mean the broker is down, not that the events are bad.
+  - id: lag_alert_minutes
+    type: INT
+    defaults: 5
+    description: Alert when the oldest unpublished event is older than this. Pick a value above your normal end-to-end latency.
+  - id: rabbitmq_host
+    type: STRING
+    defaults: localhost
+    description: AMQP host of the broker.
+  - id: rabbitmq_port
+    type: INT
+    defaults: 5672
+    description: AMQP port; 5671 is the usual TLS port.
+  - id: rabbitmq_vhost
+    type: STRING
+    defaults: /
+    description: Virtual host that holds the exchange.
+  - id: rabbitmq_management_url
+    type: STRING
+    defaults: http://localhost:15672
+    description: RabbitMQ management API, used before claiming anything to check that the exchange exists and has a bound queue.
+  - id: keep_published_days
+    type: INT
+    defaults: 7
+    description: Published rows are deleted after this many days so the outbox table stays small. Dead-lettered and discarded rows are kept.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for links in alerts.
+
+tasks:
+  - id: ensure_outbox
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Creates the outbox table (if your application has not yet), its indexes, and the relay's state row.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+    sql: |
+      CREATE TABLE IF NOT EXISTS outbox (
+        id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        aggregate_type  TEXT NOT NULL,
+        aggregate_id    TEXT NOT NULL,
+        event_type      TEXT NOT NULL,
+        payload         JSONB NOT NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'dead', 'discarded')),
+        attempts        INT NOT NULL DEFAULT 0,
+        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        claimed_by      TEXT,
+        claimed_until   TIMESTAMPTZ,
+        published_at    TIMESTAMPTZ,
+        last_error      TEXT,
+        failed_in       TEXT
+      );
+      CREATE INDEX IF NOT EXISTS outbox_unpublished ON outbox (aggregate_type, aggregate_id, id) WHERE status IN ('pending', 'dead');
+      CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (id) WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS outbox_published ON outbox (published_at) WHERE status = 'published';
+      CREATE TABLE IF NOT EXISTS outbox_relay_state (
+        id         INT PRIMARY KEY CHECK (id = 1),
+        lagging    BOOLEAN NOT NULL DEFAULT false,
+        changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      INSERT INTO outbox_relay_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+  - id: check_exchange
+    type: io.kestra.plugin.core.http.Request
+    description: Fails fast (after retries) when the broker is down; 404 means the exchange is missing.
+    uri: "{{ inputs.rabbitmq_management_url }}/api/exchanges/{{ inputs.rabbitmq_vhost | urlencode }}/{{ inputs.exchange | urlencode }}"
+    options:
+      allowFailed: true
+      auth: {type: BASIC, username: "{{ secret('RABBITMQ_USERNAME') }}", password: "{{ secret('RABBITMQ_PASSWORD') }}"}
+    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+  - id: check_bindings
+    type: io.kestra.plugin.core.http.Request
+    description: The plugin publishes without the mandatory flag, so an exchange with no bound queue would drop every message silently.
+    uri: "{{ inputs.rabbitmq_management_url }}/api/exchanges/{{ inputs.rabbitmq_vhost | urlencode }}/{{ inputs.exchange | urlencode }}/bindings/source"
+    options:
+      allowFailed: true
+      auth: {type: BASIC, username: "{{ secret('RABBITMQ_USERNAME') }}", password: "{{ secret('RABBITMQ_PASSWORD') }}"}
+    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 3}
+
+  - id: broker_guard
+    type: io.kestra.plugin.core.flow.If
+    description: Nothing is claimed unless the exchange exists and routes somewhere.
+    condition: >-
+      {{ outputs.check_exchange.code != 200
+         or ((outputs.check_bindings.body | jq('length') | first) == 0
+             and (outputs.check_exchange.body | jq('.arguments["alternate-exchange"] // ""') | first) == '') }}
+    then:
+      - id: broker_not_ready
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          {% if outputs.check_exchange.code == 404 %}Exchange '{{ inputs.exchange }}' does not exist in vhost '{{ inputs.rabbitmq_vhost }}': declare it and bind the consumer queues.{% elseif outputs.check_exchange.code == 401 %}RabbitMQ rejected RABBITMQ_USERNAME / RABBITMQ_PASSWORD (HTTP 401).{% elseif outputs.check_exchange.code != 200 %}RabbitMQ management API returned HTTP {{ outputs.check_exchange.code }} for exchange '{{ inputs.exchange }}'.{% else %}Exchange '{{ inputs.exchange }}' has no bound queue and no alternate-exchange: the broker would drop every message without an error. Bind a queue first.{% endif %} Nothing was claimed.
+
+  - id: claim_batch
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: |
+      Leases the oldest ready events with FOR UPDATE SKIP LOCKED, so a concurrent run gets a different set.
+      Per aggregate it only takes events older than the first one that cannot go now (dead, backing off or leased elsewhere).
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      batch: "{{ inputs.batch_size }}"
+      lease: "{{ inputs.lease_seconds }}"
+      token: "{{ execution.id }}"
+    sql: |
+      WITH blocked AS (
+        SELECT aggregate_type, aggregate_id, min(id) AS first_blocked
+        FROM outbox
+        WHERE status = 'dead'
+           OR (status = 'pending' AND (next_attempt_at > now() OR claimed_until > now()))
+        GROUP BY aggregate_type, aggregate_id
+      ), claimed AS (
+        UPDATE outbox o
+        SET claimed_by = :token, claimed_until = now() + make_interval(secs => CAST(:lease AS int))
+        WHERE o.id IN (
+          SELECT c.id FROM outbox c
+          LEFT JOIN blocked b ON b.aggregate_type = c.aggregate_type AND b.aggregate_id = c.aggregate_id
+          WHERE c.status = 'pending' AND c.next_attempt_at <= now()
+            AND (c.claimed_until IS NULL OR c.claimed_until <= now())
+            AND (b.first_blocked IS NULL OR c.id < b.first_blocked)
+          ORDER BY c.id
+          LIMIT CAST(:batch AS int)
+          FOR UPDATE OF c SKIP LOCKED)
+        RETURNING o.id, o.aggregate_type, o.aggregate_id, o.event_type, CAST(o.payload AS TEXT) AS payload,
+                  replace(CAST(date_trunc('milliseconds', o.created_at AT TIME ZONE 'UTC') AS TEXT), ' ', 'T') || 'Z' AS created_at, o.attempts,
+                  o.claimed_by AS token
+      )
+      SELECT * FROM claimed ORDER BY id
+
+  - id: relay
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.claim_batch.size > 0 }}"
+    then:
+      - id: publish_each
+        type: io.kestra.plugin.core.flow.Loop
+        description: One event at a time, in id order. After stop_after_failures failed events, take_turn hands the rest back unsent.
+        values: "{{ outputs.claim_batch.rows | toJson }}"
+        concurrencyLimit: 1
+        outputs:
+          - id: result
+            type: STRING
+            value: >-
+              {% if outputs.mark_published is defined %}{{ outputs.mark_published.row.marked ? 'published' : 'published, but the lease had expired: a duplicate is possible' }}{% elseif outputs.record_failure is defined %}{{ outputs.record_failure.row.status == 'dead' ? 'dead-lettered' : 'failed attempt ' ~ outputs.record_failure.row.attempts }}{% elseif outputs.take_turn is defined and outputs.take_turn.row.tripped %}not sent: the run stopped after {{ inputs.stop_after_failures }} failed events{% elseif outputs.take_turn is defined and outputs.take_turn.row.behind %}waiting for an older event of the same aggregate{% elseif outputs.take_turn is defined %}skipped: the lease was lost{% else %}not attempted{% endif %}
+        tasks:
+          - id: relay_one
+            type: io.kestra.plugin.core.flow.Sequential
+            allowFailure: true
+            tasks:
+              - id: take_turn
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: |
+                  Ordering, fencing and circuit-breaker guard. Publish only if this run still holds the lease, no older event
+                  of the same aggregate is unpublished, and this run has failed fewer than stop_after_failures events
+                  (counted in Postgres, since iterations cannot see each other's outputs). Otherwise hand the row back
+                  without counting an attempt.
+                url: "{{ secret('POSTGRES_URL') }}"
+                username: "{{ secret('POSTGRES_USER') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                parameters:
+                  id: "{{ fromJson(item.value).id }}"
+                  token: "{{ fromJson(item.value).token }}"
+                  lease: "{{ inputs.lease_seconds }}"
+                  stop: "{{ inputs.stop_after_failures }}"
+                sql: |
+                  WITH run AS (
+                    SELECT count(*) >= CAST(:stop AS int) AS tripped
+                    FROM outbox WHERE failed_in = :token AND status IN ('pending', 'dead')
+                  ), me AS (
+                    SELECT o.id, EXISTS (SELECT 1 FROM outbox p
+                                         WHERE p.aggregate_type = o.aggregate_type AND p.aggregate_id = o.aggregate_id
+                                           AND p.id < o.id AND p.status IN ('pending', 'dead')) AS behind
+                    FROM outbox o
+                    WHERE o.id = CAST(:id AS bigint) AND o.status = 'pending'
+                      AND o.claimed_by = :token AND o.claimed_until > now()
+                  ), upd AS (
+                    UPDATE outbox o
+                    SET claimed_until = CASE WHEN me.behind OR run.tripped THEN NULL ELSE now() + make_interval(secs => CAST(:lease AS int)) END,
+                        claimed_by    = CASE WHEN me.behind OR run.tripped THEN NULL ELSE o.claimed_by END
+                    FROM me, run WHERE o.id = me.id
+                    RETURNING me.behind, run.tripped
+                  )
+                  SELECT coalesce((SELECT NOT behind AND NOT tripped FROM upd), false) AS go,
+                         coalesce((SELECT behind FROM upd), false) AS behind,
+                         (SELECT tripped FROM run) AS tripped
+              - id: its_turn
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.take_turn.row.go }}"
+                then:
+                  - id: publish
+                    type: io.kestra.plugin.amqp.Publish
+                    description: Persistent message; the outbox id is the message id so consumers can drop redeliveries.
+                    host: "{{ inputs.rabbitmq_host }}"
+                    port: "{{ inputs.rabbitmq_port }}"
+                    virtualHost: "{{ inputs.rabbitmq_vhost }}"
+                    username: "{{ secret('RABBITMQ_USERNAME') }}"
+                    password: "{{ secret('RABBITMQ_PASSWORD') }}"
+                    exchange: "{{ inputs.exchange }}"
+                    routingKey: "{{ fromJson(item.value).aggregate_type }}.{{ fromJson(item.value).event_type }}"
+                    from:
+                      data: "{{ fromJson(item.value).payload }}"
+                      messageId: "{{ fromJson(item.value).id }}"
+                      type: "{{ fromJson(item.value).event_type }}"
+                      timestamp: "{{ fromJson(item.value).created_at }}"
+                      contentType: application/json
+                      deliveryMode: 2
+                      headers:
+                        aggregate_type: "{{ fromJson(item.value).aggregate_type }}"
+                        aggregate_id: "{{ fromJson(item.value).aggregate_id }}"
+                        attempt: "{{ fromJson(item.value).attempts + 1 }}"
+                    retry: {type: exponential, interval: PT1S, maxInterval: PT10S, maxAttempts: 3}
+                  - id: mark_published
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    fetchType: FETCH_ONE
+                    parameters:
+                      id: "{{ fromJson(item.value).id }}"
+                      token: "{{ fromJson(item.value).token }}"
+                    retry: {type: exponential, interval: PT2S, maxInterval: PT30S, maxAttempts: 5}
+                    sql: |
+                      WITH upd AS (
+                        UPDATE outbox SET status = 'published', published_at = now(), claimed_until = NULL
+                        WHERE id = CAST(:id AS bigint) AND claimed_by = :token AND status = 'pending'
+                        RETURNING id
+                      )
+                      SELECT EXISTS (SELECT 1 FROM upd) AS marked
+            errors:
+              - id: record_failure
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Count the attempt, back off exponentially, and dead-letter after max_attempts.
+                url: "{{ secret('POSTGRES_URL') }}"
+                username: "{{ secret('POSTGRES_USER') }}"
+                password: "{{ secret('POSTGRES_PASSWORD') }}"
+                fetchType: FETCH_ONE
+                parameters:
+                  id: "{{ fromJson(item.value).id }}"
+                  token: "{{ fromJson(item.value).token }}"
+                  max: "{{ inputs.max_attempts }}"
+                  backoff: "{{ inputs.backoff_seconds }}"
+                  # errorLogs() is empty inside Loop iterations, so name the step that failed instead.
+                  error: >-
+                    {% if outputs.take_turn is not defined %}the ordering check could not run (database unreachable?){% elseif (outputs.publish.messagesCount ?? 0) > 0 %}published, but could not be marked as published: it will be sent again with the same message id{% else %}RabbitMQ refused the message or was unreachable (3 tries); the broker's reason is in the publish log of execution {{ execution.id }}{% endif %}
+                sql: |
+                  WITH upd AS (
+                    UPDATE outbox
+                    SET attempts = attempts + 1, last_error = left(:error, 1000), failed_in = :token,
+                        status = CASE WHEN attempts + 1 >= CAST(:max AS int) THEN 'dead' ELSE 'pending' END,
+                        next_attempt_at = now() + make_interval(secs => least(CAST(:backoff AS int) * power(2, attempts), 3600)),
+                        claimed_by = NULL, claimed_until = NULL
+                    WHERE id = CAST(:id AS bigint) AND claimed_by = :token AND status = 'pending'
+                    RETURNING id, aggregate_type, aggregate_id, event_type, status, attempts, last_error,
+                              octet_length(CAST(payload AS TEXT)) AS payload_bytes,
+                              CAST(next_attempt_at AS TEXT) AS next_attempt_at
+                  )
+                  SELECT u.*,
+                         (SELECT count(*) FROM outbox w WHERE w.aggregate_type = u.aggregate_type AND w.aggregate_id = u.aggregate_id
+                            AND w.id > u.id AND w.status = 'pending') AS held_back
+                  FROM upd u
+              - id: dead_lettered
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ (outputs.record_failure.row.status ?? '') == 'dead' }}"
+                then:
+                  - id: alert_dead_letter
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    messageText: |
+                      Outbox event {{ outputs.record_failure.row.id }} ({{ outputs.record_failure.row.aggregate_type }} {{ outputs.record_failure.row.aggregate_id }}, {{ outputs.record_failure.row.event_type }}) was dead-lettered after {{ outputs.record_failure.row.attempts }} attempts.
+                      Last error: {{ outputs.record_failure.row.last_error }}. Payload size: {{ outputs.record_failure.row.payload_bytes }} bytes (compare with the broker's max_message_size).
+                      {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+                      {{ outputs.record_failure.row.held_back }} later event(s) of {{ outputs.record_failure.row.aggregate_type }} {{ outputs.record_failure.row.aggregate_id }} are held back to keep their order. Other aggregates are not affected.
+                      Fix the cause, then replay: UPDATE outbox SET status = 'pending', attempts = 0, next_attempt_at = now() WHERE id = {{ outputs.record_failure.row.id }};
+                      or give up on it: UPDATE outbox SET status = 'discarded' WHERE id = {{ outputs.record_failure.row.id }};
+
+      - id: release_unsent
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: Hands back rows the loop did not reach (it stopped early), without counting an attempt.
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: FETCH_ONE
+        parameters:
+          token: "{{ execution.id }}"
+        sql: |
+          WITH upd AS (
+            UPDATE outbox SET claimed_by = NULL, claimed_until = NULL
+            WHERE claimed_by = :token AND status = 'pending'
+            RETURNING id
+          )
+          SELECT count(*) AS released FROM upd
+
+  - id: check_lag
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Age of the oldest unpublished event, and whether the lagging state changed since the last run.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    parameters:
+      minutes: "{{ inputs.lag_alert_minutes }}"
+      token: "{{ execution.id }}"
+    sql: |
+      WITH oldest AS (
+        SELECT o.id, o.aggregate_type, o.aggregate_id, o.event_type, o.attempts, o.last_error,
+               round(extract(epoch FROM now() - o.created_at) / 60, 1) AS age_minutes,
+               (SELECT d.id FROM outbox d WHERE d.aggregate_type = o.aggregate_type AND d.aggregate_id = o.aggregate_id
+                  AND d.id < o.id AND d.status = 'dead' ORDER BY d.id LIMIT 1) AS behind_dead
+        FROM outbox o WHERE o.status = 'pending' ORDER BY o.id LIMIT 1
+      ), counts AS (
+        SELECT count(*) FILTER (WHERE status = 'pending') AS pending,
+               count(*) FILTER (WHERE status = 'dead') AS dead,
+               count(*) FILTER (WHERE failed_in = :token) AS failed_now,
+               (array_agg(last_error ORDER BY id DESC) FILTER (WHERE failed_in = :token))[1] AS run_error
+        FROM outbox WHERE status IN ('pending', 'dead')
+      ), state AS (
+        UPDATE outbox_relay_state s
+        SET lagging = coalesce((SELECT age_minutes >= CAST(:minutes AS numeric) FROM oldest), false), changed_at = now()
+        WHERE s.id = 1 AND s.lagging IS DISTINCT FROM coalesce((SELECT age_minutes >= CAST(:minutes AS numeric) FROM oldest), false)
+        RETURNING s.lagging
+      )
+      SELECT c.pending, c.dead, c.failed_now, c.run_error,
+             coalesce((SELECT age_minutes >= CAST(:minutes AS numeric) FROM oldest), false) AS lagging,
+             EXISTS (SELECT 1 FROM state) AS changed,
+             o.id AS oldest_id, o.aggregate_type, o.aggregate_id, o.event_type, o.attempts, o.last_error,
+             CAST(o.age_minutes AS TEXT) AS age_minutes, o.behind_dead
+      FROM counts c LEFT JOIN oldest o ON true
+
+  - id: prune_published
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Keeps the outbox table small; at most 10,000 rows per run.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    parameters:
+      days: "{{ inputs.keep_published_days }}"
+    sql: |
+      DELETE FROM outbox WHERE id IN (
+        SELECT id FROM outbox
+        WHERE status = 'published' AND published_at < now() - make_interval(days => CAST(:days AS int))
+        ORDER BY published_at LIMIT 10000)
+
+  - id: lag_changed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_lag.row.changed }}"
+    then:
+      - id: alert_lag
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: >-
+          {% set r = outputs.check_lag.row %}{% if r.lagging %}Outbox lagging: event {{ r.oldest_id }} ({{ r.aggregate_type }} {{ r.aggregate_id }}, {{ r.event_type }}) has waited {{ r.age_minutes }} min (threshold {{ inputs.lag_alert_minutes }}); {{ r.pending }} pending, {{ r.dead }} dead-lettered.
+          {% if (r.behind_dead ?? '') != '' %}It is held behind dead-lettered event {{ r.behind_dead }}: replay or discard that one.{% elseif r.attempts > 0 %}It failed {{ r.attempts }} time(s), last error: {{ r.last_error }}{% else %}It has not been tried yet: the relay is not keeping up or not running (check the outbox_rows trigger).{% endif %}{% else %}Outbox back to normal: no event waits longer than {{ inputs.lag_alert_minutes }} min ({{ r.pending }} pending, {{ r.dead }} dead-lettered).{% endif %}
+
+  - id: circuit_open
+    type: io.kestra.plugin.core.flow.If
+    description: Several failures in one run point at the broker, so end the run FAILED and let the errors alert say so.
+    condition: "{{ outputs.check_lag.row.failed_now >= inputs.stop_after_failures }}"
+    then:
+      - id: too_many_failures
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: >-
+          {{ outputs.check_lag.row.failed_now }} events failed in this run, so it stopped early and handed back {{ (outputs.publish_each.outputs ?? []) | jq('[.[] | select(.outputs.result | test("^not sent"))] | length') | first }} unsent event(s). Last error: {{ outputs.check_lag.row.run_error ?? 'see the logs' }}
+    else:
+      - id: some_failed
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.check_lag.row.failed_now > 0 }}"
+        then:
+          - id: partial
+            type: io.kestra.plugin.core.execution.Exit
+            description: Some events failed and will be retried with backoff; the others were published.
+            state: WARNING
+
+errors:
+  - id: release_claims
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Hand back anything this run still holds, without counting an attempt, so the next run can take it at once.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    parameters:
+      token: "{{ execution.id }}"
+    sql: UPDATE outbox SET claimed_by = NULL, claimed_until = NULL WHERE claimed_by = :token AND status = 'pending'
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: |
+      Outbox relay failed {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}
+      Claims of this run were released; unpublished events stay in the outbox for the next run.
+      {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: results
+    type: JSON
+    description: One line per claimed event, in order, with what happened to it.
+    value: "{{ (outputs.publish_each.outputs ?? []) | jq('[.[] | {id: (.item.value | fromjson | .id), result: .outputs.result}]') | first }}"
+  - id: outbox
+    type: JSON
+    description: Pending and dead-lettered counts, events that failed in this run, and the oldest pending event with its age.
+    value: "{{ outputs.check_lag.row ?? {} }}"
+
+extend:
+  title: Relay a PostgreSQL Transactional Outbox to RabbitMQ, in Order and Without Duplicates
+  shortDescription: Publish outbox rows from PostgreSQL to a RabbitMQ exchange with leased batches, per-aggregate ordering, message-id deduplication, exponential backoff, dead-lettering and lag alerts.
+  metaTitle: PostgreSQL Transactional Outbox Relay to RabbitMQ with Kestra
+  metaDescription: Relay a Postgres outbox to RabbitMQ with SKIP LOCKED leases, per-aggregate ordering, retries with backoff, dead letters and Slack lag alerts.
+  description: |
+    A service that writes to its database and then publishes to a broker can lose events: the commit succeeds and the publish fails, or the reverse. The transactional outbox fixes this. The service inserts the event into an `outbox` table in the same transaction as its data, and a relay publishes the table to the broker later. The relay is where the hard parts are:
+    - Two relays running at once must not both publish a row.
+    - Events of one order, account or other aggregate must arrive in the order they were written. Consumers apply them as state changes.
+    - A relay that dies mid-batch must not strand its rows, and one bad event must not stop the others.
+    - Someone has to notice when events pile up.
+
+    This blueprint is that relay, for PostgreSQL and RabbitMQ. It starts as soon as rows are ready (JDBC trigger). It claims them with a lease, publishes them one at a time in id order with the outbox id as the AMQP message id, and records every outcome in the outbox row itself. It runs locally against `postgres` and `rabbitmq:3-management` containers.
+
+    ## How it works
+
+    1. `outbox_rows` (PostgreSQL `Trigger`, event-based) starts a run when an event is ready: pending, out of backoff, not leased, and not waiting behind an older event of its aggregate. `after_commit` (`Webhook`) lets the application nudge the relay right after a commit. `backstop` (`Schedule`) runs the lag check when nothing is ready.
+    2. `ensure_outbox` creates the outbox table, its partial indexes and a one-row state table if they are missing.
+    3. `check_exchange` and `check_bindings` ask the RabbitMQ management API whether the exchange exists and has a bound queue. `broker_guard` (`If` + `Fail`) stops the run before anything is claimed if the broker is down, the exchange is missing, or the exchange would drop every message.
+    4. `claim_batch` leases up to `batch_size` events in one `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)`: `claimed_by` is the execution id and `claimed_until` is now + `lease_seconds`. For each aggregate it only takes events older than its first event that cannot go now (dead-lettered, backing off, or leased by another run).
+    5. `publish_each` (`Loop`, one iteration at a time, in id order) runs one `Sequential` with `allowFailure` per event:
+       - `take_turn` is the ordering, fencing and circuit-breaker guard. It continues only if this run still holds the lease, no older event of the aggregate is unpublished, and this run has failed fewer than `stop_after_failures` events. It then renews the lease; otherwise it hands the row back without counting an attempt.
+       - `publish` (AMQP `Publish`) sends a persistent message with the routing key `<aggregate_type>.<event_type>`, the outbox id as `messageId`, the event type as `type`, and the aggregate in the headers.
+       - `mark_published` sets `status = 'published'`, only while this run still holds the lease.
+       - On failure, `record_failure` counts the attempt and sets `next_attempt_at` with exponential backoff. After `max_attempts` it sets `status = 'dead'`, and `alert_dead_letter` posts to Slack with the SQL to replay or discard the event.
+       - Once `stop_after_failures` events have failed, the rest of the batch is handed back unsent: at that point the broker is the likely cause, not the events. The failure count is read from Postgres, because loop iterations are sub-executions and cannot see each other's outputs.
+    6. `release_unsent` hands back rows the loop did not reach. `check_lag` measures the oldest unpublished event and flips a lagging flag; `alert_lag` posts when it turns on and when it clears. `prune_published` deletes published rows older than `keep_published_days`.
+    7. `circuit_open` (`If`) ends the run `FAILED` after too many failures, so the `errors` alert fires, or `WARNING` after fewer.
+
+    ## Error handling
+
+    - **No double publishing between runs.** Claims use `FOR UPDATE SKIP LOCKED` and a lease, and every write after the claim checks `claimed_by` and `claimed_until`. In testing, simultaneous runs never claimed the same row. A run that is killed keeps its lease until it expires, then another run takes the rows over.
+    - **Per-aggregate order.** An event is never published while an older event of its aggregate is pending or dead. If an event fails, the later events of that aggregate wait. Other aggregates keep flowing.
+    - **Exactly-once for consumers, in practice.** The relay is at-least-once: a crash between the publish and `mark_published` sends the event again after the lease. The message id is the outbox id, so consumers drop the copy with a processed-ids table or `INSERT ... ON CONFLICT DO NOTHING`.
+    - **Poison events go to a dead letter.** The `Publish` task retries 3 times; the event then backs off (30 s, 60 s, 120 s, ...) and is dead-lettered after `max_attempts`. The alert names the event, its payload size, how many later events are held back, and the exact `UPDATE` to replay or discard it.
+    - **Broker problems do not burn attempts.** The pre-flight check fails before claiming anything when the broker is down, the exchange is missing, or it has no bound queue. If the broker fails mid-batch, the loop stops after `stop_after_failures` and the rest is released without counting an attempt.
+    - **Lag is visible.** If the oldest unpublished event is older than `lag_alert_minutes`, Slack gets one message saying why. The event may be held behind a dead letter, failing (with its last error), or not yet tried. A second message follows when it clears.
+    - Any other failure releases the run's claims and alerts with the task and the cause.
+
+    ## What this blueprint teaches about Kestra
+
+    - Making work exactly-once in the database when Kestra's own `concurrency` cannot help. `Loop` iterations are sub-executions, and the relay must allow parallel runs anyway.
+    - A `Loop` with `concurrencyLimit: 1` for ordered processing, a circuit breaker whose failure count lives in Postgres (iterations cannot share outputs), and a `Sequential` with `allowFailure` and local `errors` to isolate each item.
+    - Using the JDBC `Trigger` as an event source with a query that matches exactly what the flow can process, so it never starts empty runs.
+    - Turning silent failure modes into pre-flight checks. The AMQP `Publish` task has no publisher confirms or mandatory flag, so the flow asks the management API whether the exchange routes anywhere first.
+
+    ## Prerequisites
+
+    - PostgreSQL 12 or later (tested on 16), and a role that can create and update the outbox tables.
+    - RabbitMQ with the management plugin (tested on 3.13), and a topic exchange with at least one bound queue.
+    - A Slack incoming webhook.
+
+    Your application inserts into `outbox` in the same transaction as its business change, for example `INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload) VALUES ('order', 'ORD-1042', 'OrderPaid', '{"amount": 42}')`. The relay manages every other column.
+
+    ### Secrets
+
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: the database that holds the outbox, e.g. `jdbc:postgresql://localhost:5432/app`.
+    - `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD`: a user that can publish to the exchange and read it in the management API (the `management` user tag is enough for the read).
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+    - `OUTBOX_RELAY_WEBHOOK_KEY`: a long random string, the key in the webhook URL (`$KEY` in the trigger example).
+
+    ### Inputs
+
+    - `exchange` (STRING, default `domain-events`): the exchange to publish to.
+    - `batch_size` (INT, default 50), `lease_seconds` (INT, default 300).
+    - `max_attempts` (INT, default 5), `backoff_seconds` (INT, default 30), `stop_after_failures` (INT, default 3).
+    - `lag_alert_minutes` (INT, default 5), `keep_published_days` (INT, default 7).
+    - `rabbitmq_host`, `rabbitmq_port`, `rabbitmq_vhost`, `rabbitmq_management_url`, `kestra_url`: where things are.
+
+    ### Outputs
+
+    - `results` (JSON): one entry per claimed event, in order, e.g. `{"id": 12, "result": "published"}`, `"waiting for an older event of the same aggregate"`, `"failed attempt 2"` or `"dead-lettered"`.
+    - `outbox` (JSON): pending and dead-lettered counts, failures in this run, and the oldest pending event with its age.
+    Outputs are set on `SUCCESS` runs. A run that ends `FAILED`, or `WARNING` through `Exit`, has none; its alerts and the outbox rows carry the details.
+
+    ## Quick start
+
+    1. Start PostgreSQL and `rabbitmq:3-management`. Declare a topic exchange `domain-events` and bind a queue to it with `#`.
+    2. Add the secrets and run the flow once: it creates the `outbox` table.
+    3. Insert a few rows into `outbox` and run it again. In testing, 120 events over 12 orders reached the queue in order, with no duplicates, in 41 seconds over 3 runs.
+    4. Enable the `outbox_rows` trigger (and `backstop` for lag alerts when nothing is ready), and add the `OUTBOX_RELAY_WEBHOOK_KEY` secret before calling the webhook.
+
+    ## How to extend
+
+    - **Kafka or another broker:** replace `publish` with `io.kestra.plugin.kafka.Produce` keyed by `aggregate_id`; the claim, ordering and dead-letter logic stay the same. The catalog's `postgres-transactional-outbox-kafka-fanout` shows the Kafka side.
+    - **Several outboxes:** add a `topic` or `tenant` column and pass it to the claim, or run one copy of the flow per database.
+    - **Higher volume:** this relay publishes roughly 5 events per second, which suits business events. For thousands per second, read the WAL with Debezium's outbox event router and keep this flow's dead-letter and lag handling as the operations layer.
+
+    ## Links
+
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [AMQP plugin](https://kestra.io/plugins/plugin-amqp)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+    - [Transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Realtime Events
+    - Failure Alerting
+  ee: false
+  demo: false

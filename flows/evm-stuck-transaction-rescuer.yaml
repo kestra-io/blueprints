@@ -1,0 +1,548 @@
+id: evm-stuck-transaction-rescuer
+namespace: company.team
+description: |
+  Unblock hot wallets whose transactions are stuck in the mempool.
+  When fees rise after a transaction was sent, or a nonce is skipped, every
+  later transaction from the wallet waits behind it and payouts stop. The
+  flow finds the blocking nonce, proposes a speed-up or a cancel with fees
+  that respect your cap, and after approval sends the replacement and
+  reports which transaction was mined.
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: payout_stalled
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from your payout service when a transaction has not confirmed in time, so the check runs immediately.
+    key: stuck-tx-change-me
+  - id: periodic_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Regular check of every hot wallet. Shipped disabled.
+    disabled: true
+    cron: "*/5 * * * *"
+
+inputs:
+  - id: wallets
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "0x0000000000000000000000000000000000000000"
+    description: Hot wallets to watch. Replace the placeholder with your addresses.
+  - id: stuck_after_minutes
+    type: INT
+    defaults: 10
+    description: How long the blocking nonce must wait before it is treated as stuck. Counted from the first time this flow saw it.
+  - id: min_priority_fee_gwei
+    type: FLOAT
+    defaults: 2
+    description: Lowest priority fee (tip) a replacement pays.
+  - id: fee_bump_percent
+    type: INT
+    defaults: 15
+    description: How much a speed-up raises both fee fields over the stuck transaction. Nodes reject replacements below about 10%.
+  - id: max_fee_gwei
+    type: FLOAT
+    defaults: 200
+    description: Highest maxFeePerGas a replacement may use. Above it the flow reports the wallet instead of proposing a replacement.
+  - id: ask_again_minutes
+    type: INT
+    defaults: 30
+    description: Wait this long before proposing a replacement for the same wallet again.
+  - id: explorer_url
+    type: STRING
+    defaults: https://etherscan.io
+    description: Block explorer for links in Slack.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link.
+
+variables:
+  # One JSON-RPC batch: chain id, head block (base fee), suggested tip, the mempool, and each wallet's confirmed nonce.
+  state_batch: >-
+    [{"jsonrpc": "2.0", "id": "chain", "method": "eth_chainId", "params": []},
+    {"jsonrpc": "2.0", "id": "head", "method": "eth_getBlockByNumber", "params": ["latest", false]},
+    {"jsonrpc": "2.0", "id": "tip", "method": "eth_maxPriorityFeePerGas", "params": []},
+    {"jsonrpc": "2.0", "id": "pool", "method": "txpool_content", "params": []}{% for w in inputs.wallets %},
+    {"jsonrpc": "2.0", "id": "n:{{ w | lower }}", "method": "eth_getTransactionCount", "params": ["{{ w }}", "latest"]}{% endfor %}]
+
+tasks:
+  - id: validate_wallets
+    type: io.kestra.plugin.core.flow.If
+    description: Only well-formed addresses are accepted; they are also placed in the RPC batch.
+    condition: "{{ inputs.wallets | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | length') | first > 0 }}"
+    then:
+      - id: invalid_wallets
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "These wallets are not valid addresses: {{ inputs.wallets | jq('[.[] | select(test(\"^0x[0-9a-fA-F]{40}$\") | not)] | join(\", \")') | first }}"
+
+  - id: read_state
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('EVM_RPC_URL') }}"
+    method: POST
+    contentType: application/json
+    body: "{{ render(vars.state_batch) }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: txpool_available
+    type: io.kestra.plugin.core.flow.If
+    description: Stuck transactions are only visible in the mempool. Many hosted RPC plans do not expose txpool_content; point EVM_RPC_URL at your own node then.
+    condition: "{{ (outputs.read_state.body | jq('.[] | select(.id == \"pool\") | .error.message // \"\"') | first) != '' }}"
+    then:
+      - id: no_txpool
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "The RPC endpoint does not answer txpool_content ({{ outputs.read_state.body | jq('.[] | select(.id == \"pool\") | .error.message') | first }}). Use a node you run (geth, reth, Nethermind, Erigon) or a provider plan with the txpool API"
+
+  - id: ensure_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      CREATE TABLE IF NOT EXISTS stuck_tx_watch (
+        chain_id       BIGINT NOT NULL,
+        wallet         TEXT NOT NULL,
+        nonce          BIGINT NOT NULL,
+        tx_hash        TEXT,
+        status         TEXT NOT NULL,
+        first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        reported       BOOLEAN NOT NULL DEFAULT false,
+        proposed_at    TIMESTAMPTZ,
+        PRIMARY KEY (chain_id, wallet)
+      )
+
+  - id: analyze
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: For each wallet, find the transaction at its next nonce, decide whether it is stuck or the nonce is missing, compute replacement fees, and track it between runs.
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      batch: "{{ outputs.read_state.body }}"
+      stuck_after: "{{ inputs.stuck_after_minutes }}"
+      ask_again: "{{ inputs.ask_again_minutes }}"
+      bump: "{{ inputs.fee_bump_percent }}"
+      min_tip_gwei: "{{ inputs.min_priority_fee_gwei }}"
+      max_fee_gwei: "{{ inputs.max_fee_gwei }}"
+    sql: |
+      WITH b AS (
+        SELECT e ->> 'id' AS id, e -> 'result' AS r FROM jsonb_array_elements(CAST(:batch AS JSONB)) e
+      ),
+      net AS (
+        SELECT
+          (SELECT CAST(CAST('x' || lpad(substr(r #>> '{}', 3), 16, '0') AS BIT(64)) AS BIGINT) FROM b WHERE id = 'chain') AS chain_id,
+          (SELECT CAST(CAST('x' || lpad(substr(r ->> 'baseFeePerGas', 3), 16, '0') AS BIT(64)) AS BIGINT) FROM b WHERE id = 'head') AS base_fee,
+          (SELECT CAST(CAST('x' || lpad(substr(r #>> '{}', 3), 16, '0') AS BIT(64)) AS BIGINT) FROM b WHERE id = 'tip') AS node_tip
+      ),
+      confirmed AS (
+        SELECT substr(id, 3) AS wallet, CAST(CAST('x' || lpad(substr(r #>> '{}', 3), 16, '0') AS BIT(64)) AS BIGINT) AS nonce
+        FROM b WHERE id LIKE 'n:%'
+      ),
+      pool AS (
+        SELECT lower(a.key) AS wallet, CAST(n.key AS BIGINT) AS nonce, n.value AS tx
+        FROM b, jsonb_each(b.r) sub, jsonb_each(sub.value) a, jsonb_each(a.value) n
+        WHERE b.id = 'pool'
+      ),
+      w AS (
+        SELECT c.wallet, c.nonce,
+               (SELECT tx FROM pool p WHERE p.wallet = c.wallet AND p.nonce = c.nonce) AS blocker,
+               (SELECT count(*) FROM pool p WHERE p.wallet = c.wallet AND p.nonce > c.nonce) AS behind
+        FROM confirmed c
+      ),
+      cls AS (
+        SELECT w.*, net.*,
+          CASE WHEN blocker IS NOT NULL THEN 'fee' WHEN behind > 0 THEN 'gap' ELSE 'ok' END AS kind,
+          CAST(CAST('x' || lpad(substr(coalesce(blocker ->> 'maxFeePerGas', blocker ->> 'gasPrice', '0x0'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS old_max,
+          CAST(CAST('x' || lpad(substr(coalesce(blocker ->> 'maxPriorityFeePerGas', blocker ->> 'gasPrice', '0x0'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS old_tip
+        FROM w, net
+      ),
+      fees AS (
+        SELECT cls.*,
+          greatest(ceil(old_tip * (1 + CAST(:bump AS NUMERIC) / 100)), CAST(:min_tip_gwei AS NUMERIC) * 1e9, node_tip) AS new_tip
+        FROM cls
+      ),
+      plan AS (
+        SELECT fees.*,
+          greatest(ceil(old_max * (1 + CAST(:bump AS NUMERIC) / 100)), 2 * base_fee + new_tip) AS new_max
+        FROM fees
+      ),
+      prev AS (SELECT * FROM stuck_tx_watch),
+      upsert AS (
+        INSERT INTO stuck_tx_watch AS s (chain_id, wallet, nonce, tx_hash, status)
+        SELECT chain_id, wallet, nonce, blocker ->> 'hash', kind FROM plan WHERE kind <> 'ok'
+        ON CONFLICT (chain_id, wallet) DO UPDATE SET
+          first_seen_at = CASE WHEN s.nonce = EXCLUDED.nonce THEN s.first_seen_at ELSE now() END,
+          reported = CASE WHEN s.nonce = EXCLUDED.nonce THEN s.reported ELSE false END,
+          proposed_at = CASE WHEN s.nonce = EXCLUDED.nonce THEN s.proposed_at ELSE NULL END,
+          nonce = EXCLUDED.nonce, tx_hash = EXCLUDED.tx_hash, status = EXCLUDED.status
+        RETURNING s.wallet, s.first_seen_at, s.reported, s.proposed_at
+      ),
+      cleared AS (
+        DELETE FROM stuck_tx_watch d USING plan p
+        WHERE d.chain_id = p.chain_id AND d.wallet = p.wallet AND p.kind = 'ok'
+        RETURNING d.wallet, d.nonce, d.reported
+      )
+      SELECT p.wallet, p.chain_id, p.kind, p.nonce, p.behind,
+             p.blocker ->> 'hash' AS tx_hash, p.blocker ->> 'to' AS tx_to, coalesce(p.blocker ->> 'value', '0x0') AS tx_value,
+             coalesce(p.blocker ->> 'input', '0x') AS tx_input, coalesce(p.blocker ->> 'gas', '0x5208') AS tx_gas,
+             CASE WHEN p.base_fee < 1000000 THEN p.base_fee || ' wei' ELSE round(p.base_fee / 1e9, 3) || ' gwei' END AS base_fee_text,
+             CASE WHEN p.old_max < 1000000 THEN p.old_max || ' wei' ELSE round(p.old_max / 1e9, 3) || ' gwei' END AS old_max_text,
+             round(p.new_max / 1e9, 3) AS new_max_gwei, round(p.new_tip / 1e9, 3) AS new_tip_gwei,
+             p.new_max > CAST(:max_fee_gwei AS NUMERIC) * 1e9 AS over_cap,
+             round(CAST(extract(epoch FROM now() - u.first_seen_at) / 60 AS NUMERIC), 1) AS waiting_minutes,
+             u.first_seen_at <= now() - make_interval(mins => CAST(:stuck_after AS INT)) AS stuck,
+             u.first_seen_at <= now() - make_interval(mins => CAST(:stuck_after AS INT)) AND NOT u.reported AS newly_stuck,
+             u.first_seen_at <= now() - make_interval(mins => CAST(:stuck_after AS INT))
+               AND (u.proposed_at IS NULL OR u.proposed_at <= now() - make_interval(mins => CAST(:ask_again AS INT)))
+               AND p.new_max <= CAST(:max_fee_gwei AS NUMERIC) * 1e9 AS propose,
+             false AS resolved
+      FROM plan p JOIN upsert u USING (wallet)
+      UNION ALL
+      SELECT c.wallet, NULL, 'ok', c.nonce, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, false, 0, false, false, false, c.reported
+      FROM cleared c
+      ORDER BY 1
+
+  - id: mark_reported
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ secret('POSTGRES_URL') }}"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    parameters:
+      wallets: "{{ outputs.analyze.rows | jq('[.[] | select(.newly_stuck) | .wallet] | join(\",\")') | first }}"
+    sql: UPDATE stuck_tx_watch SET reported = true WHERE wallet = ANY(string_to_array(:wallets, ','))
+
+  - id: report
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.analyze.rows | jq('[.[] | select(.newly_stuck or .resolved)] | length') | first > 0 }}"
+    then:
+      - id: notify_stuck
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {% for x in outputs.analyze.rows %}{% if x.resolved %}Wallet {{ x.wallet }} is moving again; nonce {{ x.nonce }} was confirmed.
+          {% elseif x.newly_stuck and x.kind == 'fee' %}STUCK: {{ x.wallet }} nonce {{ x.nonce }} has waited {{ x.waiting_minutes }} min with a max fee of {{ x.old_max_text }}; the base fee is {{ x.base_fee_text }}. {{ x.behind }} later transaction(s) are queued behind it. {{ inputs.explorer_url }}/tx/{{ x.tx_hash }}{% if x.over_cap %} A replacement would need {{ x.new_max_gwei }} gwei, above the {{ inputs.max_fee_gwei }} gwei cap: decide manually.{% endif %}
+          {% elseif x.newly_stuck and x.kind == 'gap' %}NONCE GAP: {{ x.wallet }} has {{ x.behind }} transaction(s) waiting, but nonce {{ x.nonce }} was never sent (or was dropped). Nothing can confirm until it is filled.
+          {% endif %}{% endfor %}
+
+  - id: propose
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.analyze.rows | jq('[.[] | select(.propose)] | length') | first > 0 }}"
+    then:
+      - id: mark_proposed
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ secret('POSTGRES_URL') }}"
+        username: "{{ secret('POSTGRES_USER') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        parameters:
+          wallets: "{{ outputs.analyze.rows | jq('[.[] | select(.propose) | .wallet] | join(\",\")') | first }}"
+        sql: UPDATE stuck_tx_watch SET proposed_at = now() WHERE wallet = ANY(string_to_array(:wallets, ','))
+
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          Stuck wallets can be unblocked:
+          {% for x in outputs.analyze.rows %}{% if x.propose %}- {{ x.wallet }} nonce {{ x.nonce }} ({{ x.kind == 'fee' ? 'max fee ' ~ x.old_max_text ~ ', base fee ' ~ x.base_fee_text : 'missing nonce' }}, {{ x.behind }} queued behind): replacement at max fee {{ x.new_max_gwei }} gwei, tip {{ x.new_tip_gwei }} gwei
+          {% endif %}{% endfor %}Choose within 1 hour: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+          - Speed up: resend the same transaction with higher fees (a nonce gap is filled with a 0-value transfer to the wallet itself)
+          - Cancel: replace it with a 0-value transfer to the wallet itself, so the payout does not happen
+          - Leave: do nothing
+
+      - id: wait_for_decision
+        type: io.kestra.plugin.core.flow.Pause
+        description: No answer within 1 hour means nothing is sent.
+        pauseDuration: PT1H
+        behavior: RESUME
+        onResume:
+          - id: action
+            type: SELECT
+            values:
+              - Speed up
+              - Cancel
+              - Leave
+            defaults: Leave
+          - id: only_wallets
+            type: STRING
+            required: false
+            description: Optional comma-separated subset of the proposed wallets. Empty means all of them.
+
+      - id: act
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.wait_for_decision.onResume.action != 'Leave' }}"
+        then:
+          - id: recheck
+            type: io.kestra.plugin.core.http.Request
+            description: Read the chain again; the transaction may have been mined, or fees may have moved, while waiting for the decision.
+            uri: "{{ secret('EVM_RPC_URL') }}"
+            method: POST
+            contentType: application/json
+            body: "{{ render(vars.state_batch) }}"
+
+          - id: plan_replacements
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Replace only wallets that were proposed and are still blocked at the same nonce, with fees from the fresh base fee.
+            url: "{{ secret('POSTGRES_URL') }}"
+            username: "{{ secret('POSTGRES_USER') }}"
+            password: "{{ secret('POSTGRES_PASSWORD') }}"
+            fetchType: FETCH
+            parameters:
+              batch: "{{ outputs.recheck.body }}"
+              proposed: "{{ outputs.analyze.rows | jq('[.[] | select(.propose) | \"\\(.wallet):\\(.nonce)\"] | join(\",\")') | first }}"
+              only: "{{ (outputs.wait_for_decision.onResume.only_wallets ?? '') | lower }}"
+              cancel: "{{ outputs.wait_for_decision.onResume.action == 'Cancel' }}"
+              bump: "{{ inputs.fee_bump_percent }}"
+              min_tip_gwei: "{{ inputs.min_priority_fee_gwei }}"
+              max_fee_gwei: "{{ inputs.max_fee_gwei }}"
+            sql: |
+              WITH b AS (
+                SELECT e ->> 'id' AS id, e -> 'result' AS r FROM jsonb_array_elements(CAST(:batch AS JSONB)) e
+              ),
+              net AS (
+                SELECT (SELECT CAST(CAST('x' || lpad(substr(r ->> 'baseFeePerGas', 3), 16, '0') AS BIT(64)) AS BIGINT) FROM b WHERE id = 'head') AS base_fee,
+                       (SELECT CAST(CAST('x' || lpad(substr(r #>> '{}', 3), 16, '0') AS BIT(64)) AS BIGINT) FROM b WHERE id = 'tip') AS node_tip
+              ),
+              proposed AS (
+                SELECT split_part(x, ':', 1) AS wallet, CAST(split_part(x, ':', 2) AS BIGINT) AS nonce
+                FROM unnest(string_to_array(:proposed, ',')) x
+                WHERE :only = '' OR split_part(x, ':', 1) = ANY(string_to_array(replace(:only, ' ', ''), ','))
+              ),
+              confirmed AS (
+                SELECT substr(id, 3) AS wallet, CAST(CAST('x' || lpad(substr(r #>> '{}', 3), 16, '0') AS BIT(64)) AS BIGINT) AS nonce
+                FROM b WHERE id LIKE 'n:%'
+              ),
+              pool AS (
+                SELECT lower(a.key) AS wallet, CAST(n.key AS BIGINT) AS nonce, n.value AS tx
+                FROM b, jsonb_each(b.r) sub, jsonb_each(sub.value) a, jsonb_each(a.value) n WHERE b.id = 'pool'
+              ),
+              cur AS (
+                SELECT p.wallet, p.nonce, c.nonce AS confirmed_nonce, pl.tx, net.*,
+                  CAST(CAST('x' || lpad(substr(coalesce(pl.tx ->> 'maxFeePerGas', pl.tx ->> 'gasPrice', '0x0'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS old_max,
+                  CAST(CAST('x' || lpad(substr(coalesce(pl.tx ->> 'maxPriorityFeePerGas', pl.tx ->> 'gasPrice', '0x0'), 3), 16, '0') AS BIT(64)) AS BIGINT) AS old_tip
+                FROM proposed p JOIN confirmed c USING (wallet) LEFT JOIN pool pl ON pl.wallet = p.wallet AND pl.nonce = p.nonce, net
+              ),
+              f AS (
+                SELECT cur.*, greatest(ceil(old_tip * (1 + CAST(:bump AS NUMERIC) / 100)), CAST(:min_tip_gwei AS NUMERIC) * 1e9, node_tip) AS new_tip FROM cur
+              ),
+              g AS (
+                SELECT f.*, greatest(ceil(old_max * (1 + CAST(:bump AS NUMERIC) / 100)), 2 * base_fee + new_tip) AS new_max FROM f
+              )
+              SELECT wallet, nonce, tx ->> 'hash' AS old_hash,
+                CASE WHEN confirmed_nonce > nonce THEN 'skip: confirmed on its own while waiting'
+                     WHEN new_max > CAST(:max_fee_gwei AS NUMERIC) * 1e9 THEN 'skip: needs ' || round(new_max / 1e9, 3) || ' gwei, above the cap'
+                     ELSE 'send' END AS action,
+                CASE WHEN tx IS NULL THEN 'fill nonce gap' WHEN CAST(:cancel AS BOOLEAN) THEN 'cancel' ELSE 'speed up' END AS mode,
+                CASE WHEN CAST(:cancel AS BOOLEAN) OR tx IS NULL THEN wallet ELSE tx ->> 'to' END AS to_address,
+                CASE WHEN CAST(:cancel AS BOOLEAN) OR tx IS NULL THEN '0x0' ELSE coalesce(tx ->> 'value', '0x0') END AS value,
+                CASE WHEN CAST(:cancel AS BOOLEAN) OR tx IS NULL THEN '0x' ELSE coalesce(tx ->> 'input', '0x') END AS data,
+                CASE WHEN CAST(:cancel AS BOOLEAN) OR tx IS NULL THEN '0x5208' ELSE coalesce(tx ->> 'gas', '0x5208') END AS gas,
+                '0x' || to_hex(nonce) AS nonce_hex,
+                '0x' || to_hex(CAST(new_max AS BIGINT)) AS max_fee_hex, '0x' || to_hex(CAST(new_tip AS BIGINT)) AS tip_hex,
+                round(new_max / 1e9, 3) AS max_fee_gwei
+              FROM g
+              ORDER BY wallet
+
+          - id: replace
+            type: io.kestra.plugin.core.flow.Loop
+            description: One replacement per wallet, each isolated so a rejected one does not stop the others.
+            values: "{{ outputs.plan_replacements.rows | jq('[.[] | select(.action == \"send\")]') | first | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {{ fromJson(item.value).wallet }} nonce {{ fromJson(item.value).nonce }} ({{ fromJson(item.value).mode }} at {{ fromJson(item.value).max_fee_gwei }} gwei):
+                  {% if outputs.record_outcome is defined %}{{ (outputs.await_confirmation.body | jq('[.[] | select(.id == "new") | .result != null] | first') | first) ? 'replacement mined in ' ~ (outputs.send_replacement.body | jq('.result') | first) : 'the original transaction was mined first, the replacement was discarded' }}{% elseif outputs.send_replacement is defined and (outputs.send_replacement.body | jq('.error.message // ""') | first) != '' %}NOT sent, the node or signer refused: {{ outputs.send_replacement.body | jq('.error.message') | first }}{% else %}NOT confirmed, see the execution logs{% endif %}
+            tasks:
+              - id: replacement
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: send_replacement
+                    type: io.kestra.plugin.core.http.Request
+                    uri: "{{ secret('EVM_SIGNER_URL') }}"
+                    method: POST
+                    contentType: application/json
+                    options:
+                      allowFailed: true
+                    body: >-
+                      {{ {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_sendTransaction', 'params': [{
+                        'from': fromJson(item.value).wallet, 'to': fromJson(item.value).to_address,
+                        'value': fromJson(item.value).value, 'data': fromJson(item.value).data, 'gas': fromJson(item.value).gas,
+                        'nonce': fromJson(item.value).nonce_hex, 'maxFeePerGas': fromJson(item.value).max_fee_hex,
+                        'maxPriorityFeePerGas': fromJson(item.value).tip_hex}]} | toJson }}
+
+                  - id: sent_ok
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ (outputs.send_replacement.body | jq('.error.message // \"\"') | first) != '' }}"
+                    then:
+                      - id: refused
+                        type: io.kestra.plugin.core.execution.Fail
+                        errorMessage: "Replacement for {{ fromJson(item.value).wallet }} nonce {{ fromJson(item.value).nonce }} was refused: {{ outputs.send_replacement.body | jq('.error.message') | first }}"
+
+                  - id: wait_for_nonce
+                    type: io.kestra.plugin.core.flow.LoopUntil
+                    description: Either the replacement or the original can win the race; stop when one of them has a receipt.
+                    condition: "{{ outputs.await_confirmation.body | jq('[.[] | .result | select(. != null)] | length') | first > 0 }}"
+                    checkFrequency:
+                      interval: PT3S
+                      maxIterations: 200
+                    failOnMaxReached: true
+                    tasks:
+                      - id: await_confirmation
+                        type: io.kestra.plugin.core.http.Request
+                        uri: "{{ secret('EVM_RPC_URL') }}"
+                        method: POST
+                        contentType: application/json
+                        body: >-
+                          {{ [{'jsonrpc': '2.0', 'id': 'new', 'method': 'eth_getTransactionReceipt', 'params': [outputs.send_replacement.body | jq('.result') | first]},
+                              {'jsonrpc': '2.0', 'id': 'old', 'method': 'eth_getTransactionReceipt', 'params': [fromJson(item.value).old_hash ?? '0x0000000000000000000000000000000000000000000000000000000000000000']}] | toJson }}
+
+                  - id: record_outcome
+                    type: io.kestra.plugin.jdbc.postgresql.Query
+                    url: "{{ secret('POSTGRES_URL') }}"
+                    username: "{{ secret('POSTGRES_USER') }}"
+                    password: "{{ secret('POSTGRES_PASSWORD') }}"
+                    parameters:
+                      wallet: "{{ fromJson(item.value).wallet }}"
+                      nonce: "{{ fromJson(item.value).nonce }}"
+                    sql: UPDATE stuck_tx_watch SET status = 'replaced' WHERE wallet = :wallet AND nonce = CAST(:nonce AS BIGINT)
+
+          - id: notify_outcome
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: |
+              {{ outputs.wait_for_decision.onResume.action }} results:
+              {% for r in outputs.replace.outputs ?? [] %}- {{ r.outputs.result }}
+              {% endfor %}{% for r in outputs.plan_replacements.rows %}{% if r.action != 'send' %}- {{ r.wallet }} nonce {{ r.nonce }}: {{ r.action }}
+              {% endif %}{% endfor %}
+
+          - id: any_failed
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.replace.outputs ?? []) | jq('[.[] | select(.outputs.result | contains(\"NOT \"))] | length') | first > 0 }}"
+            then:
+              - id: partial
+                type: io.kestra.plugin.core.execution.Exit
+                state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Stuck transaction check failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      No replacement was sent unless a result was posted.
+
+outputs:
+  - id: wallets
+    type: JSON
+    description: Every watched wallet with its next nonce, whether it is blocked, and the proposed replacement fees.
+    value: "{{ outputs.analyze.rows ?? [] }}"
+
+extend:
+  title: Unblock Stuck EVM Transactions from Your Hot Wallets
+  shortDescription: Detect transactions stuck below the base fee or behind a missing nonce, then speed them up, cancel them, or fill the gap after on-call approval, and report which transaction was mined.
+  metaTitle: EVM Stuck Transaction Rescuer with Kestra
+  metaDescription: Find hot-wallet transactions stuck in the mempool or behind a nonce gap, and replace them safely after on-call approval.
+  description: |
+    Every transaction from an Ethereum account has a nonce, and the network processes them strictly in order. When fees rise after a payout was sent with a low max fee, or when a nonce is skipped because a service crashed between reserving and sending it, that one transaction blocks every later one. Withdrawals pile up and nothing confirms until someone notices and sends a replacement with the right nonce and higher fees. This blueprint watches your hot wallets, spots the blocking nonce, and turns the fix into a one-click decision for on-call.
+
+    ## How it works
+
+    1. `payout_stalled` (`Webhook`) runs a check when your payout service sees a transaction that has not confirmed in time. `periodic_check` (`Schedule`) runs it regularly.
+    2. `read_state` reads, in one JSON-RPC batch:
+       - the chain id
+       - the current base fee and the node's suggested tip
+       - the mempool (`txpool_content`)
+       - each wallet's confirmed nonce
+    3. `analyze` (Postgres) looks at each wallet's next nonce and classifies it:
+       - **fee-stuck:** the transaction at that nonce cannot pay the base fee
+       - **nonce gap:** later transactions are waiting but the nonce itself was never sent
+       - **ok**
+       It also computes replacement fees: the old fees raised by `fee_bump_percent`, at least twice the base fee plus the tip, and never above `max_fee_gwei`. It tracks each problem between runs.
+    4. `report` alerts once when a wallet has been blocked for `stuck_after_minutes`, and again when it moves.
+    5. `propose` asks on-call to choose Speed up, Cancel, or Leave (`Pause`, 1 hour, no answer means Leave).
+    6. `act` re-reads the chain, then `replace` (`Loop`) sends each replacement through your signer with the same nonce. It waits until either the replacement or the original has a receipt, and reports which one was mined.
+
+    ## Error handling
+
+    - **Decisions never act on stale data:**
+      - the chain is read again after the approval;
+      - a wallet that was unblocked in the meantime, for example by someone using "speed up" in their wallet app, is skipped with "confirmed on its own while waiting";
+      - fees are recomputed from the fresh base fee.
+    - **Your fee cap is respected.** A replacement above `max_fee_gwei` is not proposed; Slack says what it would cost so you can decide manually.
+    - **Races are reported correctly.** If the original transaction wins after all, the summary says so instead of claiming the replacement worked.
+    - **One failure does not block the others.** Each replacement runs in its own block with `allowFailure`. A wallet the signer cannot sign for is reported as "NOT sent, the node or signer refused: unknown account", and the run ends as `WARNING`.
+    - **No alert storms.** A blocked wallet is reported once and proposed again only after `ask_again_minutes`.
+    - **Clear failures:**
+      - malformed addresses are rejected before any RPC call;
+      - a node without the txpool API fails with instructions;
+      - RPC calls retry with backoff, and the `errors` alert names the task and cause.
+
+    ## What this blueprint teaches about Kestra
+
+    - Flow `variables` holding a templated JSON-RPC batch, rendered with `render()` and reused before and after the approval.
+    - Decision then re-check: a `Pause` followed by a fresh read, so human approval is applied to the current state.
+    - `LoopUntil` to wait for an on-chain outcome where either of two transactions can win.
+    - Per-item isolation in a `Loop` with `Sequential` + `allowFailure`, summarized through loop `outputs`.
+
+    ## Prerequisites
+
+    - An RPC endpoint with the `txpool` API: your own geth, reth, Nethermind, or Erigon node, or a provider plan that exposes it.
+    - A signer that accepts `eth_sendTransaction` for the hot wallets, such as Web3Signer or a KMS-backed relayer, on a private network. Kestra never holds the keys.
+    - A Postgres database and a Slack incoming webhook.
+
+    ### Secrets
+
+    - `EVM_RPC_URL`: JSON-RPC endpoint with the txpool API.
+    - `EVM_SIGNER_URL`: signer endpoint for the hot wallets.
+    - `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: state database.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook.
+
+    ### Inputs
+
+    - `wallets` (ARRAY): hot wallets to watch. Replace the placeholder.
+    - `stuck_after_minutes` (INT, default 10), `ask_again_minutes` (INT, default 30).
+    - `min_priority_fee_gwei` (FLOAT, default 2), `fee_bump_percent` (INT, default 15), `max_fee_gwei` (FLOAT, default 200).
+    - `explorer_url`, `kestra_url` (STRING): links in Slack.
+
+    ### Outputs
+
+    - `wallets` (JSON): each blocked wallet with its nonce, waiting time, queued transactions, and proposed fees.
+
+    ## Quick start
+
+    1. Add the secrets and set `wallets` and `max_fee_gwei`.
+    2. Run the flow once to create the `stuck_tx_watch` table.
+    3. Enable `periodic_check`, and call `payout_stalled` from your payout service when a transaction is late.
+    4. Rehearse on a testnet: send a transaction with a max fee below the base fee and approve a speed-up.
+
+    ## How to extend
+
+    - Skip the approval for small amounts by sending replacements directly when the stuck value is below a threshold.
+    - Page through PagerDuty when a wallet is blocked and above the fee cap.
+    - Feed the confirmed replacement hash back to your payout service through a webhook, so it records the right transaction.
+
+    ## Links
+
+    - [EIP-1559 fee market](https://eips.ethereum.org/EIPS/eip-1559)
+    - [txpool_content](https://geth.ethereum.org/docs/interacting-with-geth/rpc/ns-txpool)
+    - [Kestra Pause task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.pause)
+    - [Kestra LoopUntil task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil)
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack)
+
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Business
+    - Infrastructure
+  subTags:
+    - Incident Response
+    - Approval Gates
+  ee: false
+  demo: false

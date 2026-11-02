@@ -1,0 +1,506 @@
+id: receivables-dunning-credit-hold-ecl
+namespace: company.team
+
+description: |
+  Accounts receivable control run: age every open invoice, send each overdue customer one
+  consolidated reminder at the right escalation level (never twice inside the cooldown, never
+  for a disputed invoice), put customers on or off credit hold, and at month end compute the
+  IFRS 9 expected credit loss allowance with a provision matrix and post the adjustment.
+
+inputs:
+  - id: as_of
+    type: STRING
+    displayName: As of (YYYY-MM-DD)
+    defaults: "2026-09-30"
+    validator: ^\d{4}-\d{2}-\d{2}$
+
+  - id: scenario
+    type: SELECT
+    displayName: Demo scenario
+    description: ISSUES adds a payment applied twice, a duplicate invoice number and an invoice for an unknown customer, which must stop the run before any letter goes out.
+    values:
+      - CLEAN
+      - ISSUES
+    defaults: CLEAN
+
+  - id: cooldown_days
+    type: INT
+    displayName: Cooldown (days)
+    description: Minimum days between two letters to the same customer.
+    defaults: 7
+
+  - id: min_balance
+    type: FLOAT
+    displayName: Minimum overdue balance
+    description: Customers owing less than this overdue are not chased.
+    defaults: 50.0
+
+  - id: loss_rates
+    type: JSON
+    displayName: Provision matrix
+    description: Expected loss rate per aging bucket, from your historical roll rates adjusted for the outlook (IFRS 9.5.5.15 simplified approach).
+    defaults: |
+      {"Current": 0.005, "1-30": 0.015, "31-60": 0.04, "61-90": 0.10, "91-120": 0.25, "120+": 0.60}
+
+  - id: approved_by
+    type: STRING
+    displayName: Approved by
+    description: Required to hand customers over to collections (level 4) and to post an allowance change above 10,000.
+    defaults: ""
+
+variables:
+  state_key: receivables_control
+  pack_dir: "receivables/{{ inputs.as_of }}"
+
+concurrency:
+  limit: 1
+
+triggers:
+  - id: weekdays
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Every weekday morning. The allowance is only computed on the last day of a month. Disabled until the data sources are wired in.
+    cron: "0 7 * * 1-5"
+    disabled: true
+    inputs:
+      as_of: "{{ trigger.date | date('yyyy-MM-dd') }}"
+
+tasks:
+  - id: state
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Letters already sent, holds in place and the allowance booked so far.
+    values:
+      s: "{{ kv(vars.state_key, errorOnMissing=false) ?? {'letters': {}, 'holds': [], 'allowance': 0, 'last_run': ''} | toJson }}"
+      last_run: "{{ (kv(vars.state_key, errorOnMissing=false) ?? {'last_run': ''}) | jq('.last_run') | first }}"
+      month_end: "{{ (inputs.as_of | date('yyyy-MM-dd') | dateAdd(1, 'DAYS') | date('dd')) == '01' }}"
+
+  - id: order_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Runs move forward in time. A run dated before the last one would re-send letters.
+    condition: "{{ outputs.state.values.last_run != '' and inputs.as_of < outputs.state.values.last_run }}"
+    then:
+      - id: out_of_order
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "As of {{ inputs.as_of }} is before the last run ({{ outputs.state.values.last_run }})."
+
+  - id: control
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: >
+      One DuckDB session: customers, invoices, payments and disputes (demo generator or your
+      exports), open balances, aging, dunning decisions, credit holds, the provision matrix
+      and the letters.
+    outputFiles:
+      - aging
+      - letters
+      - holds
+      - provision
+      - journal
+      - blockers
+    fetchType: FETCH_ONE
+    sql: |
+      SET VARIABLE as_of = DATE '{{ inputs.as_of }}';
+
+      -- =======================================================================
+      -- Demo data. Replace with your ERP or billing exports.
+      -- =======================================================================
+      CREATE TABLE customers AS
+      SELECT 'CU-' || lpad(i::VARCHAR, 3, '0') AS customer_id,
+             ['Arcadia Foods', 'Bluefin Retail', 'Cobalt Health', 'Dune Logistics', 'Elm Street Cafe', 'Fjord Marine', 'Granite Build', 'Harbor Pharma',
+              'Iris Studios', 'Juniper Farms', 'Kite Analytics', 'Lumen Schools', 'Maple Clinics', 'Nova Telecom', 'Orchid Hotels', 'Pine Robotics',
+              'Quarry Metals', 'Raven Media', 'Saffron Kitchens', 'Tidal Energy', 'Umber Textiles', 'Vale Motors', 'Willow Dental', 'Xeno Labs',
+              'Yarrow Gardens', 'Zephyr Air', 'Atlas Print', 'Birch Legal', 'Cedar Homes', 'Delta Freight'][i] AS name,
+             'ap' || i || '@customer.example' AS email,
+             [15, 30, 30, 45, 60][1 + i % 5] AS terms_days,
+             (20000 + (i * 7919) % 80000)::DECIMAL(14, 2) AS credit_limit,
+             i IN (4, 22) AS dunning_paused
+      FROM range(1, 31) t(i);
+
+      -- Invoices from March. Most customers pay around their due date, a few are chronically late,
+      -- and two stopped paying in July.
+      CREATE TABLE invoices AS
+      SELECT 'INV-' || (60000 + n) AS invoice, 'CU-' || lpad((1 + n % 30)::VARCHAR, 3, '0') AS customer_id,
+             DATE '2026-03-01' + ((n * 13) % 214)::INT AS issued_on,
+             (300 + (n * 6007) % 9700 + ((n * 37) % 100) / 100.0)::DECIMAL(14, 2) AS amount
+      FROM range(1, 601) t(n)
+      {% if inputs.scenario == 'ISSUES' %}
+      UNION ALL SELECT 'INV-60010', 'CU-011', DATE '2026-09-02', 1250.00
+      UNION ALL SELECT 'INV-69999', 'CU-077', DATE '2026-09-05', 4800.00
+      {% endif %};
+
+      -- One invoice in seventeen is paid in two halves, thirty days apart.
+      CREATE TABLE payments AS
+      WITH due AS (
+        SELECT i.invoice, i.customer_id, i.amount,
+               (i.issued_on + c.terms_days + CASE
+                  WHEN c.customer_id IN ('CU-007', 'CU-018') THEN 45 + (hash(i.invoice) % 40)::INT
+                  WHEN c.customer_id IN ('CU-004', 'CU-013', 'CU-027') THEN 20 + (hash(i.invoice) % 30)::INT
+                  ELSE (hash(i.invoice) % 15)::INT - 5 END)::DATE AS paid_on,
+               hash(i.invoice) % 17 = 0 AS split
+        FROM invoices i JOIN customers c USING (customer_id)
+        WHERE NOT (c.customer_id IN ('CU-024', 'CU-029') AND i.issued_on >= DATE '2026-07-01')
+      )
+      SELECT 'PAY-' || invoice AS payment, invoice, customer_id, paid_on,
+             CASE WHEN split THEN round(amount * 0.5, 2) ELSE amount END::DECIMAL(14, 2) AS amount FROM due
+      UNION ALL
+      SELECT 'PAY2-' || invoice, invoice, customer_id, paid_on + 30, (amount - round(amount * 0.5, 2))::DECIMAL(14, 2) FROM due WHERE split
+      {% if inputs.scenario == 'ISSUES' %}
+      UNION ALL SELECT 'PAY-DUP', 'INV-60100', 'CU-011', DATE '2026-09-10', (SELECT amount FROM invoices WHERE invoice = 'INV-60100')
+      {% endif %};
+
+      -- Cash received without a remittance advice, not yet applied.
+      CREATE TABLE unapplied_cash (customer_id VARCHAR, amount DECIMAL(14, 2), received_on DATE);
+      INSERT INTO unapplied_cash VALUES ('CU-027', 25000.00, DATE '2026-09-25');
+
+      CREATE TABLE disputes (invoice VARCHAR, reason VARCHAR, opened_on DATE);
+      INSERT INTO disputes VALUES ('INV-60127', 'Short shipment, 3 cases missing', DATE '2026-08-20'),
+                                  ('INV-60457', 'Price does not match the contract', DATE '2026-09-12');
+
+      -- =======================================================================
+      -- Open items as of the run date.
+      -- =======================================================================
+      CREATE TABLE open_items AS
+      SELECT i.invoice, i.customer_id, c.name, i.issued_on, (i.issued_on + c.terms_days)::DATE AS due_on, i.amount,
+             coalesce((SELECT sum(p.amount) FROM payments p WHERE p.invoice = i.invoice AND p.paid_on <= getvariable('as_of')), 0) AS paid,
+             d.reason AS dispute
+      FROM invoices i LEFT JOIN customers c USING (customer_id) LEFT JOIN disputes d USING (invoice)
+      WHERE i.issued_on <= getvariable('as_of');
+      ALTER TABLE open_items ADD COLUMN open_amount DECIMAL(14, 2);
+      ALTER TABLE open_items ADD COLUMN days_past_due INT;
+      ALTER TABLE open_items ADD COLUMN bucket VARCHAR;
+      UPDATE open_items SET open_amount = amount - paid, days_past_due = greatest(date_diff('day', due_on, getvariable('as_of')), 0);
+      UPDATE open_items SET bucket = CASE WHEN days_past_due = 0 THEN 'Current' WHEN days_past_due <= 30 THEN '1-30' WHEN days_past_due <= 60 THEN '31-60'
+                                          WHEN days_past_due <= 90 THEN '61-90' WHEN days_past_due <= 120 THEN '91-120' ELSE '120+' END;
+
+      CREATE TABLE blockers AS
+      SELECT 'OVERPAID' AS code, invoice AS ref, 'Paid ' || paid || ' against ' || amount || '. A payment is applied twice or to the wrong invoice' AS detail FROM open_items WHERE open_amount < 0
+      UNION ALL SELECT 'UNKNOWN_CUSTOMER', invoice, 'Customer ' || customer_id || ' is not in the customer master' FROM open_items WHERE name IS NULL
+      UNION ALL SELECT 'DUPLICATE_INVOICE', invoice, count(*) || ' invoices with this number' FROM invoices GROUP BY invoice HAVING count(*) > 1;
+
+      CREATE TABLE aging AS
+      SELECT o.customer_id, any_value(o.name) AS name,
+             sum(open_amount) FILTER (WHERE bucket = 'Current') AS "Current",
+             sum(open_amount) FILTER (WHERE bucket = '1-30') AS "1-30",
+             sum(open_amount) FILTER (WHERE bucket = '31-60') AS "31-60",
+             sum(open_amount) FILTER (WHERE bucket = '61-90') AS "61-90",
+             sum(open_amount) FILTER (WHERE bucket = '91-120') AS "91-120",
+             sum(open_amount) FILTER (WHERE bucket = '120+') AS "120+",
+             sum(open_amount) AS total, max(days_past_due) AS oldest_dpd
+      FROM open_items o WHERE open_amount > 0 GROUP BY o.customer_id ORDER BY total DESC;
+
+      -- =======================================================================
+      -- Dunning. Level by days past due; one letter per customer at the highest level
+      -- owed; never a lower or equal level than last time for the same invoice; never
+      -- inside the cooldown; never for a disputed invoice or a paused customer.
+      -- =======================================================================
+      CREATE TABLE sent AS
+      SELECT key AS invoice, (value ->> 'level')::INT AS last_level, (value ->> 'sent_on')::DATE AS sent_on
+      FROM json_each('{{ outputs.state.values.s | jq(".letters") | first | toJson }}');
+
+      CREATE TABLE candidates AS
+      SELECT o.*, c.email, c.dunning_paused,
+             CASE WHEN o.days_past_due >= 60 THEN 4 WHEN o.days_past_due >= 30 THEN 3 WHEN o.days_past_due >= 15 THEN 2 WHEN o.days_past_due >= 3 THEN 1 ELSE 0 END AS level_due,
+             coalesce(s.last_level, 0) AS last_level, s.sent_on
+      FROM open_items o JOIN customers c USING (customer_id) LEFT JOIN sent s USING (invoice)
+      WHERE o.open_amount > 0;
+
+      CREATE TABLE customer_decision AS
+      WITH c AS (
+        SELECT customer_id, any_value(name) AS name, any_value(email) AS email, bool_or(dunning_paused) AS paused,
+               sum(open_amount) FILTER (WHERE level_due > 0 AND dispute IS NULL) AS overdue,
+               max(level_due) FILTER (WHERE dispute IS NULL) AS level,
+               bool_or(level_due > last_level AND dispute IS NULL AND level_due > 0) AS escalates,
+               max(sent_on) AS last_letter_on,
+               count(*) FILTER (WHERE dispute IS NOT NULL AND level_due > 0) AS disputed
+        FROM candidates GROUP BY customer_id
+      )
+      SELECT c.*, coalesce(u.unapplied, 0) AS unapplied,
+             CASE WHEN coalesce(c.overdue, 0) = 0 THEN 'NOTHING_OVERDUE'
+                  WHEN c.paused THEN 'SKIP_PAUSED'
+                  WHEN c.overdue < {{ inputs.min_balance }} THEN 'SKIP_SMALL'
+                  WHEN coalesce(u.unapplied, 0) >= c.overdue THEN 'APPLY_CASH_FIRST'
+                  WHEN NOT c.escalates THEN 'ALREADY_AT_LEVEL'
+                  WHEN c.last_letter_on IS NOT NULL AND date_diff('day', c.last_letter_on, getvariable('as_of')) < {{ inputs.cooldown_days }} THEN 'COOLDOWN'
+                  WHEN c.level = 4 AND '{{ inputs.approved_by }}' = '' THEN 'HANDOVER_NEEDS_APPROVAL'
+                  ELSE 'SEND' END AS decision
+      FROM c LEFT JOIN (SELECT customer_id, sum(amount) AS unapplied FROM unapplied_cash WHERE received_on <= getvariable('as_of') GROUP BY customer_id) u USING (customer_id);
+
+      CREATE TABLE letters AS
+      SELECT d.customer_id, d.name, d.email, d.level,
+             ['Friendly reminder', 'Second reminder', 'Final notice', 'Handover to collections'][d.level] AS letter_type,
+             d.overdue, count(*) AS invoices,
+             string_agg(c.invoice || ' due ' || c.due_on || ', ' || c.open_amount || ' (' || c.days_past_due || ' days)', '; ' ORDER BY c.due_on) AS invoice_list,
+             list(c.invoice) AS invoice_ids
+      FROM customer_decision d JOIN candidates c USING (customer_id)
+      WHERE d.decision = 'SEND' AND c.level_due > 0 AND c.dispute IS NULL
+      GROUP BY ALL ORDER BY d.level DESC, d.overdue DESC;
+
+      -- The letters themselves. Tone escalates with the level.
+      CREATE TABLE letter_text AS
+      SELECT customer_id, level,
+             '## ' || letter_type || ': ' || name || chr(10) || chr(10) ||
+             'To: ' || email || chr(10) || 'Subject: ' ||
+             CASE level WHEN 1 THEN 'A quick reminder about your open invoices'
+                        WHEN 2 THEN 'Second reminder: ' || overdue || ' overdue'
+                        WHEN 3 THEN 'Final notice before collection: ' || overdue || ' overdue'
+                        ELSE 'Your account has been passed to collections' END || chr(10) || chr(10) ||
+             CASE level WHEN 1 THEN 'Hello, our records show the invoices below as unpaid. If you have already paid, thank you and please ignore this message.'
+                        WHEN 2 THEN 'Hello, we wrote last week about the invoices below and have not received payment. Please pay or tell us if something is wrong with them.'
+                        WHEN 3 THEN 'The invoices below are more than 30 days overdue. Please pay within 7 days. After that we will pass the account to our collections partner and hold new orders.'
+                        ELSE 'The invoices below are more than 60 days overdue and your account has been passed to our collections partner. New orders are on hold.' END ||
+             chr(10) || chr(10) || '- ' || replace(invoice_list, '; ', chr(10) || '- ') || chr(10) || chr(10) || 'Total overdue: ' || overdue || chr(10) AS body
+      FROM letters;
+
+      -- =======================================================================
+      -- Credit hold: over the limit, or anything undisputed beyond 60 days.
+      -- =======================================================================
+      CREATE TABLE holds AS
+      SELECT c.customer_id, c.name, c.credit_limit, coalesce(a.total, 0) AS exposure, coalesce(a.oldest_dpd, 0) AS oldest_dpd,
+             CASE WHEN coalesce(a.total, 0) > c.credit_limit THEN 'over credit limit'
+                  WHEN EXISTS (SELECT 1 FROM open_items o WHERE o.customer_id = c.customer_id AND o.open_amount > 0 AND o.days_past_due > 60 AND o.dispute IS NULL) THEN 'invoice over 60 days'
+             END AS reason,
+             c.customer_id IN (SELECT unnest(from_json('{{ outputs.state.values.s | jq(".holds") | first | toJson }}', '["VARCHAR"]'))) AS was_on_hold
+      FROM customers c LEFT JOIN aging a USING (customer_id);
+
+      -- =======================================================================
+      -- Expected credit loss, simplified approach: loss rate by bucket on undisputed
+      -- balances; disputed balances are provided at the 61-90 rate until resolved.
+      -- =======================================================================
+      CREATE TABLE matrix AS
+      SELECT key AS bucket, value::DOUBLE AS loss_rate FROM json_each('{{ inputs.loss_rates | toJson }}');
+      CREATE TABLE provision AS
+      SELECT * FROM (
+        SELECT o.bucket || CASE WHEN o.dispute IS NOT NULL THEN ' (disputed)' ELSE '' END AS bucket,
+               count(*) AS invoices, sum(o.open_amount) AS balance, m.loss_rate,
+               round(sum(o.open_amount) * m.loss_rate, 2)::DECIMAL(14, 2) AS expected_loss
+        FROM open_items o JOIN matrix m ON m.bucket = CASE WHEN o.dispute IS NOT NULL AND o.bucket IN ('Current', '1-30', '31-60') THEN '61-90' ELSE o.bucket END
+        WHERE o.open_amount > 0 GROUP BY 1, m.loss_rate
+      ) ORDER BY array_position(['Current', '1-30', '31-60', '61-90', '91-120', '120+'], split_part(bucket, ' ', 1)), bucket;
+
+      CREATE TABLE journal AS
+      WITH x AS (SELECT (SELECT sum(expected_loss) FROM provision) - {{ outputs.state.values.s | jq(".allowance") | first }} AS change)
+      SELECT * FROM (
+        SELECT 1 AS line, DATE '{{ inputs.as_of }}' AS posting_date, '6950' AS account, 'Expected credit loss expense' AS account_name,
+               greatest(change, 0)::DECIMAL(14, 2) AS debit, greatest(-change, 0)::DECIMAL(14, 2) AS credit, 'ECL allowance adjustment' AS memo FROM x
+        UNION ALL
+        SELECT 2, DATE '{{ inputs.as_of }}', '1290', 'Allowance for expected credit losses',
+               greatest(-change, 0)::DECIMAL(14, 2), greatest(change, 0)::DECIMAL(14, 2), 'ECL allowance adjustment' FROM x
+      ) WHERE {{ outputs.state.values.month_end }} AND (debit <> 0 OR credit <> 0);
+
+      COPY aging TO '{{ outputFiles.aging }}' (HEADER, DELIMITER ',');
+      COPY (SELECT customer_id, name, email, level, letter_type, overdue, invoices, invoice_list FROM letters) TO '{{ outputFiles.letters }}' (HEADER, DELIMITER ',');
+      COPY (SELECT *, CASE WHEN reason IS NOT NULL AND NOT was_on_hold THEN 'NEW_HOLD' WHEN reason IS NULL AND was_on_hold THEN 'RELEASE' WHEN reason IS NOT NULL THEN 'STAYS_ON_HOLD' END AS action
+            FROM holds WHERE reason IS NOT NULL OR was_on_hold ORDER BY action, exposure DESC) TO '{{ outputFiles.holds }}' (HEADER, DELIMITER ',');
+      COPY provision TO '{{ outputFiles.provision }}' (HEADER, DELIMITER ',');
+      COPY journal TO '{{ outputFiles.journal }}' (HEADER, DELIMITER ',');
+      COPY blockers TO '{{ outputFiles.blockers }}' (HEADER, DELIMITER ',');
+
+      SELECT
+        (SELECT count(*) FROM open_items WHERE open_amount > 0) AS open_invoices,
+        (SELECT sum(open_amount) FROM open_items WHERE open_amount > 0) AS open_ar,
+        (SELECT string_agg(bucket || ' ' || balance, ', ') FROM provision) AS aging_detail,
+        -- Days sales outstanding, countback over the last 90 days of sales.
+        round((SELECT sum(open_amount) FROM open_items WHERE open_amount > 0)
+              / (SELECT sum(amount) FROM invoices WHERE issued_on > getvariable('as_of') - 90 AND issued_on <= getvariable('as_of')) * 90, 1) AS dso,
+        (SELECT count(*) FROM letters) AS letters,
+        (SELECT coalesce(string_agg(body, chr(10) || '---' || chr(10) || chr(10) ORDER BY level DESC, customer_id), 'No letters in this run.') FROM letter_text) AS letters_markdown,
+        (SELECT coalesce(string_agg('L' || level || ' ' || name || ' ' || overdue, ', ' ORDER BY level DESC, overdue DESC), '') FROM letters) AS letter_detail,
+        (SELECT coalesce(json_group_object(decision, n)::VARCHAR, '{}') FROM (SELECT decision, count(*) AS n FROM customer_decision GROUP BY decision)) AS decisions,
+        (SELECT coalesce(string_agg(name, ', '), '') FROM customer_decision WHERE decision = 'HANDOVER_NEEDS_APPROVAL') AS handover_waiting,
+        (SELECT json_group_object(i.invoice, json_object('level', l.level, 'sent_on', '{{ inputs.as_of }}'))::VARCHAR
+           FROM letters l, unnest(l.invoice_ids) AS i(invoice)) AS new_letters,
+        (SELECT coalesce(json_group_array(customer_id)::VARCHAR, '[]') FROM holds WHERE reason IS NOT NULL) AS holds,
+        (SELECT coalesce(string_agg(name || ' (' || reason || ')', ', '), '') FROM holds WHERE reason IS NOT NULL AND NOT was_on_hold) AS new_holds,
+        (SELECT coalesce(string_agg(name, ', '), '') FROM holds WHERE reason IS NULL AND was_on_hold) AS releases,
+        (SELECT sum(expected_loss) FROM provision) AS allowance_required,
+        {{ outputs.state.values.s | jq(".allowance") | first }} AS allowance_booked,
+        (SELECT sum(expected_loss) FROM provision) - {{ outputs.state.values.s | jq(".allowance") | first }} AS allowance_change,
+        (SELECT count(*) FROM blockers) AS blockers,
+        (SELECT coalesce(string_agg(code || ' ' || ref || ': ' || detail, '; ' ORDER BY code, ref), '') FROM blockers) AS blocker_detail;
+
+  - id: result
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      r: "{{ (outputs.control.outputs | last).row | toJson }}"
+
+  - id: log_run
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Receivables as of {{ inputs.as_of }} ({{ inputs.scenario }}){{ outputs.state.values.month_end == 'true' ? ', month end' : '' }}.
+      {{ outputs.result.values.r | jq('"\(.open_invoices) open invoices, \(.open_ar) open. Aging: \(.aging_detail). DSO \(.dso) days."') | first }}
+      {{ outputs.result.values.r | jq('"Letters: \(.letters). \(.letter_detail)"') | first }}
+      {{ outputs.result.values.r | jq('"Customer decisions: \(.decisions). Handover waiting for approval: \(.handover_waiting)"') | first }}
+      {{ outputs.result.values.r | jq('"New credit holds: \(.new_holds). Released: \(.releases)."') | first }}
+      {{ outputs.result.values.r | jq('"Allowance required \(.allowance_required), booked \(.allowance_booked), change \(.allowance_change)."') | first }}{{ outputs.state.values.month_end == 'true' ? '' : ' Not posted: not a month end.' }}
+      {{ outputs.result.values.r | jq('"Blockers: \(.blockers). \(.blocker_detail)"') | first }}
+
+  - id: gate
+    type: io.kestra.plugin.core.flow.Switch
+    value: >-
+      {%- set r = outputs.result.values.r -%}
+      {%- if (r | jq('.blockers') | first) > 0 -%}BLOCKED
+      {%- elseif outputs.state.values.month_end == 'true' and ((r | jq('.allowance_change') | first) > 10000 or (r | jq('.allowance_change') | first) < -10000) and inputs.approved_by == '' -%}NEEDS_APPROVAL
+      {%- else -%}PROCEED{%- endif -%}
+    cases:
+      BLOCKED:
+        - id: blocked
+          type: io.kestra.plugin.core.execution.Fail
+          errorMessage: "Receivables data is inconsistent, no letters sent: {{ outputs.result.values.r | jq('.blocker_detail') | first }}"
+      NEEDS_APPROVAL:
+        - id: approval_required
+          type: io.kestra.plugin.core.execution.Fail
+          errorMessage: >-
+            The ECL allowance moves by {{ outputs.result.values.r | jq('.allowance_change') | first }}
+            (required {{ outputs.result.values.r | jq('.allowance_required') | first }}, booked {{ outputs.result.values.r | jq('.allowance_booked') | first }}).
+            Review {{ render(vars.pack_dir) }}/provision.csv and run again with approved_by. No letters were sent.
+    defaults:
+      - id: proceed
+        type: io.kestra.plugin.core.log.Log
+        message: Data consistent, publishing letters and saving state.
+
+  - id: write_letters
+    type: io.kestra.plugin.core.storage.Write
+    extension: .md
+    content: "{{ outputs.result.values.r | jq('.letters_markdown') | first }}"
+
+  - id: publish
+    type: io.kestra.plugin.core.namespace.UploadFiles
+    description: The letters, ready for your mail task, and the evidence. Replace with io.kestra.plugin.email.MailSend per letter to send them.
+    namespace: "{{ flow.namespace }}"
+    filesMap:
+      "{{ render(vars.pack_dir) }}/aging.csv": "{{ outputs.control.outputFiles.aging }}"
+      "{{ render(vars.pack_dir) }}/letters.csv": "{{ outputs.control.outputFiles.letters }}"
+      "{{ render(vars.pack_dir) }}/letters.md": "{{ outputs.write_letters.uri }}"
+      "{{ render(vars.pack_dir) }}/credit-holds.csv": "{{ outputs.control.outputFiles.holds }}"
+      "{{ render(vars.pack_dir) }}/provision.csv": "{{ outputs.control.outputFiles.provision }}"
+      "{{ render(vars.pack_dir) }}/ecl-journal.csv": "{{ outputs.control.outputFiles.journal }}"
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Letters sent per invoice, holds in place and the allowance booked. The next run builds on this.
+    key: "{{ vars.state_key }}"
+    kvType: JSON
+    value: >-
+      {{ {'old': fromJson(outputs.state.values.s), 'r': fromJson(outputs.result.values.r), 'me': outputs.state.values.month_end, 'at': inputs.as_of}
+         | jq('{letters: (.old.letters + (.r.new_letters // "{}" | fromjson)), holds: (.r.holds | fromjson),
+                allowance: (if .me == "true" or .me == true then .r.allowance_required else .old.allowance end), last_run: .at}') | first | toJson }}
+
+extend:
+  title: Chase overdue invoices, manage credit holds and book the IFRS 9 credit loss allowance
+  metaTitle: Accounts receivable dunning, credit hold and ECL provision with Kestra and DuckDB
+  shortDescription: Age receivables, send each overdue customer one escalating reminder without repeats, put customers on and off credit hold, and compute the month-end expected credit loss allowance.
+  metaDescription: AR dunning in Kestra and DuckDB. Aging, escalating reminders with cooldown and disputes, credit holds, IFRS 9 provision matrix and allowance journal.
+  description: |
+    Collections is a daily routine with many small rules:
+    - remind politely first and firmly later,
+    - never send the same letter twice,
+    - leave disputed invoices alone,
+    - don't chase a customer whose cash is sitting unapplied,
+    - stop shipping to customers who are far behind.
+
+    At month end, finance also needs the expected credit loss allowance on what is still open. This flow runs both from the same data, and remembers what it already did.
+
+    It runs with no setup and no network. DuckDB generates 30 customers and 600 invoices since March:
+    - most customers pay around the due date, a few are chronically late, and two stopped paying in July;
+    - some invoices are paid in two halves;
+    - there are two disputes, one customer with unapplied cash and two customers with dunning paused.
+
+
+    ## Dunning rules
+
+    | Days past due | Level | Letter |
+    |---|---|---|
+    | 3 | 1 | Friendly reminder |
+    | 15 | 2 | Second reminder |
+    | 30 | 3 | Final notice: pay within 7 days or the account goes to collections |
+    | 60 | 4 | Handover to collections. Needs `approved_by` |
+
+    Each customer gets **one letter** listing every overdue undisputed invoice, at the highest level owed. A customer is decided once per run:
+
+    - `SEND`
+    - `ALREADY_AT_LEVEL`: no invoice reached a higher level than its last letter
+    - `COOLDOWN`: a letter went out fewer than `cooldown_days` ago
+    - `SKIP_PAUSED`
+    - `SKIP_SMALL`: overdue below `min_balance`
+    - `APPLY_CASH_FIRST`: unapplied cash covers the overdue amount. Apply the cash instead of chasing a paying customer
+    - `HANDOVER_NEEDS_APPROVAL`
+    - `NOTHING_OVERDUE`
+
+    The letters are written to `letters.md` and `letters.csv`, ready for a mail task. The KV state records the level sent per invoice, so the next run never repeats a letter.
+
+    ## Credit hold
+
+    A customer goes on hold when exposure exceeds the credit limit, or when an undisputed invoice is more than 60 days past due. Each run reports new holds and releases against the previous run, in `credit-holds.csv`.
+
+    ## Expected credit loss
+
+    The IFRS 9 simplified approach for trade receivables: a provision matrix of loss rates per aging bucket (input `loss_rates`), applied to open balances. Disputed invoices are provided at the 61-90 rate until resolved. On the last day of a month, the flow posts the change against the allowance already booked (6950 expense, 1290 allowance). A change above 10,000 needs `approved_by`. Other days only report it.
+
+    ## How it works
+
+    1. `state` reads the letters sent, the holds and the allowance from KV. `order_gate` refuses a run dated before the last one, which would re-send letters.
+    2. `control` (`io.kestra.plugin.jdbc.duckdb.Queries`) runs in one session:
+       - it computes open items and aging, and checks for data errors,
+       - it makes the dunning decisions and writes the letters,
+       - it computes the holds, the provision and the journal, plus DSO.
+    3. `log_run` prints the run. `gate` (`io.kestra.plugin.core.flow.Switch`) stops on data errors (`BLOCKED`) or an unapproved allowance change, before anything is published.
+    4. `write_letters` (`io.kestra.plugin.core.storage.Write`) and `publish` store `aging.csv`, `letters.csv`, `letters.md`, `credit-holds.csv`, `provision.csv` and `ecl-journal.csv` under `receivables/<as_of>/`.
+    5. `save_state` (`io.kestra.plugin.core.kv.Set`) merges the new letters, replaces the holds and, at month end, records the allowance.
+
+    ## Tested end to end
+
+    On Kestra 2.0.3 OSS, in this order.
+
+    | Run | Inputs | Result |
+    |---|---|---|
+    | 1 | 2026-09-30 | 132 open invoices, 680,193.52, DSO 47.3. 5 letters (3 final notices). Atlas Print not chased: its 25,000 unapplied cash covers it. One paused customer skipped. Granite Build and Raven Media due for handover, waiting for approval, and put on hold. Allowance 6,825.33 posted |
+    | 2 | same day, `approved_by` | Only the 2 handover letters. The 5 others are `ALREADY_AT_LEVEL`, nothing is sent twice |
+    | 3 | 2026-10-03 | 3 new level 1 letters, one customer in cooldown. Granite Build released from hold after paying. Allowance change reported, not posted |
+    | 4 | 2026-09-15 | Refused: before the last run |
+    | 5 | 2026-10-20 | 10 letters as invoices escalate. Raven Media released |
+    | 6 | 2026-10-31 `ISSUES` | Blocked before any letter: duplicate invoice number, two overpaid invoices, an invoice for unknown customer CU-077 |
+    | 7 | 2026-10-31 | 7 letters, 2 handovers waiting, 2 new holds. Allowance 5,785.39 = 669.94 + 1,992.80 + 2,411.72 + 710.93, journal releases 1,039.94 |
+    | 8 | 2026-11-30, higher loss rates | Allowance would move by 24,961.56: stops for approval, no letters sent |
+
+    ## Problems found while testing
+
+    - **Half-paid invoices aged forever.** The first demo left every partial payment's remainder unpaid, so 16 of 30 customers looked more than 60 days late. Remainders are now paid 30 days later, so only the customers meant to be late are late.
+    - **A Switch with no match fails the run.** On 2.0.3, a `Switch` whose value matches no case and has no `defaults` fails with "No task found". The gate now has a default branch.
+    - **Disputed balances split a bucket in two.** Provisioning them at another rate produced two `1-30` rows. They are now labelled `1-30 (disputed)`.
+
+    ## Inputs
+
+    | Input | Default | Purpose |
+    |---|---|---|
+    | `as_of` | `2026-09-30` | Run date. The last day of a month posts the allowance |
+    | `scenario` | `CLEAN` | Demo only |
+    | `cooldown_days` | `7` | Days between two letters to one customer |
+    | `min_balance` | `50.0` | Overdue amount below which nobody is chased |
+    | `loss_rates` | matrix | Loss rate per bucket |
+    | `approved_by` | empty | Collections handovers and large allowance changes |
+
+    ## Use it with your data
+
+    - Replace `customers`, `invoices`, `payments`, `unapplied_cash` and `disputes` with your exports.
+    - Send each row of `letters.csv` with `io.kestra.plugin.email.MailSend`, or hand `letters.md` to your mail tool.
+    - Feed the holds to your order system, for example with an HTTP task.
+    - Derive `loss_rates` from your history: the share of each bucket that was finally written off, adjusted for the economic outlook.
+
+    ## Things to know
+
+    - The letter level is recorded per invoice. An invoice listed in a final notice is not reminded again at a lower level when it ages.
+    - Letters are never sent automatically by this blueprint. It writes them for review or for a mail task.
+    - Reset the state by deleting the KV key `receivables_control`.
+
+    ## Links
+
+    - IFRS 9 Financial Instruments: https://www.ifrs.org/issued-standards/list-of-standards/ifrs-9-financial-instruments/
+    - DuckDB plugin: https://kestra.io/plugins/plugin-jdbc-duckdb
+
+    This blueprint was created by [zkasuran](https://github.com/zkasuran).
+  tags:
+    - Business
+    - Data
+  subTags:
+    - Policy & Compliance
+    - Approval Gates
+  ee: false
+  demo: false

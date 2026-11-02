@@ -1,0 +1,549 @@
+id: k8s-failed-rollout-auto-rollback
+namespace: company.platform
+
+description: |
+  Find Kubernetes Deployments whose rollout has failed (Progressing=False,
+  reason ProgressDeadlineExceeded) and roll each one back to its last
+  known-good ReplicaSet, the way `kubectl rollout undo` would but with a
+  memory. Healthy revisions are remembered in the KV store, so two bad
+  deploys in a row still roll back to the version that last worked. Only
+  opted-in Deployments are touched, each one at most once per cooldown
+  window, the patch refuses to apply if someone deployed again in the
+  meantime, and the rollout is watched until it completes.
+
+labels:
+  team: platform
+  domain: reliability
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: namespaces
+    type: ARRAY
+    itemType: STRING
+    displayName: Namespaces
+    description: Namespaces whose Deployments are guarded.
+    defaults:
+      - staging
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true, failed rollouts are detected and the rollback plan is posted, but nothing is patched and no rollback is recorded. Healthy revisions are still remembered.
+    defaults: true
+
+  - id: opt_in_annotation
+    type: STRING
+    displayName: Opt-in annotation
+    description: Only Deployments carrying this annotation with the value "true" are rolled back. Failed rollouts without it are reported, not touched.
+    defaults: rollout-guard/enabled
+
+  - id: cooldown_hours
+    type: INT
+    displayName: Cooldown in hours
+    description: A Deployment is rolled back at most once in this window. If it fails again (for example the old version is broken too), the flow escalates instead of flapping.
+    defaults: 6
+
+  - id: verify_timeout_minutes
+    type: INT
+    displayName: Rollout verification timeout (minutes)
+    description: How long to wait for a rolled-back Deployment to become fully updated and available before the execution fails and alerts.
+    defaults: 5
+
+variables:
+  kv_prefix: rollout_guard
+
+triggers:
+  - id: every_five_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Sweep the guarded namespaces. Enable once a dry run shows the plan you expect.
+    cron: "*/5 * * * *"
+    disabled: true
+    inputs:
+      dry_run: false
+
+  - id: after_deploy
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from the CD pipeline right after `kubectl apply` (and again after progressDeadlineSeconds) to react faster than the schedule.
+    key: "{{ secret('ROLLOUT_GUARD_WEBHOOK_KEY') }}"
+    disabled: true
+    inputs:
+      dry_run: false
+
+tasks:
+  - id: detect
+    type: io.kestra.plugin.core.flow.Loop
+    description: Per namespace, read every Deployment's annotations and status plus the guard state from KV. ReplicaSets (which carry the full pod templates) are fetched only when a failed rollout is present.
+    values: "{{ inputs.namespaces }}"
+    concurrencyLimit: 3
+    outputs:
+      - id: namespace
+        type: STRING
+        value: "{{ item.value }}"
+      - id: metadata_items
+        type: JSON
+        value: "{{ (outputs.deployments.metadataItems ?? []) | toJson }}"
+      - id: status_items
+        type: JSON
+        value: "{{ (outputs.deployments.statusItems ?? []) | toJson }}"
+      - id: replicasets
+        type: STRING
+        value: "{{ outputs.replicasets.body ?? '' }}"
+      - id: state
+        type: STRING
+        value: "{{ (outputs.guard_state.value ?? '') | toJson }}"
+    tasks:
+      - id: deployments
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        connection:
+          masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+          oauthToken: "{{ secret('K8S_TOKEN') }}"
+          trustCerts: true
+        namespace: "{{ item.value }}"
+        resourceType: deployments
+        apiGroup: apps
+        apiVersion: v1
+        fetchType: FETCH
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+
+      - id: has_failed_rollout
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ ((outputs.deployments.statusItems ?? []) | toJson) contains 'ProgressDeadlineExceeded' }}"
+        then:
+          - id: replicasets
+            type: io.kestra.plugin.core.http.Request
+            description: kubectl.Get returns metadata and status only, so the ReplicaSet pod templates come straight from the Kubernetes API.
+            uri: "{{ secret('K8S_MASTER_URL') }}/apis/apps/v1/namespaces/{{ item.value }}/replicasets"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ secret('K8S_TOKEN') }}"
+              Accept: application/json
+            options:
+              ssl:
+                insecureTrustAllCertificates: true
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+
+      - id: guard_state
+        type: io.kestra.plugin.core.kv.Get
+        description: Last known-good revision per Deployment and the rollbacks done inside the cooldown window.
+        key: "{{ vars.kv_prefix }}_{{ item.value }}"
+        errorOnMissing: false
+
+  - id: plan
+    type: io.kestra.plugin.scripts.python.Script
+    description: Decide, without touching the cluster, which failed rollouts to undo, to which revision, and which to escalate. Builds one guarded JSON patch per rollback.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      inventory.json: "{{ outputs.detect.outputs | toJson }}"
+    env:
+      DRY_RUN: "{{ inputs.dry_run }}"
+      OPT_IN_ANNOTATION: "{{ inputs.opt_in_annotation }}"
+      COOLDOWN_HOURS: "{{ inputs.cooldown_hours }}"
+      KV_PREFIX: "{{ vars.kv_prefix }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      PYTHONIOENCODING: utf-8
+    script: |
+      import copy
+      import json
+      import os
+      from datetime import datetime, timedelta, timezone
+
+      REVISION = "deployment.kubernetes.io/revision"
+      dry_run = os.environ["DRY_RUN"].lower() == "true"
+      opt_in = os.environ["OPT_IN_ANNOTATION"]
+      cooldown = timedelta(hours=int(os.environ["COOLDOWN_HOURS"]))
+      kv_prefix = os.environ["KV_PREFIX"]
+      execution_id = os.environ["EXECUTION_ID"]
+      now = datetime.now(timezone.utc)
+      stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+      def as_obj(value, default):
+          # Loop outputs may arrive as parsed JSON, a JSON string, or a JSON string of a JSON string.
+          for _ in range(3):
+              if value is None or value == "":
+                  return default
+              if not isinstance(value, str):
+                  return value
+              try:
+                  value = json.loads(value)
+              except ValueError:
+                  return default
+          return value if not isinstance(value, str) else default
+
+      def revision_of(meta):
+          try:
+              return int(((meta or {}).get("annotations") or {}).get(REVISION, "0"))
+          except ValueError:
+              return 0
+
+      def images(template):
+          containers = ((template or {}).get("spec") or {}).get("containers") or []
+          return ", ".join("{}={}".format(c.get("name"), c.get("image")) for c in containers)
+
+      with open("inventory.json") as f:
+          inventory = json.load(f) or []
+
+      failed, actions, escalations, state_entries = [], [], [], []
+
+      for entry in inventory:
+          out = entry.get("outputs") or {}
+          namespace = out.get("namespace")
+          metadata_items = as_obj(out.get("metadata_items"), [])
+          status_items = as_obj(out.get("status_items"), [])
+          replicasets = as_obj(out.get("replicasets"), {}).get("items") or []
+          state = as_obj(out.get("state"), {}) or {}
+          known_good = dict(state.get("known_good") or {})
+          rollbacks = {
+              name: r for name, r in (state.get("rollbacks") or {}).items()
+              if now - datetime.strptime(r["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) < cooldown
+          }
+          changed = rollbacks != (state.get("rollbacks") or {})
+          notified = dict(state.get("notified") or {})
+          still_failing = set()
+
+          for meta, status in zip(metadata_items, status_items):
+              name = meta.get("name")
+              status = (status or {}).get("status") or {}
+              conditions = {c.get("type"): c for c in status.get("conditions") or []}
+              progressing = conditions.get("Progressing") or {}
+              available = conditions.get("Available") or {}
+              revision = revision_of(meta)
+              replicas = status.get("replicas", 0)
+
+              healthy = (
+                  progressing.get("status") == "True"
+                  and progressing.get("reason") == "NewReplicaSetAvailable"
+                  and available.get("status") == "True"
+                  and (status.get("observedGeneration") or 0) >= (meta.get("generation") or 0)
+                  and status.get("updatedReplicas", 0) == replicas
+                  and status.get("availableReplicas", 0) == replicas
+              )
+              if healthy:
+                  if (known_good.get(name) or {}).get("revision") != revision:
+                      known_good[name] = {"revision": revision, "seen_at": stamp}
+                      changed = True
+                  continue
+
+              if not (progressing.get("status") == "False" and progressing.get("reason") == "ProgressDeadlineExceeded"):
+                  continue  # still rolling out, scaling, or paused: not our business yet
+
+              record = {
+                  "namespace": namespace,
+                  "name": name,
+                  "revision": revision,
+                  "message": progressing.get("message", ""),
+              }
+              failed.append(record)
+              still_failing.add(name)
+
+              def escalate(reason):
+                  # Post a standing escalation once per failing revision, not on every sweep.
+                  fingerprint = "{}:{}".format(revision, reason.split(" (")[0].split(";")[0])
+                  is_new = notified.get(name) != fingerprint
+                  escalations.append(dict(record, reason=reason, new=is_new))
+                  notified[name] = fingerprint
+
+              if str((meta.get("annotations") or {}).get(opt_in, "")).lower() != "true":
+                  escalate("not opted in ({}: \"true\" is missing)".format(opt_in))
+                  continue
+              if name in rollbacks:
+                  last = rollbacks[name]
+                  escalate("already rolled back from revision {} to {} at {}; not rolling back twice inside the cooldown, needs a human".format(
+                      last["from_revision"], last["to_revision"], last["at"]))
+                  continue
+
+              owned = {}
+              for rs in replicasets:
+                  rs_meta = rs.get("metadata") or {}
+                  if any(ref.get("uid") == meta.get("uid") for ref in rs_meta.get("ownerReferences") or []):
+                      owned[revision_of(rs_meta)] = rs
+              current_rs = owned.get(revision)
+              earlier = sorted(r for r in owned if r < revision)
+              good_revision = (known_good.get(name) or {}).get("revision")
+              if good_revision in owned and good_revision < revision:
+                  target_revision, source = good_revision, "last known-good revision"
+              elif earlier:
+                  target_revision, source = earlier[-1], "previous revision (no known-good revision recorded)"
+              else:
+                  escalate("no earlier ReplicaSet to roll back to")
+                  continue
+
+              target_rs = owned[target_revision]
+              template = copy.deepcopy((target_rs.get("spec") or {}).get("template") or {})
+              labels = (template.get("metadata") or {}).get("labels") or {}
+              target_hash = labels.pop("pod-template-hash", None)
+              current_hash = (((current_rs or {}).get("metadata") or {}).get("labels") or {}).get("pod-template-hash")
+              if current_hash and target_hash == current_hash:
+                  escalate("target ReplicaSet has the same pod template as the failing one")
+                  continue
+
+              note = "revision {} -> {} ({}) by {}".format(revision, target_revision, source, execution_id)
+              patch = [
+                  # Abort if someone shipped a new revision since we looked.
+                  {"op": "test", "path": "/metadata/annotations/deployment.kubernetes.io~1revision", "value": str(revision)},
+                  {"op": "replace", "path": "/spec/template", "value": template},
+                  {"op": "add", "path": "/metadata/annotations/rollout-guard~1last-rollback", "value": note},
+              ]
+              actions.append(dict(
+                  record,
+                  to_revision=target_revision,
+                  to_replicaset=(target_rs.get("metadata") or {}).get("name"),
+                  source=source,
+                  from_images=images((current_rs or {}).get("spec", {}).get("template")),
+                  to_images=images(template),
+                  patch=json.dumps(patch),
+              ))
+              if not dry_run:
+                  rollbacks[name] = {"at": stamp, "from_revision": revision, "to_revision": target_revision, "execution_id": execution_id}
+                  changed = True
+
+          notified = {name: fp for name, fp in notified.items() if name in still_failing}
+          if changed or notified != (state.get("notified") or {}):
+              state_entries.append({
+                  "key": "{}_{}".format(kv_prefix, namespace),
+                  "state": {"known_good": known_good, "rollbacks": rollbacks, "notified": notified, "updated_at": stamp},
+              })
+
+      new_escalations = [e for e in escalations if e["new"]]
+      lines = []
+      if actions or new_escalations:
+          if not actions:
+              verdict = "nothing rolled back"
+          elif dry_run:
+              verdict = "{} rollback(s) planned".format(len(actions))
+          else:
+              verdict = "{} rollback(s) applied and verified healthy".format(len(actions))
+          lines.append(":rewind: *Failed rollout guard{}*: {} failed rollout(s), {}".format(
+              " (dry run)" if dry_run else "", len(failed), verdict))
+          for a in actions:
+              lines.append("• {}/{}: revision {} -> {} ({})".format(a["namespace"], a["name"], a["revision"], a["to_revision"], a["source"]))
+              lines.append("    {}  ->  {}".format(a["from_images"], a["to_images"]))
+          for e in new_escalations:
+              lines.append("• :warning: {}/{} (revision {}): {}".format(e["namespace"], e["name"], e["revision"], e["reason"]))
+          lines.append("Execution: {}".format(execution_id))
+      summary = "\n".join(lines)
+
+      # Used by the errors handler: same plan, but nothing claims to be verified.
+      failure_lines = [":rotating_light: *Failed rollout guard FAILED* (execution {}). A rollback was refused (someone redeployed) or did not become available in time; a human needs to look now.".format(execution_id)]
+      for a in actions:
+          failure_lines.append("• attempted {}/{}: revision {} -> {} ({})".format(a["namespace"], a["name"], a["revision"], a["to_revision"], a["to_images"]))
+      failure_summary = "\n".join(failure_lines)
+
+      print("failed={} actions={} escalations={} (new {}) state_entries={}".format(
+          len(failed), len(actions), len(escalations), len(new_escalations), len(state_entries)))
+      print(summary or ("No failed rollouts." if not failed else "Nothing new: every failed rollout was already reported."))
+      print("::" + json.dumps({"outputs": {
+          "failed": failed,
+          "actions": actions,
+          "escalations": escalations,
+          "state_entries": state_entries,
+          "summary": summary,
+          "notify": bool(summary),
+          "failure_summary": failure_summary,
+      }}) + "::")
+
+  - id: save_state
+    type: io.kestra.plugin.core.flow.Loop
+    description: Persist known-good revisions and, before any patch is sent, the rollback about to happen. Recording the intent first is what stops a rollback loop even if verification later fails.
+    values: "{{ outputs.plan.vars.state_entries }}"
+    tasks:
+      - id: kv_set
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ fromJson(item.value).key }}"
+        value: "{{ fromJson(item.value).state | toJson }}"
+        kvType: JSON
+
+  - id: apply
+    type: io.kestra.plugin.core.flow.If
+    description: Roll back only when dry-run is off and the plan contains at least one rollback.
+    condition: "{{ inputs.dry_run == false and (outputs.plan.vars.actions | length) > 0 }}"
+    then:
+      - id: rollback
+        type: io.kestra.plugin.core.flow.Loop
+        values: "{{ outputs.plan.vars.actions }}"
+        concurrencyLimit: 3
+        tasks:
+          - id: restore_template
+            type: io.kestra.plugin.kubernetes.kubectl.Patch
+            description: JSON patch that first tests the revision annotation, then puts the known-good pod template back, which is exactly what `kubectl rollout undo` does client-side.
+            connection:
+              masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+              oauthToken: "{{ secret('K8S_TOKEN') }}"
+              trustCerts: true
+            namespace: "{{ fromJson(item.value).namespace }}"
+            resourceType: deployment
+            resourceName: "{{ fromJson(item.value).name }}"
+            apiGroup: apps
+            apiVersion: v1
+            patchStrategy: JSON_PATCH
+            patch: "{{ fromJson(item.value).patch }}"
+
+          - id: wait_for_rollout
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: Poll until the controller has observed the patch and reports Progressing=True with reason NewReplicaSetAvailable, which it only sets once every desired replica runs the restored template and is available. Same signal as `kubectl rollout status`.
+            condition: "{{ (outputs.rollout_status.statusItem.status.observedGeneration ?? 0) >= (outputs.rollout_status.metadataItem.generation ?? 1) and (((outputs.rollout_status.statusItem.status.conditions ?? []) | toJson) contains 'NewReplicaSetAvailable') }}"
+            failOnMaxReached: true
+            checkFrequency:
+              interval: PT10S
+              maxDuration: "PT{{ inputs.verify_timeout_minutes }}M"
+            tasks:
+              - id: rollout_status
+                type: io.kestra.plugin.kubernetes.kubectl.Get
+                connection:
+                  masterUrl: "{{ secret('K8S_MASTER_URL') }}"
+                  oauthToken: "{{ secret('K8S_TOKEN') }}"
+                  trustCerts: true
+                namespace: "{{ fromJson(item.value).namespace }}"
+                resourceType: deployments
+                resourcesNames:
+                  - "{{ fromJson(item.value).name }}"
+                apiGroup: apps
+                apiVersion: v1
+                fetchType: FETCH_ONE
+
+              - id: rollout_progress
+                type: io.kestra.plugin.core.log.Log
+                message: "{{ fromJson(item.value).namespace }}/{{ fromJson(item.value).name }}: generation {{ outputs.rollout_status.metadataItem.generation ?? '?' }} observed {{ outputs.rollout_status.statusItem.status.observedGeneration ?? '?' }}, {{ outputs.rollout_status.statusItem.status.updatedReplicas ?? 0 }} updated / {{ outputs.rollout_status.statusItem.status.availableReplicas ?? 0 }} available / {{ outputs.rollout_status.statusItem.status.replicas ?? 0 }} total, progressing reason {{ (outputs.rollout_status.statusItem.status.conditions ?? []) | jq('.[] | select(.type == \"Progressing\") | .reason') | first ?? '?' }}"
+    else:
+      - id: nothing_applied
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ inputs.dry_run ? 'Dry run: ' ~ (outputs.plan.vars.actions | length) ~ ' rollback(s) planned, nothing patched.' : 'No rollback needed.' }}"
+
+  - id: notify
+    type: io.kestra.plugin.core.flow.If
+    description: Stay quiet on healthy sweeps and on escalations already posted; post when a rollback is planned or applied, or a new escalation appears.
+    condition: "{{ outputs.plan.vars.notify }}"
+    then:
+      - id: digest
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {"text": {{ outputs.plan.vars.summary | toJson }}}
+
+outputs:
+  - id: failed_rollouts
+    type: JSON
+    description: Deployments found with Progressing=False and reason ProgressDeadlineExceeded.
+    value: "{{ outputs.plan.vars.failed }}"
+
+  - id: rollbacks
+    type: JSON
+    description: Rollbacks applied (or planned in dry run) with source and target revision and images.
+    value: "{{ outputs.plan.vars.actions }}"
+
+  - id: escalations
+    type: JSON
+    description: Failed rollouts that were deliberately left alone, with the reason.
+    value: "{{ outputs.plan.vars.escalations }}"
+
+  - id: applied
+    type: BOOL
+    description: True when patches were sent to the cluster and every rollout was verified.
+    value: "{{ inputs.dry_run == false and (outputs.plan.vars.actions | length) > 0 }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: A patch that was refused (someone redeployed) or a rollback that never became available both need a human now.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {"text": {{ (outputs.plan.vars.failure_summary ?? (':rotating_light: *Failed rollout guard FAILED* before planning, in ' ~ (inputs.namespaces | join(', ')) ~ '. Check execution ' ~ execution.id ~ ' of ' ~ flow.namespace ~ '.' ~ flow.id ~ '.')) | toJson }}}
+
+extend:
+  title: Kubernetes Failed Rollout Auto-Rollback to Last Known-Good Revision
+  metaTitle: Kubernetes Failed Rollout Auto-Rollback | Kestra
+  shortDescription: Detect Deployments stuck at ProgressDeadlineExceeded, roll them back to the last revision that was actually healthy, verify the rollout, and never flap.
+  metaDescription: Roll failed Kubernetes Deployment rollouts back to the last known-good ReplicaSet, with opt-in, cooldown, a race-safe JSON patch and rollout verification.
+  description: |
+    A bad image tag or a crashing release leaves a Deployment stuck: Kubernetes
+    marks the rollout `ProgressDeadlineExceeded` and then waits for a human.
+    With the `Recreate` strategy the old pods are already gone, so that wait is
+    an outage. This blueprint finds those failed rollouts and undoes them the
+    way `kubectl rollout undo` does, with three things `rollout undo` does not
+    have: it remembers which revision was last healthy, it refuses to roll the
+    same Deployment back twice in a cooldown window, and it watches the rollout
+    until the restored pods are available.
+
+    ## How it works
+
+    1. `every_five_minutes` (Schedule) sweeps the guarded namespaces; `after_deploy` (Webhook) lets a CD pipeline trigger a sweep right after it ships. Both are disabled until a dry run looks right. Flow-level `concurrency: limit 1` keeps sweeps from overlapping.
+    2. `detect` (`core.flow.Loop` over `namespaces`) reads every Deployment with `kubernetes.kubectl.Get` and the namespace's guard state with `core.kv.Get`. Only when a status contains `ProgressDeadlineExceeded` does it list the ReplicaSets through `core.http.Request` against the Kubernetes API, because `kubectl.Get` returns metadata and status but not the pod templates a rollback needs.
+    3. `plan` (`scripts.python.Script`, Process runner) records the current revision of every fully healthy Deployment as its known-good revision. For each failed rollout it picks the known-good ReplicaSet (or the previous revision when none is recorded), and escalates instead when the Deployment is not opted in, was already rolled back inside the cooldown, or has nothing older to go back to. Each rollback becomes a JSON patch that first `test`s the revision annotation, so it aborts if someone deployed again in between, then replaces `spec.template` and stamps a `rollout-guard/last-rollback` annotation.
+    4. `save_state` writes the KV state before any patch is sent, so a rollback that later fails verification is still counted and cannot loop.
+    5. `apply` (`core.flow.If`, live mode only) runs `rollback` (`Loop`): `kubectl.Patch` with `JSON_PATCH`, then `wait_for_rollout` (`core.flow.LoopUntil`) polls `kubectl.Get` every 10 seconds until the controller has observed the patch and reports `NewReplicaSetAvailable`, failing after `verify_timeout_minutes`.
+    6. `notify` posts one Slack message when a rollback is planned or done, or a new escalation appears; repeated sweeps over the same failure stay quiet. `errors` alerts with the rollbacks that were attempted if a patch is refused or a rollout never converges.
+
+    ## What you get
+
+    - Failed rollouts reverted in one sweep and verified healthy, with before and after images in the digest.
+    - Rollback to the last revision that was really healthy, so two bad deploys in a row do not land you on the other bad one.
+    - Safety rails: dry run by default, a per-Deployment opt-in annotation, one automatic rollback per Deployment per cooldown, a race-safe patch, no overlapping runs.
+    - An audit trail on the Deployment itself (`rollout-guard/last-rollback`) and flow outputs (`failed_rollouts`, `rollbacks`, `escalations`, `applied`).
+
+    ## Who it's for
+
+    - Platform and SRE teams who own shared clusters but not every team's deploy pipeline.
+    - Teams shipping with plain `kubectl apply`, Kustomize or Helm templates who want automatic rollback without adopting Argo Rollouts or Flagger.
+    - On-call engineers who would rather read "rolled back and healthy" than be paged to type `rollout undo` at 3 a.m.
+
+    ## Why orchestrate this with Kestra
+
+    A cron job running `kubectl rollout undo` forgets which version was good, rolls back again and again when the old version is broken too, and says nothing about whether the cluster recovered. Here detection, decision, the state that prevents flapping, the patch, the verification loop and the alert are one execution: every decision is logged with its reason, the KV store carries known-good revisions and cooldowns between runs, `LoopUntil` turns "did it recover" into a step that can fail, retries absorb API hiccups, and the same flow runs from a schedule, a webhook or the UI.
+
+    ## Prerequisites
+
+    - A Kubernetes cluster reachable from the Kestra worker and a ServiceAccount with `get`, `list`, `patch` on `deployments` and `get`, `list` on `replicasets` (both in the `apps` group) in the guarded namespaces.
+    - `progressDeadlineSeconds` set on your Deployments to how long a healthy rollout may take (Kubernetes defaults to 600).
+    - Python 3 on the worker (the default Kestra image has it), or switch `plan` to the Docker task runner.
+    - A Slack incoming webhook.
+
+    ### Secrets
+
+    - `K8S_MASTER_URL`: Kubernetes API server URL.
+    - `K8S_TOKEN`: ServiceAccount token with the permissions above.
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for the digest and failure alerts.
+    - `ROLLOUT_GUARD_WEBHOOK_KEY`: long random key for the `after_deploy` webhook URL.
+
+    ## Quick start
+
+    1. Create the secrets. Bind a ClusterRole with the verbs above through a RoleBinding in each guarded namespace and mint a token with `kubectl create token`.
+    2. Annotate the Deployments the guard may roll back with `rollout-guard/enabled: "true"` and set `namespaces`.
+    3. Execute once while everything is healthy: the KV store now holds a known-good revision per Deployment.
+    4. Ship a broken image to a test Deployment, wait for `progressDeadlineSeconds`, execute with `dry_run=true` and read the plan in the Slack digest and the `rollbacks` output.
+    5. Execute with `dry_run=false` and confirm the Deployment is back on the old image and carries the `rollout-guard/last-rollback` annotation.
+    6. Enable `every_five_minutes`, and `after_deploy` if your pipeline can call it.
+
+    ## How to extend
+
+    - Treat pods in `CrashLoopBackOff` on the new ReplicaSet as failed before the deadline expires, by adding a `kubectl.Get` on pods to `detect`.
+    - Gate production namespaces behind a `core.flow.Pause` approval before `apply`.
+    - Open an incident or a GitHub issue for every escalation, or revert the commit that introduced the bad image.
+    - Cover StatefulSets by reading `controllerrevisions` instead of ReplicaSets.
+
+    ## Links
+
+    - [Kestra Kubernetes plugin: kubectl.Get](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.get)
+    - [Kestra Kubernetes plugin: kubectl.Patch](https://kestra.io/plugins/plugin-kubernetes/kubectl/io.kestra.plugin.kubernetes.kubectl.patch)
+    - [Kestra LoopUntil task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil)
+    - [Kestra KV store](https://kestra.io/docs/concepts/kv-store)
+    - [Kubernetes: failed Deployment and progressDeadlineSeconds](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#failed-deployment)
+    - [Kubernetes: rolling back a Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-back-a-deployment)
+
+    - This blueprint has been created by [hiyach28](https://github.com/hiyach28)
+  tags:
+    - Infrastructure
+  subTags:
+    - Kubernetes Operations
+    - Incident Response
+    - CI/CD & Deployment
+  ee: false
+  demo: false
