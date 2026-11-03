@@ -1,0 +1,241 @@
+id: postgres-collation-drift-reindex
+namespace: company.team
+description: >-
+  After an OS or ICU upgrade changes PostgreSQL's text sort rules, rebuild every
+  index that uses a changed collation, after approval, then record the new
+  collation version and verify nothing is left.
+
+inputs:
+  - id: jdbc_url
+    type: STRING
+    displayName: JDBC URL
+    description: The database to check. Collation versions are tracked per database, so run the flow once per database.
+    defaults: jdbc:postgresql://localhost:5432/app
+
+variables:
+  # Collations in use whose recorded version differs from the one the OS or ICU provides now.
+  # 100 is the OID of the database default collation, as stored in pg_index.indcollation.
+  drift_sql: |
+    SELECT 100::oid AS coll_oid, 'database' AS kind, d.datname::text AS name,
+           d.datcollversion AS recorded_version,
+           pg_database_collation_actual_version(d.oid) AS os_version,
+           format('ALTER DATABASE %I REFRESH COLLATION VERSION', d.datname) AS refresh_sql
+      FROM pg_database d
+     WHERE d.datname = current_database()
+       AND d.datcollversion IS DISTINCT FROM pg_database_collation_actual_version(d.oid)
+    UNION ALL
+    SELECT c.oid, 'collation', format('%I.%I', n.nspname, c.collname),
+           c.collversion, pg_collation_actual_version(c.oid),
+           format('ALTER COLLATION %I.%I REFRESH VERSION', n.nspname, c.collname)
+      FROM pg_collation c
+      JOIN pg_namespace n ON n.oid = c.collnamespace
+     WHERE c.collprovider <> 'd'
+       AND c.oid IN (SELECT attcollation FROM pg_attribute UNION SELECT unnest(indcollation::oid[]) FROM pg_index)
+       AND c.collversion IS DISTINCT FROM pg_collation_actual_version(c.oid)
+  health_sql: |
+    SELECT (SELECT count(*) FROM ({{ vars.drift_sql }}) d) AS drift_left,
+           count(*) AS invalid_indexes,
+           coalesce(string_agg(format('%I.%I', n.nspname, c.relname), ', '), '') AS invalid_names
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE NOT i.indisvalid
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_toast'
+
+tasks:
+  - id: drift
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Read-only. Compares recorded and current collation versions for the database and every collation in use.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT kind, name, recorded_version, os_version, refresh_sql
+        FROM ({{ vars.drift_sql }}) d
+       ORDER BY kind, name
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {% if outputs.drift.size == 0 %}No collation version mismatch in {{ inputs.jdbc_url }}.{% else %}Collation version mismatch in {{ inputs.jdbc_url }}:
+      {% for r in outputs.drift.rows %}{{ r.kind }} {{ r.name }} was built with {{ r.recorded_version }}, the system now provides {{ r.os_version }}. {% endfor %}{% endif %}
+
+  - id: stop_if_clean
+    type: io.kestra.plugin.core.execution.Exit
+    runIf: "{{ outputs.drift.size == 0 }}"
+    state: SUCCESS
+
+  - id: precheck
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.health_sql) }}"
+
+  - id: no_invalid_indexes
+    type: io.kestra.plugin.core.execution.Assert
+    description: An invalid index left by an earlier failed rebuild must be fixed first, so it is never taken for a healthy one.
+    conditions:
+      - "{{ outputs.precheck.row.invalid_indexes == 0 }}"
+    errorMessage: "Invalid indexes found: {{ outputs.precheck.row.invalid_names }}. A failed REINDEX CONCURRENTLY leaves a _ccnew copy: fix its cause, such as duplicate keys, drop the invalid index, then run again."
+
+  - id: indexes
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Every index with a key that uses a changed collation. Partitioned parent indexes are skipped, their partitions are listed.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT format('%I.%I', n.nspname, ic.relname) AS index_name,
+             format('%I.%I', tn.nspname, tc.relname) AS table_name,
+             pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
+             format('REINDEX INDEX CONCURRENTLY %I.%I', n.nspname, ic.relname) AS reindex_sql
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = ic.relnamespace
+        JOIN pg_class tc ON tc.oid = i.indrelid
+        JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+       WHERE ic.relkind = 'i'
+         AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_toast'
+         AND i.indcollation::oid[] && ARRAY(SELECT coll_oid FROM ({{ vars.drift_sql }}) d)
+       ORDER BY pg_relation_size(i.indexrelid), 1
+
+  - id: plan
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ outputs.indexes.size }} index(es) to rebuild: {% for r in outputs.indexes.rows %}{{ r.index_name }} ({{ r.size }}){% if not loop.last %}, {% endif %}{% endfor %}.
+      Then: {% for r in outputs.drift.rows %}{{ r.refresh_sql }}{% if not loop.last %}; {% endif %}{% endfor %}.
+
+  - id: approve
+    type: io.kestra.plugin.core.flow.Pause
+    description: Resume to rebuild the indexes in the plan log. Without approval within 24 hours, the run is cancelled and nothing changes.
+    pauseDuration: PT24H
+    behavior: CANCEL
+
+  - id: reindex
+    type: io.kestra.plugin.core.flow.Loop
+    description: One index at a time, without blocking writes. The first failure stops the run before the version is refreshed.
+    runIf: "{{ outputs.indexes.size > 0 }}"
+    values: "{{ outputs.indexes.rows | toJson }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: rebuild
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: "{{ inputs.jdbc_url }}"
+        username: "{{ secret('POSTGRES_USERNAME') }}"
+        password: "{{ secret('POSTGRES_PASSWORD') }}"
+        fetchType: NONE
+        sql: "{{ fromJson(item.value).reindex_sql }}"
+
+  - id: refresh
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Records the new versions in one transaction, which also clears PostgreSQL's warning. Runs only after every rebuild succeeded.
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: NONE
+    sql: |
+      {% for r in outputs.drift.rows %}
+      {{ r.refresh_sql }};
+      {% endfor %}
+
+  - id: verify
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "{{ inputs.jdbc_url }}"
+    username: "{{ secret('POSTGRES_USERNAME') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    fetchType: FETCH_ONE
+    sql: "{{ render(vars.health_sql) }}"
+
+  - id: verified
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.verify.row.drift_left == 0 }}"
+      - "{{ outputs.verify.row.invalid_indexes == 0 }}"
+    errorMessage: "After the rebuild: {{ outputs.verify.row.drift_left }} collation mismatch(es) and {{ outputs.verify.row.invalid_indexes }} invalid index(es) left ({{ outputs.verify.row.invalid_names }})."
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: "Rebuilt {{ outputs.indexes.size }} index(es) in {{ inputs.jdbc_url }} and refreshed {{ outputs.drift.size }} collation version(s). No mismatch or invalid index left."
+
+triggers:
+  - id: after_upgrade
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Call this from the pipeline that upgrades the OS or the PostgreSQL image.
+    key: "{{ secret('POSTGRES_COLLATION_WEBHOOK_KEY') }}"
+
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Catches upgrades made outside the pipeline. Shipped disabled.
+    cron: "0 6 * * 1"
+    disabled: true
+
+extend:
+  title: Rebuild PostgreSQL Indexes After a Collation Version Change
+  metaTitle: Fix a PostgreSQL Collation Version Mismatch | Kestra
+  shortDescription: After an OS or ICU upgrade, find the PostgreSQL indexes built with the old text sort rules, rebuild them after approval, then refresh the collation version.
+  metaDescription: Fix a PostgreSQL collation version mismatch after an OS upgrade. Rebuild affected indexes concurrently after approval, then refresh and verify.
+  description: |
+    PostgreSQL sorts text with rules from the operating system's C library or from ICU. When an OS or image upgrade changes those rules, indexes built with the old rules no longer match: queries can miss rows that are there, and unique indexes can let duplicates in. PostgreSQL only logs a "collation version mismatch" warning. This flow finds the affected indexes, rebuilds them after approval, and only then records the new collation version.
+
+    ## How it works
+
+    1. The Webhook trigger starts a run from the upgrade pipeline. A weekly Schedule, shipped disabled, catches upgrades made by hand.
+    2. `drift` compares the collation version PostgreSQL recorded with the one the system provides now, for the database and every collation in use. With no mismatch, `stop_if_clean` ends the run.
+    3. `precheck` stops the run if an invalid index already exists, such as one left by an earlier failed rebuild.
+    4. `indexes` lists every index whose key uses a changed collation, and `plan` logs them. `approve` waits for a DBA to resume the run, and cancels it after 24 hours.
+    5. `reindex` rebuilds the indexes one at a time with `REINDEX INDEX CONCURRENTLY`, so writes continue.
+    6. `refresh` runs `ALTER DATABASE ... REFRESH COLLATION VERSION` and `ALTER COLLATION ... REFRESH VERSION`, only after every rebuild succeeded.
+    7. `verify` fails the run if a mismatch or an invalid index is left.
+
+    ## What you get
+
+    - Indexes that match the new sort rules, rebuilt without blocking writes.
+    - The warning cleared only after the indexes are fixed, never before.
+    - A failed run naming the index, for example a unique index that now has duplicate keys.
+
+    ## Who it's for
+
+    - DBAs and platform teams that upgrade the OS or PostgreSQL images under existing data.
+
+    ## Why orchestrate this with Kestra
+
+    The fix is an ordered sequence with a human decision in the middle. Kestra starts it from the upgrade pipeline, waits for approval, rebuilds one index at a time and keeps a history of what was rebuilt where.
+
+    ## Prerequisites
+
+    - PostgreSQL 15 or later, and a superuser or the owner of the database, tables and collations.
+    - Range-partitioned tables with a text partition key are not checked. Review them by hand.
+
+    ### Secrets
+
+    - `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`: the database login.
+    - `POSTGRES_COLLATION_WEBHOOK_KEY`: the webhook key.
+
+    ## Quick start
+
+    1. Add the secrets and set `jdbc_url`.
+    2. Execute the flow after an upgrade, read the `plan` log and resume the run.
+    3. Read the `summary` log. Run it once per database.
+
+    ## How to extend
+
+    - Post the `plan` log to Slack before the pause.
+    - Loop over every database of a cluster.
+
+    ## Links
+
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [ALTER COLLATION notes](https://www.postgresql.org/docs/current/sql-altercollation.html#SQL-ALTERCOLLATION-NOTES)
+    - [Locale data changes](https://wiki.postgresql.org/wiki/Locale_data_changes)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false

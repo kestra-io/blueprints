@@ -1,0 +1,566 @@
+id: ml-delayed-label-performance-monitor
+namespace: company.team
+
+variables:
+  # Connection and table names live in the flow, not in the inputs, so only people who can edit the flow can
+  # point it somewhere else. The tables need these columns:
+  #   predictions: prediction_id, model_name, predicted_at (timestamptz), score (0 to 1)
+  #   outcomes:    prediction_id, outcome (0 or 1), observed_at (timestamptz, when the true outcome became known)
+  db_url: jdbc:postgresql://ml-db:5432/mlmonitor
+  db_username: postgres
+  predictions_table: ml_predictions
+  outcomes_table: ml_outcomes
+  key_prefix: "ml_{{ inputs.model_name | replace({'-': '_'}) }}"
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: model_name
+    type: STRING
+    displayName: Model name
+    description: Lower case letters, digits and dashes. Matches the model_name column of the predictions table and names the report and the KV keys.
+    defaults: nyc-taxi-trip-20min
+    validator: ^[a-z0-9][a-z0-9-]{0,62}$
+
+  - id: mode
+    type: SELECT
+    displayName: Mode
+    description: >
+      MONITOR compares recent cohorts with the baseline. SET_BASELINE measures the same window and stores it as the
+      baseline: run it once after the model is validated, with `as_of` at the end of the validation period.
+    values: [MONITOR, SET_BASELINE]
+    defaults: MONITOR
+
+  - id: as_of
+    type: STRING
+    displayName: As of (ISO 8601)
+    description: Judge the model as it was known at this moment, for example 2026-03-01T00:00:00Z. Leave empty for now. Outcomes that arrived after this moment are ignored, so a past date replays what the monitor would have said then.
+    required: false
+    validator: ^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:?\d{2})?)?$
+
+  - id: label_maturity
+    type: STRING
+    displayName: Label maturity (ISO 8601 duration)
+    description: How long after a prediction its outcome is normally known, for example P30D for a loan default or PT1H for a trip. Predictions younger than this are not judged yet.
+    defaults: P7D
+    validator: ^P(?=\d|T\d)(\d+D)?(T(\d+H)?(\d+M)?(\d+S)?)?$
+
+  - id: cohort_days
+    type: INT
+    displayName: Cohort length (days)
+    description: Predictions are grouped into cohorts of this many days, counted back from the maturity cut-off. Each cohort is judged on its own.
+    defaults: 7
+    min: 1
+    max: 90
+
+  - id: lookback_cohorts
+    type: INT
+    displayName: Cohorts to look at
+    defaults: 8
+    min: 1
+    max: 26
+
+  - id: min_label_coverage
+    type: FLOAT
+    displayName: Min label coverage
+    description: A cohort is not judged when fewer than this share of its predictions has an outcome yet. Missing outcomes are rarely random, so judging a thin cohort would mislead.
+    defaults: 0.9
+
+  - id: min_labeled
+    type: INT
+    displayName: Min rows with an outcome per cohort
+    defaults: 500
+    min: 50
+
+  - id: max_auc_drop
+    type: FLOAT
+    displayName: Max AUC drop
+    description: Degraded when the AUC is lower than the baseline by more than this (0.03 is 3 points) and the drop is significant.
+    defaults: 0.03
+
+  - id: max_brier_increase
+    type: FLOAT
+    displayName: Max Brier score increase
+    description: Degraded when the Brier score (mean squared error of the probabilities) is higher than the baseline by more than this share (0.15 is 15%) and the rise is significant.
+    defaults: 0.15
+
+  - id: patience
+    type: INT
+    displayName: Cohorts in a row before retraining
+    description: The retraining flow starts only when this many of the most recent cohorts in a row are degraded.
+    defaults: 2
+    min: 1
+
+  - id: retrain_namespace
+    type: STRING
+    displayName: Retraining flow namespace
+    description: Optional. A flow that takes `model_name` and `reason` as inputs.
+    required: false
+
+  - id: retrain_flow_id
+    type: STRING
+    displayName: Retraining flow id
+    required: false
+
+  - id: fail_on_degraded
+    type: BOOL
+    displayName: Fail the execution when degraded
+    description: Set to false when a parent flow reads the `verdict` output and decides itself.
+    defaults: true
+
+  - id: alert_webhook_url
+    type: STRING
+    displayName: Alert webhook (Slack compatible)
+    description: Receives a short message when the verdict is DEGRADED or INCONCLUSIVE.
+    required: false
+    validator: ^https?://\S+$
+
+tasks:
+  - id: mark_pending
+    type: io.kestra.plugin.core.kv.Set
+    description: Replace the last verdict first, so a run that crashes or is killed never leaves an old HEALTHY behind.
+    key: "{{ render(vars.key_prefix) }}_performance"
+    kvType: JSON
+    value: |
+      {"verdict": "PENDING", "execution_id": "{{ execution.id }}", "flow_revision": {{ flow.revision }}, "started_at": {{ now() | toJson }}}
+
+  - id: query
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >
+      Join predictions with the outcomes that were known at `as_of`, keep the predictions old enough to have an
+      outcome, and aggregate them per cohort and per score bin inside the database. Only counts leave it.
+    url: "{{ vars.db_url }}"
+    username: "{{ vars.db_username }}"
+    password: "{{ secret('ML_DB_PASSWORD') }}"
+    fetchType: FETCH
+    parameters:
+      model_name: "{{ inputs.model_name }}"
+      as_of: "{{ inputs.as_of ?? now() }}"
+      maturity: "{{ inputs.label_maturity }}"
+      cohort_days: "{{ inputs.cohort_days }}"
+      lookback: "{{ inputs.lookback_cohorts }}"
+    sql: |
+      WITH win AS (
+        SELECT CAST(:as_of AS timestamptz) AS as_of,
+               CAST(:as_of AS timestamptz) - CAST(:maturity AS interval) AS cutoff,
+               CAST(:as_of AS timestamptz) - CAST(:maturity AS interval)
+                 - (CAST(:lookback AS int) * CAST(:cohort_days AS int)) * interval '1 day' AS window_start
+      ), scored AS (
+        SELECT CAST(:lookback AS int) - 1 - CAST(floor(extract(epoch FROM (p.predicted_at - win.window_start)) / (CAST(:cohort_days AS int) * 86400.0)) AS int) AS k,
+               CAST(least(floor(p.score * 200), 199) AS int) AS bin,
+               p.score, o.outcome, win.cutoff
+        FROM {{ vars.predictions_table }} p
+        CROSS JOIN win
+        LEFT JOIN {{ vars.outcomes_table }} o ON o.prediction_id = p.prediction_id AND o.observed_at <= win.as_of
+        WHERE p.model_name = :model_name
+          AND p.predicted_at < win.cutoff
+          AND p.predicted_at >= win.window_start
+      ), binned AS (
+        SELECT k, bin, min(cutoff) AS cutoff,
+               count(*) AS n,
+               count(outcome) AS labeled,
+               count(*) FILTER (WHERE outcome = 1) AS pos,
+               coalesce(sum(score) FILTER (WHERE outcome IS NOT NULL), 0) AS sum_score,
+               coalesce(sum(power(score - outcome, 2)), 0) AS sum_d2,
+               coalesce(sum(power(score - outcome, 4)), 0) AS sum_d4,
+               count(*) FILTER (WHERE score IS NULL OR score < 0 OR score > 1 OR outcome NOT IN (0, 1)) AS invalid
+        FROM scored
+        GROUP BY k, bin
+      )
+      SELECT k,
+             CAST(min(cutoff) - ((k + 1) * CAST(:cohort_days AS int)) * interval '1 day' AS date) AS cohort_start,
+             CAST(min(cutoff) - (k * CAST(:cohort_days AS int)) * interval '1 day' AS date) AS cohort_end,
+             json_agg(json_build_array(bin, n, labeled, pos, round(CAST(sum_score AS numeric), 8),
+                                       round(CAST(sum_d2 AS numeric), 8), round(CAST(sum_d4 AS numeric), 8), invalid) ORDER BY bin) AS bins
+      FROM binned
+      GROUP BY k
+      ORDER BY k
+
+  - id: evaluate
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Score every cohort that has enough outcomes (AUC and Brier score with standard errors), compare each with the
+      baseline, and write the report. Python standard library only.
+    containerImage: python:3.12-slim
+    inputFiles:
+      counts.json: "{{ outputs.query.rows | toJson }}"
+    env:
+      BASELINE: "{{ kv(render(vars.key_prefix) ~ '_baseline', errorOnMissing=false) | toJson }}"
+      HISTORY: "{{ kv(render(vars.key_prefix) ~ '_history', errorOnMissing=false) | toJson }}"
+      MODE: "{{ inputs.mode }}"
+      MODEL: "{{ inputs.model_name }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      AS_OF: "{{ inputs.as_of ?? now() }}"
+      MIN_COVERAGE: "{{ inputs.min_label_coverage }}"
+      MIN_LABELED: "{{ inputs.min_labeled }}"
+      MAX_AUC_DROP: "{{ inputs.max_auc_drop }}"
+      MAX_BRIER_INCREASE: "{{ inputs.max_brier_increase }}"
+      PATIENCE: "{{ inputs.patience }}"
+    outputFiles:
+      - performance_report.md
+    script: |
+      import json, math, os
+      from datetime import datetime, timezone
+
+      Z = 3.0               # a change counts as real only beyond this many standard errors
+      HISTORY_LENGTH = 52
+      mode = os.environ["MODE"]
+      min_coverage, min_labeled = float(os.environ["MIN_COVERAGE"]), int(os.environ["MIN_LABELED"])
+      max_auc_drop, max_brier_increase = float(os.environ["MAX_AUC_DROP"]), float(os.environ["MAX_BRIER_INCREASE"])
+      patience = int(os.environ["PATIENCE"])
+      baseline = json.loads(os.environ.get("BASELINE") or "null")
+      history = json.loads(os.environ.get("HISTORY") or "null") or []
+      BIN_FIELDS = ("bin", "n", "labeled", "pos", "sum_score", "sum_d2", "sum_d4", "invalid")
+      rows = []
+      for r in json.load(open("counts.json")):
+          packed = json.loads(r["bins"]) if isinstance(r["bins"], str) else r["bins"]
+          for values in packed:
+              rows.append({"k": r["k"], "cohort_start": r["cohort_start"], "cohort_end": r["cohort_end"],
+                           **{name: float(v) for name, v in zip(BIN_FIELDS, values)}})
+
+      def summarize(bin_rows):
+          n = sum(r["n"] for r in bin_rows)
+          labeled = sum(r["labeled"] for r in bin_rows)
+          pos = sum(r["pos"] for r in bin_rows)
+          neg = labeled - pos
+          s = {"n": int(n), "labeled": int(labeled), "pos": int(pos), "coverage": labeled / n if n else 0.0,
+               "auc": None, "auc_se": None, "brier": None, "brier_se": None, "mean_score": None, "base_rate": None}
+          if labeled:
+              s["mean_score"] = sum(r["sum_score"] for r in bin_rows) / labeled
+              s["base_rate"] = pos / labeled
+              d2, d4 = sum(r["sum_d2"] for r in bin_rows), sum(r["sum_d4"] for r in bin_rows)
+              s["brier"] = d2 / labeled
+              s["brier_se"] = math.sqrt(max(d4 / labeled - s["brier"] ** 2, 0.0) / labeled)
+          if pos and neg:
+              below, wins = 0.0, 0.0
+              for r in sorted(bin_rows, key=lambda r: r["bin"]):
+                  neg_here = r["labeled"] - r["pos"]
+                  wins += r["pos"] * (below + 0.5 * neg_here)   # a tie inside a score bin counts half
+                  below += neg_here
+              a = wins / (pos * neg)
+              q1, q2 = a / (2 - a), 2 * a * a / (1 + a)
+              # Hanley and McNeil standard error of the AUC
+              s["auc"] = a
+              s["auc_se"] = math.sqrt(max((a * (1 - a) + (pos - 1) * (q1 - a * a) + (neg - 1) * (q2 - a * a)) / (pos * neg), 0.0))
+          return s
+
+      def unjudged(s):
+          why = []
+          if s["coverage"] < min_coverage:
+              why.append("only %.0f%% of the predictions have an outcome yet (needs %.0f%%)" % (100 * s["coverage"], 100 * min_coverage))
+          if s["labeled"] < min_labeled:
+              why.append("%d rows with an outcome (needs %d)" % (s["labeled"], min_labeled))
+          if not (s["pos"] and s["labeled"] - s["pos"]):
+              why.append("the outcomes hold a single class")
+          return why
+
+      invalid = int(sum(r["invalid"] for r in rows))
+      if invalid:
+          raise SystemExit("%d rows have a score outside 0 to 1, a NULL score or an outcome other than 0 or 1; fix the data first. The verdict stays PENDING." % invalid)
+
+      by_cohort = {}
+      for r in rows:
+          by_cohort.setdefault(int(r["k"]), []).append(r)
+      cohorts = []
+      for k in sorted(by_cohort):
+          group = by_cohort[k]
+          s = summarize(group)
+          s.update(k=k, start=str(group[0]["cohort_start"]), end=str(group[0]["cohort_end"]), reasons=unjudged(s), bins=group)
+          cohorts.append(s)
+
+      def pooled(selected):
+          return summarize([r for c in selected for r in c["bins"]])
+
+      def judge(s, base):
+          drop = base["auc"] - s["auc"]
+          rise = (s["brier"] - base["brier"]) / base["brier"]
+          z_auc = drop / math.sqrt(s["auc_se"] ** 2 + base["auc_se"] ** 2)
+          z_brier = (s["brier"] - base["brier"]) / math.sqrt(s["brier_se"] ** 2 + base["brier_se"] ** 2)
+          findings = []
+          if drop > max_auc_drop and z_auc > Z:
+              findings.append("AUC %.3f is %.3f below the baseline %.3f" % (s["auc"], drop, base["auc"]))
+          if rise > max_brier_increase and z_brier > Z:
+              findings.append("Brier score %.3f is %.0f%% above the baseline %.3f" % (s["brier"], 100 * rise, base["brier"]))
+          return {"auc_drop": drop, "z_auc": z_auc, "brier_rise": rise, "z_brier": z_brier, "findings": findings}
+
+      scorable = [c for c in cohorts if not c["reasons"]]
+      now = datetime.now(timezone.utc).isoformat()
+      new_baseline = None
+      if mode == "SET_BASELINE":
+          if scorable:
+              p = pooled(scorable)
+              new_baseline = {k: p[k] for k in ("n", "labeled", "pos", "auc", "auc_se", "brier", "brier_se", "mean_score", "base_rate")}
+              new_baseline.update(set_at=now, as_of=os.environ["AS_OF"], execution_id=os.environ["EXECUTION_ID"],
+                                  cohorts=[c["start"] + " to " + c["end"] for c in scorable])
+              verdict = "BASELINE_SET"
+          else:
+              verdict = "INCONCLUSIVE"
+      else:
+          if baseline is None:
+              verdict = "INCONCLUSIVE"
+          for c in cohorts:
+              if baseline and not c["reasons"]:
+                  c["judgement"] = judge(c, baseline)
+                  c["verdict"] = "DEGRADED" if c["judgement"]["findings"] else "HEALTHY"
+              else:
+                  c["verdict"] = "INCONCLUSIVE"
+          if baseline is not None:
+              newest = next((c for c in cohorts if c["k"] == 0), None)
+              verdict = newest["verdict"] if newest else "INCONCLUSIVE"
+
+      consecutive = 0
+      for c in sorted(cohorts, key=lambda c: c["k"]):
+          if c.get("verdict") != "DEGRADED":
+              break
+          consecutive += 1
+      retrain = mode == "MONITOR" and consecutive >= patience
+
+      model = os.environ["MODEL"]
+      lines = ["# Performance report: %s (%s)" % (model, verdict), ""]
+      if mode == "SET_BASELINE":
+          if new_baseline:
+              lines += ["Baseline stored from %d cohorts (%d rows with an outcome): AUC %.3f, Brier score %.3f, mean score %.3f against an outcome rate of %.3f." % (
+                  len(scorable), new_baseline["labeled"], new_baseline["auc"], new_baseline["brier"], new_baseline["mean_score"], new_baseline["base_rate"]), ""]
+          else:
+              lines += ["No baseline stored: no cohort could be judged."]
+      elif baseline:
+          window = "%s to %s" % (baseline["cohorts"][-1].split(" to ")[0], baseline["cohorts"][0].split(" to ")[1])
+          lines += ["Baseline (measured on %s): AUC %.3f, Brier score %.3f, mean score %.3f against an outcome rate of %.3f." % (
+              window, baseline["auc"], baseline["brier"], baseline["mean_score"], baseline["base_rate"]), ""]
+      else:
+          lines += ["No baseline is stored for this model. Run once with mode SET_BASELINE after it is validated.", ""]
+      lines += ["| cohort (newest first) | predictions | with outcome | AUC | Brier | mean score vs outcome rate | verdict |", "|---|---|---|---|---|---|---|"]
+      for c in cohorts:
+          if c["reasons"]:
+              lines.append("| %s to %s | %d | %.0f%% | not judged | not judged | not judged | INCONCLUSIVE: %s |" % (
+                  c["start"], c["end"], c["n"], 100 * c["coverage"], "; ".join(c["reasons"])))
+          else:
+              lines.append("| %s to %s | %d | %.0f%% | %.3f | %.3f | %.3f vs %.3f | %s |" % (
+                  c["start"], c["end"], c["n"], 100 * c["coverage"], c["auc"], c["brier"], c["mean_score"], c["base_rate"],
+                  c.get("verdict", "baseline window")))
+      lines.append("")
+      for c in cohorts:
+          for f in c.get("judgement", {}).get("findings", []):
+              lines.append("- %s to %s: %s." % (c["start"], c["end"], f))
+      if consecutive:
+          lines.append("- %d most recent cohort(s) in a row are degraded (retraining starts at %d)." % (consecutive, patience))
+      lines += ["",
+                "## Method", "",
+                "- Predictions are grouped into cohorts counted back from the maturity cut-off, and only those old enough to have an outcome are judged. Outcomes that were not known at the as-of moment are treated as missing.",
+                "- A cohort is judged only when enough of its predictions have an outcome (%.0f%%) and it has at least %d of them. Missing outcomes are rarely random: the share and kind of rows still waiting can bias the measured performance." % (100 * min_coverage, min_labeled),
+                "- AUC comes from a 200-bin histogram of the scores (a tie inside a bin counts half) with the Hanley and McNeil standard error. The Brier score is the mean squared error of the probabilities, with its standard error.",
+                "- A cohort is degraded only when the AUC drop exceeds %.2f or the Brier score rises by more than %.0f%%, and the change is more than %.0f standard errors away from the baseline." % (max_auc_drop, 100 * max_brier_increase, Z),
+                "- This measures how well the scores rank and match the outcomes. It does not say why they changed."]
+      report = "\n".join(lines) + "\n"
+      with open("performance_report.md", "w") as f:
+          f.write(report)
+      print(report)
+
+      def brief(c):
+          return {k: v for k, v in c.items() if k not in ("bins", "reasons")} | {"reasons": c["reasons"]}
+      summary = "%s: %s." % (model, verdict)
+      newest = next((c for c in cohorts if c["k"] == 0), None)
+      if not cohorts:
+          summary += " No predictions old enough to judge were found for this model in the window."
+      elif mode == "MONITOR" and baseline is None:
+          summary += " No baseline is stored; run once with mode SET_BASELINE."
+      elif newest and not newest["reasons"]:
+          summary += " Newest cohort AUC %.3f, Brier %.3f%s" % (newest["auc"], newest["brier"],
+                     "" if not baseline else " (baseline %.3f and %.3f)." % (baseline["auc"], baseline["brier"]))
+      elif newest:
+          summary += " Newest cohort not judged: " + "; ".join(newest["reasons"]) + "."
+      for c in cohorts:
+          for f in c.get("judgement", {}).get("findings", []):
+              if c["k"] == 0:
+                  summary += " " + f + "."
+      history = (history + [{"execution_id": os.environ["EXECUTION_ID"], "at": now, "mode": mode, "verdict": verdict,
+                             "newest": ({k: newest[k] for k in ("start", "end", "auc", "brier", "coverage")} if newest else None)}])[-HISTORY_LENGTH:]
+      print("::" + json.dumps({"outputs": {
+          "verdict": verdict, "summary": summary, "report_markdown": report, "history": history,
+          "baseline": new_baseline, "retrain": retrain, "consecutive_degraded": consecutive,
+          "cohorts": [brief(c) for c in cohorts],
+      }}) + "::")
+
+  - id: publish_report
+    type: io.kestra.plugin.core.namespace.UploadFiles
+    namespace: "{{ flow.namespace }}"
+    filesMap:
+      "ml-monitor/{{ inputs.model_name }}/performance_report.md": "{{ outputs.evaluate.outputFiles['performance_report.md'] }}"
+
+  - id: store_baseline
+    type: io.kestra.plugin.core.flow.If
+    description: Keep the measured window as the baseline that later runs compare with.
+    condition: "{{ outputs.evaluate.vars.baseline is not null }}"
+    then:
+      - id: save_baseline
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ render(vars.key_prefix) }}_baseline"
+        kvType: JSON
+        value: "{{ outputs.evaluate.vars.baseline | toJson }}"
+
+  - id: record_history
+    type: io.kestra.plugin.core.kv.Set
+    key: "{{ render(vars.key_prefix) }}_history"
+    kvType: JSON
+    value: "{{ outputs.evaluate.vars.history | toJson }}"
+
+  - id: record_verdict
+    type: io.kestra.plugin.core.kv.Set
+    description: Written on every outcome, so this key always holds the latest verdict for the model.
+    key: "{{ render(vars.key_prefix) }}_performance"
+    kvType: JSON
+    value: |
+      {
+        "verdict": {{ outputs.evaluate.vars.verdict | toJson }},
+        "summary": {{ outputs.evaluate.vars.summary | toJson }},
+        "consecutive_degraded": {{ outputs.evaluate.vars.consecutive_degraded }},
+        "execution_id": "{{ execution.id }}",
+        "flow_revision": {{ flow.revision }},
+        "mode": {{ inputs.mode | toJson }},
+        "as_of": {{ (inputs.as_of ?? now()) | toJson }},
+        "report": "ml-monitor/{{ inputs.model_name }}/performance_report.md"
+      }
+
+  - id: retrain
+    type: io.kestra.plugin.core.flow.If
+    description: Start the retraining flow, without waiting for it, once enough cohorts in a row are degraded.
+    condition: "{{ outputs.evaluate.vars.retrain and inputs.retrain_namespace is not null and inputs.retrain_flow_id is not null }}"
+    then:
+      - id: start_retraining
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: "{{ inputs.retrain_namespace }}"
+        flowId: "{{ inputs.retrain_flow_id }}"
+        wait: false
+        inputs:
+          model_name: "{{ inputs.model_name }}"
+          reason: "{{ outputs.evaluate.vars.summary }}"
+
+  - id: alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.alert_webhook_url is not null and (outputs.evaluate.vars.verdict == 'DEGRADED' or outputs.evaluate.vars.verdict == 'INCONCLUSIVE') }}"
+    then:
+      - id: send_alert
+        type: io.kestra.plugin.core.http.Request
+        method: POST
+        uri: "{{ inputs.alert_webhook_url }}"
+        contentType: application/json
+        body: "{{ {'text': 'Model monitor ' ~ outputs.evaluate.vars.verdict ~ ' for ' ~ inputs.model_name ~ ': ' ~ outputs.evaluate.vars.summary ~ ' Report: ml-monitor/' ~ inputs.model_name ~ '/performance_report.md, execution ' ~ execution.id} | toJson }}"
+
+  - id: decision
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ outputs.evaluate.vars.verdict }}"
+    cases:
+      HEALTHY:
+        - id: healthy
+          type: io.kestra.plugin.core.log.Log
+          message: "{{ outputs.evaluate.vars.summary }}"
+      BASELINE_SET:
+        - id: baseline_set
+          type: io.kestra.plugin.core.log.Log
+          message: "{{ outputs.evaluate.vars.summary }}"
+      INCONCLUSIVE:
+        - id: inconclusive
+          type: io.kestra.plugin.core.log.Log
+          level: WARN
+          message: "Nothing to judge: {{ outputs.evaluate.vars.summary }} See ml-monitor/{{ inputs.model_name }}/performance_report.md."
+    defaults:
+      - id: degraded
+        type: io.kestra.plugin.core.execution.Fail
+        description: DEGRADED. Skipped when a parent flow handles the outcome (`fail_on_degraded` false).
+        condition: "{{ inputs.fail_on_degraded }}"
+        errorMessage: "{{ outputs.evaluate.vars.summary }} See ml-monitor/{{ inputs.model_name }}/performance_report.md."
+
+outputs:
+  # Every value falls back to a safe default, so a run that stops early still reports that nothing was judged.
+  - id: verdict
+    type: STRING
+    description: HEALTHY, DEGRADED, INCONCLUSIVE, BASELINE_SET, or NOT_RUN when the run did not finish.
+    value: "{{ outputs.evaluate.vars.verdict ?? 'NOT_RUN' }}"
+  - id: healthy
+    type: BOOL
+    description: True only for HEALTHY.
+    value: "{{ (outputs.evaluate.vars.verdict ?? 'NOT_RUN') == 'HEALTHY' }}"
+  - id: summary
+    type: STRING
+    value: "{{ outputs.evaluate.vars.summary ?? 'The monitor did not finish.' }}"
+  - id: retrain_started
+    type: BOOL
+    value: "{{ outputs.start_retraining is defined }}"
+  - id: report_markdown
+    type: STRING
+    value: "{{ outputs.evaluate.vars.report_markdown ?? '' }}"
+  - id: cohorts
+    type: JSON
+    value: "{{ (outputs.evaluate.vars.cohorts ?? []) | toJson }}"
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Check the model every day once the inputs and variables point at your own prediction and outcome tables.
+    cron: "0 6 * * *"
+    disabled: true
+
+extend:
+  title: Monitor a model's real performance once its delayed outcomes arrive
+  metaTitle: ML Model Performance Monitor for Delayed Labels with PostgreSQL | Kestra
+  shortDescription: Join a prediction log with the outcomes that arrive later, judge only cohorts with enough outcomes, and flag a statistically real drop in AUC or Brier score against the deploy-time baseline.
+  metaDescription: Monitor a deployed model in Kestra. Join PostgreSQL predictions with delayed outcomes, judge mature cohorts, flag real AUC or Brier drops, start retraining.
+  description: |
+    Input drift tells you the data changed, not that the model got worse. For many models the truth arrives weeks later: a loan defaults, a customer leaves, a trip ends. This flow joins your prediction log with those outcomes, judges only the cohorts old enough to have them, and tells you when the model's real performance has dropped.
+
+    ## How it works
+
+    1. `mark_pending` sets the verdict in KV to `PENDING`, so a run that crashes never leaves an old HEALTHY.
+    2. `query` (PostgreSQL) joins predictions with the outcomes known at `as_of`, drops predictions younger than `label_maturity`, and aggregates per cohort and score bin in the database. Only counts leave it.
+    3. `evaluate` (Python) computes AUC and Brier score with standard errors per cohort, leaves out cohorts with too few outcomes (INCONCLUSIVE), and compares the rest with the baseline stored in KV.
+    4. A cohort is DEGRADED only when the drop is larger than your tolerance and more than three standard errors from the baseline.
+    5. The report goes to namespace files, the verdict and history to KV. When enough cohorts in a row are degraded, `retrain` starts your retraining flow; `alert` posts to a webhook.
+
+    ## What you get
+
+    - Flow outputs: `verdict`, `healthy`, `summary`, `cohorts`, `report_markdown`, `retrain_started`.
+    - `ml-monitor/<model_name>/performance_report.md` with every cohort, its coverage and the method.
+    - KV `ml_<model_name>_performance`, `_baseline` and `_history`.
+    - `as_of` replays a past date to see when the monitor would have fired.
+
+    ## Who it's for
+
+    - ML engineers and data scientists running scored models whose outcomes arrive later (credit, churn, fraud, ETAs).
+
+    ## Why orchestrate this with Kestra
+
+    - The schedule, SQL, statistics, KV baseline, report, alert and retraining call are one audited execution, and the verdict feeds a deploy or retrain flow.
+
+    ## Prerequisites
+
+    - A PostgreSQL database with a predictions table (`prediction_id`, `model_name`, `predicted_at`, `score` between 0 and 1) and an outcomes table (`prediction_id`, `outcome` 0 or 1, `observed_at`), one outcome row per prediction. Names are in `variables`. Rows that break these rules stop the run instead of being skipped.
+    - A Docker-capable worker for the Python task.
+
+    ### Secrets
+
+    - `ML_DB_PASSWORD`: password of the database user.
+
+    ## Quick start
+
+    1. Add the secret and edit `variables` for your database and tables.
+    2. Run once with `mode: SET_BASELINE`, `as_of` at the end of the validation period and `label_maturity` for your outcomes.
+    3. Run with `mode: MONITOR` (leave `as_of` empty), then enable the `daily` trigger.
+    4. Set `retrain_namespace` and `retrain_flow_id` to start retraining.
+
+    ## How to extend
+
+    - Add a segment column to monitor each customer group, or send the verdict to a model registry.
+
+    ## Links
+
+    - [PostgreSQL plugin](https://kestra.io/plugins/plugin-jdbc-postgres)
+    - [Hanley and McNeil, the standard error of an AUC](https://pubs.rsna.org/doi/10.1148/radiology.143.1.7063747)
+  tags:
+    - Data
+    - AI
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
