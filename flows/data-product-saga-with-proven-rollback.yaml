@@ -1,0 +1,594 @@
+id: data-product-saga-with-proven-rollback
+namespace: company.platform
+
+description: |
+  Provisions a data product across PostgreSQL, S3 and Kafka as one saga. An intent is written
+  before anything changes, a failed run compensates in reverse order, rollback reads the real
+  systems instead of trusting bookkeeping, and DRILL fails every step in turn to prove it.
+
+inputs:
+  - id: mode
+    type: SELECT
+    defaults: APPLY
+    values:
+      - APPLY
+      - ROLLBACK
+      - OBSERVE
+      - DRILL
+
+  - id: product
+    type: STRING
+    defaults: orders_events
+    validator: ^(?=.{3,35}$)[a-z][a-z0-9]*(_[a-z0-9]+)*$
+    description: Name of the data product. Used for the schema, the bucket and the topic.
+
+  - id: fail_at
+    type: SELECT
+    required: false
+    description: Reserved for DRILL. Ignored unless the product name ends in _drill.
+    values:
+      - NONE
+      - AFTER_POSTGRES
+      - AFTER_S3
+      - AFTER_KAFKA
+
+variables:
+  replication_factor: 1
+  bucket: "dp-{{ inputs.product | replace({'_': '-'}) }}"
+  topic: "dp.{{ inputs.product }}.events"
+
+tasks:
+  - id: by_mode
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ inputs.mode }}"
+    cases:
+      OBSERVE:
+        - id: read_postgres
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH_ONE
+          sql: SELECT count(*) AS present FROM pg_namespace WHERE nspname = '{{ inputs.product }}'
+
+        - id: read_s3
+          type: io.kestra.plugin.aws.cli.AwsCLI
+          accessKeyId: "{{ secret('S3_ACCESS_KEY') }}"
+          secretKeyId: "{{ secret('S3_SECRET_KEY') }}"
+          region: us-east-1
+          containerImage: amazon/aws-cli:2.17.57
+          env:
+            AWS_ENDPOINT_URL: "{{ secret('S3_ENDPOINT') }}"
+          commands:
+            - |
+              n=1
+              if ! err=$(aws s3api head-bucket --bucket {{ render(vars.bucket) }} 2>&1); then
+                case "$err" in *"(404)"*) n=0 ;; *) echo "$err"; exit 1 ;; esac
+              fi
+              echo "::{\"outputs\":{\"present\":$n}}::"
+
+        - id: read_kafka
+          type: io.kestra.plugin.kafka.TopicList
+          properties:
+            bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP') }}"
+
+      APPLY:
+        - id: ensure_ledger
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: The ledger lives in PostgreSQL because claiming a product has to be atomic.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          retry:
+            type: constant
+            interval: PT2S
+            maxAttempts: 3
+          sql: |
+            CREATE SCHEMA IF NOT EXISTS saga_ledger;
+            CREATE TABLE IF NOT EXISTS saga_ledger.products (
+              product text PRIMARY KEY,
+              execution_id text NOT NULL,
+              state text NOT NULL,
+              drill_reached text,
+              updated_at timestamptz NOT NULL DEFAULT now()
+            );
+
+        - id: read_ledger
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH
+          sql: SELECT state FROM saga_ledger.products WHERE product = '{{ inputs.product }}'
+
+        - id: before_apply
+          type: io.kestra.plugin.core.flow.Subflow
+          namespace: "{{ flow.namespace }}"
+          flowId: "{{ flow.id }}"
+          wait: true
+          transmitFailed: true
+          inputs:
+            mode: OBSERVE
+            product: "{{ inputs.product }}"
+
+        - id: refuse_foreign_resources
+          type: io.kestra.plugin.core.execution.Fail
+          description: Anything already there without a ledger entry belongs to someone else. Rollback must never touch it.
+          runIf: "{{ outputs.before_apply.outputs.state != '0/0/0' and (outputs.read_ledger.size == 0 or outputs.read_ledger.rows[0].state == 'ROLLED_BACK') }}"
+          errorMessage: "{{ inputs.product }} already exists ({{ outputs.before_apply.outputs.state }}) and this saga did not create it."
+
+        - id: stop_if_committed
+          type: io.kestra.plugin.core.execution.Exit
+          description: Applying a committed product again changes nothing, so a later failure can never compensate it.
+          runIf: "{{ outputs.read_ledger.size > 0 and outputs.read_ledger.rows[0].state == 'COMMITTED' and outputs.before_apply.outputs.state == '1/1/1' }}"
+          state: SUCCESS
+
+        - id: write_intent
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Claims the product before the first side effect. ON CONFLICT makes the claim atomic, so two runs cannot both win.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH
+          sql: |
+            INSERT INTO saga_ledger.products (product, execution_id, state)
+            VALUES ('{{ inputs.product }}', '{{ execution.id }}', 'APPLYING')
+            ON CONFLICT (product) DO UPDATE
+              SET execution_id = EXCLUDED.execution_id, state = 'APPLYING', drill_reached = NULL, updated_at = now()
+              WHERE saga_ledger.products.state = 'ROLLED_BACK'
+            RETURNING product
+
+        - id: refuse_if_claimed
+          type: io.kestra.plugin.core.execution.Fail
+          runIf: "{{ outputs.write_intent.size == 0 }}"
+          errorMessage: "{{ inputs.product }} is claimed by a running, crashed or damaged saga. Wait for it, or run ROLLBACK."
+
+        - id: create_postgres
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          transaction: true
+          sql: |
+            CREATE SCHEMA IF NOT EXISTS "{{ inputs.product }}";
+            CREATE TABLE IF NOT EXISTS "{{ inputs.product }}".events (id bigserial PRIMARY KEY, payload jsonb NOT NULL);
+
+        - id: break_after_postgres
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: Records that the drill reached this point, then fails on purpose.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          runIf: "{{ (inputs.fail_at ?? 'NONE') == 'AFTER_POSTGRES' and inputs.product | endsWith('_drill') }}"
+          transaction: false
+          sql: |
+            UPDATE saga_ledger.products SET drill_reached = 'AFTER_POSTGRES' WHERE product = '{{ inputs.product }}';
+            DO $$ BEGIN RAISE EXCEPTION 'Drill failure after PostgreSQL'; END $$;
+
+        - id: create_s3
+          type: io.kestra.plugin.aws.cli.AwsCLI
+          accessKeyId: "{{ secret('S3_ACCESS_KEY') }}"
+          secretKeyId: "{{ secret('S3_SECRET_KEY') }}"
+          region: us-east-1
+          containerImage: amazon/aws-cli:2.17.57
+          env:
+            AWS_ENDPOINT_URL: "{{ secret('S3_ENDPOINT') }}"
+          commands:
+            - aws s3api head-bucket --bucket {{ render(vars.bucket) }} 2>/dev/null || aws s3api create-bucket --bucket {{ render(vars.bucket) }}
+
+        - id: break_after_s3
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: Records that the drill reached this point, then fails on purpose.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          runIf: "{{ (inputs.fail_at ?? 'NONE') == 'AFTER_S3' and inputs.product | endsWith('_drill') }}"
+          transaction: false
+          sql: |
+            UPDATE saga_ledger.products SET drill_reached = 'AFTER_S3' WHERE product = '{{ inputs.product }}';
+            DO $$ BEGIN RAISE EXCEPTION 'Drill failure after S3'; END $$;
+
+        - id: create_kafka
+          type: io.kestra.plugin.kafka.TopicCreate
+          properties:
+            bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP') }}"
+          topic: "{{ render(vars.topic) }}"
+          partitions: 3
+          replicationFactor: "{{ vars.replication_factor }}"
+          ifNotExists: true
+
+        - id: break_after_kafka
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: Records that the drill reached this point, then fails on purpose.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          runIf: "{{ (inputs.fail_at ?? 'NONE') == 'AFTER_KAFKA' and inputs.product | endsWith('_drill') }}"
+          transaction: false
+          sql: |
+            UPDATE saga_ledger.products SET drill_reached = 'AFTER_KAFKA' WHERE product = '{{ inputs.product }}';
+            DO $$ BEGIN RAISE EXCEPTION 'Drill failure after Kafka'; END $$;
+
+        - id: after_apply
+          type: io.kestra.plugin.core.flow.Subflow
+          namespace: "{{ flow.namespace }}"
+          flowId: "{{ flow.id }}"
+          wait: true
+          transmitFailed: true
+          inputs:
+            mode: OBSERVE
+            product: "{{ inputs.product }}"
+
+        - id: fail_if_incomplete
+          type: io.kestra.plugin.core.execution.Fail
+          runIf: "{{ outputs.after_apply.outputs.state != '1/1/1' }}"
+          errorMessage: "Read-back found {{ outputs.after_apply.outputs.state }}, expected 1/1/1."
+
+        - id: mark_committed
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Only the run holding the claim can commit, so a restarted or rolled back run cannot.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH
+          sql: |
+            UPDATE saga_ledger.products SET state = 'COMMITTED', updated_at = now()
+            WHERE product = '{{ inputs.product }}' AND execution_id = '{{ execution.id }}' AND state = 'APPLYING'
+            RETURNING product
+
+        - id: fail_if_claim_lost
+          type: io.kestra.plugin.core.execution.Fail
+          runIf: "{{ outputs.mark_committed.size == 0 }}"
+          errorMessage: This run no longer holds the claim on {{ inputs.product }}, so it compensates instead of committing.
+
+      ROLLBACK:
+        - id: ensure_ledger_for_rollback
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          description: The ledger lives in PostgreSQL because claiming a product has to be atomic.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          retry:
+            type: constant
+            interval: PT2S
+            maxAttempts: 3
+          sql: |
+            CREATE SCHEMA IF NOT EXISTS saga_ledger;
+            CREATE TABLE IF NOT EXISTS saga_ledger.products (
+              product text PRIMARY KEY,
+              execution_id text NOT NULL,
+              state text NOT NULL,
+              drill_reached text,
+              updated_at timestamptz NOT NULL DEFAULT now()
+            );
+
+        - id: read_ledger_for_rollback
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH
+          sql: SELECT state FROM saga_ledger.products WHERE product = '{{ inputs.product }}'
+
+        - id: refuse_without_ledger
+          type: io.kestra.plugin.core.execution.Fail
+          description: Without a ledger entry these resources are not this saga's to delete.
+          runIf: "{{ outputs.read_ledger_for_rollback.size == 0 }}"
+          errorMessage: No ledger entry for {{ inputs.product }}, so nothing will be deleted.
+
+        - id: before_rollback
+          type: io.kestra.plugin.core.flow.Subflow
+          description: Rollback works from what is really there, so it also repairs a run that crashed.
+          namespace: "{{ flow.namespace }}"
+          flowId: "{{ flow.id }}"
+          wait: true
+          transmitFailed: true
+          inputs:
+            mode: OBSERVE
+            product: "{{ inputs.product }}"
+
+        - id: guard_table
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: FETCH_ONE
+          sql: |
+            SELECT to_regclass('"{{ inputs.product }}".events') IS NOT NULL AS has_table,
+                   (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = '{{ inputs.product }}'
+                      AND c.relname NOT IN ('events', 'events_pkey', 'events_id_seq')) AS extra_tables
+
+        - id: guard_rows
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          runIf: "{{ outputs.guard_table.row.has_table }}"
+          fetchType: FETCH_ONE
+          sql: SELECT count(*) AS held FROM "{{ inputs.product }}".events
+
+        - id: guard_topic
+          type: io.kestra.plugin.kafka.Consume
+          description: Reads from the start under a throwaway group, so it moves no real consumer.
+          runIf: "{{ outputs.before_rollback.outputs.state | endsWith('/1') }}"
+          properties:
+            bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP') }}"
+            auto.offset.reset: earliest
+          topic: "{{ render(vars.topic) }}"
+          groupId: "saga-guard-{{ execution.id }}"
+          keyDeserializer: STRING
+          valueDeserializer: STRING
+          maxRecords: 1
+          pollDuration: PT15S
+          maxDuration: PT30S
+
+        - id: guard_objects
+          type: io.kestra.plugin.aws.cli.AwsCLI
+          accessKeyId: "{{ secret('S3_ACCESS_KEY') }}"
+          secretKeyId: "{{ secret('S3_SECRET_KEY') }}"
+          region: us-east-1
+          containerImage: amazon/aws-cli:2.17.57
+          env:
+            AWS_ENDPOINT_URL: "{{ secret('S3_ENDPOINT') }}"
+          commands:
+            - |
+              n=0
+              if ! err=$(aws s3api head-bucket --bucket {{ render(vars.bucket) }} 2>&1); then
+                case "$err" in *"(404)"*) echo "::{\"outputs\":{\"held\":0}}::"; exit 0 ;; *) echo "$err"; exit 1 ;; esac
+              else
+                n=$(aws s3api list-objects-v2 --bucket {{ render(vars.bucket) }} --max-items 1 --query 'length(Contents || `[]`)' --output text | head -1)
+              fi
+              echo "::{\"outputs\":{\"held\":$n}}::"
+
+        - id: refuse_if_data_exists
+          type: io.kestra.plugin.core.execution.Fail
+          description: Checked before the first delete, so a refused rollback changes nothing.
+          runIf: >-
+            {{ (outputs.guard_rows.row.held ?? 0) > 0 or outputs.guard_table.row.extra_tables > 0 or
+            (outputs.guard_topic.messagesCount ?? 0) > 0 or outputs.guard_objects.vars.held > 0 }}
+          errorMessage: >-
+            {{ inputs.product }} holds data ({{ outputs.guard_rows.row.held ?? 0 }} rows,
+            {{ outputs.guard_table.row.extra_tables }} extra objects,
+            {{ outputs.guard_topic.messagesCount ?? 0 }} or more messages,
+            {{ outputs.guard_objects.vars.held }} or more objects). A saga rollback only undoes empty
+            resources, so nothing was deleted.
+
+        - id: mark_rolling_back
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Takes the claim before the first delete, so a live APPLY cannot commit and a half-finished rollback stays visible.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: NONE
+          sql: |
+            UPDATE saga_ledger.products
+            SET state = 'ROLLING_BACK', execution_id = '{{ execution.id }}', updated_at = now()
+            WHERE product = '{{ inputs.product }}'
+
+        - id: compensate_kafka
+          type: io.kestra.plugin.kafka.TopicDelete
+          description: Reverse order of creation.
+          runIf: "{{ outputs.before_rollback.outputs.state | endsWith('/1') }}"
+          properties:
+            bootstrap.servers: "{{ secret('KAFKA_BOOTSTRAP') }}"
+          topics:
+            - "{{ render(vars.topic) }}"
+
+        - id: compensate_s3
+          type: io.kestra.plugin.aws.cli.AwsCLI
+          description: delete-bucket fails on a bucket holding data, which is the behaviour we want.
+          accessKeyId: "{{ secret('S3_ACCESS_KEY') }}"
+          secretKeyId: "{{ secret('S3_SECRET_KEY') }}"
+          region: us-east-1
+          containerImage: amazon/aws-cli:2.17.57
+          env:
+            AWS_ENDPOINT_URL: "{{ secret('S3_ENDPOINT') }}"
+          commands:
+            - |
+              if ! err=$(aws s3api head-bucket --bucket {{ render(vars.bucket) }} 2>&1); then
+                case "$err" in *"(404)"*) exit 0 ;; *) echo "$err"; exit 1 ;; esac
+              fi
+              aws s3api delete-bucket --bucket {{ render(vars.bucket) }}
+
+        - id: compensate_postgres
+          type: io.kestra.plugin.jdbc.postgresql.Queries
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          transaction: true
+          sql: |
+            DO $$ BEGIN
+              IF to_regclass('"{{ inputs.product }}".events') IS NOT NULL THEN
+                LOCK TABLE "{{ inputs.product }}".events;
+                IF EXISTS (SELECT 1 FROM "{{ inputs.product }}".events) THEN
+                  RAISE EXCEPTION 'rows arrived during rollback';
+                END IF;
+              END IF;
+            END $$;
+            DROP TABLE IF EXISTS "{{ inputs.product }}".events;
+            DROP SCHEMA IF EXISTS "{{ inputs.product }}" RESTRICT;
+
+        - id: after_rollback
+          type: io.kestra.plugin.core.flow.Subflow
+          namespace: "{{ flow.namespace }}"
+          flowId: "{{ flow.id }}"
+          wait: true
+          transmitFailed: true
+          inputs:
+            mode: OBSERVE
+            product: "{{ inputs.product }}"
+
+        - id: fail_if_anything_remains
+          type: io.kestra.plugin.core.execution.Fail
+          runIf: "{{ outputs.after_rollback.outputs.state != '0/0/0' }}"
+          errorMessage: "Rollback read back {{ outputs.after_rollback.outputs.state }}, expected 0/0/0. The ledger entry is kept so it can be rerun."
+
+        - id: close_ledger
+          type: io.kestra.plugin.jdbc.postgresql.Query
+          description: Keeps a tombstone instead of deleting the row, so ownership is never lost.
+          url: "{{ secret('PG_JDBC_URL') }}"
+          username: "{{ secret('PG_USER') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+          fetchType: NONE
+          sql: UPDATE saga_ledger.products SET state = 'ROLLED_BACK', updated_at = now() WHERE product = '{{ inputs.product }}'
+
+      DRILL:
+        - id: each_failure_point
+          type: io.kestra.plugin.core.flow.Loop
+          concurrencyLimit: 1
+          values:
+            - AFTER_POSTGRES
+            - AFTER_S3
+            - AFTER_KAFKA
+          tasks:
+            - id: drill_apply
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: "{{ flow.namespace }}"
+              flowId: "{{ flow.id }}"
+              wait: true
+              transmitFailed: false
+              allowFailure: true
+              inputs:
+                mode: APPLY
+                product: "{{ inputs.product }}_drill"
+                fail_at: "{{ item.value }}"
+
+            - id: drill_read_back
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: "{{ flow.namespace }}"
+              flowId: "{{ flow.id }}"
+              wait: true
+              transmitFailed: true
+              inputs:
+                mode: OBSERVE
+                product: "{{ inputs.product }}_drill"
+
+            - id: drill_ledger
+              type: io.kestra.plugin.jdbc.postgresql.Query
+              url: "{{ secret('PG_JDBC_URL') }}"
+              username: "{{ secret('PG_USER') }}"
+              password: "{{ secret('PG_PASSWORD') }}"
+              fetchType: FETCH_ONE
+              sql: SELECT state, drill_reached FROM saga_ledger.products WHERE product = '{{ inputs.product }}_drill'
+
+            - id: drill_fail_if_dirty
+              type: io.kestra.plugin.core.execution.Fail
+              description: Proves the run really reached this failure point and really compensated.
+              runIf: >-
+                {{ outputs.drill_read_back.outputs.state != '0/0/0' or
+                outputs.drill_ledger.row.state != 'ROLLED_BACK' or
+                outputs.drill_ledger.row.drill_reached != item.value }}
+              errorMessage: >-
+                {{ item.value }} left {{ outputs.drill_read_back.outputs.state }}, ledger
+                {{ outputs.drill_ledger.row.state }}, reached {{ outputs.drill_ledger.row.drill_reached }}.
+
+            - id: drill_report
+              type: io.kestra.plugin.core.log.Log
+              message: "{{ item.value }}: failed on purpose, compensated, read back {{ outputs.drill_read_back.outputs.state }}."
+
+errors:
+  - id: compensate_failed_apply
+    type: io.kestra.plugin.core.flow.Subflow
+    description: Runs only for a saga that wrote its intent. A refused run has nothing to undo.
+    runIf: "{{ inputs.mode == 'APPLY' and (outputs.write_intent.size ?? 0) > 0 }}"
+    namespace: "{{ flow.namespace }}"
+    flowId: "{{ flow.id }}"
+    wait: true
+    transmitFailed: true
+    inputs:
+      mode: ROLLBACK
+      product: "{{ inputs.product }}"
+
+outputs:
+  - id: state
+    type: STRING
+    required: false
+    description: Resources present as postgres/s3/kafka, for example 1/1/1.
+    value: >-
+      {%- set topic = render(vars.topic) -%}
+      {%- if inputs.mode == 'DRILL' -%}0/0/0{%- else -%}
+      {{ outputs.after_apply.outputs.state ?? outputs.after_rollback.outputs.state ?? outputs.before_apply.outputs.state ??
+      ((outputs.read_postgres.row.present ?? '') ~ '/' ~ (outputs.read_s3.vars.present ?? '') ~ '/' ~
+      ((outputs.read_kafka.topics ?? []) contains topic ? 1 : 0)) }}
+      {%- endif -%}
+
+triggers:
+  - id: agent_tool
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: provision_data_product
+    title: Provision or remove a data product
+    mcpServer: default
+    toolDescription: >-
+      Creates or removes a data product across PostgreSQL, S3 and Kafka. Call this instead of
+      creating these resources one at a time. A failed APPLY compensates itself, and ROLLBACK
+      only touches resources this tool created.
+
+extend:
+  title: Provision a Data Product Across PostgreSQL, S3 and Kafka as a Saga with Proven Rollback
+  metaTitle: Multi-System Saga with Proven Rollback | Kestra
+  shortDescription: Creates a schema, a bucket and a topic as one saga. Failures compensate in reverse order, rollback reads the real systems, and a drill fails every step to prove it.
+  metaDescription: Provision PostgreSQL, S3 and Kafka as one saga. Failed runs compensate themselves, and a drill breaks each step to prove the rollback.
+  description: |
+    A data product usually needs a schema, a bucket and a topic, and a failure halfway leaves pieces nobody owns. This flow treats the three as one saga. It writes an intent before anything changes, undoes a failed run in reverse order, and proves the result by reading each system back.
+
+    ## How it works
+
+    1. `APPLY` checks the real systems and refuses anything that exists without a ledger entry, because it belongs to someone else.
+    2. `write_intent` claims the product in a PostgreSQL ledger before the first side effect. `ON CONFLICT` makes the claim atomic, so a crash leaves a record and two runs cannot both win.
+    3. `create_postgres`, `create_s3` and `create_kafka` run in order. A committed product exits early, so a later failure cannot compensate it.
+    4. `after_apply` reads all three back, and only a `1/1/1` result is marked committed.
+    5. If a step fails, `errors` starts `ROLLBACK`. A killed run skips `errors`, so run `ROLLBACK` by hand.
+    6. `ROLLBACK` needs a ledger entry and reads what is really there, so it repairs a partial run. It refuses before the first delete if the table, the topic or the bucket holds data.
+    7. It records `ROLLING_BACK`, compensates Kafka, S3, then PostgreSQL, and closes the ledger only after reading back `0/0/0`.
+    8. `DRILL` breaks a run after each step, one at a time, and fails unless each reached that step, rolled back and left `0/0/0`.
+
+    ## What you get
+
+    - All three resources, or a failed run that compensates itself and can be rerun.
+    - Rollback that refuses to delete data, and refuses any product without a ledger entry.
+    - A repeatable proof of recovery you can schedule.
+    - An MCP tool, `provision_data_product`, that returns the state it read back.
+
+    ## Who it's for
+
+    Data platform teams who provision resources for other teams, and teams letting agents request infrastructure.
+
+    ## Why orchestrate this with Kestra
+
+    `errors` runs the compensation, and one flow is both the workflow and an agent tool.
+
+    ## Prerequisites
+
+    - PostgreSQL, Kafka and an S3-compatible store, reachable from the worker. Docker on the worker for the AWS CLI.
+    - A PostgreSQL role with `CREATE` on the database, Kafka rights to create, read and delete topics, and S3 rights to create, list and delete buckets.
+
+    Compensation restores resources. Anything a consumer already read from the topic cannot be recalled.
+
+    ### Secrets
+
+    - `PG_JDBC_URL`, `PG_USER`, `PG_PASSWORD`: PostgreSQL connection.
+    - `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`: S3 connection.
+    - `KAFKA_BOOTSTRAP`: Kafka bootstrap servers.
+
+    ## Quick start
+
+    1. Add the secrets and save the flow.
+    2. Execute with `mode` set to `DRILL` and read the three failed `APPLY` runs and their rollbacks.
+    3. Execute with `APPLY`, then `OBSERVE`, then `ROLLBACK`.
+
+    ## How to extend
+
+    Add a Schedule for a nightly `DRILL`, or more steps with their own compensation.
+
+    ## Links
+
+    - [Kafka plugin](https://kestra.io/plugins/plugin-kafka)
+    - [MCP Tool Trigger](https://kestra.io/docs/workflow-components/triggers/mcp-tool-trigger)
+  tags:
+    - Infrastructure
+  subTags:
+    - Infrastructure Automation
+    - Day 2 Operations
+  ee: false
+  demo: false
